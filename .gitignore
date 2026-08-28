@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Secrets — bot tokens live in .env, NEVER in git
+.env
+*.env
+!.env.example
+
+# State (sticky routing, audit is deliberately local-only in v1)
+*.state.json
+
+# Editor
+.idea/
+.vscode/
+*.swp
