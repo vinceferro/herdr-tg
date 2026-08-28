@@ -14,6 +14,7 @@ anyhow     = { workspace = true }
 clap       = { workspace = true }
 tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
+toml       = { workspace = true }
 
 # SLICE 2 — Telegram. `default-features = false` is LOAD-BEARING, not stylistic: teloxide 0.17.0's
 # default is ['native-tls','ctrlc_handler','teloxide-core/default'] and teloxide-core 0.13.0's default
@@ -27,4 +28,4 @@ tracing-subscriber = { workspace = true }
 # needed; the flip side is that CA-root updates need a rebuild (escape hatch: rustls -> rustls-native-roots).
 # Supply-chain facts for the decision log: 0.17.0 dates from 2025-07-11 (13 months stale), MSRV 1.82,
 # and it pulls proc-macro-error2 v2.0.1 which cargo already flags future-incompatible.
-# teloxide = { version = "0.17.0", default-features = false, features = ["rustls", "ctrlc_handler", "macros"] }
+teloxide = { version = "0.17.0", default-features = false, features = ["rustls", "ctrlc_handler", "macros"] }

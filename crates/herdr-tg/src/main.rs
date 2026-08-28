@@ -2,8 +2,8 @@
 //!
 //! # What this binary may and may not do
 //!
-//! Four subcommands, all **read-only**: `status`, `read`, `doctor`, `watch`. There is deliberately
-//! no fifth. herdr's three write RPCs — the ones that type real keystrokes into the operator's
+//! Five subcommands, all **read-only**: `status`, `read`, `doctor`, `watch`, and (slice 2) `serve`,
+//! which puts the same read-only surface behind a Telegram bot. There is deliberately no sixth. herdr's three write RPCs — the ones that type real keystrokes into the operator's
 //! real terminals — exist in `herdr-client` as typed, mock-tested code, and this crate does not so
 //! much as NAME them. That is machine-checked: `herdr-client`'s `tests/no_live_write_call_site.rs`
 //! greps this whole source tree and fails the suite on any mention, a doc comment included (which
@@ -34,7 +34,9 @@
 //! `5` herdr protocol error. Proof gate 6 asserts **3** (missing socket) and **4** (a server
 //! speaking protocol 19) exactly, and PLAN.md's failure table branches on them.
 
+mod bot;
 mod cmd;
+mod config;
 mod render;
 
 use std::io::{IsTerminal, Write};
@@ -138,6 +140,18 @@ enum Cmd {
         #[arg(long, default_value = "5000", value_name = "MS")]
         timeout_ms: u64,
     },
+
+    /// Run the Telegram bridge: long-poll the Bot API and answer the allowlisted chat.
+    ///
+    /// Still read-only (slice 2): `/status`, `/doctor`, `/help`. The bridge binds nothing — it
+    /// dials out to api.telegram.org and to the local herdr socket, so the box needs no ingress
+    /// (D7). The token comes from `$HERDR_TG_TOKEN`, never from the config file; the chat-id
+    /// allowlist is the identity gate and fails closed, so an empty allowlist answers nobody.
+    Serve {
+        /// Structure only — workspace, allowlist, socket. Never the token.
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -175,6 +189,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    let socket_override = cli.socket.clone();
     let client = connect(cli.socket)?;
     match cli.cmd {
         Cmd::Status { json, workspace } => {
@@ -188,6 +203,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             expect_status,
             timeout_ms,
         } => cmd::watch::run(&client, &pane, once, expect_status.as_deref(), timeout_ms).await,
+        Cmd::Serve { config } => {
+            let cfg = config::Config::load(config.as_deref())?;
+            // `--socket` still wins; the config's socket is the next fallback, so a probe session
+            // can be targeted from the file the unit already reads.
+            let client = match (&socket_override, &cfg.socket) {
+                (None, Some(path)) => HerdrClient::new(path.clone()),
+                _ => client,
+            };
+            bot::serve(cfg, client).await
+        }
     }
 }
 

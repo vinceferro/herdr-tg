@@ -222,6 +222,137 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+// ── The Telegram view ────────────────────────────────────────────────────────────────────────────
+
+/// The herd, rendered for a phone.
+///
+/// [`herd_table`] is 92 characters wide on a real herd. Inside Telegram's `<pre>` block that wraps
+/// into unreadable ribbon on a phone — the operator's word for it was "a bit cryptic". This view
+/// throws away the tabulation and organises by the only question that matters on a phone: **is
+/// anything waiting for me?**
+///
+/// Three deliberate choices:
+///
+/// - **Blocked first, always.** `blocked` is the one status that needs a human. Sorting by pane id
+///   or array order buries the ask among shells. The whole product exists to surface that line.
+/// - **Shell panes collapse to a count.** A pane with no agent is never an ask, and its "title" is
+///   the shell prompt — which on this box is `user@host:~/path`, i.e. pure noise that also leaks the
+///   operator's username into a chat message.
+/// - **Emoji carry the status.** They survive Telegram's font stack, are scannable at a glance, and
+///   cost no horizontal room. The word is kept beside them so the meaning does not depend on
+///   recognising a colour.
+///
+/// Returns **escaped HTML**, ready to send — every piece of agent-authored text (workspace labels,
+/// pane titles) goes through [`escape_html`], because an agent can print anything.
+pub fn herd_telegram(snap: &SessionSnapshot) -> String {
+    let labels: BTreeMap<&WorkspaceId, &str> = snap
+        .workspaces
+        .iter()
+        .map(|ws| (&ws.workspace_id, ws.label.as_str()))
+        .collect();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "<b>{} workspace{} · {} pane{}</b>",
+        snap.workspaces.len(),
+        plural(snap.workspaces.len()),
+        snap.panes.len(),
+        plural(snap.panes.len()),
+    );
+
+    // Panes with no agent are shells. Counted, never listed.
+    let (agentic, shells): (Vec<&PaneInfo>, Vec<&PaneInfo>) = snap
+        .panes
+        .iter()
+        .partition(|p| p.agent.is_some() || p.display_agent.is_some());
+
+    if agentic.is_empty() && shells.is_empty() {
+        out.push_str("\n(no panes)");
+        return out;
+    }
+
+    // Group order IS the priority order. `blocked` is what the operator opened the message for.
+    for (status, emoji, heading) in [
+        ("blocked", "🔴", "BLOCKED — waiting on you"),
+        ("working", "🟡", "WORKING"),
+        ("done", "✅", "DONE"),
+        ("idle", "💤", "IDLE"),
+        ("unknown", "❔", "UNKNOWN"),
+    ] {
+        let group: Vec<&&PaneInfo> = agentic
+            .iter()
+            .filter(|p| p.agent_status.as_str() == status)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let _ = write!(out, "\n\n{emoji} <b>{heading}</b>");
+        for pane in group {
+            let ws = labels
+                .get(&pane.workspace_id)
+                .copied()
+                .unwrap_or_else(|| pane.workspace_id.as_str());
+            let focus = if pane.focused { " ←" } else { "" };
+            let _ = write!(
+                out,
+                "\n<b>{}</b> · <code>{}</code>{}",
+                escape_html(ws),
+                escape_html(pane.pane_id.as_str()),
+                focus
+            );
+            let t = title(pane);
+            if !t.is_empty() {
+                let _ = write!(out, "\n  <i>{}</i>", escape_html(&clip(t, 60)));
+            }
+        }
+    }
+
+    if !shells.is_empty() {
+        let _ = write!(
+            out,
+            "\n\n▫️ {} shell pane{}",
+            shells.len(),
+            plural(shells.len())
+        );
+    }
+    out
+}
+
+/// Trim to `max` characters on a word boundary where one is near, with an ellipsis.
+///
+/// Character-based, not byte-based: pane titles routinely carry emoji and box-drawing glyphs, and
+/// slicing a multi-byte char would panic in the middle of answering the operator.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    let cut = head.rfind(' ').filter(|i| *i > max * 2 / 3);
+    let kept = match cut {
+        Some(i) => &head[..i],
+        None => head.as_str(),
+    };
+    format!("{}…", kept.trim_end())
+}
+
+/// Escape the three characters Telegram's HTML parse mode treats as markup.
+///
+/// Runs on every piece of agent-authored text that reaches a message body. A pane title is whatever
+/// an agent decided to print, so it is untrusted by construction.
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +487,104 @@ mod tests {
         let table = herd_table(&snap);
         assert!(table.contains("0 workspaces, 0 panes"), "{table}");
         assert!(table.contains("(no panes)"), "{table}");
+    }
+
+    // ── the Telegram view ────────────────────────────────────────────────────────────────────
+
+    /// THE property of this view: whatever is BLOCKED appears before anything else.
+    ///
+    /// `blocked` is the only status that needs a human, and the whole product exists to put that
+    /// line in front of the operator. Array order or pane-id order buries it among shells.
+    #[test]
+    fn blocked_panes_come_first() {
+        let out = herd_telegram(&snapshot());
+        let blocked = out.find("BLOCKED").expect("the fixture has a blocked pane");
+        for later in ["WORKING", "DONE", "IDLE", "shell pane"] {
+            if let Some(i) = out.find(later) {
+                assert!(blocked < i, "{later} appeared before BLOCKED:\n{out}");
+            }
+        }
+    }
+
+    /// Shell panes are never an ask, and their "title" is a shell prompt — on this box literally
+    /// `user@host:~/path`, which would leak the operator's username into a chat message.
+    #[test]
+    fn shell_panes_are_counted_never_listed() {
+        // The scrubbed fixture happens to carry an agent on every pane, so a shell pane is made
+        // here rather than assumed. Asserting against the fixture as-is passed VACUOUSLY: the
+        // count was simply absent, and the test only went red once it built the case it claims
+        // to cover.
+        let mut snap = snapshot();
+        let shell = snap.panes.first_mut().expect("the fixture has panes");
+        shell.agent = None;
+        shell.display_agent = None;
+        shell.terminal_title = Some("user@some-host:~/Projects/secret-thing".into());
+        shell.terminal_title_stripped = Some("user@some-host:~/Projects/secret-thing".into());
+        let shell_pane_id = shell.pane_id.as_str().to_string();
+
+        let out = herd_telegram(&snap);
+        assert!(out.contains("1 shell pane"), "the count is missing:\n{out}");
+        assert!(
+            !out.contains(&shell_pane_id),
+            "a shell pane was listed individually:\n{out}"
+        );
+        assert!(
+            !out.contains('@'),
+            "a shell prompt reached the body — that leaks a username:\n{out}"
+        );
+        assert!(
+            !out.contains("secret-thing"),
+            "a shell pane's cwd reached the message body:\n{out}"
+        );
+    }
+
+    /// Every line must fit a phone. `herd_table` is 92 characters wide, which is what made the
+    /// operator call the first version "a bit cryptic".
+    #[test]
+    fn no_line_is_wider_than_a_phone_screen() {
+        for line in herd_telegram(&snapshot()).lines() {
+            // Measure the visible text, not the markup the client renders away.
+            let visible = line
+                .replace("<b>", "")
+                .replace("</b>", "")
+                .replace("<i>", "")
+                .replace("</i>", "")
+                .replace("<code>", "")
+                .replace("</code>", "");
+            assert!(
+                visible.chars().count() <= 48,
+                "{} chars is too wide for a phone: {visible:?}",
+                visible.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_authored_text_is_escaped() {
+        assert_eq!(escape_html("<b>&</b>"), "&lt;b&gt;&amp;&lt;/b&gt;");
+        // The rendered view must never contain a raw metacharacter from the data side.
+        let out = herd_telegram(&snapshot());
+        assert!(!out.contains("<script"));
+    }
+
+    #[test]
+    fn clip_is_char_safe_and_marks_what_it_cut() {
+        assert_eq!(clip("short", 60), "short");
+        let long = "a ".repeat(80);
+        let out = clip(&long, 60);
+        assert!(out.chars().count() <= 61, "clip overran: {out:?}");
+        assert!(out.ends_with('…'));
+        // Multi-byte input must not panic mid-char.
+        let wide = "◑日本語—".repeat(40);
+        assert!(clip(&wide, 60).chars().count() <= 61);
+    }
+
+    #[test]
+    fn an_empty_herd_says_so_rather_than_printing_a_bare_header() {
+        let mut snap = snapshot();
+        snap.panes.clear();
+        snap.workspaces.clear();
+        let out = herd_telegram(&snap);
+        assert!(out.contains("(no panes)"), "{out}");
     }
 }

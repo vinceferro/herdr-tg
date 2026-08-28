@@ -46,7 +46,10 @@ pub(crate) async fn run(
 /// `layouts` is carried through verbatim: it is opaque to this client by design (the spec is
 /// explicit that pane geometry is not modelled), and filtering something we cannot parse would be
 /// guesswork.
-fn narrow_to_workspace(snapshot: &mut SessionSnapshot, selector: &str) -> anyhow::Result<()> {
+pub(crate) fn narrow_to_workspace(
+    snapshot: &mut SessionSnapshot,
+    selector: &str,
+) -> anyhow::Result<()> {
     let Some(target) = snapshot
         .workspaces
         .iter()
