@@ -1,0 +1,30 @@
+[package]
+name = "herdr-tg"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+herdr-client = { path = "../herdr-client" }
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# SLICE 2 — Telegram. `default-features = false` is LOAD-BEARING, not stylistic: teloxide 0.17.0's
+# default is ['native-tls','ctrlc_handler','teloxide-core/default'] and teloxide-core 0.13.0's default
+# is ['native-tls'] -> reqwest/native-tls -> openssl-sys, i.e. a build-time C dependency and a runtime
+# link against system libssl, which silently contradicts D1's single-binary thesis.
+# Verified 2026-08-28 with this exact feature string: 222 packages, reqwest 0.12.28, rustls 0.23.43,
+# ring 0.17.14 (not aws-lc-rs, which wants cmake/clang-bindgen on aarch64), webpki-roots 1.0.9,
+# hyper 1.11.0 — and ZERO openssl / openssl-sys / native-tls / aws-lc-* / rustls-native-certs crates.
+# h2 and encoding_rs are absent, so Bot API long-polling runs over HTTP/1.1 (fine for D7).
+# Consequence for slice 4's hardened unit: webpki-roots is compiled in, so no /etc/ssl/certs access is
+# needed; the flip side is that CA-root updates need a rebuild (escape hatch: rustls -> rustls-native-roots).
+# Supply-chain facts for the decision log: 0.17.0 dates from 2025-07-11 (13 months stale), MSRV 1.82,
+# and it pulls proc-macro-error2 v2.0.1 which cargo already flags future-incompatible.
+# teloxide = { version = "0.17.0", default-features = false, features = ["rustls", "ctrlc_handler", "macros"] }

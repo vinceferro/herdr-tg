@@ -1,0 +1,18 @@
+[package]
+name = "herdr-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio        = { workspace = true, features = ["net", "io-util", "time"] }  # NO rt, NO macros
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+futures-core = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tempfile = { workspace = true }

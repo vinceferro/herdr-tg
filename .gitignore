@@ -14,3 +14,26 @@
 .idea/
 .vscode/
 *.swp
+# kickoff — plugin enablement (holds an absolute core path; do not commit)
+.claude/settings.json
+
+# Rust (cont.) — a member crate run standalone gets its own target/
+target/
+*.orig
+*.rej
+perf.data
+perf.data.old
+*.profraw
+
+# Config carrying the bot token (PLAN.md "Stack") — track the example, never the real one
+herdr-tg.toml
+config/herdr-tg.toml
+!herdr-tg.example.toml
+
+# State: the atomic-write temp does NOT match the existing *.state.json rule
+*.state.json.tmp
+/state/
+
+# Audit trail — records every keystroke sent into a real terminal; local-only by design
+*.audit.log
+/logs/

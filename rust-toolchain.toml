@@ -1,0 +1,11 @@
+# Channel, NOT a version pin: a hard pin ("1.98.0") triggers a ~120 MB toolchain download on a fresh
+# clone for no benefit here.
+#
+# ⚠ THIS FILE IS INERT UNDER THE MISE SHIM ON THIS BOX. `mise` exports RUSTUP_TOOLCHAIN=stable from
+# the GLOBAL ~/.config/mise/config.toml, and RUSTUP_TOOLCHAIN overrides rust-toolchain.toml in every
+# Rust repo on the machine. Only the gates' `env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH"`
+# prefix restores this file's authority — see .kickoff/lefthook-kickoff.yml.
+[toolchain]
+channel    = "stable"
+components = ["rustfmt", "clippy"]
+profile    = "minimal"
