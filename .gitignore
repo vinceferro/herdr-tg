@@ -37,3 +37,6 @@ config/herdr-tg.toml
 # Audit trail — records every keystroke sent into a real terminal; local-only by design
 *.audit.log
 /logs/
+
+# Session scratch that lands in-tree when TMPDIR is an unexpanded specifier
+%h/

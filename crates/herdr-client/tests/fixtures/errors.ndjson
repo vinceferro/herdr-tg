@@ -1,0 +1,2 @@
+{"id":"probe","error":{"code":"pane_not_found","message":"pane zz:p9 not found"}}
+{"id":"","error":{"code":"invalid_request","message":"invalid request: missing field `params` at line 1 column 37"}}

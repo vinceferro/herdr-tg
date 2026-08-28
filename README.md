@@ -20,9 +20,12 @@ boring-correct layer.
 
 ## Status
 
-Incubated 2026-08-28 — pre-build. The plan, architecture diagrams, decision log, and slices live
-in [PLAN.md](./PLAN.md). Built for personal use by [@vinceferro](https://github.com/vinceferro)
-against herdr 0.8.x on a tailnet'd Linux box.
+Incubated 2026-08-28. **Slice 1 — the `herdr-client` crate and the `herdr-tg` CLI (`status`,
+`read`, `doctor`, `watch`) — is built**; its falsifiable proof is `./scripts/proof-slice1.sh`,
+and whether it currently runs green is not claimed here. The build spec, with the verified
+protocol-20 findings it rests on, is [docs/SLICE-1.md](./docs/SLICE-1.md); the product intent,
+architecture diagrams, decision log and slices live in [PLAN.md](./PLAN.md). Built for personal
+use by [@vinceferro](https://github.com/vinceferro) against herdr 0.8.x on a tailnet'd Linux box.
 
 ## Kickoff adoption (turnkey)
 
@@ -41,7 +44,7 @@ Per-instance wiring to carry into `.kickoff/instance.env` (modeled on the bliz i
 ```bash
 export MEMORY_DIR="$HOME/obsidian-vault/Memory"          # shared vault corpus — NOT a repo-local one
 export TELEGRAM_STATE_DIR="$HOME/.claude/channels/telegram-herdr-tg"  # this project's own dogfood bot
-export KICKOFF_CORE_DIR="$HOME/kickoff-core"             # pinned core (core-v0.41 era)
+export KICKOFF_CORE_DIR="$HOME/Projects/claude-kickoff"   # pinned core clone — must match .kickoff/instance.env
 ```
 
 **The dogfood rule:** this project's own Telegram bot is herdr-tg's first user. From slice 3

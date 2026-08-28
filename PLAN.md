@@ -134,14 +134,15 @@ stateDiagram-v2
 | herdr dies / socket gone | Connect/getUpdates errors | Bridge stays up, reconnect loop, `/status` answers "herdr unreachable"; a single recovery notice when the stream re-establishes (not one per retry) |
 | Bot token revoked / API 401 | Telegram error on poll | Bridge exits non-zero; systemd restart throttles; distinct log signature — NOT a silent loop |
 | Agent pane closed while it was the sticky target | snapshot diff shows pane gone | Next message answers with target picker instead of typing into a dead pane — never silently reroute |
+| Sticky target pane was MOVED | `pane_moved` event | The pane_id changes and the old one stops resolving even though the agent is alive and the pane is not closed; the event carries `previous_pane_id` plus the full new `PaneInfo`, so migrate sticky state silently rather than falling back to the picker |
 | Laptop asleep | (everything) | Long-poll returns on wake; missed events recovered from snapshot diff — push the asks that are still blocked, skip the ones that resolved |
 
 ## Slices (each has a falsifiable proof)
 
 | # | Slice | Proof |
 |---|---|---|
-| 1 | **herdr-client crate**: connect, handshake, `session.snapshot`, `pane.read` (visible — [never `recent` in background](https://github.com/AltanS/collie/blob/main/HERDR_API.md), it scrolls the operator's screen), `pane.send_text` + `send_keys`, `events.subscribe` | `herdr-tg status` prints the live herd; diffed against `herdr status` output |
-| 2 | **Telegram channel**: one bot (BotFather token in `.env`, git-ignored), chat-id allowlist, `/status` | You message the bot from the phone; it answers with the real herd state |
+| 1 | **herdr-client crate**: connect, `ping` handshake (assert `protocol >= 20`, record version and capabilities, fail closed below the minimum), `session.snapshot`, `pane.read` (visible — [never `recent` in background](https://github.com/AltanS/collie/blob/main/HERDR_API.md), it scrolls the operator's screen), `pane.send_text` + `send_keys`, `events.subscribe` | `./scripts/proof-slice1.sh` exits 0 — seven gates: reference sanity (protocol 20), non-vacuity, sandboxed client under a stripped PATH, sandwich-diffed `herdr-tg status --json` vs `herdr api snapshot` through `scripts/normalize.jq`, `pane.read` text parity, event decode via a filtered-status replay, and the negative paths (missing socket → exit 3, protocol 19 → exit 4). NOT `herdr status`, which prints versions, not the herd. *The status diff proves `session.snapshot`; gate 4 proves `pane.read`; gate 5 proves `events.subscribe`; `pane.send_text` / `send_keys` / `send_input` are built but have **no live proof** in slice 1.* |
+| 2 | **Telegram channel**: one bot (BotFather token in the `HERDR_TG_TOKEN` env var, never in a tracked file; structure in git-ignored `herdr-tg.toml`), chat-id allowlist, `/status` | You message the bot from the phone; it answers with the real herd state |
 | 3 | **The product loop**: blocked/done events → debounced pushes with buttons; replies → sticky routing → send_text + submit key; switcher; ✅ confirmations | Full ask→answer round trip from the phone against a real agent pane |
 | 4 | **Discipline**: quiet hours, digest batching, retraction, redaction (excerpts only, capped lines), append-only audit log | A busy build pane produces zero pushes; a blocked agent produces exactly one |
 | 5 | *(v2, separate plan)* routing agent as a pane | — |
@@ -153,8 +154,13 @@ per agent type; one workspace per bot means no cross-workspace routing in v1.
 ## Stack (locked, D1)
 
 `tokio` + `serde`/`serde_json` (herdr NDJSON client) · `teloxide` (Bot API: long-poll, inline
-keyboards) · TOML config (`herdr-tg.toml`: per-workspace bot token, chat allowlist, quiet hours,
-pane scope) · state = atomically-written JSON file (no database in v1 — deliberately) ·
+keyboards) · TOML config (`herdr-tg.toml`, git-ignored: workspace name, socket path, chat
+allowlist, quiet hours, pane scope — the bot **token** is not in it; it is read from
+`HERDR_TG_TOKEN`, delivered by the systemd unit's `EnvironmentFile=`, so the credential never
+enters the file that gets copied around. If a token ever does land in a file, name the key
+`token` or `bot_token`: `scan-secrets` has no Telegram pattern and catches a secret only by
+those names — as `bot`, `id` or `key` it is invisible to the scanner and a leak reaches origin)
+· state = atomically-written JSON file (no database in v1 — deliberately) ·
 systemd `--user` unit with Collie's hardening posture (`NoNewPrivileges`, `PrivateTmp`,
 `StartLimitIntervalSec=0`) · gates: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
 (adopted into kickoff's composed lefthook gates).

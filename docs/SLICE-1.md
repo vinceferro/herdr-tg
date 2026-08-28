@@ -136,11 +136,24 @@ out of our side and turns the diff red. That is the drift alarm, sited in one pl
 twenty implicit `deny_unknown_fields` that would all fire at once under `Restart=always`.
 
 `scripts/normalize.jq` drops from **both** sides and no more: `revision`, `state_change_seq`, `scroll`,
-`screen_detection_skipped`, `tokens`, `terminal_title`, `terminal_title_stripped`, `title`, `state_labels`,
-`interactive_ready`, `launch_pending`, `layouts`, and all nulls. It **keeps** `agent_status` (normalizing it
-out would make the proof vacuous — it is the product's entire payload), `focused`/`focused_*_id`, ids,
-labels, numbers, counts, `cwd`, `foreground_cwd`, `agent`, `display_agent`, `agent_session`, `version`,
-`protocol`. It sorts no arrays (`jq -S` sorts keys only) — tabs must render in array order, never by `number`.
+`screen_detection_skipped`, `terminal_title`, `terminal_title_stripped`, `layouts`, and all nulls. It
+**keeps** `agent_status` (normalizing it out would make the proof vacuous — it is the product's entire
+payload), `focused`/`focused_*_id`, ids, labels, numbers, counts, `cwd`, `foreground_cwd`, `agent`,
+`display_agent`, `agent_session`, `version`, `protocol`, and — since the review below — `tokens`,
+`title`, `state_labels`, `interactive_ready`, `launch_pending`. It sorts no arrays (`jq -S` sorts keys
+only) — tabs must render in array order, never by `number`.
+
+> **AMENDED 2026-08-28, review minor.** Those last five used to be on the drop list. A reviewer showed
+> that made them invisible to BOTH proof layers at once: drop-listed here AND absent from every fixture
+> AND absent from the live herd, so a wrong type would have been deleted from both sides before the
+> compare and nothing in the repo would have noticed. They now sit in the KEEP set, where a future herdr
+> that starts emitting one turns gate 3 RED instead of silently dropping it — the same safe failure mode
+> `display_agent` and `name` already had. It costs nothing today: the live census is 0 occurrences of
+> each, and the sandwich still matches on attempt 1. The offline half is
+> `crates/herdr-client/tests/golden.rs::unobserved_optional_fields_decode_from_bytes`, which hand-builds
+> the seven never-observed fields from the checked-in schema and asserts the decode. `terminal_title` /
+> `terminal_title_stripped` stayed dropped: unlike the five, they are observed on every pane and really
+> are volatile.
 
 > Drift measured with this exact file: **6 consecutive live snapshots 1 s apart → 0 diff lines, 5/5
 > intervals.** `terminal_title_stripped` is in the drop list because opencode retitles panes as the agent's
@@ -985,12 +998,12 @@ enum Cmd {
 
 ```
 herd: 6 workspaces, 6 panes   (herdr 0.8.2, protocol 20)
-  w9:p1  bliz-monorepo       idle     opencode  OC | Hello and greeting
-  wA:p1  omarchy-lab         blocked  opencode  OC | Omarchy tooling shipping
-  wB:p1  claude-kickoff      blocked  opencode  OC | Adopting kickoff framework
-  wC:p1  llm-gateway         blocked  opencode  OC | zai-usage rework
-  wD:p1  obsidian-link-map   working  opencode  OC | Consolidated review
-* wE:p1  herdr-tg            working  claude    herdr-tg coordinator onboarding
+  w9:p1  acme-monorepo       idle     opencode  OC | Session one
+  wA:p1  desktop-lab         blocked  opencode  OC | Session two
+  wB:p1  agent-kickoff       blocked  opencode  OC | Session three
+  wC:p1  api-gateway         blocked  opencode  OC | Session four
+  wD:p1  notes-linkmap       working  opencode  OC | Session five
+* wE:p1  bridge-tg           working  claude    Session six
 ```
 
 ---

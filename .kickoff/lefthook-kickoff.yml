@@ -30,6 +30,48 @@ pre-commit:
       run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all --check
     rust-clippy:
       run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo clippy --workspace --all-targets -- -D warnings
+    # ── Why the FULL suite runs at COMMIT and not only at push ────────────────────────────────
+    # It used to live only under pre-push. That put `tests/no_live_write_call_site.rs` — the one
+    # machine check standing between D3's catastrophic failure and `main` — on the wrong side of
+    # the line the coordinator actually crosses: it commits autonomously at every done-boundary
+    # while the push is gated on the operator's explicit go. A reviewer demonstrated the gap by
+    # planting a reachable `client.send_text(&pane, …)` inside `cmd/watch.rs::run()`: fmt rc=0,
+    # clippy rc=0, commit allowed, and only `git push` would ever have caught it. "Machine-checked"
+    # and "the gates run on every commit" were each true and jointly false.
+    #
+    # WHOLE SUITE rather than just that one test, measured on this box rather than guessed:
+    #   after editing two source files   clippy 0.34 s · that test alone 1.28 s · whole suite 1.51 s
+    #   fully warm                                     · that test alone 0.32 s · whole suite 0.57 s
+    # The dominant cost is compiling herdr-client and LINKING a test binary, which the single-test
+    # form already pays in full. +0.23 s buys every other invariant — schema_drift, wire, golden,
+    # failure_paths, events — instead of one, and removes the standing judgement call about which
+    # tests are load-bearing enough to gate on. That judgement call is what opened this hole.
+    #
+    # It stays under pre-push too (below), deliberately: pre-push is the last check before code
+    # leaves the machine, it costs ~0.5 s there, and it still fires for anything committed with
+    # LEFTHOOK=0. Note both are WORKING-TREE checks — see the `{staged_files}` caveat above.
+    rust-test:
+      run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo test --workspace
+    # ── Why `cargo doc` is a gate, added 2026-08-28 ───────────────────────────────────────────
+    # A reviewer found `cargo doc` RED under `-D warnings` with two `private_intra_doc_links`
+    # errors: public docs linking to the deliberately-`pub(crate)` `ReadSource`. Fixing the two
+    # links was a one-line change. Making it a GATE is the part worth writing down, because of how
+    # the fix went: within the same session, the agent that fixed those two links reintroduced the
+    # identical error in a NEW doc comment — one whose whole subject was that this class of link is
+    # an error — by linking to the `pub(crate)` `Handshake::evaluate`. `cargo doc` caught it; three
+    # code reviews and a human would not have.
+    #
+    # The failure mode this really guards is worse than a broken doc build. The tempting way to
+    # silence `private_intra_doc_links` is to widen the private item to `pub`, and the two items
+    # involved here are `ReadSource` (whose `pub(crate)`-ness is the compiler-enforced reason no
+    # timer can reach the harvest-scrolling `recent` source) and `Handshake::evaluate`. A gate that
+    # goes red at commit time makes the wrong fix a deliberate act rather than a quiet convenience.
+    #
+    # Measured on this box, not guessed: 451 ms after a source edit, 38 ms fully warm — against the
+    # 1.51 s `cargo test --workspace` already sitting above it. Same working-tree caveat as the
+    # rest of the cargo gates.
+    rust-doc:
+      run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 pre-push:
   commands:
     structure-scan:
