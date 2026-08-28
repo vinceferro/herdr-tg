@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# kickoff SEAM shim: mc → mission-control/mc-update.py  (GENERATED — DO NOT EDIT).
+# Regenerated from the pinned tag on `kickoff pull`; hand-edits are REFUSED by seam-sync and
+# flagged by preflight #8. Machine-path-free (KICKOFF_CORE_DIR comes from .kickoff/instance.env)
+# so every adopter's copy is byte-identical. See .kickoff/README.
+_here="$(cd "$(dirname "$0")" && pwd)"
+# G10c — pin REPO_DIR to THIS shim's OWN repo BEFORE sourcing instance.env, so the env's
+# ${REPO_DIR:-$PWD}-anchored data-path defaults resolve into THIS repo — never an ambient
+# REPO_DIR=<other repo> or a foreign $PWD. Explicit per-var overrides in instance.env still win.
+export REPO_DIR="$(cd "$_here/../.." && pwd)"
+# …and scrub the ambient data-path vars too: instance.env sets these as ${VAR:-default}, so a
+# parent shell's exported value would WIN and silently route reads/writes into ANOTHER repo's
+# board/tracker (reproduced live: one adopter's `mc render-tracker` rewrote a different repo's
+# TRACKER.md). Explicit values written IN instance.env still win.
+unset MC_STATE_FILE MC_TRACKER_FILE MEMORY_DB MEMORY_HOOK_LOG MEMORY_INDEX GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+[ -f "$_here/../instance.env" ] && . "$_here/../instance.env"
+_engine="${KICKOFF_CORE_DIR:-}/mission-control/mc-update.py"
+if [ ! -f "$_engine" ]; then
+  printf 'kickoff engine not present — see .kickoff/README\n' >&2
+  exit 1
+fi
+exec python3 "$_engine" "$@"

@@ -1,0 +1,3 @@
+# kickoff — extends the kickoff gate file (generic secret/structure scans); yours to edit.
+extends:
+  - .kickoff/lefthook-kickoff.yml

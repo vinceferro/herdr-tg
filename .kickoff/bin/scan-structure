@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# kickoff SEAM shim: scan-structure → scripts/scan-structure.sh  (GENERATED — DO NOT EDIT).
+# Regenerated from the pinned tag on `kickoff pull`; hand-edits are REFUSED by seam-sync and
+# flagged by preflight #8. Machine-path-free (KICKOFF_CORE_DIR comes from .kickoff/instance.env)
+# so every adopter's copy is byte-identical. See .kickoff/README.
+_here="$(cd "$(dirname "$0")" && pwd)"
+# G10c — pin REPO_DIR to THIS shim's OWN repo BEFORE sourcing instance.env, so the env's
+# ${REPO_DIR:-$PWD}-anchored data-path defaults resolve into THIS repo — never an ambient
+# REPO_DIR=<other repo> or a foreign $PWD. Explicit per-var overrides in instance.env still win.
+export REPO_DIR="$(cd "$_here/../.." && pwd)"
+# …and scrub the ambient data-path vars too: instance.env sets these as ${VAR:-default}, so a
+# parent shell's exported value would WIN and silently route reads/writes into ANOTHER repo's
+# board/tracker (reproduced live: one adopter's `mc render-tracker` rewrote a different repo's
+# TRACKER.md). Explicit values written IN instance.env still win.
+unset MC_STATE_FILE MC_TRACKER_FILE MEMORY_DB MEMORY_HOOK_LOG MEMORY_INDEX GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+[ -f "$_here/../instance.env" ] && . "$_here/../instance.env"
+_engine="${KICKOFF_CORE_DIR:-}/scripts/scan-structure.sh"
+if [ ! -f "$_engine" ]; then
+  printf 'kickoff engine not present — run `kickoff pull` (see .kickoff/README)\n' >&2
+  exit 1
+fi
+# scan THIS repo, not the caller's cwd — the engine lists files via `git ls-files` from CWD,
+# so without the cd the shim scanned whatever directory it happened to be called from.
+#
+# WORKSPACE MEMBER: when kickoff is mounted on a workspace ROOT (N sibling checkouts adopted as one
+# org), a member's git hook calls this shim from inside that member. cd-ing to the root there fans
+# the scan across every sibling AND scores THIS member's push on other repos' files. So in that
+# topology only, scan the CALLER's repo.
+# TWO SPELLINGS OF "THIS IS A WORKSPACE ROOT", because a root may now be a git repo AND a workspace:
+# the root is not itself a repo (the original shape), OR it carries the explicit `.kickoff/workspace`
+# marker. A single-repo adopt CANNOT take this branch: its REPO_DIR is a git repo's root and has no
+# marker, so the guard below is false and the cd is byte-for-byte the old behaviour.
+_ws_target="$REPO_DIR"
+_root_top="$(git -C "$REPO_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+[ -n "$_root_top" ] && _root_top="$(cd "$_root_top" 2>/dev/null && pwd -P || printf '%s' "$_root_top")"
+_root_p="$(cd "$REPO_DIR" 2>/dev/null && pwd -P || printf '%s' "$REPO_DIR")"
+if [ "$_root_top" != "$_root_p" ] || [ -f "$_root_p/.kickoff/workspace" ]; then
+  # `pwd -P` on BOTH sides: --show-toplevel is physical while REPO_DIR is logical, and a symlinked
+  # workspace would otherwise miss the prefix and silently fall back to the root fan-out.
+  _caller_top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$_caller_top" ] && _caller_top="$(cd "$_caller_top" 2>/dev/null && pwd -P || printf '%s' "$_caller_top")"
+  case "$_caller_top" in
+    "$_root_p"/*) _ws_target="$_caller_top" ;;
+  esac
+fi
+cd "$_ws_target"
+exec "$_engine" "$@"

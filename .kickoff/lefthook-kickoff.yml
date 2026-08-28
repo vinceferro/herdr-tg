@@ -1,0 +1,38 @@
+# lefthook-kickoff.yml — kickoff's GENERIC gates, wired by `kickoff adopt` (stack-agnostic).
+# The /adopt session ADDS the stack gates (typecheck · lint · test) for the detected stack
+# to this file. It is YOURS (adopter-owned): edit freely; `kickoff eject` removes it.
+#
+# ── The Rust gates live HERE, not in the root lefthook.yml ────────────────────────────────────
+# The hook runner emits root-lefthook.yml commands BEFORE `extends:` commands, so putting them in
+# the root file would run a ~1.9 s clippy ahead of a 0.09 s secret scan. Root stays a bare
+# `extends:`; `adopt-manifest.py` then treats it as pure wiring on `kickoff eject`.
+#
+# ── Why every cargo line carries `env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH"` ──────
+# BOTH halves are load-bearing on this box, and each fails differently:
+#   1. PATH=…  — `~/.cargo/bin` is NOT on an agent session's PATH here (`which -a cargo` finds only
+#      mise shims). Without it the gate dies "cargo: not found" and reads as a broken hook.
+#   2. env -u RUSTUP_TOOLCHAIN — `mise env` exports RUSTUP_TOOLCHAIN=stable from the GLOBAL
+#      ~/.config/mise/config.toml, and that variable SILENTLY OVERRIDES rust-toolchain.toml in
+#      every Rust repo on this machine. Without the `-u`, this repo's pinned channel/components
+#      are inert and the gate is checking some other toolchain than the one the build declares.
+# Do NOT add `--all-features`: our crates declare none today, and the day one declares a
+# TLS-selecting feature it would link openssl into every clippy run.
+#
+# ── Known cost, written down rather than worked around ────────────────────────────────────────
+# This runner ignores lefthook's `{staged_files}`, so the cargo gates run on the WORKING TREE, not
+# the staged index: an unstaged, half-finished file anywhere in the repo blocks every commit.
+# Workaround when that bites: `git stash -k`.
+pre-commit:
+  commands:
+    secret-scan:
+      run: bash .kickoff/bin/scan-secrets --staged
+    rust-fmt:
+      run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all --check
+    rust-clippy:
+      run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo clippy --workspace --all-targets -- -D warnings
+pre-push:
+  commands:
+    structure-scan:
+      run: bash .kickoff/bin/scan-structure
+    rust-test:
+      run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo test --workspace
