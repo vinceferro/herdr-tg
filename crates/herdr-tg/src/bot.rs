@@ -30,13 +30,19 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use herdr_client::{HerdrClient, SessionSnapshot};
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use teloxide::utils::command::BotCommands;
 
+use crate::audit::Audit;
 use crate::config::Config;
+use crate::deliver::{self, Settle};
+use crate::notify::{self, Ask, Timing};
 use crate::render::{self, escape_html};
+use crate::routing::{Routing, Target};
 
 /// Telegram's hard limit on a message body. Exceeding it is a 400 from the API, which in a
 /// long-poll loop looks like "the bot went quiet" rather than like an error.
@@ -77,6 +83,8 @@ pub enum Command {
     Status,
     #[command(description = "is the bridge talking to herdr, and on what protocol.")]
     Doctor,
+    #[command(description = "aim your replies at a pane, e.g. /target wA:p1.")]
+    Target(String),
     #[command(description = "show this help.")]
     Help,
 }
@@ -116,11 +124,71 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
     let workspace = config.workspace.clone();
     let gate = Arc::new(gate);
 
+    let routing_path = Routing::default_path();
+    let routing = Arc::new(Mutex::new(Routing::load(&routing_path)));
+    let audit = Arc::new(Audit::new(Audit::default_path()));
+    tracing::info!(
+        routing = %routing_path.display(),
+        audit = %audit.path().display(),
+        submit = %config.submit_key,
+        "reply path armed"
+    );
+    let submit = config.submit_key.clone();
+
+    // The push loop. Spawned before the repl so an ask that is ALREADY blocked reaches the phone
+    // at startup — that is the filtered subscription's replay, and it is what recovers the asks
+    // raised while the laptop was asleep or the bridge was restarting.
+    {
+        let client = Arc::clone(&client);
+        let routing = Arc::clone(&routing);
+        let bot = bot.clone();
+        let chats: Vec<i64> = config.allowed_chat_ids.iter().copied().collect();
+        tokio::spawn(async move {
+            let on_ask = move |ask: Ask| {
+                let bot = bot.clone();
+                let routing = Arc::clone(&routing);
+                let chats = chats.clone();
+                let fut = async move {
+                    for chat in chats {
+                        let body = format!(
+                            "🔴 <b>{}</b> is waiting on you\n<code>{}</code> · {}\n\n<i>Reply to this \
+                             message and I will type it into that pane.</i>",
+                            escape_html(&ask.workspace),
+                            escape_html(ask.pane.as_str()),
+                            escape_html(&ask.agent),
+                        );
+                        match bot
+                            .send_message(ChatId(chat), &body)
+                            .parse_mode(ParseMode::Html)
+                            .await
+                        {
+                            Ok(sent) => {
+                                // Remember which pane this push was about, so a REPLY to it routes
+                                // there — the one routing rule that cannot go stale.
+                                let mut r = routing.lock().await;
+                                r.record_push(sent.id.0 as i64, &ask.pane);
+                                if let Err(e) = r.save(&Routing::default_path()) {
+                                    tracing::warn!(error = %e, "could not persist the push mapping");
+                                }
+                            }
+                            Err(e) => tracing::error!(error = %e, "could not push an ask"),
+                        }
+                    }
+                };
+                Box::pin(fut) as futures_core::future::BoxFuture<'static, ()>
+            };
+            notify::watch(client, Timing::default(), Arc::new(on_ask)).await
+        });
+    }
+
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let client = Arc::clone(&client);
         let gate = Arc::clone(&gate);
         let workspace = workspace.clone();
         let username = Arc::clone(&username);
+        let routing = Arc::clone(&routing);
+        let audit = Arc::clone(&audit);
+        let submit = submit.clone();
         async move {
             let chat_id = msg.chat.id.0;
             if !gate.admit(chat_id) {
@@ -137,17 +205,19 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
                 return Ok(());
             };
             let Ok(cmd) = Command::parse(text, &username) else {
-                // An allowed operator typing prose is the slice-3 reply path. Until it exists, say
-                // so rather than ignoring them — silence here would read as a broken bot.
-                reply(
-                    &bot,
-                    msg.chat.id,
-                    &escape_html(
-                        "Not a command yet. /status, /doctor, /help. \
-                     Replying into a pane arrives in slice 3.",
-                    ),
+                // Prose from an allowed operator is a REPLY. This is the product.
+                let body = route_and_deliver(
+                    &client,
+                    &routing,
+                    &audit,
+                    &submit,
+                    chat_id,
+                    msg.reply_to_message().map(|m| m.id.0 as i64),
+                    text,
                 )
                 .await;
+                tracing::info!(chat_id, bytes = body.len(), "answered a reply");
+                reply(&bot, msg.chat.id, &body).await;
                 return Ok(());
             };
 
@@ -157,6 +227,9 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
                     Ok(snap) => fit(render::herd_telegram(&snap)),
                     Err(e) => escape_html(&format!("herdr unreachable: {e}")),
                 },
+                Command::Target(ref raw) => {
+                    set_target(&client, &routing, chat_id, raw.trim()).await
+                }
                 Command::Doctor => match client.handshake().await {
                     Ok(h) => escape_html(&format!(
                         "herdr {} · protocol {} · socket {}",
@@ -227,6 +300,133 @@ fn fit(html: String) -> String {
         kept.push('\n');
     }
     format!("{kept}\n… truncated to fit Telegram's {TELEGRAM_MAX_CHARS}-character limit.")
+}
+
+/// Route a reply, deliver it, audit it, and tell the operator exactly what was observed.
+///
+/// The confirmation is the product's honesty surface. It names the pane, names *why* that pane was
+/// chosen, and reports the highest [`deliver::Rung`] actually reached — never more. An operator who
+/// is told "sent" when the text is sitting unsubmitted in a pane will wait on an agent that never
+/// saw their answer, which costs them exactly the time the bot exists to save.
+async fn route_and_deliver(
+    client: &herdr_client::HerdrClient,
+    routing: &Mutex<Routing>,
+    audit: &Audit,
+    submit: &herdr_client::Key,
+    chat_id: i64,
+    reply_to: Option<i64>,
+    text: &str,
+) -> String {
+    let snap = match client.snapshot().await {
+        Ok(s) => s,
+        Err(e) => return escape_html(&format!("herdr unreachable, so nothing was sent: {e}")),
+    };
+
+    let target = routing.lock().await.resolve(chat_id, reply_to, &snap);
+    let (pane, why) = match target {
+        Target::Pane { pane, why } => (pane, why),
+        Target::Gone { pane } => {
+            // PLAN.md's failure table: never silently reroute a dead target.
+            return format!(
+                "<b>Not sent.</b> Your target <code>{}</code> is no longer in the herd.\nPick a \
+                 new one with /target, or reply directly to a pane's message.",
+                escape_html(pane.as_str())
+            );
+        }
+        Target::None => {
+            return escape_html(
+                "No target yet, and I will not guess which terminal to type into. \
+                 Set one with /target <pane>, or reply to a pane's message.",
+            );
+        }
+    };
+
+    let at = timestamp();
+    // Recorded BEFORE the write: if the bridge dies mid-attempt, this still says what went in.
+    if let Err(e) = audit.sent(&at, chat_id, &pane, text) {
+        tracing::error!(error = %e, "could not write the audit record; refusing to send");
+        return escape_html(
+            "Not sent: the audit log could not be written, and this bridge does not type into a \
+             terminal without a record of it.",
+        );
+    }
+
+    let outcome = deliver::deliver(client, &pane, text, submit, Settle::default(), |d| {
+        Box::pin(tokio::time::sleep(d))
+    })
+    .await;
+
+    match outcome {
+        Ok(d) => {
+            let _ = audit.outcome(&timestamp(), &d);
+            let head = format!(
+                "{} → <code>{}</code> <i>({})</i>",
+                d.rung.phrase(),
+                escape_html(pane.as_str()),
+                why.phrase()
+            );
+            if d.rung.needs_attention() {
+                format!("⚠️ {head}\n{}", escape_html(&d.detail))
+            } else {
+                head
+            }
+        }
+        Err(e) => {
+            let _ = audit.failed(&timestamp(), &pane, &e.to_string());
+            format!(
+                "<b>Failed while sending to</b> <code>{}</code>: {}\nCheck the pane — some of it \
+                 may have landed.",
+                escape_html(pane.as_str()),
+                escape_html(&e.to_string())
+            )
+        }
+    }
+}
+
+/// `/target <pane>` — aim replies at a pane, acknowledged by name.
+///
+/// The pane must exist right now. Accepting an unknown id would let the operator arm a target that
+/// silently fails at the moment they most need it to work.
+async fn set_target(
+    client: &herdr_client::HerdrClient,
+    routing: &Mutex<Routing>,
+    chat_id: i64,
+    raw: &str,
+) -> String {
+    if raw.is_empty() {
+        return escape_html("Usage: /target <pane>, e.g. /target wA:p1. See /status for pane ids.");
+    }
+    let snap = match client.snapshot().await {
+        Ok(s) => s,
+        Err(e) => return escape_html(&format!("herdr unreachable: {e}")),
+    };
+    let Some(found) = snap.panes.iter().find(|p| p.pane_id.as_str() == raw) else {
+        return format!(
+            "No pane <code>{}</code> in the herd right now. /status lists them.",
+            escape_html(raw)
+        );
+    };
+    let pane = found.pane_id.clone();
+    {
+        let mut r = routing.lock().await;
+        r.set_sticky(chat_id, &pane);
+        if let Err(e) = r.save(&Routing::default_path()) {
+            // Not fatal: routing still works this session, it just will not survive a restart.
+            tracing::warn!(error = %e, "could not persist routing state");
+        }
+    }
+    format!(
+        "Target set: <code>{}</code>. Replies with no reply-to go here.",
+        escape_html(pane.as_str())
+    )
+}
+
+/// RFC3339-ish UTC stamp for the audit log.
+fn timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:03}Z", now.as_secs(), now.subsec_millis())
 }
 
 #[cfg(test)]

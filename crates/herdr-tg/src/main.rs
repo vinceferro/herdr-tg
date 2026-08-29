@@ -34,10 +34,14 @@
 //! `5` herdr protocol error. Proof gate 6 asserts **3** (missing socket) and **4** (a server
 //! speaking protocol 19) exactly, and PLAN.md's failure table branches on them.
 
+mod audit;
 mod bot;
 mod cmd;
 mod config;
+mod deliver;
+mod notify;
 mod render;
+mod routing;
 
 use std::io::{IsTerminal, Write};
 use std::num::NonZeroU32;

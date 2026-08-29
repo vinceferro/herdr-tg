@@ -67,6 +67,18 @@ const CALL_RULE_EXEMPT: [&str; 2] = [
 /// The crate that DEFINES the three methods, and so is the one place allowed to name them.
 const DEFINING_MEMBER: &str = "crates/herdr-client";
 
+/// The ONE file outside the defining crate that may reach a write, and why.
+///
+/// Slice 1 shipped the writes with no path from any reachable crate — the invariant was simply
+/// "nowhere". Slice 3 gives the operator a reply path, so "nowhere" became false, and an invariant
+/// that is false is an invariant that gets deleted. It is replaced by a narrower one that is still
+/// worth having: **every write goes through the single module that verifies delivery and audits
+/// it.** A Telegram message can now reach a keystroke, but only along a path that reads the pane
+/// back, refuses to claim more than it observed, and writes an audit record.
+///
+/// Widening this list is a decision about the operator's terminals. It should feel like one.
+const AUDITED_WRITE_PATH: &str = "crates/herdr-tg/src/deliver.rs";
+
 /// The workspace root: `crates/herdr-client/` → up two.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -394,7 +406,7 @@ fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
             let src = fs::read_to_string(&file).expect("a source file in this repo is readable");
             for (n, line) in src.lines().enumerate() {
                 for name in WRITE_NAMES {
-                    if line.contains(name) {
+                    if line.contains(name) && rel(&root, &file) != AUDITED_WRITE_PATH {
                         offenders.push(format!("{}:{}: {}", rel(&root, &file), n + 1, line.trim()));
                     }
                 }
@@ -409,8 +421,10 @@ fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
     assert!(
         offenders.is_empty(),
         "a workspace member outside `{DEFINING_MEMBER}` names a write method. These crates are \
-         what a timer, a cron job or a Telegram message can reach; slice 1 ships the writes with \
-         NO path from any of them (spec delta #24). Found:\n  {}",
+         what a timer, a cron job or a Telegram message can reach, so a write may appear in \
+         exactly ONE of their files: `{AUDITED_WRITE_PATH}`, which reads the pane back and audits. \
+         If this is a new legitimate write path, it belongs in that module, not beside it. \
+         Found:\n  {}",
         offenders.join("\n  ")
     );
 }
@@ -453,7 +467,7 @@ fn no_write_call_site_anywhere_outside_cfg_test() {
     let mut offenders = Vec::new();
     for file in &all {
         let relp = rel(&root, file);
-        if CALL_RULE_EXEMPT.contains(&relp.as_str()) {
+        if CALL_RULE_EXEMPT.contains(&relp.as_str()) || relp == AUDITED_WRITE_PATH {
             continue;
         }
         let src = fs::read_to_string(file).expect("a source file in this repo is readable");
@@ -688,4 +702,53 @@ fn char_literals_do_not_open_a_string_span() {
             "offset drift on {case:?}"
         );
     }
+}
+
+/// The audited write path must EXIST, be exactly one file, and actually audit.
+///
+/// An exemption is only as good as the thing it points at. Three ways this one could rot into a
+/// hole, each checked here:
+///
+/// 1. The file is renamed or deleted. The exemption then matches nothing, the guard silently goes
+///    back to "nowhere", and the next write lands somewhere else entirely.
+/// 2. The file stops verifying. If `deliver.rs` ever reports success on an ack alone, the exemption
+///    is buying a guarantee that is no longer delivered — the whole reason writes are allowed there
+///    and not elsewhere.
+/// 3. A second file is added to the list. That is a decision about the operator's terminals, and it
+///    should require editing this assertion, not just appending a string.
+#[test]
+fn the_audited_write_path_exists_and_still_earns_its_exemption() {
+    let root = workspace_root();
+    let path = root.join(AUDITED_WRITE_PATH);
+    assert!(
+        path.is_file(),
+        "AUDITED_WRITE_PATH points at {}, which does not exist. A dangling exemption is worse \
+         than none: it looks like a guarantee and enforces nothing.",
+        path.display()
+    );
+
+    let src = fs::read_to_string(&path).expect("the audited write path is readable");
+
+    // It must read the pane back. That is what distinguishes this module from any other caller and
+    // is the entire justification for letting writes live here.
+    assert!(
+        src.contains("read_visible"),
+        "{AUDITED_WRITE_PATH} no longer reads the pane back. Writes are permitted here ONLY \
+         because delivery is verified rather than assumed."
+    );
+
+    // It must not be able to claim delivery from an ack. The rung vocabulary is what keeps the
+    // operator's confirmation honest.
+    assert!(
+        src.contains("Rung::Acted"),
+        "{AUDITED_WRITE_PATH} no longer distinguishes what it observed from what it hopes. \
+         An `ok` from herdr means herdr took the bytes, never that the agent acted."
+    );
+
+    // Exactly one exemption. Widening this is a deliberate act.
+    assert_eq!(
+        AUDITED_WRITE_PATH, "crates/herdr-tg/src/deliver.rs",
+        "the audited write path moved. That is allowed — but update this assertion deliberately, \
+         because it is the only thing standing between a Telegram message and a keystroke."
+    );
 }

@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use herdr_client::Key;
 use serde::Deserialize;
 
 /// The environment variable carrying the bot token. Written by `scripts/setup-token.sh`.
@@ -48,6 +49,8 @@ struct FileConfig {
     allowed_chat_ids: Vec<i64>,
     /// Socket override, for a probe session. Normally absent.
     socket: Option<PathBuf>,
+    /// The key that submits a reply in an agent pane. Default `Enter`.
+    submit_key: Option<String>,
 }
 
 /// Everything the bridge needs to start.
@@ -63,6 +66,13 @@ pub struct Config {
     pub allowed_chat_ids: BTreeSet<i64>,
     pub workspace: Option<String>,
     pub socket: Option<PathBuf>,
+    /// The key pressed after the operator's text to submit it.
+    ///
+    /// `Enter` for `opencode` is confirmed on the wire. For `claude` it is **operator-supplied
+    /// knowledge, not a probed fact** (`docs/SLICE-3-PROBE.md`, "still open"). That is survivable
+    /// only because delivery is verified by reading the pane back: a wrong key shows up as
+    /// [`crate::deliver::Rung::Echoed`] and the operator is told, rather than being told "sent".
+    pub submit_key: Key,
 }
 
 impl Config {
@@ -108,11 +118,21 @@ impl Config {
             }
         }
 
+        let submit_raw = file.submit_key.as_deref().unwrap_or("Enter");
+        let submit_key = Key::parse(submit_raw).map_err(|e| {
+            anyhow::anyhow!(
+                "submit_key `{submit_raw}` is not a key herdr accepts: {e}. Note the chord form is \
+                 `ctrl+c`, not `C-c` — the tmux form is refused for every chord except `c-c`, which \
+                 herdr special-cases (docs/SLICE-3-PROBE.md P2)."
+            )
+        })?;
+
         Ok(Self {
             token: token.trim().to_string(),
             allowed_chat_ids: allowed,
             workspace: file.workspace,
             socket: file.socket,
+            submit_key,
         })
     }
 }
@@ -174,6 +194,7 @@ mod tests {
             allowed_chat_ids: ids.iter().copied().collect(),
             workspace: None,
             socket: None,
+            submit_key: Key::parse("Enter").expect("Enter is valid"),
         }
     }
 
