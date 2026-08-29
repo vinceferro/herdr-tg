@@ -562,6 +562,7 @@ dependencies = [
  "clap",
  "futures-core",
  "herdr-client",
+ "reqwest",
  "serde",
  "serde_json",
  "teloxide",

@@ -43,6 +43,7 @@ mod notify;
 mod permission;
 mod render;
 mod routing;
+mod summarize;
 mod voice;
 
 use std::io::{IsTerminal, Write};

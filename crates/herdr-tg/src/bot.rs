@@ -104,6 +104,7 @@ struct Ctx {
     workspace: Option<String>,
     username: Arc<str>,
     forum: Option<ChatId>,
+    gist: Option<Arc<crate::summarize::Summarizer>>,
 }
 
 /// Run the bridge until the process is asked to stop.
@@ -143,7 +144,12 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
         workspace: config.workspace.clone(),
         username: Arc::from(me.username()),
         forum: config.forum_chat_id.map(ChatId),
+        gist: crate::summarize::Summarizer::from_env().map(Arc::new),
     };
+    match &ctx.gist {
+        Some(g) => tracing::info!(model = %g.model, "a one-line gist will be added above each ask"),
+        None => tracing::debug!("no summarizer configured; asks go out as-is"),
+    }
     match ctx.forum {
         Some(c) => tracing::info!(forum = c.0, "forum mode: one topic per pane"),
         None => {
@@ -285,11 +291,17 @@ async fn say_in_topic(
 }
 
 async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
+    // Best-effort, and bounded: a failure here must never stop a push.
+    let gist = match &ctx.gist {
+        Some(g) => g.one_line(&ask.excerpt).await,
+        None => None,
+    };
     let body = voice::asked(
         place(ctx),
         &ask.workspace,
         &ask.excerpt,
         !ask.options.is_empty(),
+        gist.as_deref(),
     );
     let keyboard = if ask.options.is_empty() {
         InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(

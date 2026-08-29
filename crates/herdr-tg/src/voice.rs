@@ -32,11 +32,22 @@ pub enum Place {
 }
 
 /// An agent needs an answer.
-pub fn asked(place: Place, workspace: &str, excerpt: &str, has_options: bool) -> String {
+pub fn asked(
+    place: Place,
+    workspace: &str,
+    excerpt: &str,
+    has_options: bool,
+    gist: Option<&str>,
+) -> String {
     let mut m = match place {
         Place::Topic => "🔴 <b>Needs you</b>".to_string(),
         Place::Flat => format!("🔴 <b>{} needs you</b>", esc(workspace)),
     };
+    // The gist goes ABOVE the excerpt and never replaces it: if a small model paraphrased the
+    // question wrongly, the real text is right underneath and the operator can see that.
+    if let Some(g) = gist.filter(|g| !g.trim().is_empty()) {
+        m.push_str(&format!("\n{}", esc(g.trim())));
+    }
     if !excerpt.is_empty() {
         m.push_str(&format!("\n\n<pre>{}</pre>", esc(excerpt)));
     }
@@ -196,8 +207,15 @@ mod tests {
     /// rather than the two someone remembered.
     fn every_message(place: Place) -> Vec<String> {
         let mut all = vec![
-            asked(place, "omarchy-lab", "Force-push? [y/N]", false),
-            asked(place, "omarchy-lab", "Allow access?", true),
+            asked(place, "omarchy-lab", "Force-push? [y/N]", false, None),
+            asked(place, "omarchy-lab", "Allow access?", true, None),
+            asked(
+                place,
+                "omarchy-lab",
+                "Force-push? [y/N]",
+                false,
+                Some("Force-push and drop 2 commits?"),
+            ),
             finished(place, "omarchy-lab", "Done: 3 files changed."),
             resumed(place, "omarchy-lab"),
             topic_opened("omarchy-lab", "opencode"),
@@ -252,7 +270,7 @@ mod tests {
     #[test]
     fn a_flat_message_about_a_session_names_it() {
         for m in [
-            asked(Place::Flat, "omarchy-lab", "x", false),
+            asked(Place::Flat, "omarchy-lab", "x", false, None),
             finished(Place::Flat, "omarchy-lab", "x"),
             resumed(Place::Flat, "omarchy-lab"),
             reply_landed(Place::Flat, "omarchy-lab", &delivery(Rung::Submitted)),
@@ -335,10 +353,57 @@ mod tests {
         }
     }
 
+    /// The gist is a convenience, never a replacement. A wrong paraphrase must be visible against
+    /// the real text, which is why the excerpt is always sent underneath it.
+    #[test]
+    fn a_gist_is_added_above_the_excerpt_and_never_instead_of_it() {
+        let with = asked(
+            Place::Topic,
+            "ws",
+            "Force-push and drop the 2 commits? [y/N]",
+            false,
+            Some("Force-push, losing 2 commits?"),
+        );
+        assert!(
+            with.contains("Force-push, losing 2 commits?"),
+            "no gist: {with}"
+        );
+        assert!(
+            with.contains("Force-push and drop the 2 commits? [y/N]"),
+            "the excerpt was replaced by the gist: {with}"
+        );
+        let gist_at = with.find("Force-push, losing").unwrap();
+        let excerpt_at = with.find("<pre>").unwrap();
+        assert!(gist_at < excerpt_at, "the gist must come first");
+
+        // A gist the model returned as whitespace changes nothing.
+        let without = asked(Place::Topic, "ws", "x", false, Some("   "));
+        assert_eq!(without, asked(Place::Topic, "ws", "x", false, None));
+    }
+
+    /// A gist is agent-adjacent text from a model: untrusted like everything else.
+    #[test]
+    fn a_gist_is_escaped() {
+        let m = asked(
+            Place::Topic,
+            "ws",
+            "x",
+            false,
+            Some("<script>alert(1)</script>"),
+        );
+        assert!(!m.contains("<script>"));
+    }
+
     /// Agent-authored text is untrusted: a pane title can contain anything.
     #[test]
     fn relayed_text_is_escaped() {
-        let m = asked(Place::Topic, "ws", "<b>not bold</b> & <script>", false);
+        let m = asked(
+            Place::Topic,
+            "ws",
+            "<b>not bold</b> & <script>",
+            false,
+            None,
+        );
         assert!(!m.contains("<script>"));
         assert!(m.contains("&lt;b&gt;"));
     }
