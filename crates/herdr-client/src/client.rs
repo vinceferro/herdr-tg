@@ -323,6 +323,15 @@ impl HerdrClient {
         self.finish_read(self.call(&PaneReadRequest::visible(pane)).await?.read)
     }
 
+    /// The visible screen with its colour escapes intact.
+    ///
+    /// Same `source: "visible"`, so the same safety: the scroll harvest is a property of `recent`,
+    /// never of the format. Slice 3 needs it because a TUI renders its selected option as colour,
+    /// and the text read strips exactly that.
+    pub async fn read_visible_ansi(&self, pane: &PaneId) -> Result<PaneRead, HerdrError> {
+        self.finish_read(self.call(&PaneReadRequest::visible_ansi(pane)).await?.read)
+    }
+
     /// Also safe: `visible` is clamped to the viewport however large `lines` is (verified:
     /// `lines=200` against a 63-row viewport returned the full text with `truncated:false`).
     ///

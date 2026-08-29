@@ -150,13 +150,34 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
                 let chats = chats.clone();
                 let fut = async move {
                     for chat in chats {
-                        let body = format!(
-                            "🔴 <b>{}</b> is waiting on you\n<code>{}</code> · {}\n\n<i>Reply to this \
-                             message and I will type it into that pane.</i>",
+                        let mut body = format!(
+                            "🔴 <b>{}</b> is waiting on you\n<code>{}</code> · {}",
                             escape_html(&ask.workspace),
                             escape_html(ask.pane.as_str()),
                             escape_html(&ask.agent),
                         );
+                        // The question itself. Without it this is a notification; with it, it is
+                        // the conversation the product is for.
+                        if !ask.excerpt.is_empty() {
+                            body.push_str(&format!("\n\n<pre>{}</pre>", escape_html(&ask.excerpt)));
+                        }
+                        if ask.options.is_empty() {
+                            body.push_str(
+                                "\n<i>Reply to this message and I will type it into that pane.</i>",
+                            );
+                        } else {
+                            // A dialog. Never invite prose — it goes nowhere, and the Enter after
+                            // it confirms whatever was highlighted.
+                            body.push_str("\n<b>Pick one:</b>");
+                            for (i, o) in ask.options.iter().enumerate() {
+                                body.push_str(&format!(
+                                    "\n  <b>{}</b> · {}",
+                                    i + 1,
+                                    escape_html(o)
+                                ));
+                            }
+                            body.push_str("\n<i>Reply with the number, or the option's name.</i>");
+                        }
                         match bot
                             .send_message(ChatId(chat), &body)
                             .parse_mode(ParseMode::Html)
@@ -340,6 +361,61 @@ async fn route_and_deliver(
             );
         }
     };
+
+    // Is that pane showing a choice dialog? If so the reply is a CHOICE, never text — text goes
+    // nowhere and the Enter after it confirms whatever is highlighted, which on a permission prompt
+    // is a grant the operator did not make.
+    let is_dialog = match client.read_visible_ansi(&pane).await {
+        Ok(r) => crate::permission::parse(&r.text),
+        Err(_) => None,
+    };
+    if let Some(prompt) = is_dialog {
+        let at = timestamp();
+        if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
+            tracing::error!(error = %e, "could not write the audit record; refusing to send");
+            return escape_html("Not sent: the audit log could not be written.");
+        }
+        return match deliver::choose(client, &pane, text, Settle::default(), |d| {
+            Box::pin(tokio::time::sleep(d))
+        })
+        .await
+        {
+            Ok(Ok(d)) => {
+                let _ = audit.outcome(&timestamp(), &d);
+                let head = format!(
+                    "{} → <code>{}</code> <i>({})</i>",
+                    escape_html(&d.detail),
+                    escape_html(pane.as_str()),
+                    why.phrase()
+                );
+                if d.rung.needs_attention() {
+                    format!("⚠️ {head}")
+                } else {
+                    head
+                }
+            }
+            // Not an error — the operator was ambiguous, or the dialog moved on. Show the options
+            // again rather than typing something into a terminal on a guess.
+            Ok(Err(why_not)) => {
+                let mut m = format!("<b>Nothing sent.</b> {}", escape_html(&why_not));
+                if !prompt.options.is_empty() {
+                    m.push_str("\n<b>Pick one:</b>");
+                    for (i, o) in prompt.options.iter().enumerate() {
+                        m.push_str(&format!("\n  <b>{}</b> · {}", i + 1, escape_html(o)));
+                    }
+                }
+                m
+            }
+            Err(e) => {
+                let _ = audit.failed(&timestamp(), &pane, &e.to_string());
+                format!(
+                    "<b>Failed on</b> <code>{}</code>: {}",
+                    escape_html(pane.as_str()),
+                    escape_html(&e.to_string())
+                )
+            }
+        };
+    }
 
     let at = timestamp();
     // Recorded BEFORE the write: if the bridge dies mid-attempt, this still says what went in.

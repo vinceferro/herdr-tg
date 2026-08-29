@@ -40,6 +40,7 @@ mod cmd;
 mod config;
 mod deliver;
 mod notify;
+mod permission;
 mod render;
 mod routing;
 

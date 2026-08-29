@@ -32,7 +32,7 @@ use serde::Serialize;
 use crate::ids::{PaneId, WorkspaceId};
 use crate::keys::Key;
 use crate::proto::event::Subscription;
-use crate::proto::model::ReadSource;
+use crate::proto::model::{ReadFormat, ReadSource};
 
 /// One request line: `{"id":…,"method":…,"params":{…}}`, in that field order.
 ///
@@ -103,6 +103,10 @@ pub(crate) struct PaneReadRequest<'a> {
     /// Omitted entirely for a plain visible read, so the request cannot even name a line count.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines: Option<u32>,
+    /// Omitted unless explicitly asked for, so the default request shape is byte-identical to the
+    /// one slice 1's proof diffs against `herdr api snapshot`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ReadFormat>,
 }
 
 impl<'a> PaneReadRequest<'a> {
@@ -112,6 +116,23 @@ impl<'a> PaneReadRequest<'a> {
             pane_id,
             source: ReadSource::Visible,
             lines: None,
+            format: None,
+        }
+    }
+
+    /// The visible screen WITH its colour escapes.
+    ///
+    /// Still `source: "visible"`, so it is exactly as safe as [`Self::visible`] — the harvest-scroll
+    /// hazard is a property of `recent`, not of the format. This exists because a TUI's *selection*
+    /// is rendered as colour, and `format: "text"` strips precisely that: without it the bridge can
+    /// see which options a permission dialog offers but not which one is highlighted, and would have
+    /// to guess how many arrow presses to send. A wrong guess confirms the wrong option.
+    pub(crate) fn visible_ansi(pane_id: &'a PaneId) -> Self {
+        PaneReadRequest {
+            pane_id,
+            source: ReadSource::Visible,
+            lines: None,
+            format: Some(ReadFormat::Ansi),
         }
     }
 
@@ -125,6 +146,7 @@ impl<'a> PaneReadRequest<'a> {
             pane_id,
             source: ReadSource::Visible,
             lines: Some(lines.get()),
+            format: None,
         }
     }
 }

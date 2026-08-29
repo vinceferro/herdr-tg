@@ -40,3 +40,6 @@ config/herdr-tg.toml
 
 # Session scratch that lands in-tree when TMPDIR is an unexpanded specifier
 %h/
+
+# opencode workspace config — carries a provider apiKey; never commit it
+opencode.json

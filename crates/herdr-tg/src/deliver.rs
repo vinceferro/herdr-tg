@@ -111,6 +111,10 @@ pub trait PaneIo {
     async fn read_visible(&self, pane: &PaneId) -> Result<String, HerdrError>;
     async fn send_input_text(&self, pane: &PaneId, text: &str) -> Result<(), HerdrError>;
     async fn send_submit_key(&self, pane: &PaneId, key: &Key) -> Result<(), HerdrError>;
+    /// The visible screen WITH colour, so a dialog's selection can be seen.
+    async fn read_visible_ansi(&self, pane: &PaneId) -> Result<String, HerdrError>;
+    /// Send several keys in order. Used only to drive a choice dialog.
+    async fn send_key_sequence(&self, pane: &PaneId, keys: &[Key]) -> Result<(), HerdrError>;
 }
 
 /// The real client. Deliberately in THIS file: `tests/no_live_write_call_site.rs` permits the write
@@ -135,6 +139,15 @@ impl PaneIo for herdr_client::HerdrClient {
 
     async fn send_submit_key(&self, pane: &PaneId, key: &Key) -> Result<(), HerdrError> {
         let _herdr_took_the_bytes = self.send_keys(pane, std::slice::from_ref(key)).await?;
+        Ok(())
+    }
+
+    async fn read_visible_ansi(&self, pane: &PaneId) -> Result<String, HerdrError> {
+        Ok(self.read_visible_ansi(pane).await?.text)
+    }
+
+    async fn send_key_sequence(&self, pane: &PaneId, keys: &[Key]) -> Result<(), HerdrError> {
+        let _herdr_took_the_bytes = self.send_keys(pane, keys).await?;
         Ok(())
     }
 }
@@ -258,6 +271,64 @@ fn tail_contains(pane: &str, needle: &str) -> bool {
     lines[start..].iter().any(|l| l.contains(needle))
 }
 
+/// Answer a choice dialog by moving the selection and confirming — never with text.
+///
+/// The dialog is re-parsed from a FRESH read immediately before the keys go out, so the arrow count
+/// is computed from the selection as it is now rather than as it was when the push was written. A
+/// stale index confirms the wrong option, and on a permission prompt the wrong option is a grant.
+///
+/// Verified the same way as a text reply, by looking: the dialog should be gone afterwards. If it
+/// is still there, the operator is told, because a permission prompt that silently did not resolve
+/// is worse than an error.
+pub async fn choose<P: PaneIo>(
+    io: &P,
+    pane: &PaneId,
+    want: &str,
+    settle: Settle,
+    sleep: impl Fn(Duration) -> futures_core::future::BoxFuture<'static, ()>,
+) -> Result<Result<Delivery, String>, HerdrError> {
+    let before = io.read_visible_ansi(pane).await?;
+    let Some(prompt) = crate::permission::parse(&before) else {
+        return Ok(Err("that pane is no longer showing a choice".into()));
+    };
+    let Some(idx) = prompt.match_option(want) else {
+        return Ok(Err(format!(
+            "I don't know which option \"{want}\" is. Reply with a number, or the option's name."
+        )));
+    };
+    let Some(keys) = prompt.keys_to(idx) else {
+        return Ok(Err("that option is out of range".into()));
+    };
+
+    let parsed: Vec<Key> = keys
+        .iter()
+        .map(|k| Key::parse(k).expect("the parser only emits keys the probe confirmed"))
+        .collect();
+    io.send_key_sequence(pane, &parsed).await?;
+
+    let chosen = prompt.options[idx].clone();
+    let mut detail = format!("chose \"{chosen}\" with {}", keys.join(" "));
+    let mut rung = Rung::Accepted;
+    for _ in 0..settle.attempts {
+        sleep(settle.interval).await;
+        let now = io.read_visible_ansi(pane).await?;
+        if crate::permission::parse(&now).is_none() {
+            rung = Rung::Submitted;
+            detail = format!("chose \"{chosen}\" — the dialog closed");
+            break;
+        }
+    }
+    if rung < Rung::Submitted {
+        detail = format!("{detail}, but the dialog is still on screen — it may not have taken");
+    }
+
+    Ok(Ok(Delivery {
+        pane: pane.clone(),
+        rung,
+        detail,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +372,15 @@ mod tests {
         }
         async fn send_submit_key(&self, _pane: &PaneId, key: &Key) -> Result<(), HerdrError> {
             self.sent_keys.borrow_mut().push(key.to_string());
+            Ok(())
+        }
+        async fn read_visible_ansi(&self, pane: &PaneId) -> Result<String, HerdrError> {
+            self.read_visible(pane).await
+        }
+        async fn send_key_sequence(&self, _pane: &PaneId, keys: &[Key]) -> Result<(), HerdrError> {
+            for k in keys {
+                self.sent_keys.borrow_mut().push(k.to_string());
+            }
             Ok(())
         }
     }
