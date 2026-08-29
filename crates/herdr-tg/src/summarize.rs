@@ -40,11 +40,33 @@ pub struct Summarizer {
     pub timeout: Duration,
 }
 
-/// The instruction. Deliberately narrow: one line, the decision rather than the context, and an
-/// explicit fallback for output that is not a question at all.
-const SYSTEM: &str = "You turn a terminal excerpt into ONE short line telling a person on a phone \
-     what the agent needs from them. Maximum 90 characters. State the decision, not the context. \
-     No preamble, no quotes, no markdown. If it is not a question, say what finished.";
+/// The instruction, and every clause in it is there because a model failed without it.
+///
+/// Measured against the operator's own panes. Three prompts produced three different failures:
+///
+/// - "State the decision, not the context" → the model ANSWERED the question. On a real three-way
+///   choice it replied "Work E4 clean-install.", which reads as a recommendation rather than a
+///   summary. Hence "restate — never answer it, never pick one of its options".
+/// - Asking only for a question → generic filler on panes that were not asking at all ("Please
+///   provide the necessary information..."). Hence the explicit NONE.
+/// - A terse instruction → the model echoed the INSTRUCTION back as its answer. Hence the worked
+///   examples, which show the shape of an answer rather than describing it.
+const SYSTEM: &str = concat!(
+    "You read the tail of a terminal where a coding agent runs. Decide ONE thing: is the agent ",
+    "waiting for the human to answer something?\n\n",
+    "If yes, restate its question in one short line (max 90 chars). Restate — never answer it, ",
+    "never pick one of its options.\n",
+    "If it is just working, or showing output, reply with exactly: NONE\n\n",
+    "The question, if there is one, is usually on the last lines.\n\n",
+    "Examples:\n",
+    "  ...\n  Force-push and drop the 2 commits? [y/N]\n",
+    "  -> Force-push, dropping 2 commits?\n\n",
+    "  ...\n  What do you want to do — tidy the tracker, work E4, or something else?\n",
+    "  -> Tidy the tracker, work E4, or something else?\n\n",
+    "  ...\n  Running tests... 42 passed\n",
+    "  -> NONE\n\n",
+    "No preamble, no quotes, no markdown."
+);
 
 /// The longest summary worth showing. Beyond this it stops being a glance and becomes a second
 /// thing to read.
@@ -60,13 +82,17 @@ impl Summarizer {
         let key = std::env::var("HERDR_TG_SUMMARIZER_KEY").ok()?;
         let endpoint = std::env::var("HERDR_TG_SUMMARIZER_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8090/v1/chat/completions".into());
+        // Measured on the operator's own panes: `local-coder` (~0.6s) was wrong on all three —
+        // filler, an answer instead of a question, and an echo of the instruction. `glm-5.3-flash`
+        // (~2s) was right on all three, including preserving every option of a three-way choice.
+        // Speed is worth nothing if the line above the excerpt misleads.
         let model =
-            std::env::var("HERDR_TG_SUMMARIZER_MODEL").unwrap_or_else(|_| "local-coder".into());
+            std::env::var("HERDR_TG_SUMMARIZER_MODEL").unwrap_or_else(|_| "glm-5.3-flash".into());
         let timeout = std::env::var("HERDR_TG_SUMMARIZER_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(4000));
+            .unwrap_or_else(|| Duration::from_millis(6000));
         Some(Self {
             endpoint,
             model,
@@ -124,7 +150,7 @@ impl Summarizer {
             .as_str()?
             .trim();
 
-        plausible(line)
+        plausible(line, excerpt)
     }
 }
 
@@ -132,7 +158,7 @@ impl Summarizer {
 ///
 /// Rejects rather than repairs. A summary that needs repairing is one the operator would have to
 /// second-guess, and the excerpt below it is already the truth.
-pub fn plausible(raw: &str) -> Option<String> {
+pub fn plausible(raw: &str, excerpt: &str) -> Option<String> {
     let line = raw.trim().trim_matches('"').trim();
     if line.is_empty() {
         return None;
@@ -148,8 +174,27 @@ pub fn plausible(raw: &str) -> Option<String> {
     if line.contains("```") || line.contains('<') || line.contains('>') {
         return None;
     }
-    // A model talking about itself rather than the excerpt.
     let low = line.to_lowercase();
+    // The agreed signal for "this pane is not asking anything". Not an error — most panes are not.
+    if low == "none" || low == "none." {
+        return None;
+    }
+    // A model echoing the instruction instead of following it, which `local-coder` did verbatim.
+    if low.starts_with("is the agent") || low.contains("waiting for the human to answer") {
+        return None;
+    }
+    // Filler a model reaches for when it has nothing: it looks like a summary and says nothing.
+    for filler in [
+        "please provide",
+        "the necessary information",
+        "no question",
+        "not asking",
+    ] {
+        if low.contains(filler) {
+            return None;
+        }
+    }
+    // A model talking about itself rather than the excerpt.
     for tell in [
         "as an ai",
         "i cannot",
@@ -166,7 +211,37 @@ pub fn plausible(raw: &str) -> Option<String> {
             return None;
         }
     }
+    // THE rule that matters most, and the reason it is here rather than only in the prompt: a
+    // gist that ANSWERS instead of restating is worse than no gist at all. It reads as a
+    // recommendation, and the operator may act on it without noticing the real options below.
+    //
+    // Measured: given a genuine three-way question, one model replied "Work E4 clean-install." —
+    // grammatical, confident, and one of the three choices presented as if it were the summary.
+    //
+    // The prompt forbids this, but a prompt is the part most likely to drift or be swapped for a
+    // different model. So it is also checked structurally: if the source asks, the gist must ask.
+    if asks_something(excerpt) && !line.contains('?') {
+        tracing::debug!(gist = %line, "the summary answered instead of restating; dropped");
+        return None;
+    }
+
     Some(line.to_string())
+}
+
+/// Does this excerpt put a question to the human?
+///
+/// Deliberately broad. A false positive costs a dropped gist; a false negative lets an
+/// answer-shaped gist through, which is the failure this exists to prevent.
+fn asks_something(excerpt: &str) -> bool {
+    if excerpt.contains('?') {
+        return true;
+    }
+    let low = excerpt.to_lowercase();
+    [
+        "[y/n]", "(y/n)", "y/n", "yes/no", "select", "confirm", "choose",
+    ]
+    .iter()
+    .any(|t| low.contains(t))
 }
 
 #[cfg(test)]
@@ -177,11 +252,19 @@ mod tests {
     #[test]
     fn a_real_summary_survives() {
         assert_eq!(
-            plausible("Force-push and drop the 2 commits? [y/N]").as_deref(),
+            plausible(
+                "Force-push and drop the 2 commits? [y/N]",
+                "Force-push? [y/N]"
+            )
+            .as_deref(),
             Some("Force-push and drop the 2 commits? [y/N]")
         );
         assert_eq!(
-            plausible("  \"Allow access to ~/.local/share?\"  ").as_deref(),
+            plausible(
+                "  \"Allow access to ~/.local/share?\"  ",
+                "Allow access? [y/N]"
+            )
+            .as_deref(),
             Some("Allow access to ~/.local/share?")
         );
     }
@@ -199,22 +282,67 @@ mod tests {
             "As an AI language model, I would say the agent is stuck.",
             "The agent is asking whether to force-push",
             "line one\nline two",
+            // Every one of these came out of a real model against a real pane.
+            "NONE",
+            "none.",
+            "Is the agent waiting for the human to answer something?",
+            "Please provide the necessary information for the agent to complete the task.",
             "```\nforce-push?\n```",
             "<b>Force-push?</b>",
         ] {
             assert!(
-                plausible(bad).is_none(),
+                plausible(bad, "Force-push? [y/N]").is_none(),
                 "this should have been rejected: {bad:?}"
             );
         }
     }
 
+    /// The failure the operator singled out: a gist that answers rather than restates. It reads as
+    /// a recommendation, and the real options are below where they may not be read.
+    #[test]
+    fn a_gist_that_answers_instead_of_restating_is_dropped() {
+        let question = "What do you want to do — tidy the tracker, work E4 clean-install, \
+                        or something else?";
+        // The real bad answer, verbatim from a real model against a real pane.
+        assert!(plausible("Work E4 clean-install.", question).is_none());
+        assert!(plausible("Force-push.", "Force-push and drop 2 commits? [y/N]").is_none());
+        assert!(plausible("Yes", "Allow access? [y/N]").is_none());
+
+        // The good answer to the same excerpt survives, because it is still a question.
+        assert_eq!(
+            plausible("Tidy the tracker, work E4, or something else?", question).as_deref(),
+            Some("Tidy the tracker, work E4, or something else?")
+        );
+    }
+
+    /// A pane that is not asking has no question to preserve, so a declarative line is fine there.
+    #[test]
+    fn a_declarative_gist_is_fine_when_nothing_was_asked() {
+        assert_eq!(
+            plausible("Tests finished, 42 passed.", "Running tests... 42 passed").as_deref(),
+            Some("Tests finished, 42 passed.")
+        );
+    }
+
+    #[test]
+    fn the_question_detector_is_broad_on_purpose() {
+        for asking in [
+            "Force-push? [y/N]",
+            "Allow once / Allow always / Reject   select  confirm",
+            "Choose one:",
+            "yes/no",
+        ] {
+            assert!(asks_something(asking), "missed a question: {asking:?}");
+        }
+        assert!(!asks_something("Running tests... 42 passed"));
+    }
+
     #[test]
     fn an_over_long_answer_is_thrown_away() {
         let long = "x".repeat(MAX_CHARS + 1);
-        assert!(plausible(&long).is_none());
+        assert!(plausible(&long, "x").is_none());
         let ok = "x".repeat(MAX_CHARS);
-        assert!(plausible(&ok).is_some());
+        assert!(plausible(&ok, "x").is_some());
     }
 
     /// The gate is off unless deliberately switched on, and it never goes looking through other
