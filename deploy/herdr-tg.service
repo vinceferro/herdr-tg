@@ -1,0 +1,52 @@
+[Unit]
+Description=herdr-tg — Telegram front door for the herdr agent herd
+Documentation=https://github.com/vinceferro/herdr-tg
+After=default.target
+# Never give up restarting. A phone-only operator cannot run `systemctl --user reset-failed`, so
+# the default start-limit burst would leave the bridge dead with no way back until they reach a
+# keyboard — which is the exact situation the bridge exists to avoid.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr-tg serve
+
+# The credential, and only the credential, comes from here. Written by scripts/setup-token.sh at
+# mode 0600. `-` so a missing file is a clear startup error from the binary ("HERDR_TG_TOKEN is not
+# set", naming the fix) rather than an opaque systemd 203/EXEC.
+EnvironmentFile=-%h/.config/herdr-tg/env
+
+# herdr's socket. The binary already falls back to this path, but naming it here means the unit
+# does not depend on that fallback staying the default.
+Environment=HERDR_SOCKET_PATH=%h/.config/herdr/herdr.sock
+Environment=RUST_LOG=info
+
+Restart=always
+RestartSec=5
+
+# ── Hardening ───────────────────────────────────────────────────────────────────────────────────
+# This process holds a Telegram bot token and (from slice 3) can type into real terminals. It binds
+# no port — it dials out to api.telegram.org and to a local Unix socket — so nothing here needs to
+# accept traffic.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Outbound TLS to the Bot API plus a Unix socket. Nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# ProtectSystem/ProtectHome are deliberately NOT set to their strict values: the bridge reads
+# herdr's socket and (slice 4) writes an append-only audit log, both under $HOME, and enumerating
+# those in ReadWritePaths would break the moment herdr moves its socket. Revisit with the audit log
+# in hand.
+ProtectSystem=yes
+
+[Install]
+WantedBy=default.target
