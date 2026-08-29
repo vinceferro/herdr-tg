@@ -51,6 +51,8 @@ struct FileConfig {
     socket: Option<PathBuf>,
     /// The key that submits a reply in an agent pane. Default `Enter`.
     submit_key: Option<String>,
+    /// A forum-enabled supergroup where each pane gets its own topic.
+    forum_chat_id: Option<i64>,
 }
 
 /// Everything the bridge needs to start.
@@ -73,6 +75,16 @@ pub struct Config {
     /// only because delivery is verified by reading the pane back: a wrong key shows up as
     /// [`crate::deliver::Rung::Echoed`] and the operator is told, rather than being told "sent".
     pub submit_key: Key,
+    /// A forum-enabled supergroup, if one is configured.
+    ///
+    /// When set, each pane gets its own topic and a reply inside a topic routes to that pane — no
+    /// target to aim, and no way for a reply to land in a pane the operator was not looking at.
+    /// Without it the bridge falls back to one flat conversation, where routing depends on reply-to
+    /// and a sticky target.
+    ///
+    /// It must be a SUPERGROUP with Topics enabled, and the bot must be an admin with "Manage
+    /// Topics" — a plain group or a DM cannot carry topics at all.
+    pub forum_chat_id: Option<i64>,
 }
 
 impl Config {
@@ -133,6 +145,10 @@ impl Config {
             workspace: file.workspace,
             socket: file.socket,
             submit_key,
+            forum_chat_id: std::env::var("HERDR_TG_FORUM_CHAT_ID")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .or(file.forum_chat_id),
         })
     }
 }
@@ -195,6 +211,7 @@ mod tests {
             workspace: None,
             socket: None,
             submit_key: Key::parse("Enter").expect("Enter is valid"),
+            forum_chat_id: None,
         }
     }
 

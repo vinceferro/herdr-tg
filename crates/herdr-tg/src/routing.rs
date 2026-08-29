@@ -10,6 +10,10 @@
 //!
 //! # The rules, in priority order
 //!
+//! 0. **The topic wins, when there is one.** In a forum group each pane has its own topic, so the
+//!    conversation you are looking at *is* the target. Nothing to aim, nothing to remember, and no
+//!    way for a reply to land somewhere you were not looking. This is the strongest rule and it
+//!    comes first.
 //! 1. **Reply-to wins.** If the message is a Telegram reply to one of the bridge's own pushes, the
 //!    target is the pane that push was about. This is the only rule that needs no memory and cannot
 //!    go stale, so it comes first.
@@ -42,6 +46,8 @@ pub enum Target {
 /// routing decision they cannot correct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
+    /// The message was sent inside a pane's own topic.
+    Topic,
     /// The operator replied to a specific push.
     ReplyTo,
     /// The remembered target.
@@ -51,6 +57,7 @@ pub enum Why {
 impl Why {
     pub fn phrase(self) -> &'static str {
         match self {
+            Why::Topic => "this topic's pane",
             Why::ReplyTo => "the pane that asked",
             Why::Sticky => "your current target",
         }
@@ -62,6 +69,9 @@ impl Why {
 pub struct Routing {
     /// chat id → sticky pane id.
     sticky: BTreeMap<i64, String>,
+    /// forum topic id → the pane that topic is for.
+    #[serde(default)]
+    topics: BTreeMap<i32, String>,
     /// message id of a bridge push → the pane it was about.
     ///
     /// Bounded: Telegram message ids are monotonic per chat, so the oldest entries are the least
@@ -91,6 +101,23 @@ impl Routing {
         }
     }
 
+    /// Bind a forum topic to a pane. One topic per pane, for the life of the pane.
+    pub fn bind_topic(&mut self, thread_id: i32, pane: &PaneId) {
+        self.topics.insert(thread_id, pane.as_str().to_string());
+    }
+
+    /// The topic this pane already has, if any.
+    pub fn topic_for(&self, pane: &PaneId) -> Option<i32> {
+        self.topics
+            .iter()
+            .find(|(_, p)| p.as_str() == pane.as_str())
+            .map(|(t, _)| *t)
+    }
+
+    pub fn pane_for_topic(&self, thread_id: i32) -> Option<PaneId> {
+        self.topics.get(&thread_id).map(|s| PaneId::new(s.clone()))
+    }
+
     pub fn set_sticky(&mut self, chat: i64, pane: &PaneId) {
         self.sticky.insert(chat, pane.as_str().to_string());
     }
@@ -104,8 +131,29 @@ impl Routing {
     /// `reply_to` is the message id this message replies to, if any. `snapshot` is the live herd —
     /// passed in rather than fetched here so the decision is a pure function and can be tested
     /// against herds this machine does not have.
-    pub fn resolve(&self, chat: i64, reply_to: Option<i64>, snapshot: &SessionSnapshot) -> Target {
+    pub fn resolve(
+        &self,
+        chat: i64,
+        reply_to: Option<i64>,
+        thread_id: Option<i32>,
+        snapshot: &SessionSnapshot,
+    ) -> Target {
         let alive = |p: &PaneId| snapshot.panes.iter().any(|pane| pane.pane_id == *p);
+
+        // Rule 0: the topic. Unambiguous by construction — the operator is looking at exactly one
+        // pane's conversation, so there is nothing to misroute.
+        if let Some(tid) = thread_id
+            && let Some(pane) = self.pane_for_topic(tid)
+        {
+            return if alive(&pane) {
+                Target::Pane {
+                    pane,
+                    why: Why::Topic,
+                }
+            } else {
+                Target::Gone { pane }
+            };
+        }
 
         // Rule 1: reply-to. Needs no memory of "current" anything, so it cannot be stale.
         if let Some(mid) = reply_to
@@ -194,6 +242,65 @@ mod tests {
             .to_string()
     }
 
+    /// The strongest rule: inside a pane's topic, the conversation IS the target. Nothing to aim,
+    /// and no way for a reply to land somewhere the operator was not looking.
+    #[test]
+    fn a_topic_beats_both_reply_to_and_sticky() {
+        let a = any_pane();
+        let snap = snapshot_with(&[&a]);
+        let mut r = Routing::default();
+        r.bind_topic(42, &PaneId::new(a.clone()));
+        r.record_push(77, &PaneId::new("wZ:p9"));
+        r.set_sticky(1, &PaneId::new("wY:p8"));
+
+        assert_eq!(
+            r.resolve(1, Some(77), Some(42), &snap),
+            Target::Pane {
+                pane: PaneId::new(a),
+                why: Why::Topic
+            }
+        );
+    }
+
+    #[test]
+    fn a_topic_whose_pane_died_is_gone_not_rerouted() {
+        let snap = snapshot_with(&[&any_pane()]);
+        let mut r = Routing::default();
+        r.bind_topic(42, &PaneId::new("wZ:p9"));
+        assert_eq!(
+            r.resolve(1, None, Some(42), &snap),
+            Target::Gone {
+                pane: PaneId::new("wZ:p9")
+            }
+        );
+    }
+
+    #[test]
+    fn an_unbound_topic_falls_through_to_the_other_rules() {
+        let a = any_pane();
+        let snap = snapshot_with(&[&a]);
+        let mut r = Routing::default();
+        r.set_sticky(1, &PaneId::new(a.clone()));
+        // thread 99 is not bound to anything — must not swallow the message.
+        assert_eq!(
+            r.resolve(1, None, Some(99), &snap),
+            Target::Pane {
+                pane: PaneId::new(a),
+                why: Why::Sticky
+            }
+        );
+    }
+
+    #[test]
+    fn a_pane_keeps_one_topic() {
+        let mut r = Routing::default();
+        let p = PaneId::new("wA:p1");
+        r.bind_topic(7, &p);
+        assert_eq!(r.topic_for(&p), Some(7));
+        assert_eq!(r.pane_for_topic(7), Some(p));
+        assert_eq!(r.topic_for(&PaneId::new("wB:p1")), None);
+    }
+
     #[test]
     fn reply_to_beats_sticky() {
         let a = any_pane();
@@ -203,7 +310,7 @@ mod tests {
         r.record_push(77, &pane);
         r.set_sticky(1, &PaneId::new("wZ:p9")); // a different, dead pane
 
-        let t = r.resolve(1, Some(77), &snap);
+        let t = r.resolve(1, Some(77), None, &snap);
         assert_eq!(
             t,
             Target::Pane {
@@ -221,7 +328,7 @@ mod tests {
         let mut r = Routing::default();
         r.set_sticky(1, &PaneId::new(a.clone()));
         assert_eq!(
-            r.resolve(1, None, &snap),
+            r.resolve(1, None, None, &snap),
             Target::Pane {
                 pane: PaneId::new(a),
                 why: Why::Sticky
@@ -235,7 +342,7 @@ mod tests {
         let snap = snapshot_with(&[&any_pane()]);
         let r = Routing::default();
         assert_eq!(
-            r.resolve(1, None, &snap),
+            r.resolve(1, None, None, &snap),
             Target::None,
             "there must be no most-recent-pane fallback: a guess that is right nine times teaches \
              the operator to trust the tenth"
@@ -250,7 +357,7 @@ mod tests {
         let mut r = Routing::default();
         r.set_sticky(1, &PaneId::new("wZ:p9"));
         assert_eq!(
-            r.resolve(1, None, &snap),
+            r.resolve(1, None, None, &snap),
             Target::Gone {
                 pane: PaneId::new("wZ:p9")
             }
@@ -260,7 +367,7 @@ mod tests {
         let mut r2 = Routing::default();
         r2.record_push(5, &PaneId::new("wZ:p9"));
         assert_eq!(
-            r2.resolve(1, Some(5), &snap),
+            r2.resolve(1, Some(5), None, &snap),
             Target::Gone {
                 pane: PaneId::new("wZ:p9")
             }
@@ -273,8 +380,11 @@ mod tests {
         let snap = snapshot_with(&[&a]);
         let mut r = Routing::default();
         r.set_sticky(1, &PaneId::new(a.clone()));
-        assert!(matches!(r.resolve(1, None, &snap), Target::Pane { .. }));
-        assert_eq!(r.resolve(2, None, &snap), Target::None);
+        assert!(matches!(
+            r.resolve(1, None, None, &snap),
+            Target::Pane { .. }
+        ));
+        assert_eq!(r.resolve(2, None, None, &snap), Target::None);
     }
 
     #[test]

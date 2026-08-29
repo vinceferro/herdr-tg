@@ -32,9 +32,9 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use herdr_client::{HerdrClient, SessionSnapshot};
+use herdr_client::{HerdrClient, PaneId, SessionSnapshot};
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use teloxide::utils::command::BotCommands;
 
 use crate::audit::Audit;
@@ -83,17 +83,32 @@ pub enum Command {
     Status,
     #[command(description = "is the bridge talking to herdr, and on what protocol.")]
     Doctor,
-    #[command(description = "aim your replies at a pane, e.g. /target wA:p1.")]
+    #[command(description = "tap a pane to aim your replies at it.")]
+    Panes,
+    #[command(description = "aim your replies at a pane by id, e.g. /target wA:p1.")]
     Target(String),
     #[command(description = "show this help.")]
     Help,
 }
 
 /// Run the bridge until the process is asked to stop.
+/// Everything the handlers share. One Arc, so adding a handler does not mean threading six clones.
+#[derive(Clone)]
+struct Ctx {
+    client: Arc<HerdrClient>,
+    gate: Arc<Gate>,
+    routing: Arc<Mutex<Routing>>,
+    audit: Arc<Audit>,
+    submit: herdr_client::Key,
+    workspace: Option<String>,
+    username: Arc<str>,
+    forum: Option<ChatId>,
+}
+
+/// Run the bridge until the process is asked to stop.
 pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
-    // Prove the herd is reachable BEFORE announcing readiness. Starting a bot that cannot answer
-    // its one command is worse than failing here: the operator gets a bot that responds to nothing
-    // and no way to tell why from their phone.
+    // Prove the herd is reachable BEFORE announcing readiness. A bot that answers nothing, with no
+    // way to tell why from a phone, is worse than a startup failure.
     let handshake = client.handshake().await?;
     tracing::info!(
         protocol = handshake.pong.protocol,
@@ -103,8 +118,6 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
 
     let gate = Gate::new(config.allowed_chat_ids.clone());
     if gate.is_deaf() {
-        // Not a hard error: a deaf bot is safe, and the operator may be mid-setup. But it must be
-        // impossible to miss, because the symptom (total silence) is identical to a wrong token.
         tracing::warn!(
             "the chat allowlist is EMPTY — this bot will answer nobody. Set \
              HERDR_TG_ALLOWED_CHAT_IDS or `allowed_chat_ids` in herdr-tg.toml. \
@@ -117,162 +130,321 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
     let bot = Bot::new(config.token());
     let me = bot.get_me().await?;
     tracing::info!(bot = %me.username(), "connected to the Bot API; long-polling");
-    // Owned and shared: the repl closure must be `Fn`, so it may not consume anything.
-    let username: Arc<str> = Arc::from(me.username());
-
-    let client = Arc::new(client);
-    let workspace = config.workspace.clone();
-    let gate = Arc::new(gate);
 
     let routing_path = Routing::default_path();
-    let routing = Arc::new(Mutex::new(Routing::load(&routing_path)));
     let audit = Arc::new(Audit::new(Audit::default_path()));
+    let ctx = Ctx {
+        client: Arc::new(client),
+        gate: Arc::new(gate),
+        routing: Arc::new(Mutex::new(Routing::load(&routing_path))),
+        audit: Arc::clone(&audit),
+        submit: config.submit_key.clone(),
+        workspace: config.workspace.clone(),
+        username: Arc::from(me.username()),
+        forum: config.forum_chat_id.map(ChatId),
+    };
+    match ctx.forum {
+        Some(c) => tracing::info!(forum = c.0, "forum mode: one topic per pane"),
+        None => {
+            tracing::info!("flat mode: no forum group configured; routing uses reply-to + sticky")
+        }
+    }
     tracing::info!(
         routing = %routing_path.display(),
         audit = %audit.path().display(),
         submit = %config.submit_key,
         "reply path armed"
     );
-    let submit = config.submit_key.clone();
 
-    // The push loop. Spawned before the repl so an ask that is ALREADY blocked reaches the phone
-    // at startup — that is the filtered subscription's replay, and it is what recovers the asks
-    // raised while the laptop was asleep or the bridge was restarting.
+    // The push loop, spawned before dispatch so an ask that is ALREADY blocked reaches the phone at
+    // startup — the filtered subscription's replay, which is what recovers asks raised while the
+    // laptop slept.
     {
-        let client = Arc::clone(&client);
-        let routing = Arc::clone(&routing);
+        let ctx = ctx.clone();
         let bot = bot.clone();
         let chats: Vec<i64> = config.allowed_chat_ids.iter().copied().collect();
         tokio::spawn(async move {
+            let client = Arc::clone(&ctx.client);
             let on_ask = move |ask: Ask| {
-                let bot = bot.clone();
-                let routing = Arc::clone(&routing);
-                let chats = chats.clone();
-                let fut = async move {
-                    for chat in chats {
-                        let mut body = format!(
-                            "🔴 <b>{}</b> is waiting on you\n<code>{}</code> · {}",
-                            escape_html(&ask.workspace),
-                            escape_html(ask.pane.as_str()),
-                            escape_html(&ask.agent),
-                        );
-                        // The question itself. Without it this is a notification; with it, it is
-                        // the conversation the product is for.
-                        if !ask.excerpt.is_empty() {
-                            body.push_str(&format!("\n\n<pre>{}</pre>", escape_html(&ask.excerpt)));
-                        }
-                        if ask.options.is_empty() {
-                            body.push_str(
-                                "\n<i>Reply to this message and I will type it into that pane.</i>",
-                            );
-                        } else {
-                            // A dialog. Never invite prose — it goes nowhere, and the Enter after
-                            // it confirms whatever was highlighted.
-                            body.push_str("\n<b>Pick one:</b>");
-                            for (i, o) in ask.options.iter().enumerate() {
-                                body.push_str(&format!(
-                                    "\n  <b>{}</b> · {}",
-                                    i + 1,
-                                    escape_html(o)
-                                ));
-                            }
-                            body.push_str("\n<i>Reply with the number, or the option's name.</i>");
-                        }
-                        match bot
-                            .send_message(ChatId(chat), &body)
-                            .parse_mode(ParseMode::Html)
-                            .await
-                        {
-                            Ok(sent) => {
-                                // Remember which pane this push was about, so a REPLY to it routes
-                                // there — the one routing rule that cannot go stale.
-                                let mut r = routing.lock().await;
-                                r.record_push(sent.id.0 as i64, &ask.pane);
-                                if let Err(e) = r.save(&Routing::default_path()) {
-                                    tracing::warn!(error = %e, "could not persist the push mapping");
-                                }
-                            }
-                            Err(e) => tracing::error!(error = %e, "could not push an ask"),
-                        }
-                    }
-                };
-                Box::pin(fut) as futures_core::future::BoxFuture<'static, ()>
+                let (bot, ctx, chats) = (bot.clone(), ctx.clone(), chats.clone());
+                Box::pin(async move { push_ask(&bot, &ctx, &chats, ask).await })
+                    as futures_core::future::BoxFuture<'static, ()>
             };
             notify::watch(client, Timing::default(), Arc::new(on_ask)).await
         });
     }
 
-    teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let client = Arc::clone(&client);
-        let gate = Arc::clone(&gate);
-        let workspace = workspace.clone();
-        let username = Arc::clone(&username);
-        let routing = Arc::clone(&routing);
-        let audit = Arc::clone(&audit);
-        let submit = submit.clone();
-        async move {
-            let chat_id = msg.chat.id.0;
-            if !gate.admit(chat_id) {
-                // Silence, deliberately. See the module docs.
-                tracing::warn!(
-                    chat_id,
-                    "message from a chat that is NOT on the allowlist — ignored. If this is you, \
-                     add this id to the allowlist."
-                );
-                return Ok(());
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(on_message))
+        .branch(Update::filter_callback_query().endpoint(on_callback));
+
+    Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![ctx])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+
+    Ok(())
+}
+
+/// Send one ask, with buttons that make the common actions a tap.
+///
+/// A dialog gets one button per option. A question gets a button that aims replies at its pane, so
+/// answering a *later* plain message does not need the operator to remember a pane id — which was
+/// the tedious part of the first version.
+async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
+    let mut body = format!(
+        "🔴 <b>{}</b> is waiting on you\n<code>{}</code> · {}",
+        escape_html(&ask.workspace),
+        escape_html(ask.pane.as_str()),
+        escape_html(&ask.agent),
+    );
+    if !ask.excerpt.is_empty() {
+        body.push_str(&format!("\n\n<pre>{}</pre>", escape_html(&ask.excerpt)));
+    }
+
+    let keyboard = if ask.options.is_empty() {
+        body.push_str("\n<i>Reply to this message and I'll type it into that pane.</i>");
+        InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
+            "📌 Aim my replies here",
+            format!("t|{}", ask.pane.as_str()),
+        )]])
+    } else {
+        // Never invite prose at a dialog: text goes nowhere and the Enter after it confirms
+        // whatever was highlighted.
+        body.push_str("\n<b>Pick one:</b>");
+        InlineKeyboardMarkup::new([ask
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                InlineKeyboardButton::callback(o.clone(), format!("c|{}|{i}", ask.pane.as_str()))
+            })
+            .collect::<Vec<_>>()])
+    };
+
+    // In forum mode every ask goes to its pane's own topic, so the operator sees one pane's
+    // conversation at a time and an approval appears inline in it.
+    if let Some(forum) = ctx.forum {
+        let thread = match ensure_topic(bot, ctx, forum, &ask).await {
+            Some(t) => t,
+            None => return,
+        };
+        match bot
+            .send_message(forum, &body)
+            .parse_mode(ParseMode::Html)
+            .message_thread_id(thread)
+            .reply_markup(keyboard.clone())
+            .await
+        {
+            Ok(sent) => {
+                let mut r = ctx.routing.lock().await;
+                r.record_push(sent.id.0 as i64, &ask.pane);
+                let _ = r.save(&Routing::default_path());
             }
-
-            let Some(text) = msg.text() else {
-                return Ok(());
-            };
-            let Ok(cmd) = Command::parse(text, &username) else {
-                // Prose from an allowed operator is a REPLY. This is the product.
-                let body = route_and_deliver(
-                    &client,
-                    &routing,
-                    &audit,
-                    &submit,
-                    chat_id,
-                    msg.reply_to_message().map(|m| m.id.0 as i64),
-                    text,
-                )
-                .await;
-                tracing::info!(chat_id, bytes = body.len(), "answered a reply");
-                reply(&bot, msg.chat.id, &body).await;
-                return Ok(());
-            };
-
-            let body = match cmd {
-                Command::Help => escape_html(&Command::descriptions().to_string()),
-                Command::Status => match snapshot_for(&client, workspace.as_deref()).await {
-                    Ok(snap) => fit(render::herd_telegram(&snap)),
-                    Err(e) => escape_html(&format!("herdr unreachable: {e}")),
-                },
-                Command::Target(ref raw) => {
-                    set_target(&client, &routing, chat_id, raw.trim()).await
-                }
-                Command::Doctor => match client.handshake().await {
-                    Ok(h) => escape_html(&format!(
-                        "herdr {} · protocol {} · socket {}",
-                        h.pong.version,
-                        h.pong.protocol,
-                        client.socket_path().display()
-                    )),
-                    Err(e) => escape_html(&format!("herdr unreachable: {e}")),
-                },
-            };
-
-            // Log every HANDLED command, not only the failures. When the bot goes quiet, the
-            // operator is on a phone with nothing but `journalctl` to look at, and "no lines at
-            // all" cannot be told apart from "the poll loop died". A line per command makes
-            // silence diagnosable.
-            tracing::info!(chat_id, command = ?cmd, bytes = body.len(), "answered");
-            reply(&bot, msg.chat.id, &body).await;
-            Ok(())
+            Err(e) => tracing::error!(error = %e, "could not push into the topic"),
         }
-    })
-    .await;
+        return;
+    }
 
+    for chat in chats {
+        match bot
+            .send_message(ChatId(*chat), &body)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard.clone())
+            .await
+        {
+            Ok(sent) => {
+                let mut r = ctx.routing.lock().await;
+                // A reply to THIS message routes to this pane — the rule that cannot go stale.
+                r.record_push(sent.id.0 as i64, &ask.pane);
+                if let Err(e) = r.save(&Routing::default_path()) {
+                    tracing::warn!(error = %e, "could not persist the push mapping");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "could not push an ask"),
+        }
+    }
+}
+
+/// A button tap: choose a dialog option, or aim replies at a pane.
+async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()> {
+    let chat_id = q.message.as_ref().map(|m| m.chat().id.0).unwrap_or(0);
+    if !ctx.gate.admit(chat_id) {
+        tracing::warn!(
+            chat_id,
+            "callback from a chat NOT on the allowlist — ignored"
+        );
+        return Ok(());
+    }
+    let Some(data) = q.data.clone() else {
+        return Ok(());
+    };
+
+    let reply = match data.split('|').collect::<Vec<_>>().as_slice() {
+        ["t", pane] => {
+            let p = PaneId::new(*pane);
+            let mut r = ctx.routing.lock().await;
+            r.set_sticky(chat_id, &p);
+            let _ = r.save(&Routing::default_path());
+            format!("📌 Replies now go to {pane}")
+        }
+        ["c", pane, idx] => {
+            let p = PaneId::new(*pane);
+            let want = idx.to_string();
+            // `choose` re-parses the dialog from a fresh read, so the arrow count comes from the
+            // selection as it is NOW. The index is 0-based here; match_option takes 1-based.
+            let one_based = idx.parse::<usize>().map(|i| i + 1).unwrap_or(0).to_string();
+            let at = timestamp();
+            let _ = ctx
+                .audit
+                .sent(&at, chat_id, &p, &format!("[button] option {want}"));
+            match deliver::choose(&*ctx.client, &p, &one_based, Settle::default(), |d| {
+                Box::pin(tokio::time::sleep(d))
+            })
+            .await
+            {
+                Ok(Ok(d)) => {
+                    let _ = ctx.audit.outcome(&timestamp(), &d);
+                    d.detail
+                }
+                Ok(Err(why)) => why,
+                Err(e) => {
+                    let _ = ctx.audit.failed(&timestamp(), &p, &e.to_string());
+                    format!("failed: {e}")
+                }
+            }
+        }
+        _ => "I don't recognise that button".to_string(),
+    };
+
+    // Answer the query first, or Telegram leaves a spinner on the button.
+    let _ = bot.answer_callback_query(q.id.clone()).text(&reply).await;
+    if let Some(msg) = q.message.as_ref() {
+        let _ = bot
+            .send_message(msg.chat().id, escape_html(&reply))
+            .parse_mode(ParseMode::Html)
+            .await;
+    }
+    tracing::info!(chat_id, data = %data, "handled a button");
+    Ok(())
+}
+
+/// An incoming message: a command, or a reply to route into a pane.
+async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
+    let chat_id = msg.chat.id.0;
+    if !ctx.gate.admit(chat_id) {
+        // Silence, deliberately: a refusal confirms the bot exists and says what it is for.
+        tracing::warn!(
+            chat_id,
+            "message from a chat that is NOT on the allowlist — ignored. If this is you, \
+             add this id to the allowlist."
+        );
+        return Ok(());
+    }
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+
+    let Ok(cmd) = Command::parse(text, &ctx.username) else {
+        let body = route_and_deliver(
+            &ctx,
+            chat_id,
+            msg.reply_to_message().map(|m| m.id.0 as i64),
+            msg.thread_id.map(|t| t.0.0),
+            text,
+        )
+        .await;
+        tracing::info!(chat_id, bytes = body.len(), "answered a reply");
+        reply(&bot, msg.chat.id, &body).await;
+        return Ok(());
+    };
+
+    // `/panes` answers with buttons, so it is sent separately from the text-only commands.
+    if matches!(cmd, Command::Panes) {
+        return panes_switcher(&bot, &ctx, msg.chat.id).await;
+    }
+
+    let body = match cmd {
+        Command::Help => escape_html(&Command::descriptions().to_string()),
+        Command::Status => match snapshot_for(&ctx.client, ctx.workspace.as_deref()).await {
+            Ok(snap) => fit(render::herd_telegram(&snap)),
+            Err(e) => escape_html(&format!("herdr unreachable: {e}")),
+        },
+        Command::Target(ref raw) => {
+            set_target(&ctx.client, &ctx.routing, chat_id, raw.trim()).await
+        }
+        Command::Doctor => match ctx.client.handshake().await {
+            Ok(h) => escape_html(&format!(
+                "herdr {} · protocol {} · socket {}",
+                h.pong.version,
+                h.pong.protocol,
+                ctx.client.socket_path().display()
+            )),
+            Err(e) => escape_html(&format!("herdr unreachable: {e}")),
+        },
+        Command::Panes => unreachable!("handled above"),
+    };
+    tracing::info!(chat_id, command = ?cmd, bytes = body.len(), "answered");
+    reply(&bot, msg.chat.id, &body).await;
+    Ok(())
+}
+
+/// One tappable button per agent pane — the switcher PLAN.md asked for.
+///
+/// Typing `/target wA:p1` meant finding a cryptic id in `/status` first, which the operator
+/// reasonably called tedious. Blocked panes are listed first, because those are the ones a reply is
+/// usually meant for.
+async fn panes_switcher(bot: &Bot, ctx: &Ctx, chat: ChatId) -> anyhow::Result<()> {
+    let snap = match snapshot_for(&ctx.client, ctx.workspace.as_deref()).await {
+        Ok(s) => s,
+        Err(e) => {
+            reply(bot, chat, &escape_html(&format!("herdr unreachable: {e}"))).await;
+            return Ok(());
+        }
+    };
+    let labels: std::collections::BTreeMap<_, _> = snap
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.clone(), w.label.clone()))
+        .collect();
+
+    let mut panes: Vec<_> = snap
+        .panes
+        .iter()
+        .filter(|p| p.agent.is_some() || p.display_agent.is_some())
+        .collect();
+    panes.sort_by_key(|p| p.agent_status != herdr_client::AgentStatus::Blocked);
+
+    if panes.is_empty() {
+        reply(bot, chat, &escape_html("No agent panes in the herd.")).await;
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<InlineKeyboardButton>> = panes
+        .iter()
+        .map(|p| {
+            let mark = if p.agent_status == herdr_client::AgentStatus::Blocked {
+                "🔴 "
+            } else {
+                ""
+            };
+            let label = labels
+                .get(&p.workspace_id)
+                .cloned()
+                .unwrap_or_else(|| p.workspace_id.as_str().to_string());
+            vec![InlineKeyboardButton::callback(
+                format!("{mark}{label} · {}", p.pane_id.as_str()),
+                format!("t|{}", p.pane_id.as_str()),
+            )]
+        })
+        .collect();
+
+    let _ = bot
+        .send_message(chat, "Aim your replies at:")
+        .reply_markup(InlineKeyboardMarkup::new(rows))
+        .await;
     Ok(())
 }
 
@@ -330,20 +502,22 @@ fn fit(html: String) -> String {
 /// is told "sent" when the text is sitting unsubmitted in a pane will wait on an agent that never
 /// saw their answer, which costs them exactly the time the bot exists to save.
 async fn route_and_deliver(
-    client: &herdr_client::HerdrClient,
-    routing: &Mutex<Routing>,
-    audit: &Audit,
-    submit: &herdr_client::Key,
+    ctx: &Ctx,
     chat_id: i64,
     reply_to: Option<i64>,
+    thread_id: Option<i32>,
     text: &str,
 ) -> String {
+    let (client, routing, audit, submit) = (&*ctx.client, &*ctx.routing, &*ctx.audit, &ctx.submit);
     let snap = match client.snapshot().await {
         Ok(s) => s,
         Err(e) => return escape_html(&format!("herdr unreachable, so nothing was sent: {e}")),
     };
 
-    let target = routing.lock().await.resolve(chat_id, reply_to, &snap);
+    let target = routing
+        .lock()
+        .await
+        .resolve(chat_id, reply_to, thread_id, &snap);
     let (pane, why) = match target {
         Target::Pane { pane, why } => (pane, why),
         Target::Gone { pane } => {
@@ -503,6 +677,42 @@ fn timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:03}Z", now.as_secs(), now.subsec_millis())
+}
+
+/// The pane's topic, creating it the first time.
+///
+/// Named for the workspace rather than the pane id, because the workspace is what the operator
+/// recognises — the id is in the message body for when it matters. Returns `None` if the topic
+/// cannot be made, which is almost always the bot lacking "Manage Topics" in the group; that is
+/// logged with the fix rather than retried, because retrying a permission error just fills the log.
+async fn ensure_topic(
+    bot: &Bot,
+    ctx: &Ctx,
+    forum: ChatId,
+    ask: &Ask,
+) -> Option<teloxide::types::ThreadId> {
+    if let Some(t) = ctx.routing.lock().await.topic_for(&ask.pane) {
+        return Some(teloxide::types::ThreadId(teloxide::types::MessageId(t)));
+    }
+    let name = format!("{} · {}", ask.workspace, ask.pane.as_str());
+    match bot.create_forum_topic(forum, &name).await {
+        Ok(topic) => {
+            let tid = topic.thread_id;
+            let mut r = ctx.routing.lock().await;
+            r.bind_topic(tid.0.0, &ask.pane);
+            let _ = r.save(&Routing::default_path());
+            tracing::info!(pane = %ask.pane, topic = tid.0.0, name = %name, "created a topic");
+            Some(tid)
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "could not create a forum topic. The chat must be a SUPERGROUP with Topics \
+                 enabled, and this bot must be an admin with the \"Manage Topics\" permission."
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
