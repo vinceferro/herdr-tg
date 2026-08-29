@@ -70,19 +70,6 @@ pub enum Rung {
 }
 
 impl Rung {
-    /// Wording for the operator, on their phone, in a hurry.
-    ///
-    /// Never the word "delivered" below [`Rung::Acted`]: the whole module exists because an ack is
-    /// not delivery, and a confirmation that overstates is worse than none.
-    pub fn phrase(self) -> &'static str {
-        match self {
-            Rung::Accepted => "sent (herdr took it; the agent has not visibly reacted)",
-            Rung::Echoed => "sent (it is in the pane, but did not submit — check the pane)",
-            Rung::Submitted => "sent",
-            Rung::Acted => "sent — the agent picked it up",
-        }
-    }
-
     /// Does this rung warrant telling the operator something looks wrong?
     ///
     /// `Echoed` is the dangerous one: the text is sitting in the input buffer unsent, which is
@@ -441,10 +428,9 @@ mod tests {
             "the operator must be told what to suspect: {}",
             d.detail
         );
-        assert!(
-            !d.rung.phrase().contains("delivered"),
-            "no rung below Acted may say delivered"
-        );
+        // The operator-facing wording is `voice`'s, and it has its own test that only the top
+        // rung sounds certain. Here we only pin that this outcome is flagged as doubtful.
+        assert!(d.rung.needs_attention());
     }
 
     /// A TUI that swallows the text entirely — a modal dialog had focus.
@@ -511,13 +497,10 @@ mod tests {
         assert!(Rung::Accepted < Rung::Echoed);
         assert!(Rung::Echoed < Rung::Submitted);
         assert!(Rung::Submitted < Rung::Acted);
-        assert!(Rung::Acted.phrase().contains("picked it up"));
-        for r in [Rung::Accepted, Rung::Echoed, Rung::Submitted] {
-            assert!(
-                !r.phrase().contains("picked it up"),
-                "{r:?} must not claim the agent acted"
-            );
-        }
+        // The wording itself lives in `voice`, which has its own test that only the top rung
+        // sounds certain. What matters here is the ORDER those rules depend on.
+        assert!(Rung::Accepted.needs_attention() && Rung::Echoed.needs_attention());
+        assert!(!Rung::Submitted.needs_attention() && !Rung::Acted.needs_attention());
     }
 
     #[test]

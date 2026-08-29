@@ -40,9 +40,10 @@ use teloxide::utils::command::BotCommands;
 use crate::audit::Audit;
 use crate::config::Config;
 use crate::deliver::{self, Settle};
-use crate::notify::{self, Ask, Timing};
+use crate::notify::{self, Ask, Beat, Timing};
 use crate::render::{self, escape_html};
 use crate::routing::{Routing, Target};
+use crate::voice::{self, Place, Reason};
 
 /// Telegram's hard limit on a message body. Exceeding it is a 400 from the API, which in a
 /// long-poll loop looks like "the bot went quiet" rather than like an error.
@@ -165,12 +166,24 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
         let chats: Vec<i64> = config.allowed_chat_ids.iter().copied().collect();
         tokio::spawn(async move {
             let client = Arc::clone(&ctx.client);
-            let on_ask = move |ask: Ask| {
+            let on_beat = move |beat: Beat| {
                 let (bot, ctx, chats) = (bot.clone(), ctx.clone(), chats.clone());
-                Box::pin(async move { push_ask(&bot, &ctx, &chats, ask).await })
+                Box::pin(async move { push_beat(&bot, &ctx, &chats, beat).await })
                     as futures_core::future::BoxFuture<'static, ()>
             };
-            notify::watch(client, Timing::default(), Arc::new(on_ask)).await
+            notify::watch(client, Timing::default(), Arc::new(on_beat)).await
+        });
+    }
+
+    // A topic for every agent pane, up front. Creating them lazily on the first ask meant a
+    // session that never got stuck had no conversation to open — which is exactly the session the
+    // operator wants to pick up from their phone. Idempotent: a pane that already has a topic keeps
+    // it, so restarts do not multiply topics.
+    if ctx.forum.is_some() {
+        let ctx2 = ctx.clone();
+        let bot2 = bot.clone();
+        tokio::spawn(async move {
+            ensure_all_topics(&bot2, &ctx2).await;
         });
     }
 
@@ -193,27 +206,97 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
 /// A dialog gets one button per option. A question gets a button that aims replies at its pane, so
 /// answering a *later* plain message does not need the operator to remember a pane id — which was
 /// the tedious part of the first version.
-async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
-    let mut body = format!(
-        "🔴 <b>{}</b> is waiting on you\n<code>{}</code> · {}",
-        escape_html(&ask.workspace),
-        escape_html(ask.pane.as_str()),
-        escape_html(&ask.agent),
-    );
-    if !ask.excerpt.is_empty() {
-        body.push_str(&format!("\n\n<pre>{}</pre>", escape_html(&ask.excerpt)));
+async fn push_beat(bot: &Bot, ctx: &Ctx, chats: &[i64], beat: Beat) {
+    match beat {
+        Beat::Asked(ask) => push_ask(bot, ctx, chats, ask).await,
+        Beat::Finished {
+            pane,
+            workspace,
+            agent,
+            excerpt,
+            ..
+        } => {
+            let _ = agent;
+            let body = voice::finished(place(ctx), &workspace, &excerpt);
+            say_in_topic(bot, ctx, chats, &pane, &workspace, &body, None).await;
+        }
+        // Deliberately terse: this is a status line in a conversation, not a notification worth a
+        // buzz on its own. It exists so the topic reads continuously.
+        Beat::Resumed { pane, workspace } => {
+            let body = voice::resumed(place(ctx), &workspace);
+            say_in_topic(bot, ctx, chats, &pane, &workspace, &body, None).await;
+        }
     }
+}
 
+/// Where messages appear, which decides how much context each one must carry.
+fn place(ctx: &Ctx) -> Place {
+    if ctx.forum.is_some() {
+        Place::Topic
+    } else {
+        Place::Flat
+    }
+}
+
+/// Send into a pane's topic, creating it if this pane has never had one.
+async fn say_in_topic(
+    bot: &Bot,
+    ctx: &Ctx,
+    chats: &[i64],
+    pane: &PaneId,
+    workspace: &str,
+    body: &str,
+    keyboard: Option<InlineKeyboardMarkup>,
+) {
+    if let Some(forum) = ctx.forum {
+        let Some(thread) = topic_for(bot, ctx, forum, pane, workspace).await else {
+            return;
+        };
+        let mut req = bot
+            .send_message(forum, body)
+            .parse_mode(ParseMode::Html)
+            .message_thread_id(thread);
+        if let Some(k) = keyboard {
+            req = req.reply_markup(k);
+        }
+        match req.await {
+            Ok(sent) => {
+                let mut r = ctx.routing.lock().await;
+                r.record_push(sent.id.0 as i64, pane);
+                let _ = r.save(&Routing::default_path());
+            }
+            Err(e) => tracing::error!(error = %e, "could not send into the topic"),
+        }
+        return;
+    }
+    for chat in chats {
+        let mut req = bot
+            .send_message(ChatId(*chat), body)
+            .parse_mode(ParseMode::Html);
+        if let Some(k) = keyboard.clone() {
+            req = req.reply_markup(k);
+        }
+        if let Ok(sent) = req.await {
+            let mut r = ctx.routing.lock().await;
+            r.record_push(sent.id.0 as i64, pane);
+            let _ = r.save(&Routing::default_path());
+        }
+    }
+}
+
+async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
+    let body = voice::asked(
+        place(ctx),
+        &ask.workspace,
+        &ask.excerpt,
+        !ask.options.is_empty(),
+    );
     let keyboard = if ask.options.is_empty() {
-        body.push_str("\n<i>Reply to this message and I'll type it into that pane.</i>");
         InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
-            "📌 Aim my replies here",
+            "📌 Send my replies here",
             format!("t|{}", ask.pane.as_str()),
         )]])
     } else {
-        // Never invite prose at a dialog: text goes nowhere and the Enter after it confirms
-        // whatever was highlighted.
-        body.push_str("\n<b>Pick one:</b>");
         InlineKeyboardMarkup::new([ask
             .options
             .iter()
@@ -223,49 +306,16 @@ async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
             })
             .collect::<Vec<_>>()])
     };
-
-    // In forum mode every ask goes to its pane's own topic, so the operator sees one pane's
-    // conversation at a time and an approval appears inline in it.
-    if let Some(forum) = ctx.forum {
-        let thread = match ensure_topic(bot, ctx, forum, &ask).await {
-            Some(t) => t,
-            None => return,
-        };
-        match bot
-            .send_message(forum, &body)
-            .parse_mode(ParseMode::Html)
-            .message_thread_id(thread)
-            .reply_markup(keyboard.clone())
-            .await
-        {
-            Ok(sent) => {
-                let mut r = ctx.routing.lock().await;
-                r.record_push(sent.id.0 as i64, &ask.pane);
-                let _ = r.save(&Routing::default_path());
-            }
-            Err(e) => tracing::error!(error = %e, "could not push into the topic"),
-        }
-        return;
-    }
-
-    for chat in chats {
-        match bot
-            .send_message(ChatId(*chat), &body)
-            .parse_mode(ParseMode::Html)
-            .reply_markup(keyboard.clone())
-            .await
-        {
-            Ok(sent) => {
-                let mut r = ctx.routing.lock().await;
-                // A reply to THIS message routes to this pane — the rule that cannot go stale.
-                r.record_push(sent.id.0 as i64, &ask.pane);
-                if let Err(e) = r.save(&Routing::default_path()) {
-                    tracing::warn!(error = %e, "could not persist the push mapping");
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "could not push an ask"),
-        }
-    }
+    say_in_topic(
+        bot,
+        ctx,
+        chats,
+        &ask.pane,
+        &ask.workspace,
+        &body,
+        Some(keyboard),
+    )
+    .await;
 }
 
 /// A button tap: choose a dialog option, or aim replies at a pane.
@@ -511,30 +561,37 @@ async fn route_and_deliver(
     let (client, routing, audit, submit) = (&*ctx.client, &*ctx.routing, &*ctx.audit, &ctx.submit);
     let snap = match client.snapshot().await {
         Ok(s) => s,
-        Err(e) => return escape_html(&format!("herdr unreachable, so nothing was sent: {e}")),
+        Err(e) => {
+            tracing::warn!(error = %e, "herd unreachable while routing a reply");
+            return voice::nothing_sent(Reason::HerdUnreachable);
+        }
     };
 
+    let pl = place(ctx);
     let target = routing
         .lock()
         .await
         .resolve(chat_id, reply_to, thread_id, &snap);
-    let (pane, why) = match target {
+    let (pane, _why) = match target {
         Target::Pane { pane, why } => (pane, why),
-        Target::Gone { pane } => {
-            // PLAN.md's failure table: never silently reroute a dead target.
-            return format!(
-                "<b>Not sent.</b> Your target <code>{}</code> is no longer in the herd.\nPick a \
-                 new one with /target, or reply directly to a pane's message.",
-                escape_html(pane.as_str())
-            );
-        }
-        Target::None => {
-            return escape_html(
-                "No target yet, and I will not guess which terminal to type into. \
-                 Set one with /target <pane>, or reply to a pane's message.",
-            );
-        }
+        // PLAN.md's failure table: never silently reroute a dead target.
+        Target::Gone { .. } => return voice::nothing_sent(Reason::TargetGone),
+        Target::None => return voice::nothing_sent(Reason::NoTarget),
     };
+
+    // The workspace label, for flat mode — in a topic it is redundant and voice omits it.
+    let ws_owned = snap
+        .panes
+        .iter()
+        .find(|p| p.pane_id == pane)
+        .and_then(|p| {
+            snap.workspaces
+                .iter()
+                .find(|w| w.workspace_id == p.workspace_id)
+                .map(|w| w.label.clone())
+        })
+        .unwrap_or_else(|| pane.as_str().to_string());
+    let ws = ws_owned.as_str();
 
     // Is that pane showing a choice dialog? If so the reply is a CHOICE, never text — text goes
     // nowhere and the Enter after it confirms whatever is highlighted, which on a permission prompt
@@ -547,7 +604,7 @@ async fn route_and_deliver(
         let at = timestamp();
         if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
             tracing::error!(error = %e, "could not write the audit record; refusing to send");
-            return escape_html("Not sent: the audit log could not be written.");
+            return voice::nothing_sent(Reason::NoAudit);
         }
         return match deliver::choose(client, &pane, text, Settle::default(), |d| {
             Box::pin(tokio::time::sleep(d))
@@ -556,37 +613,19 @@ async fn route_and_deliver(
         {
             Ok(Ok(d)) => {
                 let _ = audit.outcome(&timestamp(), &d);
-                let head = format!(
-                    "{} → <code>{}</code> <i>({})</i>",
-                    escape_html(&d.detail),
-                    escape_html(pane.as_str()),
-                    why.phrase()
-                );
-                if d.rung.needs_attention() {
-                    format!("⚠️ {head}")
-                } else {
-                    head
-                }
+                let chosen = prompt
+                    .match_option(text)
+                    .and_then(|i| prompt.options.get(i).cloned())
+                    .unwrap_or_else(|| text.trim().to_string());
+                voice::choice_made(pl, ws, &chosen, !d.rung.needs_attention())
             }
-            // Not an error — the operator was ambiguous, or the dialog moved on. Show the options
-            // again rather than typing something into a terminal on a guess.
-            Ok(Err(why_not)) => {
-                let mut m = format!("<b>Nothing sent.</b> {}", escape_html(&why_not));
-                if !prompt.options.is_empty() {
-                    m.push_str("\n<b>Pick one:</b>");
-                    for (i, o) in prompt.options.iter().enumerate() {
-                        m.push_str(&format!("\n  <b>{}</b> · {}", i + 1, escape_html(o)));
-                    }
-                }
-                m
-            }
+            // Not an error — the operator was ambiguous, or the prompt moved on. Show the options
+            // again rather than typing into a terminal on a guess.
+            Ok(Err(_)) => voice::nothing_sent(Reason::UnclearChoice(prompt.options.clone())),
             Err(e) => {
                 let _ = audit.failed(&timestamp(), &pane, &e.to_string());
-                format!(
-                    "<b>Failed on</b> <code>{}</code>: {}",
-                    escape_html(pane.as_str()),
-                    escape_html(&e.to_string())
-                )
+                tracing::error!(error = %e, "the choice failed to send");
+                voice::nothing_sent(Reason::HerdUnreachable)
             }
         };
     }
@@ -609,26 +648,12 @@ async fn route_and_deliver(
     match outcome {
         Ok(d) => {
             let _ = audit.outcome(&timestamp(), &d);
-            let head = format!(
-                "{} → <code>{}</code> <i>({})</i>",
-                d.rung.phrase(),
-                escape_html(pane.as_str()),
-                why.phrase()
-            );
-            if d.rung.needs_attention() {
-                format!("⚠️ {head}\n{}", escape_html(&d.detail))
-            } else {
-                head
-            }
+            voice::reply_landed(pl, ws, &d)
         }
         Err(e) => {
             let _ = audit.failed(&timestamp(), &pane, &e.to_string());
-            format!(
-                "<b>Failed while sending to</b> <code>{}</code>: {}\nCheck the pane — some of it \
-                 may have landed.",
-                escape_html(pane.as_str()),
-                escape_html(&e.to_string())
-            )
+            tracing::error!(error = %e, "the reply failed to send");
+            voice::nothing_sent(Reason::HerdUnreachable)
         }
     }
 }
@@ -681,27 +706,28 @@ fn timestamp() -> String {
 
 /// The pane's topic, creating it the first time.
 ///
-/// Named for the workspace rather than the pane id, because the workspace is what the operator
-/// recognises — the id is in the message body for when it matters. Returns `None` if the topic
-/// cannot be made, which is almost always the bot lacking "Manage Topics" in the group; that is
-/// logged with the fix rather than retried, because retrying a permission error just fills the log.
-async fn ensure_topic(
+/// Named for the workspace, because that is what the operator recognises — the pane id is in the
+/// message body for when it matters. Returns `None` if the topic cannot be made, which is almost
+/// always the bot lacking "Manage Topics" in the group; logged with the fix rather than retried,
+/// because retrying a permission error only fills the log.
+async fn topic_for(
     bot: &Bot,
     ctx: &Ctx,
     forum: ChatId,
-    ask: &Ask,
+    pane: &PaneId,
+    workspace: &str,
 ) -> Option<teloxide::types::ThreadId> {
-    if let Some(t) = ctx.routing.lock().await.topic_for(&ask.pane) {
+    if let Some(t) = ctx.routing.lock().await.topic_for(pane) {
         return Some(teloxide::types::ThreadId(teloxide::types::MessageId(t)));
     }
-    let name = format!("{} · {}", ask.workspace, ask.pane.as_str());
+    let name = format!("{workspace} · {}", pane.as_str());
     match bot.create_forum_topic(forum, &name).await {
         Ok(topic) => {
             let tid = topic.thread_id;
             let mut r = ctx.routing.lock().await;
-            r.bind_topic(tid.0.0, &ask.pane);
+            r.bind_topic(tid.0.0, pane);
             let _ = r.save(&Routing::default_path());
-            tracing::info!(pane = %ask.pane, topic = tid.0.0, name = %name, "created a topic");
+            tracing::info!(pane = %pane, topic = tid.0.0, name = %name, "created a topic");
             Some(tid)
         }
         Err(e) => {
@@ -711,6 +737,48 @@ async fn ensure_topic(
                  enabled, and this bot must be an admin with the \"Manage Topics\" permission."
             );
             None
+        }
+    }
+}
+
+/// Give every agent pane a topic, and say hello in the new ones.
+///
+/// Run at startup and whenever the herd's shape changes. The greeting matters: a topic with no
+/// messages in it is invisible in Telegram's topic list, so a silently-created topic is the same as
+/// no topic at all to the person looking for it.
+async fn ensure_all_topics(bot: &Bot, ctx: &Ctx) {
+    let Some(forum) = ctx.forum else { return };
+    let Ok(snap) = snapshot_for(&ctx.client, ctx.workspace.as_deref()).await else {
+        tracing::warn!("could not read the herd; topics will be created as asks arrive");
+        return;
+    };
+    let labels: std::collections::BTreeMap<_, _> = snap
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.clone(), w.label.clone()))
+        .collect();
+
+    for p in snap
+        .panes
+        .iter()
+        .filter(|p| p.agent.is_some() || p.display_agent.is_some())
+    {
+        let already = ctx.routing.lock().await.topic_for(&p.pane_id).is_some();
+        if already {
+            continue;
+        }
+        let ws = labels
+            .get(&p.workspace_id)
+            .cloned()
+            .unwrap_or_else(|| p.workspace_id.as_str().to_string());
+        if topic_for(bot, ctx, forum, &p.pane_id, &ws).await.is_some() {
+            let agent = p
+                .display_agent
+                .as_deref()
+                .or(p.agent.as_deref())
+                .unwrap_or("agent");
+            let hello = voice::topic_opened(&ws, agent);
+            say_in_topic(bot, ctx, &[], &p.pane_id, &ws, &hello, None).await;
         }
     }
 }

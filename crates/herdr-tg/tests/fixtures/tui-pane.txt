@@ -1,0 +1,60 @@
+
+     Supplements delivered to both live sessions. Poll cycle:
+
+  ┃
+  ┃  $ sleep 570; for L in lane-0000-000000-0000000 lane-0000-000000-0000000; do W=/
+  ┃  home/user/worktrees/example-project/$L; echo "══ $L"; git -C "$W" log --
+  ┃  oneline -1 --format="%h %s" | head -c 110; echo " …dirty: $(git -C "$W" status --
+  ┃  porcelain | wc -l) · $(tail -n 1 .kickoff/lane-runner-$L.log 2>/dev/null || echo
+  ┃  runner-silent)"; done
+  ┃
+  ┃  ══ lane-0000-000000-0000000
+  ┃  616b46b merge: PULL lane D — adopt's opencode gate is pin-rooted at the source (
+  ┃  lane-C finding adjudicated:  …dirty: 0 · [runner] lane lane-0000-000000-0000000
+  ┃  stalled post-nudge — RESPAWN #1: fresh session ses_00000000000000000000000009
+  ┃  continues from worktree state
+  ┃  ══ lane-0000-000000-0000000
+  ┃  c2ceae3 fix(config): root dev pin must name a model that exists + no tracked
+  ┃  secrets — x-preview-f-free was  …dirty: 2 · [runner] stall detected — nudging
+  ┃  once
+  ┃
+
+     + Thought: 8.1s
+
+     F respawned too (its supplement went to the dead predecessor). E is one stall
+     from cap. Decision: one more ladder-cycle each — any lane that hits cap, I
+     finish its scope inline (both are small, tightly specified, and I hold the drift
+     analysis already). Supplementing F's fresh session now:
+
+  ┃
+  ┃  $ P=$(head -1 .kickoff/opencode-bridge.port); curl -s --max-time 8 -X POST "http:
+  ┃  //127.0.0.1:$P/session/ses_00000000000000000000000009/prompt_async" -H "Content-
+  ┃  Type: application/json" -H "x-opencode-directory:/home/user/worktrees/
+  ┃  example-project/lane-0000-000000-0000000" -d "$(jq -nc '{sessionID:
+  ┃  "ses_00000000000000000000000009",directory:"/home/user/worktrees/claude-
+  ┃  kickoff/lane-0000-000000-0000000",parts:[{type:"text",text:"COORDINATOR
+  ┃  SUPPLEMENT (process only): run suites as (nohup bash scripts/pull-selftest.sh >/
+  ┃  tmp/f.log 2>&1 &) + short sleep/tail polls — NEVER one long foreground call;
+  ┃  emit a short text note between steps. Your whole task is small: recompute,
+  ┃  review, document, re-pin. Commit as soon as the suite is green."}]}')" -o /dev/
+  ┃  null -w "%{http_code}\n"
+  ┃
+  ┃  204
+  ┃
+
+  ┃
+  ┃  ⠋ sleep 570; for L in lane-0000-000000-0000000 lane-0000-000000-0000000; do W=/
+  ┃    home/user/worktrees/example-project/$L; echo "══ $L"; git -C "$W" log --
+  ┃    oneline -1 --format="%h %s" | head -c 110; echo " …dirty: $(git -C "$W" status
+  ┃    --porcelain | wc -l) · $(tail -n 1 .kickoff/lane-runner-$L.log 2>/dev/null ||
+  ┃    echo runner-silent)"; done
+  ┃
+
+     ▣  Coordinator · model-x
+
+  ┃
+  ┃
+  ┃
+  ┃  Coordinator · model-x Example Plan · max
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                               113.0K (11%)  ctrl+p commands

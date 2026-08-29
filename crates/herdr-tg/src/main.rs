@@ -43,6 +43,7 @@ mod notify;
 mod permission;
 mod render;
 mod routing;
+mod voice;
 
 use std::io::{IsTerminal, Write};
 use std::num::NonZeroU32;

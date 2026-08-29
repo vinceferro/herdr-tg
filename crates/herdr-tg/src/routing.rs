@@ -54,16 +54,6 @@ pub enum Why {
     Sticky,
 }
 
-impl Why {
-    pub fn phrase(self) -> &'static str {
-        match self {
-            Why::Topic => "this topic's pane",
-            Why::ReplyTo => "the pane that asked",
-            Why::Sticky => "your current target",
-        }
-    }
-}
-
 /// Per-chat routing state, persisted so a restart does not lose the operator's target.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Routing {
