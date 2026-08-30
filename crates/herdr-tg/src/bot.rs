@@ -843,10 +843,13 @@ fn reply_path(ansi: Option<&str>) -> ReplyPath {
     }
 }
 
-/// Say, in the operator's words, why nothing was pressed.
+/// Say, in the operator's words, why nothing was confirmed.
 ///
-/// Every arm means the same thing about the terminal — not one key reached it — and differs only in
-/// what the operator can do about it.
+/// Every arm means the same thing about the answer — no option was confirmed — and differs in what
+/// the operator can do about it. It does NOT follow that the terminal was left untouched: the
+/// highlight may have been moved before the bridge stopped, which is what `keys_sent` carries. An
+/// operator told "nothing was typed into that terminal" about a menu whose highlight moved goes to
+/// their keyboard expecting it where they left it.
 fn refusal_reason(refused: deliver::ChoiceRefused) -> Reason {
     match refused {
         deliver::ChoiceRefused::NotADialog => Reason::NoLongerAsking,
@@ -856,7 +859,9 @@ fn refusal_reason(refused: deliver::ChoiceRefused) -> Reason {
         deliver::ChoiceRefused::Unreadable => Reason::UnreadablePrompt,
         deliver::ChoiceRefused::Unclear { options } => Reason::UnclearChoice(options),
         deliver::ChoiceRefused::Changed { .. } => Reason::PromptChanged,
-        deliver::ChoiceRefused::NotConfirmed(why) => Reason::ChoiceNotConfirmed(why),
+        deliver::ChoiceRefused::NotConfirmed { why, keys_sent } => {
+            Reason::ChoiceNotConfirmed { why, keys_sent }
+        }
     }
 }
 
@@ -943,7 +948,7 @@ async fn route_and_deliver(
                     // The label a settled read showed HIGHLIGHTED just before the confirm key went
                     // out — never the one this function matched from its own earlier read. That
                     // earlier read is the one the operator's own keyboard may have overtaken.
-                    voice::choice_made(pl, ws, &c.option, !c.delivery.rung.needs_attention())
+                    voice::choice_made(pl, ws, &c.option, c.afterwards)
                 }
                 // Not an error — the operator was ambiguous, or the menu moved on. Say which,
                 // rather than typing into a terminal on a guess. The record above says an answer

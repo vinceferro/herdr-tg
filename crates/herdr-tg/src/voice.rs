@@ -26,7 +26,7 @@
 //! 7. **Never claim more than was observed.** This is the one rule that outranks brevity: a
 //!    confirmation that overstates costs the operator the time the bridge exists to save.
 
-use crate::deliver::{Delivery, Rung};
+use crate::deliver::{Afterwards, Delivery, Rung};
 
 /// Where the message will appear, which decides how much context it must carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,18 +235,25 @@ pub fn reply_landed(place: Place, workspace: &str, d: &Delivery) -> String {
 }
 
 /// What happened to a tapped or named option.
-pub fn choice_made(place: Place, workspace: &str, option: &str, closed: bool) -> String {
+///
+/// Three outcomes, not two. The confirm key can land and the look that would check it can then
+/// fail, and "the prompt is still up" is a claim about a screen nobody saw. Say what is known.
+pub fn choice_made(place: Place, workspace: &str, option: &str, after: Afterwards) -> String {
     let where_to = match place {
         Place::Topic => String::new(),
         Place::Flat => format!(" in {}", esc(workspace)),
     };
-    if closed {
-        format!("✅ <b>{}{where_to}.</b>", esc(option))
-    } else {
-        format!(
+    match after {
+        Afterwards::MenuClosed => format!("✅ <b>{}{where_to}.</b>", esc(option)),
+        Afterwards::MenuStillUp => format!(
             "⚠️ <b>{}{where_to} — but the prompt is still up.</b>\nIt may not have registered.",
             esc(option)
-        )
+        ),
+        Afterwards::NotSeen => format!(
+            "⚠️ <b>{}{where_to} — I couldn't check what it did.</b>\nI lost contact with that \
+             session as the key went out. Have a look at it.",
+            esc(option)
+        ),
     }
 }
 
@@ -299,8 +306,24 @@ pub fn nothing_sent(reason: Reason) -> String {
         // The account comes from `deliver`, which watched the menu; it is the only place that
         // knows which option ended up highlighted instead. It is escaped because the option names
         // in it are the agent's words, not this bridge's.
-        Reason::ChoiceNotConfirmed(why) => format!(
+        //
+        // The second line is the one that has to be earned. On the path where the highlight was
+        // moved and the confirm key then withheld, arrow keys DID reach that terminal, and saying
+        // nothing was typed into it is false — the operator would go to their keyboard expecting
+        // the menu where they left it.
+        Reason::ChoiceNotConfirmed {
+            why,
+            keys_sent: false,
+        } => format!(
             "{}\n<i>Nothing was typed into that terminal.</i>",
+            esc(&why)
+        ),
+        Reason::ChoiceNotConfirmed {
+            why,
+            keys_sent: true,
+        } => format!(
+            "{}\n<i>No answer was confirmed. Keys had already gone out toward that menu, so check \
+             where its highlight is sitting before you answer at the keyboard.</i>",
             esc(&why)
         ),
     }
@@ -331,7 +354,14 @@ pub enum Reason {
     /// The highlight could not be got onto the option the operator asked for, so nothing was
     /// confirmed. Carries `deliver`'s account of what it actually saw, which names the option it
     /// ended up on — that is the information, and only `deliver` has it.
-    ChoiceNotConfirmed(String),
+    ///
+    /// `keys_sent` is whether arrow keys had already gone into that terminal. Nothing was
+    /// confirmed either way; what changes is whether the operator may be told that nothing was
+    /// typed there.
+    ChoiceNotConfirmed {
+        why: String,
+        keys_sent: bool,
+    },
 }
 
 /// Escape the three characters Telegram's HTML mode treats as markup.
@@ -386,8 +416,9 @@ mod tests {
             finished(place, "omarchy-lab", "Done: 3 files changed."),
             resumed(place, "omarchy-lab"),
             topic_opened("omarchy-lab", "opencode"),
-            choice_made(place, "omarchy-lab", "Reject", true),
-            choice_made(place, "omarchy-lab", "Reject", false),
+            choice_made(place, "omarchy-lab", "Reject", Afterwards::MenuClosed),
+            choice_made(place, "omarchy-lab", "Reject", Afterwards::MenuStillUp),
+            choice_made(place, "omarchy-lab", "Reject", Afterwards::NotSeen),
             nothing_sent(Reason::NoTarget),
             nothing_sent(Reason::TargetGone),
             nothing_sent(Reason::NoAudit),
@@ -397,11 +428,18 @@ mod tests {
             nothing_sent(Reason::PromptChanged),
             nothing_sent(Reason::CannotTellIfMovedOn),
             nothing_sent(Reason::ButtonExpired),
-            nothing_sent(Reason::ChoiceNotConfirmed(
-                "I couldn't get the highlight onto \"Reject\" — it is on \"Allow once\". Nothing \
-                 was confirmed; answer it at the keyboard."
+            nothing_sent(Reason::ChoiceNotConfirmed {
+                why: "I couldn't get the highlight onto \"Reject\" — it is on \"Allow once\". \
+                      Nothing was confirmed; answer it at the keyboard."
                     .into(),
-            )),
+                keys_sent: false,
+            }),
+            nothing_sent(Reason::ChoiceNotConfirmed {
+                why: "I moved the highlight toward \"Reject\" and then lost contact with that \
+                      session, so I did not press the confirm key."
+                    .into(),
+                keys_sent: true,
+            }),
             nothing_sent(Reason::UnclearChoice(vec![
                 "Allow once".into(),
                 "Reject".into(),
@@ -451,7 +489,7 @@ mod tests {
             finished(Place::Flat, "omarchy-lab", "x"),
             resumed(Place::Flat, "omarchy-lab"),
             reply_landed(Place::Flat, "omarchy-lab", &delivery(Rung::Submitted)),
-            choice_made(Place::Flat, "omarchy-lab", "Reject", true),
+            choice_made(Place::Flat, "omarchy-lab", "Reject", Afterwards::MenuClosed),
         ] {
             assert!(m.contains("omarchy-lab"), "no session named in: {m:?}");
         }
@@ -714,5 +752,46 @@ mod tests {
             !regex_lite_pane_id(&m),
             "a pane id reached the operator: {m:?}"
         );
+    }
+
+    /// Never tell the operator that nothing was typed into a terminal that keys went into.
+    ///
+    /// The refusal that follows a moved highlight is a refusal to CONFIRM, not a promise that
+    /// nothing was pressed. An operator who believes the stronger claim walks to their keyboard
+    /// expecting the menu where they left it, and answers the one they find without looking.
+    #[test]
+    fn a_refusal_after_keys_went_out_never_claims_nothing_was_typed() {
+        let after_keys = nothing_sent(Reason::ChoiceNotConfirmed {
+            why: "I couldn't get the highlight onto \"Reject\" — it is on \"Allow once\".".into(),
+            keys_sent: true,
+        });
+        assert!(
+            !after_keys.to_lowercase().contains("nothing was typed"),
+            "arrow keys reached that terminal: {after_keys}"
+        );
+        assert!(
+            after_keys.contains("highlight"),
+            "the operator must be told the highlight moved: {after_keys}"
+        );
+
+        // And where no key went out, the stronger, more reassuring line is the true one.
+        let before_keys = nothing_sent(Reason::ChoiceNotConfirmed {
+            why: "That menu is moving — someone is answering it at the keyboard.".into(),
+            keys_sent: false,
+        });
+        assert!(before_keys.contains("Nothing was typed into that terminal"));
+    }
+
+    /// A confirmation that could not be checked says so, rather than claiming the prompt is still
+    /// up — which is a statement about a screen nobody managed to look at.
+    #[test]
+    fn a_choice_nobody_could_look_at_afterwards_claims_neither_outcome() {
+        let m = choice_made(Place::Topic, "omarchy-lab", "Reject", Afterwards::NotSeen);
+        assert!(!m.contains("still up"), "{m}");
+        assert!(
+            !m.contains("✅"),
+            "nothing here was confirmed to have taken: {m}"
+        );
+        assert!(m.contains("lost contact"), "{m}");
     }
 }

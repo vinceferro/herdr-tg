@@ -69,16 +69,6 @@ pub enum Rung {
     Acted,
 }
 
-impl Rung {
-    /// Does this rung warrant telling the operator something looks wrong?
-    ///
-    /// `Echoed` is the dangerous one: the text is sitting in the input buffer unsent, which is
-    /// exactly what a wrong submit key looks like.
-    pub fn needs_attention(self) -> bool {
-        matches!(self, Rung::Accepted | Rung::Echoed)
-    }
-}
-
 /// What happened when the bridge tried to put text into a pane.
 #[derive(Debug, Clone)]
 pub struct Delivery {
@@ -275,7 +265,8 @@ pub enum Choice<'a> {
     },
 }
 
-/// Why nothing was chosen. In EVERY variant, not one key reached the pane.
+/// Why nothing was chosen. No option was confirmed in any of these — but see
+/// [`ChoiceRefused::NotConfirmed`], which is the one that can follow keys that DID reach the pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChoiceRefused {
     /// The pane is not showing a menu any more.
@@ -293,7 +284,11 @@ pub enum ChoiceRefused {
     Changed { now: Vec<String> },
     /// The menu would not hold still, would not move, or ended up on the wrong option, so the
     /// confirm key never went out. Carries an operator-readable account of what was seen.
-    NotConfirmed(String),
+    ///
+    /// `keys_sent` says whether ARROW keys had already reached that terminal before the bridge
+    /// stopped. Nothing was confirmed either way — but when arrows went out, the highlight in the
+    /// operator's own terminal has moved, and telling them nothing was typed there is false.
+    NotConfirmed { why: String, keys_sent: bool },
 }
 
 impl std::fmt::Display for ChoiceRefused {
@@ -312,15 +307,33 @@ impl std::fmt::Display for ChoiceRefused {
             ChoiceRefused::Changed { .. } => f.write_str(
                 "That menu has changed since those buttons were drawn, so I pressed nothing.",
             ),
-            ChoiceRefused::NotConfirmed(why) => f.write_str(why),
+            ChoiceRefused::NotConfirmed { why, .. } => f.write_str(why),
         }
     }
+}
+
+/// What the pane showed after the confirm key went out.
+///
+/// [`Afterwards::NotSeen`] is the honest third answer. The read that would have checked whether the
+/// menu closed can itself fail — a herd restart, a dropped socket — and that failure says nothing
+/// about the key, which has already landed. Reporting it as an error had the operator told "nothing
+/// was sent" about a permission that had just been granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Afterwards {
+    /// Ordinary output is on screen: the menu took the answer and closed.
+    MenuClosed,
+    /// The menu is still up. It may not have registered.
+    MenuStillUp,
+    /// The pane could not be looked at again at all, so what the key did is simply unknown.
+    NotSeen,
 }
 
 /// A choice that was actually made.
 #[derive(Debug, Clone)]
 pub struct Chosen {
     pub delivery: Delivery,
+    /// What a look after the confirm key found — including "I could not look".
+    pub afterwards: Afterwards,
     /// The label a SETTLED read showed highlighted immediately before the confirm key went out.
     ///
     /// This — never the index a button carried, never a label from an earlier read — is the only
@@ -427,10 +440,12 @@ pub async fn choose<P: PaneIo>(
         Look::Gone => return Ok(Err(ChoiceRefused::NotADialog)),
         Look::Unreadable => return Ok(Err(ChoiceRefused::Unreadable)),
         Look::Moving => {
-            return Ok(Err(ChoiceRefused::NotConfirmed(
-                "That menu is moving — someone is answering it at the keyboard. I pressed nothing."
+            return Ok(Err(ChoiceRefused::NotConfirmed {
+                why: "That menu is moving — someone is answering it at the keyboard. I pressed \
+                      nothing."
                     .into(),
-            )));
+                keys_sent: false,
+            }));
         }
     };
 
@@ -474,75 +489,161 @@ pub async fn choose<P: PaneIo>(
         // unwrap so that an edit which breaks that invariant costs the operator a trip to their
         // keyboard instead of pressing a key nobody chose.
         let Some(keys) = start.move_to(idx) else {
-            return Ok(Err(ChoiceRefused::NotConfirmed(
-                "I lost track of which option you meant, so I pressed nothing.".into(),
-            )));
+            return Ok(Err(ChoiceRefused::NotConfirmed {
+                why: "I lost track of which option you meant, so I pressed nothing.".into(),
+                keys_sent: false,
+            }));
         };
-        io.send_key_sequence(pane, &to_keys(&keys)).await?;
+        // A failure on this send is not proof the arrows did not land — a timeout is the shape of
+        // a herd that took the write and never answered — so from here on the operator is told
+        // that keys went out, not that the terminal was left alone.
+        if let Err(e) = io.send_key_sequence(pane, &to_keys(&keys)).await {
+            tracing::warn!(error = %e, "lost contact with the herd as the arrow keys went out");
+            return Ok(Err(ChoiceRefused::NotConfirmed {
+                why: format!(
+                    "I lost contact with that session while aiming at \"{chosen}\", so I did not \
+                     press the confirm key."
+                ),
+                keys_sent: true,
+            }));
+        }
+        // From here the arrows have reached a real terminal, so nothing below may tell the operator
+        // that nothing was typed into it. The confirm key is still the thing that grants a
+        // permission, and it has not gone out — that part stays true in every branch.
+        //
         // One aim, then look. No corrective loop: if the highlight did not land where it was
         // asked to, someone else is driving, and pressing more keys at them is how the wrong
         // permission gets granted.
-        match settled_dialog(io, pane, settle, &sleep).await? {
+        let looked = match settled_dialog(io, pane, settle, &sleep).await {
+            Ok(l) => l,
+            // The look failed, not the keys. An error here would be reported to the operator as
+            // "nothing was sent", about a terminal whose highlight this function just moved.
+            Err(e) => {
+                tracing::warn!(error = %e, "lost sight of the menu after moving the highlight");
+                return Ok(Err(ChoiceRefused::NotConfirmed {
+                    why: format!(
+                        "I moved the highlight toward \"{chosen}\" and then lost contact with that \
+                         session, so I did not press the confirm key."
+                    ),
+                    keys_sent: true,
+                }));
+            }
+        };
+        match looked {
             Look::Settled(p) => p,
             Look::Gone => {
-                return Ok(Err(ChoiceRefused::NotConfirmed(
-                    "That menu went away while I was answering it, so I confirmed nothing.".into(),
-                )));
+                return Ok(Err(ChoiceRefused::NotConfirmed {
+                    why: "That menu went away while I was answering it, so I confirmed nothing."
+                        .into(),
+                    keys_sent: true,
+                }));
             }
             Look::Unreadable => {
-                return Ok(Err(ChoiceRefused::NotConfirmed(
-                    "I lost track of which option that menu is on, so I confirmed nothing; \
-                     answer it at the keyboard."
+                return Ok(Err(ChoiceRefused::NotConfirmed {
+                    why: "I lost track of which option that menu is on, so I confirmed nothing; \
+                          answer it at the keyboard."
                         .into(),
-                )));
+                    keys_sent: true,
+                }));
             }
             Look::Moving => {
-                return Ok(Err(ChoiceRefused::NotConfirmed(
-                    "That menu kept moving while I was answering it. I confirmed nothing.".into(),
-                )));
+                return Ok(Err(ChoiceRefused::NotConfirmed {
+                    why: "That menu kept moving while I was answering it. I confirmed nothing."
+                        .into(),
+                    keys_sent: true,
+                }));
             }
         }
     };
+    // True exactly when arrow keys went into that terminal above.
+    let moved = start.selected != idx;
 
     // THE GATE. Everything above is preparation; this is the line that makes the confirmation
     // honest. Nothing is pressed unless a settled read shows the SAME options with the wanted one
     // highlighted. Checking the label alone is not enough — a different menu can offer the same
     // word, and confirming it would answer a question nobody read.
     if aimed.options != start.options {
-        return Ok(Err(ChoiceRefused::NotConfirmed(format!(
-            "The choices on that menu changed while I was answering it, so I did not confirm \
-             \"{chosen}\"."
-        ))));
+        return Ok(Err(ChoiceRefused::NotConfirmed {
+            why: format!(
+                "The choices on that menu changed while I was answering it, so I did not confirm \
+                 \"{chosen}\"."
+            ),
+            keys_sent: moved,
+        }));
     }
     if aimed.highlighted() != Some(chosen.as_str()) {
-        return Ok(Err(ChoiceRefused::NotConfirmed(format!(
-            "I couldn't get the highlight onto \"{chosen}\" — it is on \"{}\". Nothing was \
-             confirmed; answer it at the keyboard.",
-            aimed.highlighted().unwrap_or("something else")
-        ))));
+        return Ok(Err(ChoiceRefused::NotConfirmed {
+            why: format!(
+                "I couldn't get the highlight onto \"{chosen}\" — it is on \"{}\". Nothing was \
+                 confirmed; answer it at the keyboard.",
+                aimed.highlighted().unwrap_or("something else")
+            ),
+            keys_sent: moved,
+        }));
     }
 
     // Its own send, which is what makes the check above a gate rather than a comment.
-    io.send_key_sequence(pane, &to_keys(&[crate::permission::CONFIRM]))
-        .await?;
+    //
+    // A failure here is NOT evidence that the key did not land: a timeout is the shape of a herd
+    // that took the write and never answered. So it is reported as "I don't know", never as
+    // "nothing was sent" — the operator has to look at that terminal either way, and only one of
+    // those two sends them to it.
+    let sent = io
+        .send_key_sequence(pane, &to_keys(&[crate::permission::CONFIRM]))
+        .await;
+    if let Err(e) = sent {
+        tracing::warn!(error = %e, "lost contact with the herd as the confirm key went out");
+        return Ok(Ok(Chosen {
+            delivery: Delivery {
+                pane: pane.clone(),
+                rung: Rung::Accepted,
+                detail: format!(
+                    "asked that session to confirm \"{chosen}\" and lost contact as the key went \
+                     out — I could not check whether it took"
+                ),
+            },
+            afterwards: Afterwards::NotSeen,
+            option: chosen,
+        }));
+    }
 
+    // The key has landed. Nothing from here on may return an error: the caller turns an error into
+    // "I can't reach the herd right now, so nothing was sent", and that would be said about a
+    // permission that has just been granted. What CAN still fail is looking, and a failure to look
+    // is reported as exactly that.
     let mut rung = Rung::Accepted;
+    let mut afterwards = Afterwards::MenuStillUp;
     let mut detail = format!("moved the highlight onto \"{chosen}\" and confirmed it");
     for _ in 0..settle.attempts {
         sleep(settle.interval).await;
-        let now = io.read_visible_ansi(pane).await?;
+        let now = match io.read_visible_ansi(pane).await {
+            Ok(now) => now,
+            Err(e) => {
+                tracing::warn!(error = %e, "lost sight of the pane after the confirm key landed");
+                afterwards = Afterwards::NotSeen;
+                break;
+            }
+        };
         // Ordinary output is the ONLY evidence that the menu closed. "Nothing parsed" is not: a
         // menu the bridge merely failed to understand reads the same way, and answering it is
         // exactly what did not happen.
         if crate::permission::classify(&now) == crate::permission::Screen::Prose {
             rung = Rung::Submitted;
+            afterwards = Afterwards::MenuClosed;
             detail = format!("chose \"{chosen}\" — the menu closed");
             break;
         }
     }
-    if rung < Rung::Submitted {
-        detail = format!("{detail}, but the menu is still on screen — it may not have taken");
-    }
+    detail = match afterwards {
+        Afterwards::MenuClosed => detail,
+        Afterwards::MenuStillUp => {
+            format!("{detail}, but the menu is still on screen — it may not have taken")
+        }
+        // Says only what is known: the key went out, and the pane could not be looked at again.
+        Afterwards::NotSeen => format!(
+            "{detail}, and then lost contact with that session before I could see what it did"
+        ),
+    };
 
     Ok(Ok(Chosen {
         delivery: Delivery {
@@ -550,6 +651,7 @@ pub async fn choose<P: PaneIo>(
             rung,
             detail,
         },
+        afterwards,
         option: chosen,
     }))
 }
@@ -731,7 +833,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d.rung, Rung::Submitted);
-        assert!(!d.rung.needs_attention());
         assert_eq!(io.sent_text.borrow().as_slice(), ["ship it please"]);
         assert_eq!(io.sent_keys.borrow().as_slice(), ["Enter"]);
     }
@@ -751,15 +852,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d.rung, Rung::Echoed, "must not claim Submitted");
-        assert!(d.rung.needs_attention());
         assert!(
             d.detail.contains("submit key"),
             "the operator must be told what to suspect: {}",
             d.detail
         );
         // The operator-facing wording is `voice`'s, and it has its own test that only the top
-        // rung sounds certain. Here we only pin that this outcome is flagged as doubtful.
-        assert!(d.rung.needs_attention());
+        // rung sounds certain. Here we only pin the rung, which is what that wording reads.
     }
 
     /// A TUI that swallows the text entirely — a modal dialog had focus.
@@ -770,7 +869,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d.rung, Rung::Accepted);
-        assert!(d.rung.needs_attention());
     }
 
     /// The text is still at the BOTTOM after the submit key: the pane changed for some other
@@ -828,8 +926,6 @@ mod tests {
         assert!(Rung::Submitted < Rung::Acted);
         // The wording itself lives in `voice`, which has its own test that only the top rung
         // sounds certain. What matters here is the ORDER those rules depend on.
-        assert!(Rung::Accepted.needs_attention() && Rung::Echoed.needs_attention());
-        assert!(!Rung::Submitted.needs_attention() && !Rung::Acted.needs_attention());
     }
 
     // ---- the two-writer race ------------------------------------------------------------------
@@ -865,6 +961,17 @@ mod tests {
     /// different things. A real TUI redraws tens of milliseconds after the key that moved it, so a
     /// read taken just after the operator's own keypress renders the frame from before it. `truth`
     /// is where the highlight is; `rendered` is the frame the next read will return.
+    /// When the herd stops answering reads. A dropped socket or a herd restart does not wait for
+    /// a convenient moment, and the two moments that matter are the ones AFTER keys have gone out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum GoesQuiet {
+        Never,
+        /// After the arrow keys have moved the highlight, before the gate can look.
+        AfterTheArrows,
+        /// After the confirm key has landed — a permission that has just been granted.
+        AfterTheConfirmKey,
+    }
+
     struct DialogPane {
         options: Vec<String>,
         edge: Edge,
@@ -872,6 +979,9 @@ mod tests {
         arrows_work: bool,
         /// Someone is scrolling it: every read finds the highlight somewhere new.
         restless: bool,
+        quiet: GoesQuiet,
+        arrow_keys_fail: bool,
+        confirm_key_fails: bool,
         after: AfterConfirm,
         truth: RefCell<usize>,
         rendered: RefCell<usize>,
@@ -888,6 +998,9 @@ mod tests {
                 edge,
                 arrows_work: true,
                 restless: false,
+                quiet: GoesQuiet::Never,
+                arrow_keys_fail: false,
+                confirm_key_fails: false,
                 after: AfterConfirm::Closes,
                 truth: RefCell::new(truth),
                 rendered: RefCell::new(truth),
@@ -913,6 +1026,26 @@ mod tests {
 
         fn restless(mut self) -> Self {
             self.restless = true;
+            self
+        }
+
+        fn goes_quiet(mut self, quiet: GoesQuiet) -> Self {
+            self.quiet = quiet;
+            self
+        }
+
+        /// The send of the arrow keys fails. Whether they moved the highlight is then exactly
+        /// what nobody knows.
+        fn drops_the_arrow_keys(mut self) -> Self {
+            self.arrow_keys_fail = true;
+            self
+        }
+
+        /// The send of the confirm key itself fails. Whether the key reached the terminal is then
+        /// exactly what nobody knows — a timeout is the shape of a herd that took the write and
+        /// never answered.
+        fn drops_the_confirm_key(mut self) -> Self {
+            self.confirm_key_fails = true;
             self
         }
 
@@ -951,6 +1084,16 @@ mod tests {
             panic!("the dialog path sends its keys as a sequence, so all of them are recorded")
         }
         async fn read_visible_ansi(&self, _pane: &PaneId) -> Result<String, HerdrError> {
+            let gone = HerdrError::Timeout {
+                method: "pane.readVisible",
+                elapsed: Duration::from_secs(5),
+            };
+            if self.quiet == GoesQuiet::AfterTheConfirmKey && self.confirmed.borrow().is_some() {
+                return Err(gone);
+            }
+            if self.quiet == GoesQuiet::AfterTheArrows && !self.keys.borrow().is_empty() {
+                return Err(gone);
+            }
             if self.confirmed.borrow().is_some() {
                 return Ok(match self.after {
                     AfterConfirm::Closes => "agent: working on it\n> ".to_string(),
@@ -968,6 +1111,18 @@ mod tests {
             Ok(out)
         }
         async fn send_key_sequence(&self, _pane: &PaneId, keys: &[Key]) -> Result<(), HerdrError> {
+            if self.arrow_keys_fail && keys.iter().any(|k| k.to_string() != "Enter") {
+                return Err(HerdrError::Timeout {
+                    method: "pane.sendKeys",
+                    elapsed: Duration::from_secs(5),
+                });
+            }
+            if self.confirm_key_fails && keys.iter().any(|k| k.to_string() == "Enter") {
+                return Err(HerdrError::Timeout {
+                    method: "pane.sendKeys",
+                    elapsed: Duration::from_secs(5),
+                });
+            }
             let n = self.options.len();
             for k in keys {
                 let name = k.to_string();
@@ -1046,7 +1201,7 @@ mod tests {
                 "{edge:?}: the confirm key went out anyway: {:?}",
                 io.keys()
             );
-            let ChoiceRefused::NotConfirmed(why) =
+            let ChoiceRefused::NotConfirmed { why, .. } =
                 r.expect_err("nothing was confirmed, so this is a refusal")
             else {
                 panic!("{edge:?}: the operator must be told the highlight would not move");
@@ -1069,7 +1224,7 @@ mod tests {
         assert!(io.keys().is_empty(), "keys went out: {:?}", io.keys());
         assert_eq!(io.confirmed(), None);
         assert!(
-            matches!(r, Err(ChoiceRefused::NotConfirmed(_))),
+            matches!(r, Err(ChoiceRefused::NotConfirmed { .. })),
             "a menu someone else is driving must be refused, and said so"
         );
     }
@@ -1134,7 +1289,6 @@ mod tests {
         .expect("the dialog was there when we looked");
         assert_eq!(io.confirmed().as_deref(), Some("Allow once"));
         assert_eq!(c.delivery.rung, Rung::Accepted, "{}", c.delivery.detail);
-        assert!(c.delivery.rung.needs_attention());
         assert!(
             c.delivery.detail.contains("may not have taken"),
             "{}",
@@ -1152,7 +1306,6 @@ mod tests {
             .unwrap()
             .expect("the dialog was there when we looked");
         assert_eq!(c.delivery.rung, Rung::Accepted);
-        assert!(c.delivery.rung.needs_attention());
         assert!(
             c.delivery.detail.contains("may not have taken"),
             "{}",
@@ -1395,5 +1548,108 @@ mod tests {
             "a needle high up is history"
         );
         assert!(tail_contains(pane, "bottom"));
+    }
+
+    /// The herd goes quiet AFTER the confirm key has landed. The permission was granted; the read
+    /// that would have checked whether the menu closed is the thing that failed. Handing the caller
+    /// an error there had it tell the operator "I can't reach the herd right now, so nothing was
+    /// sent" — about a permission that had just been granted.
+    ///
+    /// Never tell the operator nothing was sent when something was. Say what is known and what is
+    /// not.
+    #[tokio::test]
+    async fn a_herd_that_goes_quiet_after_the_confirm_key_is_never_reported_as_nothing_sent() {
+        let io =
+            DialogPane::new(&OPTIONS, 0, Edge::Clamps).goes_quiet(GoesQuiet::AfterTheConfirmKey);
+        let r = choose(&io, &pane(), Choice::Reply("Reject"), settle(), no_sleep).await;
+        assert_eq!(
+            io.confirmed().as_deref(),
+            Some("Reject"),
+            "the confirm key landed, so nothing here may report that it did not"
+        );
+        let c = r
+            .expect(
+                "the confirm key had already gone out; an error here is reported to the operator \
+                 as \"nothing was sent\"",
+            )
+            .expect("the option was confirmed");
+        assert_eq!(c.option, "Reject");
+        assert!(
+            c.delivery.detail.contains("confirmed"),
+            "the operator must be told the key went out: {}",
+            c.delivery.detail
+        );
+        assert!(
+            !c.delivery.detail.contains("still on screen"),
+            "the pane was never seen again, so nothing may be claimed about it: {}",
+            c.delivery.detail
+        );
+    }
+
+    /// The herd goes quiet after the ARROWS have moved the highlight but before the gate can look.
+    /// The confirm key never goes out — that part is true — but the highlight in the operator's
+    /// terminal has moved, and telling them nothing was typed there is false.
+    #[tokio::test]
+    async fn a_herd_that_goes_quiet_after_the_arrows_admits_the_highlight_moved() {
+        let io = DialogPane::new(&OPTIONS, 0, Edge::Clamps).goes_quiet(GoesQuiet::AfterTheArrows);
+        let r = choose(&io, &pane(), Choice::Reply("Reject"), settle(), no_sleep).await;
+        assert_eq!(io.confirmed(), None, "nothing may be confirmed here");
+        let refused = r
+            .expect(
+                "arrow keys had already gone into that terminal; an error here is reported to the \
+                 operator as \"nothing was sent\"",
+            )
+            .expect_err("nothing was confirmed, so this is a refusal");
+        let ChoiceRefused::NotConfirmed { why, keys_sent } = refused else {
+            panic!("the operator must be told what was seen");
+        };
+        assert!(keys_sent, "the arrows reached that terminal");
+        assert!(
+            why.contains("Reject"),
+            "the operator must be told what they asked for: {why}"
+        );
+    }
+
+    /// The send of the confirm key itself fails. Whether it reached the terminal is unknowable from
+    /// here — a timeout is the shape of a herd that took the write and never answered — so the one
+    /// thing that must not be said is that nothing was sent.
+    #[tokio::test]
+    async fn a_confirm_key_that_may_or_may_not_have_landed_is_never_reported_as_nothing_sent() {
+        let io = DialogPane::new(&OPTIONS, 0, Edge::Clamps).drops_the_confirm_key();
+        let c = choose(&io, &pane(), Choice::Reply("Reject"), settle(), no_sleep)
+            .await
+            .expect(
+                "whether the confirm key landed is unknown; an error here is reported to the \
+                 operator as \"nothing was sent\"",
+            )
+            .expect("the operator must be told what is and is not known");
+        assert_eq!(c.afterwards, Afterwards::NotSeen);
+        assert_eq!(c.option, "Reject");
+        assert!(
+            c.delivery.detail.contains("could not check"),
+            "the operator must be told what was not established: {}",
+            c.delivery.detail
+        );
+    }
+
+    /// The send of the ARROW keys fails. Nothing was confirmed — that is certain, the confirm key
+    /// is a separate send that never happened — but whether the highlight moved is unknown, and
+    /// "nothing was sent" is a claim about the terminal that this function cannot make.
+    #[tokio::test]
+    async fn arrow_keys_that_may_or_may_not_have_landed_are_never_reported_as_nothing_sent() {
+        let io = DialogPane::new(&OPTIONS, 0, Edge::Clamps).drops_the_arrow_keys();
+        let refused = choose(&io, &pane(), Choice::Reply("Reject"), settle(), no_sleep)
+            .await
+            .expect(
+                "whether the arrows landed is unknown; an error here is reported to the operator \
+                 as \"nothing was sent\"",
+            )
+            .expect_err("the confirm key never went out, so nothing was confirmed");
+        assert_eq!(io.confirmed(), None);
+        let ChoiceRefused::NotConfirmed { why, keys_sent } = refused else {
+            panic!("the operator must be told what was and was not done");
+        };
+        assert!(keys_sent, "keys went out toward that terminal");
+        assert!(why.contains("Reject"), "{why}");
     }
 }

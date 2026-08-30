@@ -48,6 +48,35 @@
 //! first arrow key goes into the dialog that really has focus. Nothing here can tell which of two
 //! control rows holds the keyboard, so neither is answered.
 //!
+//! Those rows are counted by SHAPE, not by whether they could be read. Counting the ones that
+//! resolved meant a modal this parser could not read did not count at all — so a screen carrying
+//! such a modal plus any chrome below it handed the CHROME back as the dialog, which is the worst
+//! outcome this module has: buttons labelled with status-bar segments, and a tap on one sliding
+//! the live modal's highlight onto something the operator never chose.
+//!
+//! # What makes a row an option row
+//!
+//! The words. A row is looked at when it carries the affordance — "select" and "confirm", or the
+//! arrows — because those are what a harness writes to tell a human how to answer. That is a weak
+//! test, and it is weak in a known direction: the agent writes the words in the pane, so the words
+//! can be missing where a control is and present where none is.
+//!
+//! Two places it is not the whole test:
+//!
+//! - **The hints on the line below.** Plenty of harnesses draw the keybind line UNDER the options
+//!   rather than beside them. The option row then carries no affordance words at all, and reading
+//!   it as prose is the catastrophic path. So a line that is ONLY keys and the words for them is
+//!   taken as a modal's hint line, and the row above it is read as its options when that row is
+//!   painted like a selector: several runs, not all on one background, inside something drawn.
+//!   Structure alone would be far too loose — that is also the shape of syntax-highlighted output —
+//!   so the hint line below is the corroboration, and the hint line is also used as the panel
+//!   witness, which it can be because it sits inside the same panel.
+//! - **Where the options end and the footer begins.** A footer is found at a run that NAMES A KEY,
+//!   as a whole word, or that is a phrase of nothing but key names and the words around them. Not
+//!   at a bare word: `Cancel`, `Confirm` and `Select` are the commonest button labels there are,
+//!   and ending the scan at one dropped it — and every option to its right — from the menu the
+//!   operator was shown. Not by prefix either: `Escalate` is not the `Esc` key.
+//!
 //! # A control we cannot read is not prose
 //!
 //! A dialog that stops being recognised used to fall back to being treated as prose, which is the
@@ -171,8 +200,43 @@ impl Prompt {
     }
 }
 
-/// Tokens that end the option row: everything after them is the keybind footer.
-const HINT_TOKENS: [&str; 8] = ["ctrl+", "alt+", "⇆", "esc", "enter", "tab", "↑", "↓"];
+/// The key names a keybind footer is built from. A run that BEGINS with one of these, as a whole
+/// word, is where the footer starts and the options end.
+///
+/// Matched as a whole word, never as a bare prefix: a bare prefix read `Escalate to a human` as the
+/// `esc` key, which dropped that option — and every option to the right of it — from the menu the
+/// operator was shown and offered buttons for.
+const KEY_TOKENS: [&str; 12] = [
+    "ctrl+", "alt+", "shift+", "cmd+", "⇆", "esc", "enter", "tab", "↑", "↓", "←", "→",
+];
+
+/// The words a keybind footer uses AROUND its key names.
+///
+/// None of them ends the options on its own. `Cancel`, `Confirm` and `Select` are the commonest
+/// button labels there are as well as footer words, and treating one as the footer dropped it and
+/// everything after it from the menu. A word from this list counts as footer only inside a phrase
+/// that also NAMES a key — `Use ←/→ to select, Enter to confirm` — or once the footer has already
+/// started.
+const AFFORDANCE_WORDS: [&str; 18] = [
+    "select",
+    "confirm",
+    "cancel",
+    "fullscreen",
+    "choose",
+    "submit",
+    "accept",
+    "back",
+    "quit",
+    "close",
+    "move",
+    "use",
+    "press",
+    "hit",
+    "to",
+    "or",
+    "and",
+    "then",
+];
 
 /// What a pane is showing, as far as this parser can tell.
 ///
@@ -199,41 +263,63 @@ pub enum Screen {
 /// a live dialog has the shape of a menu — segments on their own backgrounds, one of them
 /// highlighted, the words "select" and "confirm" in it — and reading it as the dialog offers the
 /// operator buttons labelled with status-bar segments, whose first arrow key goes into the dialog
-/// that really has focus. So when TWO rows on one screen both read as live controls, neither is
-/// answered: nothing here can tell which one has the keyboard, and the wrong guess types into a
-/// terminal. That costs the operator a trip to their keyboard; the alternative costs them a
-/// keypress they never chose.
+/// that really has focus. So when TWO rows on one screen are both SHAPED like live controls,
+/// neither is answered: nothing here can tell which one has the keyboard, and the wrong guess
+/// types into a terminal. Shape, not readability — a modal this parser cannot read is still a
+/// modal, and it is exactly the one whose chrome used to be handed back in its place. That costs
+/// the operator a trip to their keyboard; the alternative costs them a keypress they never chose.
 pub fn classify(ansi: &str) -> Screen {
-    let mut resolved: Option<Prompt> = None;
-    let mut resolved_rows = 0usize;
-    let mut lowest = true;
+    let rows = control_rows(ansi);
+    let Some(bottom) = rows.first() else {
+        return Screen::Prose;
+    };
+    // The bottom-most control row is the one a modal would be. If ITS highlight cannot be read,
+    // no other row on the screen may be answered in its place: that row does not hold the
+    // keyboard, and its labels are not the ones the operator is looking at.
+    let Some(prompt) = bottom.read() else {
+        return Screen::UnreadableControl;
+    };
+    // Any second row shaped like a control and nothing here can tell which one holds the keyboard.
+    //
+    // Counted by SHAPE, not by whether the rows resolved. Counting the resolved ones let a modal
+    // this parser could not read pass unnoticed, so a screen carrying such a modal plus a status
+    // bar below it handed the STATUS BAR back as the dialog — buttons labelled with status-bar
+    // segments, and a tap on one sending a real arrow key into the modal that has focus.
+    if rows.len() > 1 {
+        return Screen::UnreadableControl;
+    }
+    Screen::Dialog(prompt)
+}
 
-    for line in ansi.lines().rev() {
-        let Some(row) = control_row(line) else {
+/// Every row on the screen that is shaped like a control, bottom-most first.
+///
+/// Scans BOTTOM-UP, because a modal is the last thing drawn and the agent's own transcript — which
+/// it writes, and which can contain the words "select" and "confirm" — sits above it.
+fn control_rows(ansi: &str) -> Vec<ControlRow> {
+    let lines: Vec<&str> = ansi.lines().collect();
+    let mut rows = Vec::new();
+    let mut i = lines.len();
+    while i > 0 {
+        i -= 1;
+        let line = lines[i];
+        // A line made of nothing but keys and the words for them is a modal's HINT line, and the
+        // modal it belongs to is the row above it. The two are read as ONE control: a harness that
+        // draws its hints under its options rather than beside them is an ordinary layout, and
+        // reading that option row as prose types the operator's words into a live modal — which
+        // swallows them and then presses whatever is highlighted.
+        if i > 0
+            && is_affordance_only_line(line)
+            && let Some(row) = split_row(lines[i - 1], Some(line))
+        {
+            rows.push(row);
+            i -= 1;
             continue;
-        };
-        let read = row.read();
-        if lowest {
-            lowest = false;
-            // The bottom-most control row is the one a modal would be. If its highlight cannot be
-            // resolved, nothing above it may be driven instead — that row is not the one with
-            // focus.
-            if read.is_none() {
-                return Screen::UnreadableControl;
-            }
         }
-        if let Some(p) = read {
-            resolved_rows += 1;
-            resolved.get_or_insert(p);
+        if let Some(row) = split_row(line, None) {
+            rows.push(row);
         }
     }
-
-    match resolved {
-        Some(p) if resolved_rows == 1 => Screen::Dialog(p),
-        // Two rows that both look like live controls: see the note above.
-        Some(_) => Screen::UnreadableControl,
-        None => Screen::Prose,
-    }
+    rows
 }
 
 /// Parse a choice dialog out of an ANSI pane read, or `None` if none could be resolved.
@@ -263,14 +349,18 @@ struct ControlRow {
 
 /// Split a row into options, padding and footer, or `None` if it is not shaped like a control.
 ///
-/// A control row carries the affordance footer AND at least two separately rendered runs. Prose
-/// that merely mentions the words is one uncoloured run, and is skipped — but a row with two runs
-/// is treated as a control whether or not its options can be read out of it. That second half is
-/// the point: a modal whose buttons happen to be labelled `Confirm` and `Cancel` collides with the
-/// words a footer uses, and the option scan ends up empty. Falling through to prose there types
-/// the operator's words into a modal that swallows them.
-fn control_row(line: &str) -> Option<ControlRow> {
-    if !is_option_row(line) {
+/// A row qualifies two ways. Either it carries the affordance words itself, or `hints` is the
+/// affordance line drawn directly BELOW it and the row is painted like a selector — several runs,
+/// not all on the same background, inside something that is drawn. The second way is what stops a
+/// modal whose keybind hints sit on the next line from being read as ordinary prose.
+///
+/// Either way it needs at least two separately rendered runs. Prose that merely mentions the words
+/// is one uncoloured run and is skipped — but a row with two runs is treated as a control whether
+/// or not its options can be read out of it. That second half is the point: falling through to
+/// prose types the operator's words into a modal that swallows them.
+fn split_row(line: &str, hints: Option<&str>) -> Option<ControlRow> {
+    let corroborated = hints.is_some() && looks_like_options(line);
+    if !is_option_row(line) && !corroborated {
         return None;
     }
     let mut row = ControlRow {
@@ -285,7 +375,7 @@ fn control_row(line: &str) -> Option<ControlRow> {
         let bg = background_of(&sgr);
         let width = text.chars().count();
         let t = text.trim();
-        if t.is_empty() || t.chars().all(|c| "│┃╹▀ ".contains(c)) {
+        if is_spacing(&text) {
             if in_footer {
                 row.footer.push((bg, width));
             } else {
@@ -294,7 +384,7 @@ fn control_row(line: &str) -> Option<ControlRow> {
             continue;
         }
         candidates += 1;
-        if in_footer || is_hint(t) {
+        if in_footer || begins_footer(t) {
             in_footer = true;
             row.footer.push((bg, width));
             continue;
@@ -302,7 +392,43 @@ fn control_row(line: &str) -> Option<ControlRow> {
         row.options.push((t.to_string(), bg));
     }
 
+    // The hint line sits inside the same panel as the options it belongs to, so it witnesses the
+    // panel colour exactly as an end-of-row footer does — and like one, it is a stretch no harness
+    // draws inside a highlight bar.
+    if let Some(h) = hints {
+        for (sgr, text) in sgr_runs(h) {
+            row.footer.push((background_of(&sgr), text.chars().count()));
+        }
+    }
+
     (candidates >= 2).then_some(row)
+}
+
+/// Blank, or the box-drawing a panel is framed with: it carries a background and nothing else.
+fn is_spacing(text: &str) -> bool {
+    let t = text.trim();
+    t.is_empty() || t.chars().all(|c| "│┃╹▀ ".contains(c))
+}
+
+/// Is this row painted like a row of options — several runs, not all on one background, at least
+/// one of them painted at all?
+///
+/// This is the STRUCTURE of a selector: labels side by side with one of them wearing a highlight,
+/// inside something that is drawn rather than plain text. It is never used on its own, because it
+/// is also the shape of ordinary syntax-highlighted output. It qualifies a row only when the line
+/// directly below it is the modal's affordance line, which is the corroboration.
+fn looks_like_options(line: &str) -> bool {
+    let backgrounds: Vec<String> = sgr_runs(line)
+        .into_iter()
+        .filter(|(_, t)| !is_spacing(t))
+        .map(|(sgr, _)| background_of(&sgr))
+        .collect();
+    if backgrounds.len() < 2 {
+        return false;
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        backgrounds.iter().map(String::as_str).collect();
+    distinct.len() >= 2 && distinct.iter().any(|b| !b.is_empty())
 }
 
 impl ControlRow {
@@ -412,10 +538,67 @@ fn is_option_row(line: &str) -> bool {
     (plain.contains("select") && plain.contains("confirm")) || plain.contains("↑/↓")
 }
 
-fn is_hint(t: &str) -> bool {
-    let low = t.to_lowercase();
-    HINT_TOKENS.iter().any(|h| low.starts_with(h))
-        || matches!(low.as_str(), "select" | "confirm" | "fullscreen" | "cancel")
+/// A word with its surrounding punctuation stripped, lowercased. `select,` is the word "select".
+fn bare_word(w: &str) -> String {
+    w.trim_matches(|c: char| !c.is_alphanumeric() && !"+↑↓←→⇆/".contains(c))
+        .to_lowercase()
+}
+
+/// Is this word the name of a key?
+///
+/// Whole-word, so `Escalate` is not the `Esc` key and `Table` is not `Tab`. A modifier ending in
+/// `+` is the exception, because the key it modifies is written joined to it: `ctrl+f`.
+fn is_key_word(w: &str) -> bool {
+    let w = bare_word(w);
+    KEY_TOKENS.iter().any(|tok| {
+        w.starts_with(tok)
+            && (tok.ends_with('+')
+                || w.len() == tok.len()
+                || !w[tok.len()..].starts_with(|c: char| c.is_alphanumeric()))
+    })
+}
+
+/// A word a keybind footer can be made of: a key name, one of the words used around them, or the
+/// panel's own box-drawing, which strips to nothing.
+fn is_affordance_word(w: &str) -> bool {
+    let w = bare_word(w);
+    w.is_empty() || is_key_word(&w) || AFFORDANCE_WORDS.contains(&w.as_str())
+}
+
+/// A phrase made of nothing but key names and the words for them, e.g. `Use ←/→ to select, Enter
+/// to confirm`.
+///
+/// It must NAME a key, and be more than one word. That is what keeps an ordinary button label out:
+/// `Cancel` is one affordance word and no key, so it stays an option — and so does `Cancel and
+/// quit`, which is three of them and still names no key. A footer written as a sentence used to be
+/// scanned as an OPTION and pushed to the operator as a button, and tapping it sent real arrow keys
+/// into the live modal.
+fn is_affordance_phrase(t: &str) -> bool {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    words.len() >= 2
+        && words.iter().all(|w| is_affordance_word(w))
+        && words.iter().any(|w| is_key_word(w))
+}
+
+/// Does this run BEGIN the keybind footer — is everything from here to the end of the row hints?
+fn begins_footer(t: &str) -> bool {
+    t.split_whitespace().next().is_some_and(is_key_word) || is_affordance_phrase(t)
+}
+
+/// Is this line ONLY the affordance — keys and the words for them, and no labels of its own?
+///
+/// That is a modal's hint line, which harnesses commonly draw under the options rather than beside
+/// them. It has to name a key, so a sentence of agent prose that happens to use the words "select"
+/// and "confirm" is not one of these and keeps the text path.
+fn is_affordance_only_line(line: &str) -> bool {
+    if !is_option_row(line) {
+        return false;
+    }
+    let plain = strip_sgr(line);
+    let words: Vec<&str> = plain.split_whitespace().collect();
+    !words.is_empty()
+        && words.iter().all(|w| is_affordance_word(w))
+        && words.iter().any(|w| is_key_word(w))
 }
 
 /// Split a line into `(sgr-prefix, text)` runs.
@@ -730,7 +913,7 @@ mod tests {
     fn the_footer_is_not_mistaken_for_an_option() {
         let p = parse(REAL).unwrap();
         for o in &p.options {
-            assert!(!is_hint(o), "{o} is a keybind hint, not a choice");
+            assert!(!begins_footer(o), "{o} is a keybind hint, not a choice");
         }
         assert!(!p.options.iter().any(|o| o.contains("fullscreen")));
     }
@@ -1054,6 +1237,154 @@ mod tests {
         assert_eq!(
             classify("I will select the first option and confirm it later"),
             Screen::Prose
+        );
+    }
+
+    /// The affordance drawn on the line BELOW the options, which is an ordinary TUI layout. The
+    /// options row carries no keybind words of its own, so the row detector — which looks for those
+    /// words on the row itself — called the whole screen prose. The operator's words then went into
+    /// a live modal that swallows them, and the submit key after them pressed whatever was
+    /// highlighted. That is the catastrophic failure this module exists to prevent.
+    #[test]
+    fn a_modal_whose_hints_are_drawn_on_the_line_below_is_not_prose() {
+        let unpainted =
+            "\u{1b}[0m\u{1b}[38;2;164;164;164m  \u{2191}/\u{2193} select   enter confirm";
+        let screen = format!(
+            "agent: I need a decision before I go on.\n{}\n{unpainted}",
+            render_dialog_with(&["Yes", "No"], 0, "")
+        );
+        assert_ne!(
+            classify(&screen),
+            Screen::Prose,
+            "a live modal drawn with its hints on the line below is not prose"
+        );
+
+        // And when the hint line is painted in the panel, as a drawn modal paints it, the panel is
+        // witnessed and the dialog is answerable. This must not become a machine that refuses
+        // every split-line modal.
+        let painted = format!("{PANEL}  \u{2191}/\u{2193} select   enter confirm");
+        for selected in 0..2 {
+            let screen = format!(
+                "agent: I need a decision before I go on.\n{}\n{painted}",
+                render_dialog_with(&["Yes", "No"], selected, "")
+            );
+            assert_eq!(
+                classify(&screen),
+                Screen::Dialog(Prompt {
+                    options: vec!["Yes".into(), "No".into()],
+                    selected
+                }),
+                "the hint line sits in the panel and witnesses it"
+            );
+        }
+
+        // What keeps the structural read narrow: the affordance line below is the corroboration,
+        // and several coloured runs on a line is also the shape of ordinary highlighted output. A
+        // coloured line followed by a sentence that merely uses the words is still prose, and the
+        // operator keeps their reply path.
+        let diff = "\u{1b}[32m+ let chosen = confirm(x);\u{1b}[0m  \u{1b}[31m- let chosen = old(x);\u{1b}[0m";
+        assert_eq!(
+            classify(&format!(
+                "{diff}\nI will select the first option and confirm it later"
+            )),
+            Screen::Prose,
+            "a coloured line under a sentence must not cost the operator their reply path"
+        );
+    }
+
+    /// What the "a second control row on the screen refuses everything" rule costs on the one
+    /// screen anybody has captured: nothing. The real dialog is one control row.
+    #[test]
+    fn the_captured_screen_carries_exactly_one_control_row() {
+        assert_eq!(
+            control_rows(REAL).len(),
+            1,
+            "the refusal rule would fire on the real dialog, which would refuse every permission"
+        );
+    }
+
+    /// A screen carrying a modal this parser cannot read PLUS any chrome below it used to hand the
+    /// chrome back as the dialog: the count that decides "two live controls" counted the rows that
+    /// RESOLVED, not the rows that look like controls. The operator was pushed buttons labelled
+    /// with status-bar segments, and a tap sent a real arrow key into the modal that has the
+    /// keyboard — silently moving what their own confirm key would press.
+    #[test]
+    fn a_modal_this_parser_cannot_read_is_never_answered_as_the_chrome_below_it() {
+        const BAR: &str = "\u{1b}[48;5;236m ready  \u{1b}[48;5;33m NORMAL \u{1b}[48;5;236m \u{2191}/\u{2193} select  enter confirm ";
+        /// The affordance painted on the selection colour: the two panel witnesses disagree, so
+        /// this row is one no reader may resolve.
+        const FOOTER_ON_THE_HIGHLIGHT: &str =
+            "\u{1b}[0m\u{1b}[38;2;10;14;26m\u{1b}[48;2;255;225;77m\u{2191}/\u{2193} select";
+        /// Every option painted the same: nothing marks the highlight.
+        const NO_HIGHLIGHT: &str = "\u{1b}[48;5;1mAllow once\u{1b}[0m \u{1b}[48;5;1mReject\u{1b}[0m  \u{1b}[0m\u{21c6} select  enter confirm";
+
+        for modal in [
+            render_dialog_with(&["Yes", "No"], 0, FOOTER_ON_THE_HIGHLIGHT),
+            NO_HIGHLIGHT.to_string(),
+        ] {
+            let screen = format!("{modal}\n{BAR}");
+            assert_eq!(
+                classify(&screen),
+                Screen::UnreadableControl,
+                "a screen carrying a modal this parser cannot read must never be answered as \
+                 though the chrome below it were the modal"
+            );
+        }
+
+        // The same compound with the modal's hints on the line below it.
+        let split = format!(
+            "{}\n\u{1b}[0m\u{1b}[38;2;164;164;164m  \u{2191}/\u{2193} select   enter confirm\n{BAR}",
+            render_dialog_with(&["Yes", "No"], 0, "")
+        );
+        assert_eq!(classify(&split), Screen::UnreadableControl);
+
+        // The price of counting by shape, stated plainly: a coloured transcript line that happens
+        // to use the words, drawn ABOVE a live dialog, costs the operator the buttons for that
+        // dialog — nothing here can tell such a line from a second control. That is a trip to
+        // their keyboard. The alternative is the tap above: a keystroke they never chose.
+        let sql = "\u{1b}[36mSELECT\u{1b}[0m \u{1b}[37mid FROM confirmations\u{1b}[0m";
+        assert_eq!(
+            classify(&format!("{sql}\n{REAL}")),
+            Screen::UnreadableControl
+        );
+    }
+
+    /// An option whose label collides with a keybind word was silently dropped from the menu, and
+    /// every option to its right with it. The operator is then shown, and offered buttons for, a
+    /// menu that is not the menu on the screen — and on `Yes / No / Cancel` the option that goes
+    /// missing is the refusal.
+    #[test]
+    fn every_option_reaches_the_operator_even_when_its_label_reads_like_a_key() {
+        for options in [
+            vec!["Yes", "No", "Cancel"],
+            vec!["Allow once", "Allow always", "Escalate to a human"],
+            vec!["Confirm", "Cancel"],
+        ] {
+            let want: Vec<String> = options.iter().map(|o| o.to_string()).collect();
+            assert_eq!(
+                classify(&render_dialog(&options, 0)),
+                Screen::Dialog(Prompt {
+                    options: want,
+                    selected: 0
+                }),
+                "every option on the row must reach the operator"
+            );
+        }
+    }
+
+    /// A keybind footer worded as a sentence rather than as tokens was scanned as an OPTION and
+    /// offered to the operator as a button. Tapping it aims at an index the terminal's menu does not
+    /// have, so real arrow keys go into the live modal before the gate refuses.
+    #[test]
+    fn a_keybind_footer_written_as_a_sentence_is_never_offered_as_an_option() {
+        let sentence = format!("{PANEL}Use \u{2190}/\u{2192} to select, Enter to confirm");
+        assert_eq!(
+            classify(&render_dialog_with(&["Yes", "No"], 0, &sentence)),
+            Screen::Dialog(Prompt {
+                options: vec!["Yes".into(), "No".into()],
+                selected: 0
+            }),
+            "the keybind sentence must not be offered to the operator as a button"
         );
     }
 }
