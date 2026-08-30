@@ -9,7 +9,7 @@
  },
  {
   "id": "permission",
-  "excerpt": "△ Permission required\n  Access external directory ~/.local/share/example\n\n  Allow once   Allow always   Reject"
+  "excerpt": "△ Permission required\n  Access external directory /srv/example-data\n\n  Allow once   Allow always   Reject"
  },
  {
   "id": "database",

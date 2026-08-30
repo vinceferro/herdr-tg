@@ -43,23 +43,57 @@ use std::path::{Path, PathBuf};
 /// The one home directory a committed fixture is allowed to mention.
 const PLACEHOLDER_HOME_USER: &str = "user";
 
+/// EVERY crate's fixtures, not just this one's.
+///
+/// This scanned only `herdr-client/tests/fixtures` and so never looked at `herdr-tg`'s — which
+/// then carried a real session id from the operator's machine right up to the moment of a public
+/// push, caught by a manual sweep rather than by this test. Deny-by-omission: the same shape of
+/// hole that `no_live_write_call_site.rs` had, fixed the same way. A new crate's fixtures are
+/// covered by default, and a directory that cannot be read is a failure rather than a skip.
+fn fixture_dirs() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/<name> sits two levels below the workspace root")
+        .join("crates");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&root).expect("the crates directory is readable") {
+        let d = entry
+            .expect("a readable crate entry")
+            .path()
+            .join("tests/fixtures");
+        if d.is_dir() {
+            out.push(d);
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no fixture directory found — a vacuous scan is not a pass"
+    );
+    out
+}
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Every fixture file, enumerated from the directory itself.
+/// Every fixture file in the WORKSPACE, enumerated from the directories themselves.
 fn fixture_files() -> Vec<PathBuf> {
-    let dir = fixtures_dir();
-    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in fixture_dirs() {
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
             panic!(
                 "the fixture directory {} must be readable: {e}",
                 dir.display()
             )
-        })
-        .map(|e| e.expect("a readable dir entry").path())
-        .filter(|p| p.is_file())
-        .collect();
+        });
+        for entry in entries {
+            let p = entry.expect("a readable dir entry").path();
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
     out.sort();
     out
 }

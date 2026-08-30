@@ -2,7 +2,7 @@
 //!
 //! # The bug this exists to close
 //!
-//! An agent asking *"Access external directory ~/.local/share/example? — Allow once · Allow always
+//! An agent asking *"Access external directory /srv/example-data? — Allow once · Allow always
 //! · Reject"* is `blocked`, exactly like an agent asking a question in prose. But it cannot be
 //! answered with prose. The dialog captures keys, so text sent to it goes nowhere, and the `Enter`
 //! that follows confirms **whatever option happens to be highlighted** — which is the leftmost one,
