@@ -54,7 +54,10 @@
 //! the gateway answers with, a name the resolver moves. Each of those once carried the excerpt off
 //! this machine with every gate above still passing. So the client is built with all three closed,
 //! and then the address it actually reached is read back off the connection and checked — on the
-//! probe, before any of the operator's text follows.
+//! probe, before any of the operator's text follows, and on every reply after it. Where the bytes
+//! went is a fact about the connection, so it is established before the reply's status or body is
+//! so much as looked at: a 500, or a body that is not JSON, came off the same socket as a good
+//! answer would have.
 //!
 //! Two variables widen this, and they are the only two. `HERDR_TG_SUMMARIZER_LOCAL_MODELS` replaces
 //! the list of responder names that count as local — for the operator whose own gateway answers to
@@ -191,6 +194,53 @@ fn as_prose(names: &BTreeSet<String>) -> String {
     names.iter().cloned().collect::<Vec<_>>().join(", ")
 }
 
+/// The endpoint as it can safely be written into the journal.
+///
+/// A URL may carry a password in front of its host, and both of the sentences this module writes
+/// for the operator name the endpoint. This crate hand-wrote a `Debug` impl to keep the gateway key
+/// out of logs; a credential arriving by the other door gets the same treatment, on the paths the
+/// operator hits precisely when they are misconfigured and reading the journal.
+///
+/// A value that does not parse as a URL is not printed at all. There is nowhere reliable to look
+/// for a password inside a string with no structure, and naming the variable is enough to fix it.
+fn without_userinfo(raw: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(raw) else {
+        return "a value that is not a URL (not printed here, in case it carries a password)"
+            .to_string();
+    };
+    // Both refuse on a URL that cannot hold userinfo at all, which is already not an endpoint this
+    // crate would have accepted.
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.to_string()
+}
+
+/// The half-sentence saying whether any of the operator's screen had gone by the time this was
+/// found out. Never guessed here: the caller knows what it had just put on the wire.
+fn exposure(screen_text_was_sent: bool) -> &'static str {
+    if screen_text_was_sent {
+        "a piece of the operator's screen had already been sent when this came back"
+    } else {
+        "nothing from the screen was sent"
+    }
+}
+
+/// What a request is carrying, which is the only thing that decides what the journal may say when
+/// the reply turns out to have come from the wrong place.
+#[derive(Clone, Copy)]
+enum Sending {
+    /// The public probe line out of the prompt shipped in this repository.
+    Probe,
+    /// A piece of the operator's screen.
+    Excerpt,
+}
+
+impl Sending {
+    fn screen_text_was_sent(self) -> bool {
+        matches!(self, Sending::Excerpt)
+    }
+}
+
 /// Where to ask, what to ask, and what has been proved about the answer so far.
 #[derive(Clone)]
 pub struct Summarizer {
@@ -306,6 +356,19 @@ const SYSTEM: &str = include_str!("../prompts/gist.txt");
 /// thing to read.
 const MAX_CHARS: usize = 110;
 
+/// The most of a reply this will read before deciding it is not a summary.
+///
+/// `Response::text` accumulates whatever the other end sends, bounded only by the request timeout,
+/// which is gigabytes of resident memory in a few seconds — and an OOM kill of this process takes
+/// away the operator's only channel to their terminals. The endpoint is proved to be on this
+/// machine; it is not thereby promised to be well behaved, and `max_tokens` is a request made of it
+/// rather than a bound this crate can enforce.
+///
+/// 64 KiB is roughly six hundred times the longest line [`MAX_CHARS`] would let through, so it
+/// leaves room for a model that pads its reply with reasoning and still stops long before this
+/// costs anything.
+const MAX_REPLY_BYTES: usize = 64 * 1024;
+
 impl Summarizer {
     /// Read the configuration from the environment, or `None` if there will be no summaries.
     ///
@@ -351,10 +414,11 @@ impl Summarizer {
             std::env::var("HERDR_TG_SUMMARIZER_URL").unwrap_or_else(|_| DEFAULT_ENDPOINT.into());
         if !allow_remote && !is_local_endpoint(&endpoint) {
             return Setup::Refused(format!(
-                "HERDR_TG_SUMMARIZER_URL={endpoint} is not on this machine, and what gets sent \
+                "HERDR_TG_SUMMARIZER_URL={} is not on this machine, and what gets sent \
                  there is a piece of the operator's screen. No summaries will be added. Point it \
                  at 127.0.0.1 or localhost, or set {ALLOW_REMOTE_ENV}=1 if sending screen text off \
-                 this machine is what you meant."
+                 this machine is what you meant.",
+                without_userinfo(&endpoint)
             ));
         }
 
@@ -395,6 +459,39 @@ impl Summarizer {
             }
         }
 
+        // Two of these variables are copied straight into HTTP headers, and reqwest does not
+        // report a value that cannot be one until the request is sent. So a stray newline — the
+        // shape a pasted key arrives in — makes every request fail, for the life of the run, behind
+        // a debug line nobody reads. That is the case `Setup::Refused` exists for, and the URL, the
+        // allowlist and the pinned model already use it.
+        let key = key.trim().to_string();
+        if reqwest::header::HeaderValue::try_from(format!("Bearer {key}")).is_err() {
+            // The value is the gateway credential, so the sentence names the variable and stops.
+            return Setup::Refused(
+                "HERDR_TG_SUMMARIZER_KEY cannot be sent as an HTTP header, so every request to the \
+                 gateway would fail and no summaries would be added at all. It holds a character no \
+                 header value may carry, most likely a line break picked up when it was pasted. The \
+                 value is not printed here. Set it again on one line."
+                    .to_string(),
+            );
+        }
+
+        let task_class = std::env::var("HERDR_TG_SUMMARIZER_CLASS")
+            .ok()
+            .filter(|c| !c.trim().is_empty())
+            .or_else(|| Some("autocomplete".into()));
+        if let Some(class) = &task_class {
+            if reqwest::header::HeaderValue::from_str(class).is_err() {
+                return Setup::Refused(
+                    "HERDR_TG_SUMMARIZER_CLASS cannot be sent as an HTTP header, so every request \
+                     to the gateway would fail and no summaries would be added at all. It holds a \
+                     character no header value may carry, such as a line break. Set it to a plain \
+                     word like autocomplete, or unset it."
+                        .to_string(),
+                );
+            }
+        }
+
         let timeout = std::env::var("HERDR_TG_SUMMARIZER_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -404,12 +501,9 @@ impl Summarizer {
         Setup::On(Self {
             endpoint,
             model,
-            key: key.trim().to_string(),
+            key,
             timeout,
-            task_class: std::env::var("HERDR_TG_SUMMARIZER_CLASS")
-                .ok()
-                .filter(|c| !c.trim().is_empty())
-                .or_else(|| Some("autocomplete".into())),
+            task_class,
             local_models,
             allow_remote,
             // Under an explicit grant there is nothing left to prove, so no probe is spent.
@@ -466,7 +560,11 @@ impl Summarizer {
     /// says who actually answered as opposed to who was asked for. It travels with the content, and
     /// with the address that was reached, rather than being fished out at the call site: a caller
     /// that can reach the content without those two is a caller that will forget to check them.
-    async fn ask(&self, excerpt: &str, max_tokens: u32) -> Option<Answer> {
+    ///
+    /// `carrying` is what this request put on the wire, and it exists so that a reply from the
+    /// wrong place can be reported honestly without this guessing: only the caller knows whether
+    /// the bytes that already went were a public probe line or the operator's screen.
+    async fn ask(&self, excerpt: &str, max_tokens: u32, carrying: Sending) -> Option<Answer> {
         let mut body = serde_json::json!({
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -485,26 +583,35 @@ impl Summarizer {
         if let Some(c) = &self.task_class {
             req = req.header("X-Task-Class", c);
         }
-        let res = req.json(&body).send().await;
-
-        // Read off the connection before the body is consumed. This is the crate's own account of
-        // where it wrote to, and the only claim here that no configuration file can contradict.
-        let peer = res.as_ref().ok().and_then(|r| r.remote_addr());
-
-        let text = match res {
-            Ok(r) if r.status().is_success() => r.text().await.ok()?,
-            Ok(r) => {
-                // A redirect arrives here rather than being followed, and is declined like any
-                // other status this bridge did not ask for.
-                tracing::debug!(status = %r.status(), "the summarizer declined; pushing without it");
-                return None;
-            }
+        let res = match req.json(&body).send().await {
+            Ok(res) => res,
             Err(e) => {
                 tracing::debug!(error = %e, "the summarizer is unreachable; pushing without it");
                 return None;
             }
         };
 
+        // Read off the connection before the status is so much as looked at. This is the crate's
+        // own account of where it wrote to, and the only claim here that no configuration file can
+        // contradict — so it is taken on EVERY reply, because where the bytes went does not depend
+        // on what came back. Reading it here and checking it only further down, on the one path
+        // that built an answer, left three quarters of the replies unchecked: a destination off
+        // this machine that answered 500, or 200 with rubbish, kept the excerpt and the gateway key
+        // and nothing latched, so the next push went to the same place.
+        let peer = res.remote_addr();
+        if !self.allow_remote && !answer_came_from_this_machine(peer) {
+            self.trip_off_machine(peer, carrying.screen_text_was_sent());
+            return None;
+        }
+
+        if !res.status().is_success() {
+            // A redirect arrives here rather than being followed, and is declined like any other
+            // status this bridge did not ask for.
+            tracing::debug!(status = %res.status(), "the summarizer declined; pushing without it");
+            return None;
+        }
+
+        let text = read_capped(res).await?;
         let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
         let responder = parsed
             .get("model")
@@ -533,6 +640,10 @@ impl Summarizer {
     /// Both halves, because either alone has been defeated: a recognised name is worthless if the
     /// bytes went to a proxy, and a loopback socket is worthless if what is behind it is a tunnel
     /// answering for a hosted provider.
+    ///
+    /// The address half is now also settled earlier, in [`Summarizer::ask`], where it can be
+    /// settled for replies that never become an answer at all. Keeping it here as well costs a
+    /// comparison and means no future caller can reach an answer's content without it.
     fn answer_is_local(&self, answer: &Answer) -> bool {
         if self.allow_remote {
             return true;
@@ -588,7 +699,7 @@ impl Summarizer {
         if !self.armed.load(Ordering::SeqCst) {
             // Gateway down or answering nonsense: no summary this time, and still nothing proved,
             // so the next push probes again. Going without a summary costs the operator nothing.
-            let answer = self.ask(PROBE, 16).await?;
+            let answer = self.ask(PROBE, 16, Sending::Probe).await?;
             if !self.answer_is_local(&answer) {
                 self.trip(&answer, false);
                 return None;
@@ -600,7 +711,7 @@ impl Summarizer {
             );
         }
 
-        let answer = self.ask(excerpt, 500).await?;
+        let answer = self.ask(excerpt, 500, Sending::Excerpt).await?;
         if !self.answer_is_local(&answer) {
             // The excerpt is already on the wire by the time this reply can be inspected, and the
             // journal has to say so rather than repeat the reassuring sentence from the probe.
@@ -620,25 +731,11 @@ impl Summarizer {
     /// comforting version in both is a false statement about a leak, so the caller passes in which
     /// it is and this never guesses.
     fn why_summaries_stopped(&self, answer: &Answer, screen_text_was_sent: bool) -> String {
-        let exposure = if screen_text_was_sent {
-            "a piece of the operator's screen had already been sent when this came back"
-        } else {
-            "nothing from the screen was sent"
-        };
-
         if !answer_came_from_this_machine(answer.peer) {
-            let reached = match answer.peer {
-                Some(addr) => format!("at {addr}, which is not on this machine"),
-                None => "at an address this bridge could not read back".to_string(),
-            };
-            return format!(
-                "the summarizer answered {reached}, so summaries are OFF for the rest of this run \
-                 and {exposure}. The address it was told to use was {}. Look for a proxy setting \
-                 in this service's environment, or a gateway that answers with a redirect.",
-                self.endpoint
-            );
+            return self.why_the_address_was_wrong(answer.peer, screen_text_was_sent);
         }
 
+        let exposure = exposure(screen_text_was_sent);
         let who = if answer.responder.is_empty() {
             "the reply did not say who answered".to_string()
         } else {
@@ -662,13 +759,79 @@ impl Summarizer {
     /// a sentence in the module that owns the bridge's words, and that module is being changed
     /// elsewhere right now. Nothing about the safety of this waits on it.
     fn trip(&self, answer: &Answer, screen_text_was_sent: bool) {
+        self.trip_saying(self.why_summaries_stopped(answer, screen_text_was_sent));
+    }
+
+    /// The same latch, thrown for the one failure that can be seen without a reply to read: the
+    /// bytes went to a socket this bridge cannot show is on this machine.
+    ///
+    /// Separate from [`Summarizer::trip`] because it is reached before there is an `Answer` at all
+    /// — which is the point. A 500 from the wrong address is the same leak as a good answer from
+    /// the wrong address, and it used to be the one nobody noticed.
+    fn trip_off_machine(&self, peer: Option<SocketAddr>, screen_text_was_sent: bool) {
+        self.trip_saying(self.why_the_address_was_wrong(peer, screen_text_was_sent));
+    }
+
+    /// Switch summaries off for the rest of the run, and say why exactly once.
+    fn trip_saying(&self, why: String) {
         if !self.off.swap(true, Ordering::SeqCst) {
-            tracing::warn!(
-                "{}",
-                self.why_summaries_stopped(answer, screen_text_was_sent)
-            );
+            tracing::warn!("{why}");
         }
     }
+
+    /// The sentence for a reply that came off a socket this bridge cannot vouch for.
+    ///
+    /// Its own function because two callers reach it — one that has a reply to read and one that
+    /// deliberately refuses to read it — and the operator must get the same words either way.
+    fn why_the_address_was_wrong(
+        &self,
+        peer: Option<SocketAddr>,
+        screen_text_was_sent: bool,
+    ) -> String {
+        let reached = match peer {
+            Some(addr) => format!("at {addr}, which is not on this machine"),
+            None => "at an address this bridge could not read back".to_string(),
+        };
+        format!(
+            "the summarizer answered {reached}, so summaries are OFF for the rest of this run and \
+             {}. The address it was told to use was {}. Look for a proxy setting in this service's \
+             environment, or a gateway that answers with a redirect.",
+            exposure(screen_text_was_sent),
+            without_userinfo(&self.endpoint)
+        )
+    }
+}
+
+/// The reply body, or nothing at all if it is longer than a one-line summary could ever be.
+///
+/// The bound is on the bytes actually read, not on the `content-length` the sender declares: a
+/// header is the other end's claim about the body, and believing the claim while letting the bytes
+/// through is the exact shape of the bugs this file has already had.
+///
+/// An over-long reply is a refusal and nothing more. A local gateway that talks too much is not a
+/// leak, so it costs this one summary and does not switch the feature off for the run.
+async fn read_capped(mut res: reqwest::Response) -> Option<String> {
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match res.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_REPLY_BYTES {
+                    tracing::debug!(
+                        "the summarizer sent more than {MAX_REPLY_BYTES} bytes for a one-line \
+                         summary; pushing without it"
+                    );
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(error = %e, "the summarizer's reply broke off; pushing without it");
+                return None;
+            }
+        }
+    }
+    String::from_utf8(body).ok()
 }
 
 /// Is this actually a one-line summary, or is it something else the model decided to say?
@@ -963,10 +1126,22 @@ mod tests {
     /// A hand-rolled stand-in for reqwest would prove nothing here: the question is what this crate
     /// does with a real reply, and whether the operator's text was already on the wire by then.
     async fn fake_server(responses: Vec<String>) -> (std::net::SocketAddr, Recorded) {
+        fake_server_on(IpAddr::V4(Ipv4Addr::LOCALHOST), responses).await
+    }
+
+    /// The same recorder, bound to a chosen address of this machine.
+    ///
+    /// Loopback for almost everything here. The one property that cannot be shown on loopback is
+    /// what happens when the bytes go somewhere this crate would refuse, and the only such socket a
+    /// test can bind without root is one of this machine's own LAN addresses.
+    async fn fake_server_on(
+        bind: IpAddr,
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, Recorded) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind((bind, 0))
             .await
-            .expect("bind loopback");
+            .expect("bind the recorder");
         let addr = listener.local_addr().expect("local addr");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::clone(&seen);
@@ -1733,6 +1908,246 @@ mod tests {
                 .len(),
             2,
             "one probe, then the excerpt"
+        );
+    }
+
+    /// An address of this machine that is not loopback, or `None` on a box that has none.
+    ///
+    /// The socket proof can only be shown to be missing by answering from a socket the proof would
+    /// refuse, and the only such socket a test can bind without root is one of this machine's own
+    /// LAN addresses. Nothing leaves the machine to find it: connecting a UDP socket sends no
+    /// packet, it only makes the routing table pick the source address it would use.
+    fn an_address_of_this_machine_that_is_not_loopback() -> Option<IpAddr> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        // TEST-NET-1, reserved for documentation, and never actually addressed.
+        sock.connect("192.0.2.1:9").ok()?;
+        let ip = sock.local_addr().ok()?.ip();
+        (!on_this_machine(ip)).then_some(ip)
+    }
+
+    /// Where the bytes went is a fact about the connection, not about the reply, so it has to be
+    /// established on every reply. It was established on one: the peer was read off the connection
+    /// and then thrown away on every path except a 2xx whose body parsed as JSON. A destination off
+    /// this machine that answered 500, or 200 with rubbish, was handed the operator's pane text and
+    /// the gateway key, nothing latched, and the next push went to the same place.
+    #[tokio::test]
+    async fn a_reply_that_is_not_a_good_one_is_still_proved_to_have_come_from_this_machine() {
+        let Some(off_machine) = an_address_of_this_machine_that_is_not_loopback() else {
+            // There is no socket here this crate would refuse, so there is nothing to send to one.
+            // Said out loud rather than passed over quietly.
+            eprintln!("not run: this machine has no address that is not loopback");
+            return;
+        };
+
+        for (what, response) in [
+            (
+                "a 500",
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ),
+            (
+                "a 200 whose body is not JSON at all",
+                "HTTP/1.1 200 OK\r\ncontent-length: 15\r\nconnection: close\r\n\r\nnot json at all",
+            ),
+        ] {
+            let (addr, seen) = fake_server_on(
+                off_machine,
+                vec![response.to_string(), response.to_string()],
+            )
+            .await;
+            let s = Summarizer {
+                // Armed: the state every run is in once one good probe has been answered, and the
+                // only state in which the operator's screen goes out at all.
+                armed: Arc::new(AtomicBool::new(true)),
+                ..at(
+                    &format!("http://{addr}/v1/chat/completions"),
+                    &["local-coder"],
+                )
+            };
+
+            assert!(
+                s.one_line("SECRET-PANE-TEXT force-push? [y/N]")
+                    .await
+                    .is_none(),
+                "{what}"
+            );
+            assert!(
+                s.off.load(Ordering::SeqCst),
+                "the pane text went to {addr}, which is not on this machine, and {what} coming \
+                 back was enough for this bridge not to notice"
+            );
+
+            assert!(
+                s.one_line("SECRET-PANE-TEXT and again? [y/N]")
+                    .await
+                    .is_none(),
+                "{what}"
+            );
+            let sent = seen
+                .lock()
+                .expect("the recorder is free once the calls return")
+                .len();
+            assert_eq!(
+                sent, 1,
+                "summaries were supposed to be off after {what}, and a second excerpt still went \
+                 to {addr}"
+            );
+        }
+    }
+
+    /// A reply is read into memory before anything is decided about it, and nothing about a
+    /// one-line summary justifies reading a gigabyte. The bridge is the operator's only channel to
+    /// their terminals, so a model server streaming a runaway reply has to cost a summary, not the
+    /// process. The endpoint is trusted to be on this machine, never to be well behaved.
+    #[tokio::test]
+    async fn a_reply_that_never_ends_is_refused_rather_than_buffered() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A ceiling on the test's own appetite, so a regression here cannot run the machine out of
+        // memory before the assertion below gets to say so.
+        const CEILING: usize = 64 * 1024 * 1024;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tally = Arc::clone(&written);
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let (mut rd, mut wr) = sock.into_split();
+            // Drained in its own task so writing below can never deadlock against a client that is
+            // still sending its request.
+            tokio::spawn(async move {
+                let mut sink = vec![0u8; 8192];
+                while rd.read(&mut sink).await.unwrap_or(0) > 0 {}
+            });
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                        content-length: 100000000000\r\n\r\n";
+            if wr.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let chunk = vec![b'x'; 1024 * 1024];
+            while tally.load(Ordering::SeqCst) < CEILING {
+                if wr.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                tally.fetch_add(chunk.len(), Ordering::SeqCst);
+            }
+        });
+
+        let s = Summarizer {
+            timeout: Duration::from_millis(1000),
+            armed: Arc::new(AtomicBool::new(true)),
+            ..at(
+                &format!("http://{addr}/v1/chat/completions"),
+                &["local-coder"],
+            )
+        };
+        let got = s.one_line("Force-push? [y/N]").await;
+
+        assert!(got.is_none(), "a reply that long is not a one-line summary");
+        let accepted = written.load(Ordering::SeqCst);
+        assert!(
+            accepted < CEILING / 2,
+            "one reply from one local gateway drew {} MiB into this process; a summary that has to \
+             fit {MAX_CHARS} characters has no business reading that",
+            accepted / (1024 * 1024)
+        );
+        assert!(
+            !s.off.load(Ordering::SeqCst),
+            "a local gateway that talks too much is a refusal, not a leak, and must not switch \
+             summaries off for the rest of the run"
+        );
+    }
+
+    /// A URL can carry a password in front of its host. Both sentences this module writes to the
+    /// journal name the endpoint, and the journal is exactly where the operator is looking on the
+    /// run where they are misconfigured. This crate hand-wrote a Debug impl to keep the gateway key
+    /// out of logs; the same class of credential arriving by the other door gets the same treatment.
+    #[test]
+    fn a_password_in_the_endpoint_url_never_reaches_the_journal() {
+        let _env = env_guard();
+        // SAFETY: `_env` holds ENV_LOCK, so no other test reads or writes these vars concurrently.
+        unsafe {
+            std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
+            std::env::set_var(
+                "HERDR_TG_SUMMARIZER_URL",
+                "http://user:hunter2@evil.example/v1",
+            );
+        }
+        let Setup::Refused(why) = Summarizer::configure() else {
+            panic!("an endpoint off this machine has to be refused");
+        };
+        assert!(
+            !why.contains("hunter2"),
+            "the URL password is in the journal line: {why}"
+        );
+        assert!(
+            why.contains("evil.example"),
+            "and the operator still has to see which address was refused: {why}"
+        );
+
+        // The second sentence, on the worse path: this one is written after the operator's screen
+        // has already gone somewhere. Redacting one site and not the other leaks the password
+        // exactly when the journal is most likely to be read and pasted somewhere.
+        let s = at(
+            "http://user:hunter2@127.0.0.1:8090/v1/chat/completions",
+            &["local-coder"],
+        );
+        let told = s.why_summaries_stopped(
+            &answered_by("local-coder", Some("192.168.178.155:18099")),
+            true,
+        );
+        assert!(
+            !told.contains("hunter2"),
+            "the URL password is in the journal line: {told}"
+        );
+        assert!(
+            told.contains("127.0.0.1:8090"),
+            "and which one was configured? {told}"
+        );
+    }
+
+    /// Two of these variables are copied straight into HTTP headers, and a value that cannot be one
+    /// does not fail loudly: reqwest holds the error until the request is sent, so every request
+    /// fails, no request ever reaches the gateway, and summaries are off for the life of the run
+    /// behind a debug line nobody reads. That is precisely the case `Setup::Refused` was invented
+    /// for, and the URL, the allowlist and the pinned model all already use it.
+    #[test]
+    fn a_key_or_a_task_class_that_cannot_be_a_header_is_refused_at_startup() {
+        let _env = env_guard();
+        // SAFETY: `_env` holds ENV_LOCK, so no other test reads or writes these vars concurrently.
+        unsafe {
+            std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
+            std::env::set_var(
+                "HERDR_TG_SUMMARIZER_CLASS",
+                "autocomplete\r\nX-Smuggled: yes",
+            );
+        }
+        let Setup::Refused(why) = Summarizer::configure() else {
+            panic!("a task class that cannot be a header silently costs every summary in the run");
+        };
+        assert!(
+            why.contains("HERDR_TG_SUMMARIZER_CLASS"),
+            "which variable? {why}"
+        );
+
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("HERDR_TG_SUMMARIZER_CLASS");
+            std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "sk-live-0000\nX-Smuggled: yes");
+        }
+        let Setup::Refused(why) = Summarizer::configure() else {
+            panic!("a key that cannot be a header silently costs every summary in the run");
+        };
+        assert!(
+            why.contains("HERDR_TG_SUMMARIZER_KEY"),
+            "which variable? {why}"
+        );
+        assert!(
+            !why.contains("sk-live-0000"),
+            "the refusal wrote the gateway key into the journal: {why}"
         );
     }
 }
