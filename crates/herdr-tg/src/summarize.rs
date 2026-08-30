@@ -35,6 +35,25 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct Summarizer {
     pub endpoint: String,
+    /// What kind of work this is, sent as `X-Task-Class` when set.
+    ///
+    /// The gateway routes on this header, and the honest answer today is **do not set it**.
+    /// Measured on this box against three real panes plus a clean synthetic ask:
+    ///
+    /// | class | model | latency | quality |
+    /// |---|---|---|---|
+    /// | `autocomplete` | qwen2.5-coder-1.5b | 340–710ms | echoed the instruction on all three real panes |
+    /// | `bulk` | qwen3-8b | 11–16s | correct on all four — but past any push-worthy timeout |
+    /// | unset (`default`) | glm-5.3-flash | 2–3s | correct on all four |
+    ///
+    /// So the fast local model is too weak for messy terminal output and the accurate one is too
+    /// slow. Left unset the call takes the `default` chain, which is where quality is — and under
+    /// the operator's coding-plan subscription it carries no incremental cost anyway.
+    ///
+    /// Set `HERDR_TG_SUMMARIZER_CLASS=bulk` to force it local, accepting ~15s. That will exceed the
+    /// default timeout, so raise `HERDR_TG_SUMMARIZER_TIMEOUT_MS` with it or every gist will be
+    /// dropped — failing open, so pushes still go out bare.
+    pub task_class: Option<String>,
     pub model: String,
     pub key: String,
     pub timeout: Duration,
@@ -98,6 +117,9 @@ impl Summarizer {
             model,
             key,
             timeout,
+            task_class: std::env::var("HERDR_TG_SUMMARIZER_CLASS")
+                .ok()
+                .filter(|c| !c.trim().is_empty()),
         })
     }
 
@@ -123,12 +145,11 @@ impl Summarizer {
             .timeout(self.timeout)
             .build()
             .ok()?;
-        let res = client
-            .post(&self.endpoint)
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .await;
+        let mut req = client.post(&self.endpoint).bearer_auth(&self.key);
+        if let Some(c) = &self.task_class {
+            req = req.header("X-Task-Class", c);
+        }
+        let res = req.json(&body).send().await;
 
         let text = match res {
             Ok(r) if r.status().is_success() => r.text().await.ok()?,
@@ -345,6 +366,31 @@ mod tests {
         assert!(plausible(&ok, "x").is_some());
     }
 
+    /// No class by default, so the call takes the gateway's `default` chain — measured as the only
+    /// one that is both correct and fast enough on this box. Forcing it local is opt-in.
+    #[test]
+    fn no_task_class_is_sent_unless_the_operator_asks_for_one() {
+        // SAFETY: single-threaded test; these vars are read only by from_env.
+        unsafe {
+            std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
+            std::env::remove_var("HERDR_TG_SUMMARIZER_CLASS");
+        }
+        assert_eq!(Summarizer::from_env().expect("configured").task_class, None);
+
+        unsafe { std::env::set_var("HERDR_TG_SUMMARIZER_CLASS", "bulk") };
+        assert_eq!(
+            Summarizer::from_env()
+                .expect("configured")
+                .task_class
+                .as_deref(),
+            Some("bulk")
+        );
+        unsafe {
+            std::env::remove_var("HERDR_TG_SUMMARIZER_CLASS");
+            std::env::remove_var("HERDR_TG_SUMMARIZER_KEY");
+        }
+    }
+
     /// The gate is off unless deliberately switched on, and it never goes looking through other
     /// tools' credentials for a key it could use.
     #[test]
@@ -363,6 +409,7 @@ mod tests {
             model: "m".into(),
             key: "k".into(),
             timeout: Duration::from_millis(50),
+            task_class: None,
         };
         assert!(s.one_line("   \n  ").await.is_none());
     }
@@ -375,6 +422,7 @@ mod tests {
             model: "m".into(),
             key: "k".into(),
             timeout: Duration::from_millis(200),
+            task_class: None,
         };
         assert!(s.one_line("Force-push? [y/N]").await.is_none());
     }
