@@ -65,17 +65,30 @@
 //!
 //! - **The hints on the line below.** Plenty of harnesses draw the keybind line UNDER the options
 //!   rather than beside them. The option row then carries no affordance words at all, and reading
-//!   it as prose is the catastrophic path. So a line that is ONLY keys and the words for them is
-//!   taken as a modal's hint line, and the row above it is read as its options when that row is
-//!   painted like a selector: several runs, not all on one background, inside something drawn.
-//!   Structure alone would be far too loose — that is also the shape of syntax-highlighted output —
-//!   so the hint line below is the corroboration, and the hint line is also used as the panel
-//!   witness, which it can be because it sits inside the same panel.
+//!   it as prose is the catastrophic path. So a line that is ONLY keys and the words for them, with
+//!   nothing on it to choose, is taken as a modal's hint line, and the row above it is read as its
+//!   options — but on STRUCTURE, not on the strength of the hint line's mere presence. The row has
+//!   to be DRAWN like a menu: labels inside a painted panel, the hint line inside that same panel,
+//!   and exactly one label wearing a highlight BAR — a run of colour wider than the label itself.
+//!   See [`is_a_drawn_selector`]. Taking the hint line as corroboration on its own was the round-3
+//!   regression: harnesses draw that keybind line permanently, question or no question, so every
+//!   coloured transcript row, table header and status bar under one came back as a live menu, and
+//!   a tap on the buttons it produced sent real arrow and `Enter` keys into a terminal that was
+//!   never asking anything.
 //! - **Where the options end and the footer begins.** A footer is found at a run that NAMES A KEY,
 //!   as a whole word, or that is a phrase of nothing but key names and the words around them. Not
 //!   at a bare word: `Cancel`, `Confirm` and `Select` are the commonest button labels there are,
 //!   and ending the scan at one dropped it — and every option to its right — from the menu the
 //!   operator was shown. Not by prefix either: `Escalate` is not the `Esc` key.
+//!
+//! # What this parser still cannot see
+//!
+//! It reads ROWS. A menu drawn one option per line — a caret column with the highlight on the
+//! chosen line — has no row for it to find, so such a screen reads as prose and the operator's
+//! words go to it as text. That has been true of every version of this module; the round-3 rule
+//! did not fix it either, it merely handed the caret line back as a two-option menu whose first
+//! button was labelled with the caret glyph itself. Nothing here should be trusted to notice a
+//! vertical menu.
 //!
 //! # A control we cannot read is not prose
 //!
@@ -302,17 +315,21 @@ fn control_rows(ansi: &str) -> Vec<ControlRow> {
     while i > 0 {
         i -= 1;
         let line = lines[i];
-        // A line made of nothing but keys and the words for them is a modal's HINT line, and the
-        // modal it belongs to is the row above it. The two are read as ONE control: a harness that
-        // draws its hints under its options rather than beside them is an ordinary layout, and
-        // reading that option row as prose types the operator's words into a live modal — which
-        // swallows them and then presses whatever is highlighted.
-        if i > 0
-            && is_affordance_only_line(line)
-            && let Some(row) = split_row(lines[i - 1], Some(line))
-        {
-            rows.push(row);
-            i -= 1;
+        // A line made of nothing but keys and the words for them, with nothing on it to CHOOSE, is
+        // a modal's HINT line. It belongs to the options drawn above it — a harness that draws its
+        // hints under its options rather than beside them is an ordinary layout, and reading that
+        // option row as prose types the operator's words into a live modal, which swallows them and
+        // then presses whatever is highlighted.
+        //
+        // "Nothing on it to choose" is the load-bearing half. A modal whose buttons are labelled
+        // `Confirm` and `Cancel` is a line of nothing but affordance words too, and it is a real
+        // menu — so the test is whether the row splits into any options at all, not whether its
+        // words look like hints.
+        if is_affordance_only_line(line) && split_row(line, None).is_none() {
+            if let Some((row, at)) = options_above(&lines, i) {
+                rows.push(row);
+                i = at;
+            }
             continue;
         }
         if let Some(row) = split_row(line, None) {
@@ -320,6 +337,37 @@ fn control_rows(ansi: &str) -> Vec<ControlRow> {
         }
     }
     rows
+}
+
+/// The options row a hint line belongs to, and the line it sits on.
+///
+/// How far a modal may put its hints from its options: directly under them, or under its own blank
+/// bottom row or bottom border. Those in-between lines carry the panel background and nothing else,
+/// so stepping over them cannot step over anything with a label on it — and the walk stops at the
+/// first line that is neither the options nor panel filler, so it can never wander up into the
+/// transcript.
+fn options_above(lines: &[&str], hint_at: usize) -> Option<(ControlRow, usize)> {
+    /// Blank panel rows a modal may draw between its options and its hints.
+    const MOST_FILLER_ROWS: usize = 2;
+    let hint = lines[hint_at];
+    let panel = dominant_background(hint);
+    let mut j = hint_at;
+    for _ in 0..=MOST_FILLER_ROWS {
+        if j == 0 {
+            return None;
+        }
+        j -= 1;
+        if let Some(row) = split_row(lines[j], Some(hint)) {
+            return Some((row, j));
+        }
+        // Only a PAINTED hint line can have panel filler above it: with no panel colour there is
+        // nothing to recognise the filler by, and stepping over a blank line on that basis would
+        // pair a hint line with a transcript row two lines away from it.
+        if panel.is_empty() || !is_panel_filler(lines[j], &panel) {
+            return None;
+        }
+    }
+    None
 }
 
 /// Parse a choice dialog out of an ANSI pane read, or `None` if none could be resolved.
@@ -350,16 +398,16 @@ struct ControlRow {
 /// Split a row into options, padding and footer, or `None` if it is not shaped like a control.
 ///
 /// A row qualifies two ways. Either it carries the affordance words itself, or `hints` is the
-/// affordance line drawn directly BELOW it and the row is painted like a selector — several runs,
-/// not all on the same background, inside something that is drawn. The second way is what stops a
-/// modal whose keybind hints sit on the next line from being read as ordinary prose.
+/// affordance line drawn BELOW it and the row is DRAWN like a selector — see
+/// [`is_a_drawn_selector`], which is structure, not words. The second way is what stops a modal
+/// whose keybind hints sit on the next line from being read as ordinary prose.
 ///
 /// Either way it needs at least two separately rendered runs. Prose that merely mentions the words
-/// is one uncoloured run and is skipped — but a row with two runs is treated as a control whether
-/// or not its options can be read out of it. That second half is the point: falling through to
-/// prose types the operator's words into a modal that swallows them.
+/// is one uncoloured run and is skipped — but a row that qualifies on the WORDS is treated as a
+/// control whether or not its options can be read out of it. That second half is the point:
+/// falling through to prose types the operator's words into a modal that swallows them.
 fn split_row(line: &str, hints: Option<&str>) -> Option<ControlRow> {
-    let corroborated = hints.is_some() && looks_like_options(line);
+    let corroborated = hints.is_some_and(|h| is_a_drawn_selector(line, h));
     if !is_option_row(line) && !corroborated {
         return None;
     }
@@ -401,7 +449,11 @@ fn split_row(line: &str, hints: Option<&str>) -> Option<ControlRow> {
         }
     }
 
-    (candidates >= 2).then_some(row)
+    // A row that splits into no options at all is a keybind footer, not a control: there is
+    // nothing on it for the operator to answer. Calling one a control made every ordinary pane of
+    // a harness that draws its hints permanently — question or no question — come back as a
+    // control nobody could read, and refused every text reply to that session.
+    (candidates >= 2 && !row.options.is_empty()).then_some(row)
 }
 
 /// Blank, or the box-drawing a panel is framed with: it carries a background and nothing else.
@@ -410,25 +462,89 @@ fn is_spacing(text: &str) -> bool {
     t.is_empty() || t.chars().all(|c| "│┃╹▀ ".contains(c))
 }
 
-/// Is this row painted like a row of options — several runs, not all on one background, at least
-/// one of them painted at all?
+/// Is this row DRAWN as a menu — a set of styled runs inside a panel, exactly one of them wearing
+/// a highlight bar — with `hints` as the modal's affordance line sitting in that same panel?
 ///
-/// This is the STRUCTURE of a selector: labels side by side with one of them wearing a highlight,
-/// inside something that is drawn rather than plain text. It is never used on its own, because it
-/// is also the shape of ordinary syntax-highlighted output. It qualifies a row only when the line
-/// directly below it is the modal's affordance line, which is the corroboration.
-fn looks_like_options(line: &str) -> bool {
-    let backgrounds: Vec<String> = sgr_runs(line)
-        .into_iter()
-        .filter(|(_, t)| !is_spacing(t))
-        .map(|(sgr, _)| background_of(&sgr))
-        .collect();
-    if backgrounds.len() < 2 {
+/// This is the whole test on the path where the row carries no affordance words of its own. Three
+/// rounds tried to do it with the words instead, and each one traded a false negative for a false
+/// positive, because the agent writes the words in the pane: the round before this accepted ANY row
+/// with two runs on two backgrounds as long as the line below it was affordance-only, and a tmux
+/// status bar under a harness's permanent keybind footer was handed back as a live menu — real
+/// arrow and `Enter` keys into a terminal that was never asking a question.
+///
+/// So the row has to be drawn like one, and all four of these have to hold:
+///
+/// 1. **At least two labels.** One is not a choice.
+/// 2. **It is inside something drawn.** The spacing around and between the labels — the panel
+///    showing through — has to carry a real background. Syntax highlighting, a diff, a progress
+///    bar and a segmented status bar all paint their TEXT and leave the gaps unpainted, or have no
+///    gaps at all.
+/// 3. **The hint line is in the same panel.** A painted hint line whose background is not this
+///    row's panel belongs to some other drawn thing; it is not this row's affordance, and it
+///    corroborates nothing. (An unpainted hint line is allowed: it witnesses no panel, so it
+///    contradicts none, and the highlight then has to survive [`ControlRow::panel`]'s two
+///    witnesses on its own.)
+/// 4. **Exactly one label wears a highlight BAR.** Not merely a different colour — a bar: the
+///    padding beside it carries that same colour, which is what a selector draws and what a
+///    syntax highlighter never does. A single coloured word inside a panel is transcript.
+///
+/// What this costs, stated plainly: a modal that draws no panel background at all, or paints its
+/// highlight tight around the label with no bar, is not recognised on this path. It is recognised
+/// on the other one — the words — the moment it draws its hints beside its options rather than
+/// under them. That price is the reason condition 4 exists, and it is the direction the corpus
+/// holds: see the `corpus` module.
+fn is_a_drawn_selector(line: &str, hints: &str) -> bool {
+    let mut labels: Vec<String> = Vec::new();
+    let mut padding: Vec<(String, usize)> = Vec::new();
+    for (sgr, text) in sgr_runs(line) {
+        let bg = background_of(&sgr);
+        if is_spacing(&text) {
+            padding.push((bg, text.chars().count()));
+        } else {
+            labels.push(bg);
+        }
+    }
+    if labels.len() < 2 {
         return false;
     }
-    let distinct: std::collections::BTreeSet<&str> =
-        backgrounds.iter().map(String::as_str).collect();
-    distinct.len() >= 2 && distinct.iter().any(|b| !b.is_empty())
+    // 2 — the panel, measured from the spacing, which is the only part of the row that is panel
+    // and nothing else.
+    let Some(panel) = widest(&padding).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    // 3 — the hints have to be inside it.
+    let hint_panel = dominant_background(hints);
+    if !hint_panel.is_empty() && hint_panel != panel {
+        return false;
+    }
+    // 4 — exactly one label off the panel, and the padding beside it wearing the same colour.
+    let highlighted: Vec<&String> = labels.iter().filter(|bg| **bg != panel).collect();
+    match highlighted.as_slice() {
+        [bar] => padding.iter().any(|(bg, _)| bg == *bar),
+        _ => false,
+    }
+}
+
+/// The background covering the most columns of a whole line, or an empty string when the line is
+/// unpainted or no background dominates it.
+fn dominant_background(line: &str) -> String {
+    let runs: Vec<(String, usize)> = sgr_runs(line)
+        .into_iter()
+        .map(|(sgr, text)| (background_of(&sgr), text.chars().count()))
+        .collect();
+    widest(&runs).unwrap_or_default()
+}
+
+/// Is this line the panel and nothing else — a blank row or a bottom border a modal draws between
+/// its options and its hints?
+///
+/// It must carry a label nowhere: stepping over a line with anything readable on it would pair a
+/// hint line with options that are not the ones above it.
+fn is_panel_filler(line: &str, panel: &str) -> bool {
+    let runs = sgr_runs(line);
+    !runs.is_empty()
+        && runs.iter().all(|(_, text)| is_spacing(text))
+        && dominant_background(line) == panel
 }
 
 impl ControlRow {
@@ -1372,6 +1488,60 @@ mod tests {
         }
     }
 
+    /// The exact rows the round-3 rule handed back as live menus, each one drawn under a keybind
+    /// hint line — which is how a harness that draws its hints permanently really looks between
+    /// questions. Every one of them is ordinary output: a tap on the buttons this used to produce
+    /// sent a real arrow key, and then `Enter`, into a terminal that was never asking anything, and
+    /// the operator's actual reply was never delivered at all.
+    #[test]
+    fn ordinary_coloured_output_under_a_hint_line_is_never_a_menu() {
+        const BARE_HINTS: &str = "\u{2191}/\u{2193} select   enter confirm";
+        let rows = [
+            // A coloured file path in the transcript.
+            "  \u{1b}[38;5;39m\u{1b}[48;5;236mreading\u{1b}[0m \u{1b}[38;5;33msrc/permission.rs\u{1b}[0m  now",
+            // A table or status header, painted in segments.
+            "\u{1b}[48;5;236m NAME  \u{1b}[48;5;238m STATUS \u{1b}[48;5;236m PANE ",
+            // A diff hunk with a trailing comment.
+            "\u{1b}[48;2;20;60;20m+    let mut total = 0;\u{1b}[0m   // running sum",
+            // An editor's mode indicator, just before the prompt.
+            "\u{1b}[48;5;33m INSERT \u{1b}[0m > ",
+            // A vertical menu's caret row. This parser reads ROWS, so it cannot see a menu drawn
+            // one option per line either way — but reading it as a two-option menu whose first
+            // button is the caret glyph is strictly worse than leaving it alone: that button moved
+            // the live highlight. See the module doc.
+            "\u{276f} \u{1b}[48;2;255;225;77m 3. Reject ",
+        ];
+        for row in rows {
+            for hints in [BARE_HINTS, FOOTER] {
+                assert_eq!(
+                    classify(&format!("agent: working on it\n{row}\n{hints}")),
+                    Screen::Prose,
+                    "ordinary output under a hint line was answered as a menu: {row:?}"
+                );
+            }
+        }
+    }
+
+    /// A harness draws its keybind footer whether or not it is asking anything. Reading that line
+    /// as a control in its own right left every ordinary pane classified as a control nobody could
+    /// read — so no text reply to that session was delivered, ever.
+    #[test]
+    fn a_keybind_footer_with_no_menu_above_it_leaves_the_text_path_open() {
+        assert_eq!(classify(&format!("agent: done.\n{FOOTER}")), Screen::Prose);
+        assert_eq!(classify(FOOTER), Screen::Prose);
+        assert_eq!(
+            classify("agent: done.\n\u{2191}/\u{2193} select   enter confirm"),
+            Screen::Prose
+        );
+
+        // And a modal whose BUTTONS are affordance words is still a modal: `Confirm` and `Cancel`
+        // make a line of nothing but those words, and it is a real menu.
+        assert!(matches!(
+            classify(&render_dialog(&["Confirm", "Cancel"], 0)),
+            Screen::Dialog(_)
+        ));
+    }
+
     /// A keybind footer worded as a sentence rather than as tokens was scanned as an OPTION and
     /// offered to the operator as a button. Tapping it aims at an index the terminal's menu does not
     /// have, so real arrow keys go into the live modal before the gate refuses.
@@ -1385,6 +1555,200 @@ mod tests {
                 selected: 0
             }),
             "the keybind sentence must not be offered to the operator as a button"
+        );
+    }
+}
+
+/// The two-sided corpus this parser is held to.
+///
+/// Three rounds of fixes to [`classify`] each closed a real defect and opened its opposite: a rule
+/// that stopped a dialog being read as prose started reading prose as a dialog, and the next rule
+/// swapped them back. Every one of those trades was possible because the tests only ever carried
+/// the cases the CURRENT bug was about.
+///
+/// So the property is stated over a fixed set of whole screens, half of them dialogs and half of
+/// them ordinary panes, and it is three sentences long:
+///
+/// - every positive screen classifies as [`Screen::Dialog`] with the right options and the right
+///   highlight,
+/// - every negative screen classifies as [`Screen::Prose`], so the operator keeps their reply path,
+/// - and anything this parser cannot place is [`Screen::UnreadableControl`] — never one of the
+///   other two.
+///
+/// A change that trades one direction for the other now turns a test red instead of shipping.
+#[cfg(test)]
+mod corpus {
+    use super::{Prompt, Screen, classify};
+
+    /// What a screen in the corpus must classify as.
+    #[derive(Debug)]
+    enum Expect {
+        /// A live choice dialog: these options, left to right, with this one highlighted.
+        Dialog(&'static [&'static str], usize),
+        /// Ordinary output. Answering it with text is safe, and refusing it costs a reply.
+        Prose,
+    }
+
+    /// The screens, as files rather than inline strings, so a real capture and a hand-drawn one sit
+    /// side by side and neither can be quietly edited to suit a rule.
+    const CORPUS: &[(&str, &str, Expect)] = &[
+        // ------------------------------------------------------------------ positives
+        // The one screen anybody actually captured, from the operator's own herd.
+        (
+            "opencode-permission.ansi",
+            include_str!("../tests/fixtures/opencode-permission.ansi"),
+            Expect::Dialog(&["Allow once", "Allow always", "Reject"], 0),
+        ),
+        (
+            "dialog-two-options-inline-footer.ansi",
+            include_str!("../tests/fixtures/screens/dialog-two-options-inline-footer.ansi"),
+            Expect::Dialog(&["Yes", "No"], 0),
+        ),
+        (
+            "dialog-two-options-selected-right.ansi",
+            include_str!("../tests/fixtures/screens/dialog-two-options-selected-right.ansi"),
+            Expect::Dialog(&["Yes", "No"], 1),
+        ),
+        (
+            "dialog-three-options-selected-middle.ansi",
+            include_str!("../tests/fixtures/screens/dialog-three-options-selected-middle.ansi"),
+            Expect::Dialog(&["Allow once", "Allow always", "Reject"], 1),
+        ),
+        (
+            "dialog-long-labels.ansi",
+            include_str!("../tests/fixtures/screens/dialog-long-labels.ansi"),
+            Expect::Dialog(&["Allow once", "Escalate to a human"], 1),
+        ),
+        // The geometry that once read the row backwards: a long SELECTED label and the least
+        // affordance a row can carry, so the highlight bar is the widest colour on the line.
+        (
+            "dialog-short-footer-long-selected-label.ansi",
+            include_str!("../tests/fixtures/screens/dialog-short-footer-long-selected-label.ansi"),
+            Expect::Dialog(&["Reject and stop the run", "Allow"], 0),
+        ),
+        // The affordance drawn UNDER the options rather than beside them — an ordinary layout, and
+        // the one where reading the row as prose types into a live modal.
+        (
+            "dialog-hint-on-the-next-line.ansi",
+            include_str!("../tests/fixtures/screens/dialog-hint-on-the-next-line.ansi"),
+            Expect::Dialog(&["Yes", "No"], 0),
+        ),
+        // The same, with the panel's own blank bottom row drawn between the two.
+        (
+            "dialog-hint-below-a-bottom-border.ansi",
+            include_str!("../tests/fixtures/screens/dialog-hint-below-a-bottom-border.ansi"),
+            Expect::Dialog(&["Yes", "No"], 1),
+        ),
+        // The agent writes the words this parser looks for, right above its own dialog.
+        (
+            "dialog-under-chatty-transcript.ansi",
+            include_str!("../tests/fixtures/screens/dialog-under-chatty-transcript.ansi"),
+            Expect::Dialog(&["Allow once", "Allow always", "Reject"], 2),
+        ),
+        // ------------------------------------------------------------------ negatives
+        // Every one of these ends with the harness's own keybind footer on a line of its own,
+        // because that is how the pane really looks between questions — and that footer is what
+        // the hint-line rule mistook for corroboration of the transcript row above it.
+        (
+            "prose-coloured-transcript.ansi",
+            include_str!("../tests/fixtures/screens/prose-coloured-transcript.ansi"),
+            Expect::Prose,
+        ),
+        (
+            "prose-syntax-highlighted-code.ansi",
+            include_str!("../tests/fixtures/screens/prose-syntax-highlighted-code.ansi"),
+            Expect::Prose,
+        ),
+        (
+            "prose-unified-diff.ansi",
+            include_str!("../tests/fixtures/screens/prose-unified-diff.ansi"),
+            Expect::Prose,
+        ),
+        (
+            "prose-status-bar.ansi",
+            include_str!("../tests/fixtures/screens/prose-status-bar.ansi"),
+            Expect::Prose,
+        ),
+        (
+            "prose-progress.ansi",
+            include_str!("../tests/fixtures/screens/prose-progress.ansi"),
+            Expect::Prose,
+        ),
+        (
+            "prose-table.ansi",
+            include_str!("../tests/fixtures/screens/prose-table.ansi"),
+            Expect::Prose,
+        ),
+        (
+            "prose-plain-transcript.ansi",
+            include_str!("../tests/fixtures/screens/prose-plain-transcript.ansi"),
+            Expect::Prose,
+        ),
+        // A keybind footer with no menu above it at all. There is nothing to choose here, so there
+        // is nothing to refuse — an ordinary pane must not cost the operator their reply path just
+        // because the harness draws its hints all the time.
+        (
+            "prose-bare-footer.ansi",
+            include_str!("../tests/fixtures/screens/prose-bare-footer.ansi"),
+            Expect::Prose,
+        ),
+        // A real pane captured off the operator's own screen, with no ANSI in it at all.
+        (
+            "tui-pane.txt",
+            include_str!("../tests/fixtures/tui-pane.txt"),
+            Expect::Prose,
+        ),
+    ];
+
+    #[test]
+    fn every_screen_in_the_corpus_classifies_the_way_it_is_labelled() {
+        let mut wrong: Vec<String> = Vec::new();
+        for (name, ansi, expect) in CORPUS {
+            let got = classify(ansi);
+            let ok = match expect {
+                Expect::Dialog(options, selected) => {
+                    got == Screen::Dialog(Prompt {
+                        options: options.iter().map(|o| (*o).to_string()).collect(),
+                        selected: *selected,
+                    })
+                }
+                Expect::Prose => got == Screen::Prose,
+            };
+            if !ok {
+                wrong.push(format!(
+                    "  {name}\n    wanted {expect:?}\n    got    {got:?}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} screens in the corpus classified wrongly.\n\
+             A dialog read as prose types the operator's words into a live modal and then presses \
+             whatever is highlighted; ordinary output read as a dialog sends real arrow and Enter \
+             keys into a terminal that was never asking a question.\n{}",
+            wrong.len(),
+            CORPUS.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// A fixture that nothing asserts on is a fixture that proves nothing. Adding a screen to the
+    /// directory without adding it to the table is the quiet way this corpus would rot.
+    #[test]
+    fn every_screen_on_disk_is_named_in_the_corpus() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/screens");
+        let mut missing: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("the corpus directory must exist") {
+            let name = entry.expect("a readable directory entry").file_name();
+            let name = name.to_string_lossy().to_string();
+            if !CORPUS.iter().any(|(n, _, _)| *n == name) {
+                missing.push(name);
+            }
+        }
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "these screens are on disk but nothing holds the parser to them: {missing:?}"
         );
     }
 }
