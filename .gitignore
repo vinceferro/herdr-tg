@@ -17,8 +17,10 @@
 # kickoff — plugin enablement (holds an absolute core path; do not commit)
 .claude/settings.json
 
-# Rust (cont.) — a member crate run standalone gets its own target/
-target/
+# Rust (cont.) — a member crate run standalone gets its own target/. ANCHORED: a bare `target/`
+# matches at any depth, so it also hid crates/herdr-tg/src/target/ — an ordinary source module —
+# from `git status`, and from any human reading the tree before a commit.
+crates/*/target/
 *.orig
 *.rej
 perf.data

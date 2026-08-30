@@ -15,8 +15,9 @@
 //! shape — a new bot crate — so the guard would have gone blind on the commit that needed it most.
 //!
 //! So the walk now starts at the WORKSPACE ROOT and scans every `.rs` file it finds, skipping only
-//! `target/` and `.git/`. A crate added tomorrow is covered the day it is added rather than the day
-//! someone remembers to add it here. Three properties make that real rather than nominal:
+//! REAL cargo build directories (a `target/` beside a Cargo.toml) and `.git/`. A crate added
+//! tomorrow is covered the day it is added rather than the day someone remembers to add it here.
+//! Three properties make that real rather than nominal:
 //!
 //! 1. **An unreadable directory or file FAILS.** The old walk had `Err(_) => continue`, so a
 //!    permission error read as "nothing to see". A guard that cannot see must not report green.
@@ -42,15 +43,12 @@
 //! It reads only files inside this repository. It opens no socket and touches no herd.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The three methods, spelled as they appear anywhere at all.
 const WRITE_NAMES: [&str; 3] = ["send_text", "send_keys", "send_input"];
-
-/// Directory names never walked. `target/` holds build-script-generated `.rs` and vendored code;
-/// `.git/` holds packfiles. Nothing a human writes lives in either.
-const SKIP_DIRS: [&str; 2] = ["target", ".git"];
 
 /// Files excused from the CALL rule, workspace-relative and exact.
 ///
@@ -88,6 +86,27 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Is `parent/name` a directory the walk may skip?
+///
+/// A name alone is never enough, and that is the entire point of this function. The previous rule
+/// was a two-name list matched against the bare directory name at ANY depth, so
+/// `crates/herdr-tg/src/target/` — an ordinary Rust module, in a crate that already has a `Target`
+/// enum — was pruned out of the tree, and a live `send_text` sat inside it with every test green.
+///
+/// `target` is skipped ONLY when its parent holds a `Cargo.toml`, i.e. when it is the build output
+/// of the crate or workspace directly above it (`<root>/target`, `crates/<member>/target`). A
+/// `src/target/` has no sibling manifest and is walked like any other module.
+///
+/// `.git` is skipped on the name alone, and that is safe for a reason that is CHECKED rather than
+/// assumed: git refuses to track any path with a `.git` component, so this skip cannot hide a file
+/// that ships, and the git cross-check proves it on every run.
+fn is_skippable_dir(parent: &Path, name: &OsStr) -> bool {
+    if name == OsStr::new(".git") {
+        return true;
+    }
+    name == OsStr::new("target") && parent.join("Cargo.toml").is_file()
+}
+
 /// Every `.rs` file under `dir`, sorted so a failure names the same file every run.
 ///
 /// **Panics on an unreadable directory.** That is the point: the previous version swallowed the
@@ -113,7 +132,7 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             if path.is_dir() {
-                if SKIP_DIRS.iter().any(|s| *s == name) {
+                if is_skippable_dir(&d, &name) {
                     continue;
                 }
                 stack.push(path);
@@ -750,5 +769,68 @@ fn the_audited_write_path_exists_and_still_earns_its_exemption() {
         AUDITED_WRITE_PATH, "crates/herdr-tg/src/deliver.rs",
         "the audited write path moved. That is allowed — but update this assertion deliberately, \
          because it is the only thing standing between a Telegram message and a keystroke."
+    );
+}
+
+/// The sibling of [`the_guard_itself_detects_a_planted_call_site`]: that one proves the LEXER can
+/// fire, this proves the WALK can reach the line to hand it.
+///
+/// `target` is an ordinary module name — this crate already has a `Target` enum in routing.rs — and
+/// a skip written on the bare directory name pruned `crates/<crate>/src/target/` out of the tree
+/// before either textual rule ever saw it. A live, reachable `send_text` sat there with all seven
+/// tests green. The tree here is SYNTHETIC and lives in a tempdir on purpose: a plant inside this
+/// repository would be found by `no_write_call_site_anywhere_outside_cfg_test`, which walks the
+/// workspace root, and would turn an unrelated test red for a reason no one could follow.
+#[test]
+fn the_walk_sees_a_source_module_named_target_and_still_skips_build_dirs() {
+    let tmp = tempfile::tempdir().expect("a tempdir to build the synthetic workspace in");
+    let root = tmp.path();
+    let mk = |p: &str| {
+        fs::create_dir_all(root.join(p)).expect("the synthetic workspace directories are creatable")
+    };
+    let put = |p: &str, body: &str| {
+        fs::write(root.join(p), body).expect("the synthetic workspace files are writable")
+    };
+
+    mk("crates/demo/src/target");
+    mk("target/debug/build");
+    mk("crates/demo/target/debug/build");
+    put("Cargo.toml", "[workspace]\nmembers = [\"crates/demo\"]\n");
+    put("crates/demo/Cargo.toml", "[package]\nname = \"demo\"\n");
+    put("crates/demo/src/lib.rs", "pub mod target;\n");
+    // A source module that merely happens to be called `target`, with a live write in it.
+    let plant = "fn relay(c: &C, p: &P) { c.send_text(p, \"oops\"); }\n";
+    put("crates/demo/src/target/mod.rs", plant);
+    // Real build output, above and beside a manifest. Both must stay unwalked.
+    put(
+        "target/debug/build/out.rs",
+        "// generated by a build script\n",
+    );
+    put(
+        "crates/demo/target/debug/build/out.rs",
+        "// generated by a build script\n",
+    );
+
+    let seen: BTreeSet<String> = rust_files(root).iter().map(|f| rel(root, f)).collect();
+
+    assert!(
+        seen.contains("crates/demo/src/target/mod.rs"),
+        "the walk skipped a SOURCE module because it is spelled `target`. Everything under it is \
+         invisible to both textual rules, so a write into the operator's terminals can live there \
+         with this suite green. Saw: {seen:?}"
+    );
+    assert!(
+        !seen.contains("target/debug/build/out.rs"),
+        "the workspace build directory is being walked; it holds generated code no human wrote"
+    );
+    assert!(
+        !seen.contains("crates/demo/target/debug/build/out.rs"),
+        "a member crate's own build directory is being walked"
+    );
+    assert_eq!(
+        write_reach_on(plant.lines().next().expect("the plant is one line")),
+        Some("send_text"),
+        "the planted line is one the scanner already knows how to catch — reaching it was the only \
+         thing ever missing"
     );
 }
