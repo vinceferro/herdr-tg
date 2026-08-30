@@ -169,9 +169,28 @@ fn rel(root: &Path, file: &Path) -> String {
 fn workspace_members(root: &Path) -> Vec<String> {
     let manifest = fs::read_to_string(root.join("Cargo.toml"))
         .expect("the workspace root Cargo.toml is readable");
-    let start = manifest
-        .find("members")
-        .expect("the workspace manifest declares `members`");
+    // Anchored to a line whose first word is `members`, because a plain search for the word also
+    // matches inside `default-members` — and a manifest that declares `default-members` first
+    // handed this parser that shorter list, so rule 1 quietly stopped looking at every crate
+    // missing from it while still reporting a clean scan.
+    let mut found = None;
+    let mut offset = 0usize;
+    for line in manifest.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start().len();
+        if line
+            .trim_start()
+            .strip_prefix("members")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            found = Some(offset + indent);
+            break;
+        }
+        offset += line.len();
+    }
+    let start = found.expect(
+        "the workspace manifest has no line beginning `members =`. This guard will not fall back \
+         to a looser search: the looser search is what made it read `default-members`.",
+    );
     let open = manifest[start..]
         .find('[')
         .map(|i| start + i)
@@ -308,14 +327,21 @@ fn test_line_span(src: &str) -> Vec<bool> {
 /// `const METHOD: &'static str = "pane.send_text";` and
 /// `tracing::warn!(… "pane.send_keys called with NO keys" …)` are the real lines this has to let
 /// through: they name the method in data, and blanking string spans is what tells them apart from
-/// a reference to the function. Raw strings blank correctly too (`r#"…"#` opens on its `"`).
+/// a reference to the function.
 ///
-/// CHAR LITERALS ARE CONSUMED BEFORE STRINGS, and that ordering is load-bearing. A `'"'`
-/// char literal used to be read as a string OPENER, which blanked everything after it —
-/// so a real `c.send_text(..)` later on the same line became invisible to the guard. That
-/// is a FAIL-OPEN, not the fail-closed the old comment claimed: blanking more code means
-/// the scanner sees less, never more. A reviewer drove `pane.send_text` onto the wire
-/// through the shipped binary with this test green. Do not remove the char-literal arm.
+/// EVERY OTHER TOKEN THAT CAN CONTAIN A `"` IS CONSUMED WHOLE, BEFORE THE PLAIN-STRING ARM, and
+/// that ordering is the whole design. Read one quote at a time, each of these looked like a string
+/// that opened where it did not, so the scanner stayed "inside a string" across the rest of the
+/// line and a real `c.send_text(..)` after it became invisible:
+///
+/// * a `'"'` char literal, which a reviewer used to drive `pane.send_text` onto the wire through
+///   the shipped binary with this suite green;
+/// * a raw string — `r#"say "hi"#` closes on `"#`, and this file used to claim, wrongly, that raw
+///   strings "blank correctly" because they open on their `"`;
+/// * a `/* 6" of rope */` block comment, a kind of comment the scanner did not know existed.
+///
+/// All three are FAIL-OPEN, whatever they look like: blanking more code means the scanner sees
+/// less, never more. Do not remove an arm; if a fourth token shape turns up, add one.
 fn code_only(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let bytes = line.as_bytes();
@@ -352,6 +378,24 @@ fn code_only(line: &str) -> String {
                 continue;
             }
         }
+        // A raw string is a token, not a run of quotes.
+        if let Some(len) = raw_string_len(bytes, i) {
+            for _ in 0..len {
+                out.push(' ');
+            }
+            i += len;
+            continue;
+        }
+        // A block comment is prose that may contain a quote, and the plain-string arm would have
+        // taken that quote for the start of a span.
+        if c == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let len = block_comment_len(bytes, i);
+            for _ in 0..len {
+                out.push(' ');
+            }
+            i += len;
+            continue;
+        }
         if c == b'"' {
             in_str = true;
             out.push(' ');
@@ -371,6 +415,70 @@ fn code_only(line: &str) -> String {
         i += ch.len_utf8();
     }
     out
+}
+
+/// Length in bytes of the raw string literal starting at `bytes[start]`, or `None` if nothing
+/// starts one there. Covers `r"…"`, `r#"…"#`, `r##"…"##` and the `br…` byte-string spellings.
+///
+/// An `r` or `b` that is only the tail of an identifier (`for`, `char`) opens nothing — checked on
+/// the byte before it, so a name is never mistaken for a prefix.
+///
+/// An unterminated literal consumes the rest of the line. That is not a concession: if the closing
+/// delimiter is not on this line then the rest of this line really is string content.
+fn raw_string_len(bytes: &[u8], start: usize) -> Option<usize> {
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        return None;
+    }
+    let mut i = match bytes[start] {
+        b'r' => start + 1,
+        b'b' if bytes.get(start + 1) == Some(&b'r') => start + 2,
+        _ => return None,
+    };
+    let first_hash = i;
+    while bytes.get(i) == Some(&b'#') {
+        i += 1;
+    }
+    let hashes = i - first_hash;
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    // The closing delimiter is a quote followed by exactly as many `#` as the opener carried.
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if bytes[j] == b'"'
+            && bytes
+                .get(j + 1..j + 1 + hashes)
+                .is_some_and(|tail| tail.iter().all(|b| *b == b'#'))
+        {
+            return Some(j + 1 + hashes - start);
+        }
+        j += 1;
+    }
+    Some(bytes.len() - start)
+}
+
+/// Length in bytes of the `/* … */` comment starting at `bytes[start]`, nesting counted the way
+/// rustc counts it. An unclosed comment consumes the rest of the line, which is what it is.
+fn block_comment_len(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut i = start + 2;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return i - start;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    bytes.len() - start
 }
 
 /// Length in bytes of the Rust char literal starting at `bytes[start]` (a `'`), or `None` if this
@@ -992,5 +1100,80 @@ fn every_crate_that_ships_is_a_declared_workspace_member() {
         phantom.is_empty(),
         "the member list names crates that ship no Cargo.toml: {phantom:?}. Either a crate moved \
          and the scan is now looking at nothing, or the manifest parse picked up the wrong list."
+    );
+}
+
+/// Regression: a raw string or a block comment must not blank the code that follows it.
+///
+/// The same fail-open as the `'"'` char literal, twice more. `code_only` understood one kind of
+/// quote and one kind of comment, so `r#"say "hi"#` left it convinced it was still inside a string
+/// — and everything up to the next quote, including a real call, was blanked out of the scanner's
+/// view. `/* 6" of rope */` did it with a quote inside a comment the scanner did not know existed.
+/// Blanking MORE means the scanner sees LESS, which is the dangerous direction.
+#[test]
+fn raw_strings_and_block_comments_do_not_hide_a_call_from_the_scanner() {
+    // Both shapes a reviewer used, verbatim.
+    let raw = r##"    let doc = r#"say "hi"#; c.send_text(&pane, "rm -rf ~\n").await?;"##;
+    assert!(
+        code_only(raw).contains("send_text("),
+        "a call after a raw string must stay visible, got: {:?}",
+        code_only(raw)
+    );
+    let block = r#"    /* 6" of rope */ c.send_keys(&pane, &keys).await?; let z = "";"#;
+    assert!(
+        code_only(block).contains("send_keys("),
+        "a call after a block comment must stay visible, got: {:?}",
+        code_only(block)
+    );
+
+    // The method name INSIDE either one is data, not a call site — the property that made string
+    // blanking worth having in the first place.
+    let named = r####"    const M: &str = r#"pane.send_text"#; /* and send_keys too */"####;
+    assert_eq!(
+        write_reach_on(named),
+        None,
+        "the method name in a raw string or a comment is data: {:?}",
+        code_only(named)
+    );
+
+    // A byte-string raw literal is the same token with one more prefix letter.
+    let byte_raw = r##"    let b = br#"send_input"#; c.send_input(&pane, "x").await?;"##;
+    assert_eq!(write_reach_on(byte_raw), Some("send_input"));
+
+    // An `r` that is only the tail of an identifier does not open anything.
+    let ident = r#"    for pane in panes { c.send_text(&pane, "x"); }"#;
+    assert_eq!(write_reach_on(ident), Some("send_text"));
+
+    // The property that makes the whole scanner sound: blanking preserves byte offsets.
+    for case in [raw, block, named, byte_raw, ident] {
+        assert_eq!(
+            code_only(case).len(),
+            case.len(),
+            "offset drift on {case:?}"
+        );
+    }
+}
+
+/// Regression: `default-members` is not `members`, and confusing the two shrinks rule 1's world.
+///
+/// The list was located with `find("members")`, which matches inside `default-members` as happily
+/// as it matches the real key. A manifest that declares `default-members` first therefore handed
+/// rule 1 a shorter list, and every crate missing from it was free to name a write method — with
+/// the guard reporting a clean scan of the crates it had been told about.
+#[test]
+fn a_manifest_that_declares_default_members_first_still_finds_the_real_member_list() {
+    let tmp = tempfile::tempdir().expect("a tempdir to hold the synthetic manifest");
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\ndefault-members = [\"crates/one\"]\nmembers  = \
+         [\"crates/one\", \"crates/two\"]\n",
+    )
+    .expect("the synthetic manifest is writable");
+
+    assert_eq!(
+        workspace_members(tmp.path()),
+        vec!["crates/one".to_owned(), "crates/two".to_owned()],
+        "the parser picked up `default-members` instead of `members`, so rule 1 would scan a \
+         shorter list than the workspace actually ships"
     );
 }
