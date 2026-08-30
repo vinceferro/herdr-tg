@@ -36,6 +36,19 @@
 //! that is shaped like a control but whose highlight cannot be resolved is refused, and the
 //! operator is told to answer it at the keyboard. A false refusal costs them one trip to their
 //! terminal; a false "this is prose" grants a permission they never gave.
+//!
+//! # This bridge is not the only thing driving the dialog
+//!
+//! The whole point of the product is the operator at their laptop with their phone in their hand,
+//! so their own keyboard is answering the same dialog. Worse, the screen this module reads lags
+//! that keyboard by tens of milliseconds, so a read taken just after they moved the highlight
+//! renders the frame from before it. The selection in any single read may therefore already be
+//! wrong.
+//!
+//! That is why moving and confirming are separate here: [`Prompt::move_to`] emits arrows and never
+//! the confirm key, and [`CONFIRM`] travels on its own after a settled re-read has shown the
+//! wanted option highlighted. `deliver::choose` owns that sequence. Nothing in this module may
+//! hand a caller a batch it cannot look inside.
 
 /// A choice dialog found in a pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,32 +59,57 @@ pub struct Prompt {
     pub selected: usize,
 }
 
+/// The key that confirms a choice.
+///
+/// Hardcoded on purpose: this is NOT the operator's configured submit key. The captured dialog's
+/// own footer reads "enter confirm", and routing a config value here would let a mis-set key — the
+/// interrupt form among them, which herdr accepts (`docs/SLICE-3-PROBE.md` P2) — be delivered into
+/// a focused modal.
+pub const CONFIRM: &str = "Enter";
+
 impl Prompt {
-    /// The keys that move the selection to `target` and confirm it.
+    /// The keys that move the highlight from where THIS read saw it to `target`.
     ///
-    /// Computed from the selection observed in the *same read* that produced this prompt, so the
-    /// arrow count is derived rather than assumed. Re-parse immediately before sending: nothing
-    /// else drives this pane, but a stale index would confirm the wrong option, and that is not a
-    /// mistake worth risking to save one RPC.
+    /// Never includes the confirm key. Moving and confirming go out separately because the only
+    /// defence against a screen that lagged the operator's own keypresses is to look again in
+    /// between — and there is no such moment if the two travel together.
     ///
-    /// Deliberately never wraps around the ends. Wrapping would be fewer keypresses in some cases,
-    /// but it depends on the harness wrapping too — and if it does not, the selection stops at the
-    /// edge and `Enter` confirms the wrong option.
-    pub fn keys_to(&self, target: usize) -> Option<Vec<&'static str>> {
+    /// `None` if `target` is out of range; empty when the highlight is already there.
+    ///
+    /// Never wraps, so the highlight is never driven past an end and nothing here depends on what
+    /// the harness does at one. That has NOT been probed: `docs/SLICE-3-PROBE.md` P2 settles which
+    /// key NAMES herdr accepts and says nothing about what a TUI does with them at an edge.
+    pub fn move_to(&self, target: usize) -> Option<Vec<&'static str>> {
         if target >= self.options.len() {
             return None;
         }
-        let mut keys = Vec::new();
         let step = if target > self.selected {
             "Right"
         } else {
             "Left"
         };
-        for _ in 0..target.abs_diff(self.selected) {
-            keys.push(step);
-        }
-        keys.push("Enter");
-        Some(keys)
+        Some(vec![step; target.abs_diff(self.selected)])
+    }
+
+    /// The option highlighted right now, as this read saw it.
+    pub fn highlighted(&self) -> Option<&str> {
+        self.options.get(self.selected).map(String::as_str)
+    }
+
+    /// Where `label` sits, or `None` if it is absent or appears more than once.
+    ///
+    /// Ambiguity is refused rather than resolved by order — the same rule [`Prompt::match_option`]
+    /// follows, and for the same reason: on a dialog offering two similar permissions, picking the
+    /// first grants the broader one about half the time it was meant to grant the narrower.
+    pub fn exact_option(&self, label: &str) -> Option<usize> {
+        let hits: Vec<usize> = self
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.as_str() == label)
+            .map(|(i, _)| i)
+            .collect();
+        (hits.len() == 1).then(|| hits[0])
     }
 }
 
@@ -353,27 +391,28 @@ fn strip_sgr(s: &str) -> String {
     sgr_runs(s).into_iter().map(|(_, t)| t).collect()
 }
 
+/// Synthetic dialog rows, in the captured fixture's own colours.
+///
+/// Lives beside the parser rather than inside a test module because `deliver`'s tests need to stage
+/// a dialog whose highlight moves between reads, which the single captured screen cannot do. A
+/// second renderer living over there would drift from this one, and those tests would then pass
+/// against screens this parser has never seen.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The real dialog, captured from the operator's herd and scrubbed of their paths.
-    const REAL: &str = include_str!("../tests/fixtures/opencode-permission.ansi");
-
-    /// The selected option's colours in that capture.
+pub(crate) mod synthetic {
+    /// The selected option's colours in the capture.
     const SEL: &str = "\u{1b}[0m\u{1b}[38;2;10;14;26m\u{1b}[48;2;255;225;77m";
-    /// An unselected option's colours in that capture.
-    const UNSEL: &str = "\u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70m";
+    /// An unselected option's colours in the capture.
+    pub(crate) const UNSEL: &str = "\u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70m";
     /// The modal panel the whole row sits on.
-    const PANEL: &str = "\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m";
+    pub(crate) const PANEL: &str = "\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m";
     /// The keybind footer, copied out of the capture so a synthetic row ends the way a real one does.
-    const FOOTER: &str = "\u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70mctrl+f \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mfullscreen\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  \u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70m\u{21c6} \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mselect\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  \u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70menter \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mconfirm\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m   \u{1b}[0m\u{1b}[38;2;255;255;255m  \u{1b}[0m";
+    pub(crate) const FOOTER: &str = "\u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70mctrl+f \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mfullscreen\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  \u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70m\u{21c6} \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mselect\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  \u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70menter \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mconfirm\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m   \u{1b}[0m\u{1b}[38;2;255;255;255m  \u{1b}[0m";
 
-    /// A dialog row in the captured fixture's own colours, for the option counts nobody captured.
+    /// A dialog row for the option counts and selections nobody captured.
     ///
-    /// A synthetic fixture is worth only what its faithfulness is worth, so the first test below
-    /// checks this renderer against the real capture before any other test leans on it.
-    fn row(options: &[&str], selected: usize) -> String {
+    /// A synthetic fixture is worth only what its faithfulness is worth, so `permission`'s own tests
+    /// check it against the real capture before anything else leans on it.
+    pub(crate) fn render_dialog(options: &[&str], selected: usize) -> String {
         let mut s = String::from(
             "\u{1b}[0m\u{1b}[38;2;255;255;255m  \u{1b}[0m\u{1b}[38;2;255;225;77m\u{1b}[48;2;21;29;55m\u{2503}\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  ",
         );
@@ -389,6 +428,15 @@ mod tests {
         s.push_str(FOOTER);
         s
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::synthetic::*;
+    use super::*;
+
+    /// The real dialog, captured from the operator's herd and scrubbed of their paths.
+    const REAL: &str = include_str!("../tests/fixtures/opencode-permission.ansi");
 
     #[test]
     fn the_real_opencode_permission_dialog_parses() {
@@ -400,16 +448,16 @@ mod tests {
     /// THE reason this module exists. `Reject` is two to the right of the default, and a reply of
     /// "no" would previously have confirmed `Allow once`.
     #[test]
-    fn choosing_reject_sends_two_rights_and_enter() {
+    fn choosing_reject_moves_the_highlight_two_to_the_right() {
         let p = parse(REAL).unwrap();
         let reject = p.options.iter().position(|o| o == "Reject").unwrap();
-        assert_eq!(p.keys_to(reject).unwrap(), ["Right", "Right", "Enter"]);
+        assert_eq!(p.move_to(reject).unwrap(), ["Right", "Right"]);
     }
 
     #[test]
-    fn choosing_the_already_selected_option_just_confirms() {
+    fn choosing_the_already_highlighted_option_moves_nothing() {
         let p = parse(REAL).unwrap();
-        assert_eq!(p.keys_to(0).unwrap(), ["Enter"]);
+        assert_eq!(p.move_to(0).unwrap(), Vec::<&str>::new());
     }
 
     #[test]
@@ -418,11 +466,74 @@ mod tests {
             options: vec!["a".into(), "b".into(), "c".into()],
             selected: 2,
         };
-        assert_eq!(p.keys_to(0).unwrap(), ["Left", "Left", "Enter"]);
+        assert_eq!(p.move_to(0).unwrap(), ["Left", "Left"]);
         assert!(
-            p.keys_to(3).is_none(),
+            p.move_to(3).is_none(),
             "an out-of-range target must be refused, not wrapped"
         );
+    }
+
+    /// Moving and confirming go out separately, so the bridge has a moment to look before it
+    /// commits. A move that carries the confirm key with it leaves no such moment — and the
+    /// operator's own keyboard is driving the same dialog.
+    #[test]
+    fn move_to_never_emits_a_confirm_key() {
+        let p = parse(REAL).unwrap();
+        for target in 0..p.options.len() {
+            for k in p.move_to(target).unwrap() {
+                assert!(
+                    matches!(k, "Left" | "Right"),
+                    "{k} confirms a choice; nothing that only moves the highlight may emit it"
+                );
+                assert_ne!(k, CONFIRM);
+            }
+        }
+        assert_eq!(
+            p.move_to(p.selected).unwrap().len(),
+            0,
+            "a highlight already where it belongs needs no keys at all"
+        );
+    }
+
+    /// The direction is decided by where the highlight is, not by the caller.
+    #[test]
+    fn the_direction_follows_the_highlight() {
+        let p = Prompt {
+            options: vec!["a".into(), "b".into(), "c".into()],
+            selected: 1,
+        };
+        assert_eq!(p.move_to(2).unwrap(), ["Right"]);
+        assert_eq!(p.move_to(0).unwrap(), ["Left"]);
+    }
+
+    /// A label that appears twice is refused rather than resolved by order — the same rule
+    /// `match_option` follows, and for the same reason.
+    #[test]
+    fn exact_option_refuses_a_duplicate_label() {
+        let p = Prompt {
+            options: vec!["Allow".into(), "Deny".into(), "Allow".into()],
+            selected: 0,
+        };
+        assert_eq!(p.exact_option("Deny"), Some(1));
+        assert_eq!(
+            p.exact_option("Allow"),
+            None,
+            "two options carry that label"
+        );
+        assert_eq!(p.exact_option("Maybe"), None);
+        // Exact, not a prefix: a button carries the label it displayed, character for character.
+        assert_eq!(p.exact_option("deny"), None);
+    }
+
+    #[test]
+    fn highlighted_names_the_option_this_read_saw_selected() {
+        let p = parse(REAL).unwrap();
+        assert_eq!(p.highlighted(), Some("Allow once"));
+        let out_of_range = Prompt {
+            options: vec!["a".into()],
+            selected: 7,
+        };
+        assert_eq!(out_of_range.highlighted(), None);
     }
 
     /// Every key this module emits must be one herdr accepts on protocol 20. `Left`, `Right` and
@@ -431,17 +542,19 @@ mod tests {
     #[test]
     fn every_emitted_key_is_one_the_probe_confirmed() {
         let p = parse(REAL).unwrap();
+        let mut emitted: Vec<&str> = vec![CONFIRM];
         for target in 0..p.options.len() {
-            for k in p.keys_to(target).unwrap() {
-                assert!(
-                    matches!(k, "Left" | "Right" | "Enter"),
-                    "{k} was never confirmed against protocol 20"
-                );
-                assert!(
-                    herdr_client::Key::parse(k).is_ok(),
-                    "{k} is not a key the client will accept"
-                );
-            }
+            emitted.extend(p.move_to(target).unwrap());
+        }
+        for k in emitted {
+            assert!(
+                matches!(k, "Left" | "Right" | "Enter"),
+                "{k} was never confirmed against protocol 20"
+            );
+            assert!(
+                herdr_client::Key::parse(k).is_ok(),
+                "{k} is not a key the client will accept"
+            );
         }
     }
 
@@ -514,20 +627,20 @@ mod tests {
     #[test]
     fn a_two_option_dialog_is_recognised_and_the_synthetic_row_is_faithful() {
         assert_eq!(
-            parse(&row(&["Allow once", "Allow always", "Reject"], 0)),
+            parse(&render_dialog(&["Allow once", "Allow always", "Reject"], 0)),
             parse(REAL),
             "the synthetic row must read exactly like the captured one"
         );
         for sel in 0..2 {
             assert_eq!(
-                parse(&row(&["Allow", "Deny"], sel)),
+                parse(&render_dialog(&["Allow", "Deny"], sel)),
                 Some(Prompt {
                     options: vec!["Allow".into(), "Deny".into()],
                     selected: sel,
                 })
             );
             assert_eq!(
-                parse(&row(&["Yes", "No"], sel)),
+                parse(&render_dialog(&["Yes", "No"], sel)),
                 Some(Prompt {
                     options: vec!["Yes".into(), "No".into()],
                     selected: sel,
@@ -540,13 +653,19 @@ mod tests {
     /// confirm key after them pressed whatever was highlighted — which is Yes.
     #[test]
     fn answering_no_to_a_two_option_dialog_moves_the_selection_instead_of_typing() {
-        let p = parse(&row(&["Yes", "No"], 0)).expect("a Yes/No dialog is a dialog");
+        let p = parse(&render_dialog(&["Yes", "No"], 0)).expect("a Yes/No dialog is a dialog");
         assert_eq!(p.selected, 0, "the highlight starts on Yes");
         assert_eq!(
             p.match_option("no"),
             Some(1),
             "the operator's \"no\" must resolve to the option they named"
         );
+        assert_eq!(
+            p.move_to(1).unwrap(),
+            ["Right"],
+            "answering it moves the highlight; it does not type the word"
+        );
+        assert_eq!(CONFIRM, "Enter", "and the confirm key travels on its own");
     }
 
     /// `38;2;248;250;252` is a stock light foreground. It contains the digits "48;", and the old

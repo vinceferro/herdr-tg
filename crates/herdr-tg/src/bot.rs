@@ -380,23 +380,26 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         ["c", pane, idx] => {
             let p = PaneId::new(*pane);
             let want = idx.to_string();
-            // `choose` re-parses the dialog from a fresh read, so the arrow count comes from the
-            // selection as it is NOW. The index is 0-based here; match_option takes 1-based.
+            // The index is 0-based here; match_option takes 1-based.
             let one_based = idx.parse::<usize>().map(|i| i + 1).unwrap_or(0).to_string();
             let at = timestamp();
             let _ = ctx
                 .audit
                 .sent(&at, chat_id, &p, &format!("[button] option {want}"));
-            match deliver::choose(&*ctx.client, &p, &one_based, Settle::default(), |d| {
-                Box::pin(tokio::time::sleep(d))
-            })
+            match deliver::choose(
+                &*ctx.client,
+                &p,
+                deliver::Choice::Reply(&one_based),
+                Settle::default(),
+                |d| Box::pin(tokio::time::sleep(d)),
+            )
             .await
             {
-                Ok(Ok(d)) => {
-                    let _ = ctx.audit.outcome(&timestamp(), &d);
-                    d.detail
+                Ok(Ok(c)) => {
+                    let _ = ctx.audit.outcome(&timestamp(), &c.delivery);
+                    c.delivery.detail
                 }
-                Ok(Err(why)) => why,
+                Ok(Err(why)) => why.to_string(),
                 Err(e) => {
                     let _ = ctx.audit.failed(&timestamp(), &p, &e.to_string());
                     format!("failed: {e}")
@@ -612,6 +615,19 @@ fn reply_path(ansi: Option<&str>) -> ReplyPath {
     }
 }
 
+/// Say, in the operator's words, why nothing was pressed.
+///
+/// Every arm means the same thing about the terminal — not one key reached it — and differs only in
+/// what the operator can do about it.
+fn refusal_reason(refused: deliver::ChoiceRefused) -> Reason {
+    match refused {
+        deliver::ChoiceRefused::NotADialog => Reason::NoLongerAsking,
+        deliver::ChoiceRefused::Unclear { options } => Reason::UnclearChoice(options),
+        deliver::ChoiceRefused::Changed { .. } => Reason::PromptChanged,
+        deliver::ChoiceRefused::NotConfirmed(why) => Reason::ChoiceNotConfirmed(why),
+    }
+}
+
 /// Route a reply, deliver it, audit it, and tell the operator exactly what was observed.
 ///
 /// The confirmation is the product's honesty surface. It names the pane, names *why* that pane was
@@ -671,28 +687,34 @@ async fn route_and_deliver(
         );
     }
     match reply_path(read.as_ref().ok().map(|r| r.text.as_str())) {
-        ReplyPath::Choice(prompt) => {
+        // The menu itself is deliberately not carried into `choose`: this read is only evidence
+        // that words must not go into this pane. `choose` looks again for itself, twice, because
+        // the operator's own keyboard may have moved the highlight since.
+        ReplyPath::Choice(_) => {
             let at = timestamp();
             if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
                 tracing::error!(error = %e, "could not write the audit record; refusing to send");
                 return voice::nothing_sent(Reason::NoAudit);
             }
-            return match deliver::choose(client, &pane, text, Settle::default(), |d| {
-                Box::pin(tokio::time::sleep(d))
-            })
+            return match deliver::choose(
+                client,
+                &pane,
+                deliver::Choice::Reply(text),
+                Settle::default(),
+                |d| Box::pin(tokio::time::sleep(d)),
+            )
             .await
             {
-                Ok(Ok(d)) => {
-                    let _ = audit.outcome(&timestamp(), &d);
-                    let chosen = prompt
-                        .match_option(text)
-                        .and_then(|i| prompt.options.get(i).cloned())
-                        .unwrap_or_else(|| text.trim().to_string());
-                    voice::choice_made(pl, ws, &chosen, !d.rung.needs_attention())
+                Ok(Ok(c)) => {
+                    let _ = audit.outcome(&timestamp(), &c.delivery);
+                    // The label a settled read showed HIGHLIGHTED just before the confirm key went
+                    // out — never the one this function matched from its own earlier read. That
+                    // earlier read is the one the operator's own keyboard may have overtaken.
+                    voice::choice_made(pl, ws, &c.option, !c.delivery.rung.needs_attention())
                 }
-                // Not an error — the operator was ambiguous, or the prompt moved on. Show the options
-                // again rather than typing into a terminal on a guess.
-                Ok(Err(_)) => voice::nothing_sent(Reason::UnclearChoice(prompt.options.clone())),
+                // Not an error — the operator was ambiguous, or the menu moved on. Say which,
+                // rather than typing into a terminal on a guess.
+                Ok(Err(r)) => voice::nothing_sent(refusal_reason(r)),
                 Err(e) => {
                     let _ = audit.failed(&timestamp(), &pane, &e.to_string());
                     tracing::error!(error = %e, "the choice failed to send");

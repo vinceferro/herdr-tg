@@ -279,6 +279,20 @@ pub fn nothing_sent(reason: Reason) -> String {
              can't tell which option is highlighted.\n<i>Answer it at the keyboard — anything I \
              sent would press whatever is selected.</i>"
             .to_string(),
+        Reason::NoLongerAsking => "That session isn't asking that any more.\n<i>Nothing was typed \
+             into it. Have a look at what it is showing now.</i>"
+            .to_string(),
+        Reason::PromptChanged => "That menu changed after those buttons were drawn, so I left it \
+             alone.\n<i>Nothing was typed into that terminal. Reply again to see the choices as \
+             they are now.</i>"
+            .to_string(),
+        // The account comes from `deliver`, which watched the menu; it is the only place that
+        // knows which option ended up highlighted instead. It is escaped because the option names
+        // in it are the agent's words, not this bridge's.
+        Reason::ChoiceNotConfirmed(why) => format!(
+            "{}\n<i>Nothing was typed into that terminal.</i>",
+            esc(&why)
+        ),
     }
 }
 
@@ -293,6 +307,14 @@ pub enum Reason {
     /// The pane is showing a menu whose highlight could not be read — or could not be looked at
     /// at all. Nothing may be typed there, because the confirm key would press an unknown option.
     UnreadablePrompt,
+    /// The menu the operator was answering is gone.
+    NoLongerAsking,
+    /// A menu is up, but not the one the buttons were drawn for.
+    PromptChanged,
+    /// The highlight could not be got onto the option the operator asked for, so nothing was
+    /// confirmed. Carries `deliver`'s account of what it actually saw, which names the option it
+    /// ended up on — that is the information, and only `deliver` has it.
+    ChoiceNotConfirmed(String),
 }
 
 /// Escape the three characters Telegram's HTML mode treats as markup.
@@ -354,6 +376,13 @@ mod tests {
             nothing_sent(Reason::NoAudit),
             nothing_sent(Reason::HerdUnreachable),
             nothing_sent(Reason::UnreadablePrompt),
+            nothing_sent(Reason::NoLongerAsking),
+            nothing_sent(Reason::PromptChanged),
+            nothing_sent(Reason::ChoiceNotConfirmed(
+                "I couldn't get the highlight onto \"Reject\" — it is on \"Allow once\". Nothing \
+                 was confirmed; answer it at the keyboard."
+                    .into(),
+            )),
             nothing_sent(Reason::UnclearChoice(vec![
                 "Allow once".into(),
                 "Reject".into(),
