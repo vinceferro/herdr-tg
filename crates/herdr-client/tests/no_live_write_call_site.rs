@@ -14,10 +14,11 @@
 //! `tests/`, `examples/` or `build.rs` of the two crates it did scan. Slice 2 adds exactly that
 //! shape — a new bot crate — so the guard would have gone blind on the commit that needed it most.
 //!
-//! So the walk now starts at the WORKSPACE ROOT and scans every `.rs` file it finds, skipping only
-//! REAL cargo build directories (a `target/` beside a Cargo.toml) and `.git/`. A crate added
-//! tomorrow is covered the day it is added rather than the day someone remembers to add it here.
-//! Four properties make that real rather than nominal:
+//! So the walk now starts at the WORKSPACE ROOT and scans every `.rs` file it finds — plus every
+//! file a `include!` or a `#[path]` pulls into a crate, whatever it is called — skipping only REAL
+//! cargo build directories (a `target/` beside a Cargo.toml) and `.git/`. A crate added tomorrow
+//! is covered the day it is added rather than the day someone remembers to add it here. Five
+//! properties make that real rather than nominal:
 //!
 //! 1. **An unreadable directory or file FAILS.** The old walk had `Err(_) => continue`, so a
 //!    permission error read as "nothing to see". A guard that cannot see must not report green.
@@ -27,12 +28,19 @@
 //!    prefix, not a pattern. If `wire.rs` is renamed its exemption goes stale, the new file gets
 //!    scanned, and the suite goes red — the safe direction.
 //! 4. **The walk's coverage is cross-checked against a source of truth it had no hand in.** Rules
-//!    that decide what NOT to look at have now been wrong three times here — an allowlist of two
-//!    directories, a member list nobody verified, a bare-name `target` skip. Each round fixed the
-//!    instance and left the class open, because nothing outside the walk could contradict the
-//!    walk. `every_git_tracked_rust_file_is_actually_walked` compares what was scanned against the
-//!    git index, which is by definition what ships, so the NEXT silent skip is loud on the commit
-//!    that introduces it rather than in the review after it.
+//!    that decide what NOT to look at have now been wrong four times here — an allowlist of two
+//!    directories, a member list nobody verified, a bare-name `target` skip, a `.rs` extension
+//!    filter. Each round fixed the instance and left the class open, because nothing outside the
+//!    walk could contradict the walk.
+//!    [`every_file_that_ships_is_scanned_or_carries_no_write`] compares what was scanned against
+//!    the git index, which is by definition what ships, so the NEXT silent skip is loud on the
+//!    commit that introduces it rather than in the review after it.
+//! 5. **The cross-check does not share the walk's assumptions.** The first version of it filtered
+//!    the index down to `.rs` — the very rule it was auditing — so a tracked `relay.inc` holding a
+//!    live `send_text`, one `include!` line from the shipped binary, was invisible to the walk and
+//!    to its own second opinion at the same time. An oracle that shares its subject's blind spot
+//!    is not an oracle. It now judges a file by whether the guard READ it, not by what it is
+//!    called, and it fails rather than skipping when it cannot reach git at all.
 //!
 //! # The three rules
 //!
@@ -110,7 +118,7 @@ fn workspace_root() -> PathBuf {
 ///
 /// One hole is left open here deliberately: a `Cargo.toml` dropped beside a `src/target/` would
 /// buy the skip back. The rule stays this simple and this readable, and
-/// [`every_git_tracked_rust_file_is_actually_walked`] is the backstop — that module would be
+/// [`every_file_that_ships_is_scanned_or_carries_no_write`] is the backstop — that module would be
 /// tracked and unwalked, and it fails. Read the two together; neither is enough on its own, and
 /// the oracle's own blind spot (a file that is neither tracked nor walked, which cannot ship but
 /// can be built locally) is what this rule closes. Deleting either half reopens the other's.
@@ -157,6 +165,184 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// Byte offset of the first non-whitespace byte at or after `i`.
+fn skip_ws(line: &str, mut i: usize) -> usize {
+    while line.as_bytes().get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// `p` with every `.` and `..` component resolved textually.
+///
+/// Not `fs::canonicalize`: that resolves symlinks too, so the result no longer starts with the
+/// workspace root the rest of this file compares against.
+fn normalise(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The files a CODE-inclusion directive in `src` names, resolved against `file`'s directory.
+///
+/// `include!("relay.inc")` and `#[path = "relay.txt"] mod relay;` both make a file that is not
+/// spelled `.rs` into code inside a crate. That is the hole a reviewer walked through: a tracked
+/// `relay.inc` holding a live `send_text`, one `include!` line away from the shipped binary, with
+/// the walk collecting only `.rs` files and BOTH git oracles filtering the index down to `.rs`
+/// as well — the oracle sharing the exact assumption it existed to contradict.
+///
+/// The two directives are read with deliberately different strictness, because they are different
+/// words:
+///
+/// * **`include!` is unambiguous.** It names code and nothing else, so it is parsed strictly: all
+///   three bracket shapes, then a plain string literal, then a file that exists inside the
+///   workspace. Anything else — a `concat!(env!("OUT_DIR"), …)`, an argument on the following
+///   line, a path climbing out of the tree — is a hard FAIL. The guard saw a directive and could
+///   not read it, and "I could not look" must never come out as "I looked and it was clean". This
+///   is the same treatment a glob workspace member gets.
+/// * **`path` is an ordinary English word.** `let path = "…"` is not a module redirect, and
+///   `#[cfg_attr(…, path = "…")]` is one under another spelling, so it is detected loosely and
+///   judged by what it names: any `path = "literal"` whose file exists inside the workspace is
+///   scanned. Nothing that ships is missed by being lenient here, because a `#[path]` naming a
+///   file that does not exist does not compile.
+///
+/// `include_str!` / `include_bytes!` are deliberately NOT followed: they produce DATA, not code,
+/// so the method name inside one cannot be a call site — and the crate's JSON schema fixture
+/// legitimately carries `"const": "pane.send_text"`. What stops that data from becoming a method
+/// name on the wire is [`the_request_trait_is_sealed_so_no_foreign_crate_can_choose_a_method`],
+/// not this function.
+fn code_includes(root: &Path, file: &Path, src: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        // Searched in the BLANKED line, so this file's own mentions of both directives — all of
+        // which live in strings and comments — cannot fire. The literal is then read out of the
+        // ORIGINAL line, which `code_only` guarantees is byte-for-byte the same length.
+        let code = code_only(line);
+        for marker in ["include!", "path"] {
+            let strict = marker == "include!";
+            let mut from = 0;
+            while let Some(off) = code[from..].find(marker) {
+                let at = from + off;
+                from = at + marker.len();
+                // `foo_include!` is a different macro; `filepath` is a different word.
+                if code[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    || code[from..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let mut i = skip_ws(line, from);
+                let opener = line.as_bytes().get(i).copied();
+                let wanted: &[u8] = if strict { b"([{" } else { b"=" };
+                if !opener.is_some_and(|o| wanted.contains(&o)) {
+                    assert!(
+                        !strict,
+                        "`include!` in {} does not open with a bracket and a string literal on \
+                         the same line:\n  {}\nThis guard will not guess what it expands to. A \
+                         file the compiler pulls in is code in the operator's binary, so teach \
+                         this function the shape deliberately rather than letting the file \
+                         through unscanned.",
+                        file.display(),
+                        line.trim()
+                    );
+                    continue;
+                }
+                i = skip_ws(line, i + 1);
+                if line.as_bytes().get(i) != Some(&b'"') {
+                    assert!(
+                        !strict,
+                        "`include!` in {} names its target with something other than a plain \
+                         string literal:\n  {}\nThis guard will not guess what it expands to. A \
+                         file the compiler pulls in is code in the operator's binary, so teach \
+                         this function the shape deliberately rather than letting the file \
+                         through unscanned.",
+                        file.display(),
+                        line.trim()
+                    );
+                    continue;
+                }
+                let body = i + 1;
+                let Some(len) = line[body..].find('"') else {
+                    assert!(
+                        !strict,
+                        "unterminated path literal after `include!` in {}:\n  {}",
+                        file.display(),
+                        line.trim()
+                    );
+                    continue;
+                };
+                let named = &line[body..body + len];
+                let dir = file
+                    .parent()
+                    .expect("a scanned file has a parent directory");
+                let target = normalise(&dir.join(named));
+                if !target.starts_with(root) {
+                    assert!(
+                        !strict,
+                        "`include!` in {} names `{named}`, which resolves OUTSIDE the workspace \
+                         ({}). The guard scans the workspace; it cannot vouch for a file it will \
+                         never read.",
+                        file.display(),
+                        target.display()
+                    );
+                    continue;
+                }
+                if !target.is_file() {
+                    assert!(
+                        !strict,
+                        "`include!` in {} names `{named}`, and {} is not a file. Either the path \
+                         is stale, or it names a directory this guard does not know how to \
+                         expand — both are for a human to resolve, not for the guard to skip.",
+                        file.display(),
+                        target.display()
+                    );
+                    continue;
+                }
+                out.push(target);
+            }
+        }
+    }
+    out
+}
+
+/// Every file the compiler can pull into a crate rooted at `from`: the `.rs` files under it, plus
+/// everything a code-inclusion directive in one of them names, transitively.
+///
+/// This is the entry point BOTH textual rules and the git oracle use, so widening it widens all
+/// three at once — which is the point. The walk used to be "collect `.rs`", and every check on it
+/// filtered on `.rs` too, so the extension was an assumption no part of the guard could question.
+fn scanned_sources(root: &Path, from: &Path) -> Vec<PathBuf> {
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue = rust_files(from);
+    while let Some(file) = queue.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let src = fs::read_to_string(&file).unwrap_or_else(|e| {
+            panic!(
+                "the D3 write guard could not read {} ({e}). A guard that cannot see a file the \
+                 compiler reads must not report green.",
+                file.display()
+            )
+        });
+        queue.extend(code_includes(root, &file, &src));
+    }
+    seen.into_iter().collect()
 }
 
 /// Workspace-relative, forward-slashed, for stable comparison against the exemption list.
@@ -242,33 +428,37 @@ fn workspace_members(root: &Path) -> Vec<String> {
 /// say otherwise. `git ls-files` is a source of truth this file had no hand in building: it is, by
 /// definition, the set of files that ship.
 ///
-/// `None` means exactly one thing: there is no `.git` beside `root`, as in a vendored tarball.
-/// EVERY other failure panics — git not on PATH, a non-zero exit, a non-UTF-8 path, an empty
-/// listing. A second opinion the guard could not obtain must never read as agreement.
+/// **There is no `None`.** The first version returned one when `root/.git` did not exist, and the
+/// two oracles answered that with an `eprintln!` and a `return` — which `cargo test` swallows for
+/// a passing test, so the guard silently reverted to its pre-oracle strength and still printed
+/// `ok`. It also mis-read every workspace that is a SUBDIRECTORY of its repository, where there is
+/// no `.git` beside the root and the index is perfectly readable. So the question is put to git
+/// itself rather than to a directory listing, and every failure — no repository, git not on PATH,
+/// a non-zero exit, a non-UTF-8 path, an empty listing — is a hard FAIL. A second opinion the
+/// guard could not obtain must never read as agreement.
 ///
 /// `-z` is load-bearing: without it git quotes non-ASCII paths, and a path containing a newline
 /// would split into two rows. Shelling to git is safe where shelling to cargo was not (see
 /// [`workspace_members`]): this reads `.git/index`, takes no lock, and inside the pre-commit hook
 /// it reads exactly the index that is about to be committed, which is the set we want.
-fn git_tracked(root: &Path) -> Option<Vec<String>> {
-    if !root.join(".git").exists() {
-        return None;
-    }
+fn git_tracked(root: &Path) -> Vec<String> {
     let out = std::process::Command::new("git")
         .args(["ls-files", "-z", "--cached"])
         .current_dir(root)
         .output()
         .unwrap_or_else(|e| {
             panic!(
-                "git could not be run in {} ({e}). There is a .git here, so this cross-check is \
-                 meant to run; a build environment with an index but no git is incoherent, and \
-                 fixing the environment is the answer rather than softening this.",
+                "git could not be run in {} ({e}). This guard's only independent second opinion \
+                 cannot be obtained, and a guard that stops checking must say so rather than \
+                 pass. Fix the environment; do not soften this.",
                 root.display()
             )
         });
     assert!(
         out.status.success(),
-        "`git ls-files` failed in {}: {}",
+        "`git ls-files` failed in {}: {}\nThis is the cross-check that catches a file the scan \
+         never opened, and it cannot run. If this tree is an export with no repository, it cannot \
+         be verified here — build from the repository instead.",
         root.display(),
         String::from_utf8_lossy(&out.stderr).trim()
     );
@@ -285,41 +475,209 @@ fn git_tracked(root: &Path) -> Option<Vec<String>> {
          agree with absolutely anything",
         root.display()
     );
-    Some(files)
+    files
+}
+
+/// Which lines BEGIN inside a string, raw string or block comment that opened on an EARLIER line.
+///
+/// [`code_only`] reads one line at a time, which is safe for the call rule — an unclosed literal
+/// only makes it blank more, and blanking more can only produce a false positive. It is NOT safe
+/// for [`test_line_span`], which decides what to SKIP: the two lines `#[cfg(test)]` and
+/// `mod tests {` written inside a multi-line raw string are prose, and a span opened on them runs
+/// on through real production code. So the one decision that can excuse code gets the whole-file
+/// view that the line-at-a-time scanner cannot give it.
+///
+/// This can only ever make the span refuse to open, never open one it otherwise would not — so a
+/// mistake here costs a false positive, which is the direction this file always errs in.
+fn carried_lines(src: &str) -> Vec<bool> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Carry {
+        None,
+        Str,
+        Raw(usize),
+        Comment(usize),
+    }
+
+    let mut out = Vec::new();
+    let mut carry = Carry::None;
+    for line in src.lines() {
+        out.push(carry != Carry::None);
+        let b = line.as_bytes();
+        let mut i = 0;
+        loop {
+            match carry {
+                Carry::Str => {
+                    let mut closed = false;
+                    while i < b.len() {
+                        if b[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if b[i] == b'"' {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        break;
+                    }
+                    carry = Carry::None;
+                }
+                Carry::Raw(hashes) => {
+                    let mut closed = false;
+                    while i < b.len() {
+                        if b[i] == b'"'
+                            && b.get(i + 1..i + 1 + hashes)
+                                .is_some_and(|t| t.iter().all(|c| *c == b'#'))
+                        {
+                            i += 1 + hashes;
+                            closed = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        break;
+                    }
+                    carry = Carry::None;
+                }
+                Carry::Comment(depth) => {
+                    let mut depth = depth;
+                    let mut closed = false;
+                    while i + 1 < b.len() {
+                        if b[i] == b'/' && b[i + 1] == b'*' {
+                            depth += 1;
+                            i += 2;
+                            continue;
+                        }
+                        if b[i] == b'*' && b[i + 1] == b'/' {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                closed = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        carry = Carry::Comment(depth);
+                        break;
+                    }
+                    carry = Carry::None;
+                }
+                Carry::None => {
+                    if i >= b.len() {
+                        break;
+                    }
+                    // A char literal is consumed whole, for the same reason `code_only` does it:
+                    // the `"` inside `'"'` is not a quote.
+                    if b[i] == b'\''
+                        && let Some(len) = char_literal_len(b, i)
+                    {
+                        i += len;
+                        continue;
+                    }
+                    // A raw-string opener: `r"`, `r#"`, `br##"`, … The body is then left to the
+                    // Raw arm, which closes it on this line or carries it to the next.
+                    let prefix = if b[i] == b'r' {
+                        Some(i + 1)
+                    } else if b[i] == b'b' && b.get(i + 1) == Some(&b'r') {
+                        Some(i + 2)
+                    } else {
+                        None
+                    };
+                    if let Some(first) = prefix
+                        && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                    {
+                        let mut j = first;
+                        while b.get(j) == Some(&b'#') {
+                            j += 1;
+                        }
+                        if b.get(j) == Some(&b'"') {
+                            carry = Carry::Raw(j - first);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        carry = Carry::Comment(1);
+                        i += 2;
+                        continue;
+                    }
+                    // A line comment ends the line; nothing after it can open anything.
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
+                        break;
+                    }
+                    if b[i] == b'"' {
+                        carry = Carry::Str;
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The 0-based line numbers that sit inside a `#[cfg(test)]` module.
 ///
-/// The whole workspace is `cargo fmt`-normalised, so a test module is always the exact line
-/// `#[cfg(test)]` followed by a `mod …{` at the same indentation, closed by a `}` at that same
-/// indentation. That is a narrow rule on purpose: it CANNOT accidentally mark production code as
-/// test code, because a mismatch just means fewer lines are excused and the test gets stricter.
+/// This function decides what the call rule is allowed to SKIP, so every ambiguity in it has to
+/// resolve towards excusing less. It did not, and a reviewer walked through the gap: the closing
+/// line was found by an EXACT match against `}` at the module's indentation, so a module that
+/// closed with `} // tests` was never found, and the span ran on to the next same-indent brace —
+/// or, failing that, to the end of the file — marking whole sibling modules of production code as
+/// test code. `cargo fmt` PRESERVES that trailing comment, so the "the tree is fmt-normalised"
+/// argument the old doc rested on was simply false.
+///
+/// Three rules keep the ambiguity pointed the safe way now:
+///
+/// 1. The close is the first line at the module's indentation whose CODE — comments and strings
+///    blanked by [`code_only`] — begins with `}`. A trailing comment cannot hide it.
+/// 2. If no such line exists, NOTHING is excused. Running to the end of the file was the
+///    fail-open answer to "I could not find the end".
+/// 3. The closing line itself is not excused, so anything written after the brace on that line is
+///    still read as production code.
+/// 4. A `#[cfg(test)]` that is only TEXT — inside a multi-line string or comment, per
+///    [`carried_lines`] — opens nothing. It is the one place in this file that needs a whole-file
+///    view rather than a line at a time, because it is the one place that excuses code.
 fn test_line_span(src: &str) -> Vec<bool> {
     let lines: Vec<&str> = src.lines().collect();
     let mut in_test = vec![false; lines.len()];
+    let carried = carried_lines(src);
 
     let mut i = 0;
     while i < lines.len() {
-        if lines[i].trim() == "#[cfg(test)]" {
+        // A `#[cfg(test)]` inside a multi-line string is TEXT. Opening a span on it excuses every
+        // line down to the next brace at that indentation, which is production code.
+        if lines[i].trim() == "#[cfg(test)]" && !carried[i] && !carried.get(i + 1).unwrap_or(&true)
+        {
             let indent = lines[i].len() - lines[i].trim_start().len();
             // The item it applies to. Only a `mod` opens a span worth tracking; a `#[cfg(test)]`
             // on a single `use` or `fn` covers no call sites we would otherwise excuse.
             if let Some(open) = lines.get(i + 1)
                 && open.trim_start().starts_with("mod ")
-                && open.trim_end().ends_with('{')
+                && code_only(open).trim_end().ends_with('{')
             {
-                let close = format!("{}}}", " ".repeat(indent));
-                let end = lines
-                    .iter()
-                    .enumerate()
-                    .skip(i + 2)
-                    .find(|(_, l)| **l == close)
-                    .map_or(lines.len() - 1, |(n, _)| n);
-                for flag in in_test.iter_mut().take(end + 1).skip(i) {
-                    *flag = true;
+                let end = lines.iter().enumerate().skip(i + 2).find(|(_, l)| {
+                    let code = code_only(l);
+                    let body = code.trim_start();
+                    body.starts_with('}') && code.len() - body.len() == indent
+                });
+                // No closing brace found at this indentation: excuse NOTHING. The old code
+                // excused every remaining line in the file instead.
+                if let Some((end, _)) = end {
+                    for flag in in_test.iter_mut().take(end).skip(i) {
+                        *flag = true;
+                    }
+                    i = end + 1;
+                    continue;
                 }
-                i = end + 1;
-                continue;
             }
         }
         i += 1;
@@ -590,7 +948,7 @@ fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
              guard cannot scan it and will not pretend it did",
             dir.display()
         );
-        let files = rust_files(&dir);
+        let files = scanned_sources(&root, &dir);
         assert!(
             !files.is_empty(),
             "workspace member `{member}` yielded ZERO .rs files. A vacuous scan is not a pass."
@@ -639,7 +997,7 @@ fn no_write_call_site_anywhere_outside_cfg_test() {
 
     // Scanning from the ROOT, not from a list of crate directories: a `.rs` file that is not in any
     // member yet (a half-added crate, a stray example) is still a file someone can `cargo run`.
-    let all = rust_files(&root);
+    let all = scanned_sources(&root, &root);
     assert!(
         all.len() > 10,
         "only {} .rs files found under {} — that is not this workspace; the walk is broken",
@@ -1016,33 +1374,47 @@ fn the_walk_sees_a_source_module_named_target_and_still_skips_build_dirs() {
 
 /// The scan's own coverage, held against a set it did not compute.
 ///
-/// This is the general form of the bug that has now been fixed three times in this file. Each
-/// round fixed one way of looking at too little — two hardcoded directories, an unverified member
-/// list, a bare-name `target` skip — and each round left the class open, because every check the
-/// guard had was computed from the same walk it was supposed to be checking. A guard that cannot
-/// tell you it scanned nothing is not a guard.
+/// This is the general form of the bug that has now been fixed four times in this file. Each round
+/// fixed one way of looking at too little — two hardcoded directories, an unverified member list,
+/// a bare-name `target` skip, a `.rs` extension filter — and the first three rounds left the class
+/// open, because every check the guard had was computed from the same walk it was supposed to be
+/// checking. A guard that cannot tell you it scanned nothing is not a guard.
 ///
-/// The direction is one-way on purpose: every tracked `.rs` must be walked, but the walk may hold
-/// more. Scanning extra files has never been the failure; a shipped file nobody opened is.
+/// Round four is why this test has two clauses instead of one. The oracle DID exist, and a
+/// reviewer walked straight past it anyway: it filtered the git index down to `.rs`, exactly like
+/// the walk it was auditing, so a tracked `relay.inc` with a live `send_text` in it — one
+/// `include!` line from the shipped binary — was invisible to the walk AND to its own second
+/// opinion. **An oracle that shares its subject's blind spot is not an oracle.** So:
+///
+/// 1. every tracked `.rs` must be scanned, whatever the walk thinks of the directory it is in; and
+/// 2. **extension-blind**: any other tracked file inside a workspace member that nothing scanned
+///    must not REACH a write method. `.rs` gets no special standing here — a file is judged by
+///    whether the guard read it and by what is in it.
+///
+/// Clause 2 stops at member directories because that is where crate sources live, and files
+/// further out are covered from the other side: [`scanned_sources`] FOLLOWS a code inclusion
+/// wherever it points, and [`code_includes`] hard-fails on an inclusion it cannot resolve from the
+/// source tree. There is no third way for a file to become code.
+///
+/// The `.rs` direction is one-way on purpose: every tracked `.rs` must be scanned, but the scan
+/// may hold more. Scanning extra files has never been the failure; a shipped file nobody opened is.
 ///
 /// Tracked paths are filtered to ones that exist on disk, so a file staged for deletion is not
 /// blamed on the walk. That is not a way out for a skipped directory — its files are all still
 /// sitting there.
 #[test]
-fn every_git_tracked_rust_file_is_actually_walked() {
+fn every_file_that_ships_is_scanned_or_carries_no_write() {
     let root = workspace_root();
-    let Some(tracked) = git_tracked(&root) else {
-        eprintln!(
-            "no .git under {} — walk cross-check skipped",
-            root.display()
-        );
-        return;
-    };
-
-    let ships: Vec<String> = tracked
+    let on_disk: Vec<String> = git_tracked(&root)
         .into_iter()
-        .filter(|p| p.ends_with(".rs") && root.join(p).is_file())
+        .filter(|p| root.join(p).is_file())
         .collect();
+    let scanned: BTreeSet<String> = scanned_sources(&root, &root)
+        .iter()
+        .map(|f| rel(&root, f))
+        .collect();
+
+    let ships: Vec<&String> = on_disk.iter().filter(|p| p.ends_with(".rs")).collect();
     assert!(
         ships.len() > 10,
         "only {} tracked .rs files under {} — an oracle that finds almost nothing agrees with \
@@ -1051,13 +1423,11 @@ fn every_git_tracked_rust_file_is_actually_walked() {
         root.display()
     );
 
-    let walked: BTreeSet<String> = rust_files(&root).iter().map(|f| rel(&root, f)).collect();
     let missed: Vec<&str> = ships
         .iter()
-        .filter(|p| !walked.contains(*p))
-        .map(String::as_str)
+        .filter(|p| !scanned.contains(**p))
+        .map(|p| p.as_str())
         .collect();
-
     assert!(
         missed.is_empty(),
         "{} of {} git-tracked .rs files were never opened by the scan. These files SHIP, and this \
@@ -1067,6 +1437,35 @@ fn every_git_tracked_rust_file_is_actually_walked() {
         missed.len(),
         ships.len(),
         missed.join("\n  ")
+    );
+
+    // Clause 2. Nothing here looks at an extension.
+    let members = workspace_members(&root);
+    let mut unread_reach = Vec::new();
+    let mut unread = 0usize;
+    for path in &on_disk {
+        if scanned.contains(path) || !members.iter().any(|m| path.starts_with(&format!("{m}/"))) {
+            continue;
+        }
+        unread += 1;
+        // Lossy on purpose: a fixture full of terminal escapes is still a file to look through,
+        // and refusing to decode one would be a way to stop looking.
+        let bytes = fs::read(root.join(path)).expect("a tracked file in this repo is readable");
+        for (n, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+            if let Some(name) = write_reach_on(line) {
+                unread_reach.push(format!("{path}:{}: [{name}] {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        unread_reach.is_empty(),
+        "{unread} tracked files inside a workspace member were never opened by the scan, and {} \
+         of their lines REACH a write method. The extension is not the question — whether the \
+         guard read the file is. If the compiler pulls this file in, make the scan follow it \
+         (see `code_includes`); if it does not, the write reference does not belong there. \
+         Found:\n  {}",
+        unread_reach.len(),
+        unread_reach.join("\n  ")
     );
 }
 
@@ -1079,13 +1478,7 @@ fn every_git_tracked_rust_file_is_actually_walked() {
 #[test]
 fn every_crate_that_ships_is_a_declared_workspace_member() {
     let root = workspace_root();
-    let Some(tracked) = git_tracked(&root) else {
-        eprintln!(
-            "no .git under {} — member cross-check skipped",
-            root.display()
-        );
-        return;
-    };
+    let tracked = git_tracked(&root);
 
     let declared: BTreeSet<String> = workspace_members(&root).into_iter().collect();
     // The root manifest has no `/` before it and drops out of this on its own.
@@ -1182,5 +1575,295 @@ fn a_manifest_that_declares_default_members_first_still_finds_the_real_member_li
         vec!["crates/one".to_owned(), "crates/two".to_owned()],
         "the parser picked up `default-members` instead of `members`, so rule 1 would scan a \
          shorter list than the workspace actually ships"
+    );
+}
+
+/// Regression: a file the compiler pulls in is scanned like the `.rs` file that names it.
+///
+/// The walk collected `.rs` files, and BOTH git oracles filtered the index down to `.rs` too — so
+/// the oracle shared the exact assumption it existed to contradict. A tracked `relay.inc` holding
+/// a live `send_text`, pulled into the shipped binary by a one-line `include!`, was invisible to
+/// every rule and to both oracles, with the word `send_text` sitting in plain sight in a committed
+/// file and all five gates green.
+#[test]
+fn a_file_pulled_in_by_include_or_path_is_scanned_like_the_rs_file_that_names_it() {
+    let tmp = tempfile::tempdir().expect("a tempdir to build the synthetic workspace in");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("crates/demo/src")).expect("the synthetic tree is creatable");
+    let put = |p: &str, body: &str| {
+        fs::write(root.join(p), body).expect("the synthetic workspace files are writable")
+    };
+    put("Cargo.toml", "[workspace]\nmembers = [\"crates/demo\"]\n");
+    put("crates/demo/Cargo.toml", "[package]\nname = \"demo\"\n");
+    put(
+        "crates/demo/src/lib.rs",
+        "pub mod relay;\n#[path = \"redirected.txt\"]\npub mod redirected;\n",
+    );
+    put("crates/demo/src/relay.rs", "include!(\"relay.inc\");\n");
+    let plant = "pub async fn relay(c: &C, p: &P) { let _ = c.send_text(p, \"oops\").await; }\n";
+    put("crates/demo/src/relay.inc", plant);
+    put(
+        "crates/demo/src/redirected.txt",
+        "pub fn r(c: &C, p: &P) { c.send_keys(p, &k); }\n",
+    );
+
+    let seen: BTreeSet<String> = scanned_sources(root, root)
+        .iter()
+        .map(|f| rel(root, f))
+        .collect();
+
+    assert!(
+        seen.contains("crates/demo/src/relay.inc"),
+        "a file `include!`d into a crate is CODE in the shipped binary, and the scan never opened \
+         it. Saw: {seen:?}"
+    );
+    assert!(
+        seen.contains("crates/demo/src/redirected.txt"),
+        "a `#[path]` attribute makes any file a module, whatever it is called, and the scan never \
+         opened it. Saw: {seen:?}"
+    );
+    assert_eq!(
+        write_reach_on(plant.lines().next().expect("the plant is one line")),
+        Some("send_text"),
+        "the planted line is one the scanner already knows how to catch — reaching it was the \
+         only thing ever missing"
+    );
+}
+
+/// Regression: a `#[cfg(test)] mod` whose closing brace carries a trailing comment must not
+/// excuse the production code that follows it.
+///
+/// The span ended at the first line that EXACTLY equalled `}` at the module's indentation, so
+/// `} // tests` did not match, and the span ran on to the next same-indent brace — or to EOF —
+/// marking sibling production modules as test code. `cargo fmt` PRESERVES that trailing comment,
+/// so the "the tree is fmt-normalised" argument did not hold. A publicly exported, unaudited
+/// keystroke path was excused this way with all five gates green.
+#[test]
+fn a_test_module_closed_with_a_trailing_comment_does_not_excuse_the_code_after_it() {
+    let src = "\
+mod a {
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn nothing() {}
+    } // tests
+}
+
+pub mod b {
+    pub async fn probe(c: &crate::HerdrClient, p: &crate::PaneId) {
+        let _ = c.send_text(p, \"rm -rf ~\").await;
+    }
+}
+";
+    let in_test = test_line_span(src);
+    let live = src
+        .lines()
+        .position(|l| l.contains("c.send_text("))
+        .expect("the planted call is in the fixture");
+
+    assert!(
+        !in_test[live],
+        "the call on line {} sits in a SIBLING module, outside every `#[cfg(test)]`, and the span \
+         excused it. Everything the trailing comment swallowed is production code the call rule \
+         then skipped.",
+        live + 1
+    );
+    // The real test body is still excused, or the fix would just be "excuse nothing".
+    let inside = src
+        .lines()
+        .position(|l| l.contains("fn nothing()"))
+        .expect("the test fn is in the fixture");
+    assert!(
+        in_test[inside],
+        "the body of the `#[cfg(test)]` module must still be excused"
+    );
+}
+
+/// Regression: a workspace root BELOW the repository root still gets its second opinion.
+///
+/// The oracles asked `root.join(".git").exists()`, so a workspace checked out as a subdirectory of
+/// a larger repository — or copied into a build context — answered "no index here", and both
+/// oracles returned early after an `eprintln!` that `cargo test` swallows for a passing test. The
+/// guard silently reverted to its pre-oracle strength and still printed `ok`. Fail closed: ask git
+/// where the repository is instead of guessing from a directory listing.
+#[test]
+fn a_workspace_root_below_the_repository_root_still_gets_its_second_opinion() {
+    let tmp = tempfile::tempdir().expect("a tempdir to init a repository in");
+    let repo = tmp.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    fs::create_dir_all(repo.join("workspace/crates/demo/src")).expect("the tree is creatable");
+    fs::write(repo.join("top.md"), "not part of the workspace\n").expect("writable");
+    fs::write(
+        repo.join("workspace/crates/demo/src/lib.rs"),
+        "pub fn demo() {}\n",
+    )
+    .expect("writable");
+    git(&["add", "-A"]);
+
+    let tracked = git_tracked(&repo.join("workspace"));
+    assert!(
+        tracked.contains(&"crates/demo/src/lib.rs".to_owned()),
+        "the workspace sits below the repository root, so there is no `.git` beside it — and the \
+         guard answered `no index` and stopped cross-checking anything. Got: {tracked:?}"
+    );
+}
+
+/// The deny-by-default half of the include fix: an inclusion the guard cannot resolve is a FAIL.
+///
+/// Following a literal `include!("relay.inc")` is only worth having if the alternative spellings
+/// cannot be used to slip past it. `include!(concat!(env!("OUT_DIR"), "/gen.rs"))` names a file
+/// that does not exist in the source tree at all — a build script generating a call site is
+/// exactly the shape a human has to look at — and a path climbing out of the workspace names a
+/// file this guard will never read. Neither may be quietly skipped, so both panic. Same treatment
+/// as a glob workspace member.
+#[test]
+fn an_inclusion_the_guard_cannot_resolve_fails_rather_than_being_skipped() {
+    let refuses = |body: &str| -> String {
+        let tmp = tempfile::tempdir().expect("a tempdir for the synthetic crate");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).expect("the synthetic tree is creatable");
+        fs::write(root.join("src/lib.rs"), body).expect("writable");
+        let hushed = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| scanned_sources(root, root));
+        std::panic::set_hook(hushed);
+        let err = outcome.expect_err(
+            "an inclusion the guard cannot resolve was accepted in silence. Skipping it is how a \
+             generated call site ships unread.",
+        );
+        err.downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "<non-string panic>".to_owned())
+    };
+
+    let computed = refuses("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
+    assert!(
+        computed.contains("will not guess"),
+        "a computed include must say why it is refused, got: {computed}"
+    );
+
+    let escaping = refuses("include!(\"../../../etc/hosts\");\n");
+    assert!(
+        escaping.contains("OUTSIDE the workspace"),
+        "an include climbing out of the workspace must say so, got: {escaping}"
+    );
+
+    // And the shapes that merely LOOK like one must not fire: a longer macro name, a different
+    // attribute, and the data-only inclusions the crate really uses.
+    let tmp = tempfile::tempdir().expect("a tempdir for the synthetic crate");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).expect("the synthetic tree is creatable");
+    fs::write(root.join("src/fixture.json"), "{}\n").expect("writable");
+    fs::write(
+        root.join("src/lib.rs"),
+        "const F: &str = include_str!(\"fixture.json\");\nfn my_include!() {}\n#[pathological]\nfn \
+         x() {}\n",
+    )
+    .expect("writable");
+    let seen: BTreeSet<String> = scanned_sources(root, root)
+        .iter()
+        .map(|f| rel(root, f))
+        .collect();
+    assert_eq!(
+        seen,
+        BTreeSet::from(["src/lib.rs".to_owned()]),
+        "`include_str!` is DATA — the crate's JSON schema fixture legitimately carries \
+         `\"const\": \"pane.send_text\"`, and what stops that becoming a method name on the wire \
+         is the seal, not this walk. `my_include!` and `#[pathological]` are neither."
+    );
+}
+
+/// The same class again, turned on the fix itself: a `#[cfg(test)]` that is TEXT must not open a
+/// span.
+///
+/// [`test_line_span`] reads one line at a time, so a raw string that runs across several lines is
+/// not string content to it — it is code. Write the two lines `#[cfg(test)]` and `mod tests {`
+/// inside one and the span opens on prose, then runs to the next brace at that indentation and
+/// excuses every line of production code in between. Fixing the trailing-comment close without
+/// fixing this would have moved the hole rather than shut it.
+#[test]
+fn a_cfg_test_attribute_inside_a_multi_line_string_does_not_open_a_span() {
+    let src = "\
+const DOC: &str = r#\"
+#[cfg(test)]
+mod tests {
+\"#;
+
+pub async fn evil(c: &crate::HerdrClient, p: &crate::PaneId) {
+    let _ = c.send_text(p, \"rm -rf ~\").await;
+}
+";
+    let in_test = test_line_span(src);
+    let live = src
+        .lines()
+        .position(|l| l.contains("c.send_text("))
+        .expect("the planted call is in the fixture");
+    assert!(
+        !in_test[live],
+        "the two lines that opened the span are the CONTENTS of a raw string, and the call on \
+         line {} is ordinary production code the span went on to excuse.",
+        live + 1
+    );
+}
+
+/// The other half of deny-by-default: a directive the guard RECOGNISES but cannot read must fail.
+///
+/// `include!` accepts all three bracket shapes and may put its argument on the next line, and
+/// `#[cfg_attr(…, path = "…")]` is a `#[path]` by another spelling. Each of those was a silent
+/// `continue` in the first version of the fix — the guard saw the word, could not parse what
+/// followed, and moved on. That is the same "I could not look, so it must be clean" the whole
+/// file exists to refuse.
+#[test]
+fn an_inclusion_the_guard_recognises_but_cannot_read_is_a_failure_not_a_shrug() {
+    let tmp = tempfile::tempdir().expect("a tempdir for the synthetic crate");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).expect("the synthetic tree is creatable");
+    let plant = "pub fn r(c: &C, p: &P) { c.send_keys(p, &k); }\n";
+    fs::write(root.join("src/evil.txt"), plant).expect("writable");
+    fs::write(root.join("src/braced.inc"), plant).expect("writable");
+
+    let sources = |body: &str| -> BTreeSet<String> {
+        fs::write(root.join("src/lib.rs"), body).expect("writable");
+        scanned_sources(root, root)
+            .iter()
+            .map(|f| rel(root, f))
+            .collect()
+    };
+
+    assert!(
+        sources("include!{\"braced.inc\"}\n").contains("src/braced.inc"),
+        "`include!` takes all three bracket shapes, and a file included with braces is code just \
+         the same"
+    );
+    assert!(
+        sources("#[cfg_attr(all(), path = \"evil.txt\")]\nmod outside;\n").contains("src/evil.txt"),
+        "`cfg_attr` spells `#[path]` too, and the module it names is code in the crate"
+    );
+
+    // An argument on the next line: recognised, unreadable, therefore fatal.
+    fs::write(
+        root.join("src/lib.rs"),
+        "include!(\n    \"braced.inc\"\n);\n",
+    )
+    .expect("writable");
+    let hushed = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(|| scanned_sources(root, root));
+    std::panic::set_hook(hushed);
+    outcome.expect_err(
+        "an `include!` whose argument is on the following line was skipped in silence. The guard \
+         saw the directive and could not read it — that has to be loud.",
     );
 }
