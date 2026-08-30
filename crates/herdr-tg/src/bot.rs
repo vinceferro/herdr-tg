@@ -42,8 +42,9 @@ use crate::config::Config;
 use crate::deliver::{self, Settle};
 use crate::mirror::Mirror;
 use crate::notify::{self, Ask, Beat, Timing};
+use crate::permission::Screen;
 use crate::render::{self, escape_html};
-use crate::routing::{Routing, Target};
+use crate::routing::{PromptRecord, Routing, Target};
 use crate::voice::{self, Place, Reason};
 
 /// Telegram's hard limit on a message body. Exceeding it is a 400 from the API, which in a
@@ -136,10 +137,19 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
 
     let routing_path = Routing::default_path();
     let audit = Arc::new(Audit::new(Audit::default_path()));
+
+    // A state file written before routing was filed by chat is re-filed as it is read. Write it
+    // back straight away: until something saves, the move lives only in memory, so every restart
+    // would do it again and repeat its warnings.
+    let routing = Routing::load(&routing_path, config.forum_chat_id);
+    if let Err(e) = routing.save(&routing_path) {
+        tracing::warn!(error = %e, "could not write the routing state back after re-filing it by chat");
+    }
+
     let ctx = Ctx {
         client: Arc::new(client),
         gate: Arc::new(gate),
-        routing: Arc::new(Mutex::new(Routing::load(&routing_path))),
+        routing: Arc::new(Mutex::new(routing)),
         audit: Arc::clone(&audit),
         submit: config.submit_key.clone(),
         workspace: config.workspace.clone(),
@@ -268,7 +278,23 @@ fn place(ctx: &Ctx) -> Place {
     }
 }
 
+/// What the operator is told when they try to aim replies inside the group that has topics.
+const TOPIC_IS_THE_AIM: &str =
+    "In this group each session has its own topic — open the one you want and reply there.";
+
+/// Whether "send my replies here" means anything in this chat.
+///
+/// In the group with topics it does not: the topic is the aim, and a message typed outside one now
+/// gets a picker. Offering the button there would promise an aim nothing honours.
+fn sticky_offered(forum: Option<ChatId>, chat: ChatId) -> bool {
+    forum != Some(chat)
+}
+
 /// Send into a pane's topic, creating it if this pane has never had one.
+///
+/// Returns the chat and message id of everything that actually went out, so a caller that drew
+/// buttons can write down which menu each one was drawn for. A send that failed is simply absent:
+/// there is no message for the operator to tap, so there is nothing to remember.
 async fn say_in_topic(
     bot: &Bot,
     ctx: &Ctx,
@@ -277,10 +303,11 @@ async fn say_in_topic(
     workspace: &str,
     body: &str,
     keyboard: Option<InlineKeyboardMarkup>,
-) {
+) -> Vec<(i64, i64)> {
+    let mut sent_to = Vec::new();
     if let Some(forum) = ctx.forum {
         let Some(thread) = topic_for(bot, ctx, forum, pane, workspace).await else {
-            return;
+            return sent_to;
         };
         let mut req = bot
             .send_message(forum, body)
@@ -292,12 +319,13 @@ async fn say_in_topic(
         match req.await {
             Ok(sent) => {
                 let mut r = ctx.routing.lock().await;
-                r.record_push(sent.id.0 as i64, pane);
+                r.record_push(forum.0, sent.id.0 as i64, pane);
                 let _ = r.save(&Routing::default_path());
+                sent_to.push((forum.0, sent.id.0 as i64));
             }
             Err(e) => tracing::error!(error = %e, "could not send into the topic"),
         }
-        return;
+        return sent_to;
     }
     for chat in chats {
         let mut req = bot
@@ -308,10 +336,12 @@ async fn say_in_topic(
         }
         if let Ok(sent) = req.await {
             let mut r = ctx.routing.lock().await;
-            r.record_push(sent.id.0 as i64, pane);
+            r.record_push(*chat, sent.id.0 as i64, pane);
             let _ = r.save(&Routing::default_path());
+            sent_to.push((*chat, sent.id.0 as i64));
         }
     }
+    sent_to
 }
 
 async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
@@ -327,31 +357,213 @@ async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
         !ask.options.is_empty(),
         gist.as_deref(),
     );
+    // The menu buttons are drawn wherever the push lands. The "send my replies here" button is
+    // not: in the group with topics it would aim at something nothing reads.
     let keyboard = if ask.options.is_empty() {
-        InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
-            "📌 Send my replies here",
-            format!("t|{}", ask.pane.as_str()),
-        )]])
+        ctx.forum.is_none().then(|| {
+            InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
+                "📌 Send my replies here",
+                format!("t|{}", ask.pane.as_str()),
+            )]])
+        })
     } else {
-        InlineKeyboardMarkup::new([ask
+        Some(InlineKeyboardMarkup::new([ask
             .options
             .iter()
             .enumerate()
             .map(|(i, o)| {
                 InlineKeyboardButton::callback(o.clone(), format!("c|{}|{i}", ask.pane.as_str()))
             })
-            .collect::<Vec<_>>()])
+            .collect::<Vec<_>>()]))
     };
-    say_in_topic(
-        bot,
-        ctx,
-        chats,
-        &ask.pane,
-        &ask.workspace,
-        &body,
-        Some(keyboard),
+    let sent_to = say_in_topic(bot, ctx, chats, &ask.pane, &ask.workspace, &body, keyboard).await;
+
+    // The buttons carry a position, which means nothing once the menu redraws. The labels they
+    // showed are written down here, beside the message they are attached to, and a tap is answered
+    // against this. A tap with nothing written down is refused — which is the point: an answer must
+    // go to the question the operator read.
+    if !ask.options.is_empty() && !sent_to.is_empty() {
+        let mut r = ctx.routing.lock().await;
+        for (chat, message_id) in &sent_to {
+            r.record_prompt(*chat, *message_id, &ask.pane, ask.seq, &ask.options);
+        }
+        let _ = r.save(&Routing::default_path());
+    }
+}
+
+/// A tap, once it has been matched to the menu its buttons were drawn for.
+#[derive(Debug, PartialEq, Eq)]
+enum Tap {
+    /// The label the tapped button displayed, and the whole menu it was one of.
+    Answer {
+        pane: PaneId,
+        label: String,
+        drawn_from: Vec<String>,
+        /// Where the session stood when those buttons were drawn, as the herd reported it then.
+        /// `None` means it did not report it — see [`still_the_same_question`].
+        seq: Option<u64>,
+    },
+    /// Nothing may be pressed. Carries what the operator is told.
+    Refuse(Reason),
+}
+
+/// Match `c|<pane>|<position>` to the menu those buttons were drawn for.
+///
+/// Pure, so every way this can refuse is testable without a terminal. The button's payload carries
+/// a POSITION, which is a fact about a menu that was on screen at some point in the past — a
+/// Telegram button stays tappable forever. So the position is read against the menu that was
+/// written down when the buttons were drawn, and the pane in the payload is only a cross-check.
+/// Nothing written down means nothing to answer, and that refuses.
+fn resolve_tap(recalled: Option<&PromptRecord>, chat: i64, pane: &str, position: &str) -> Tap {
+    let Some(record) = recalled else {
+        return Tap::Refuse(Reason::ButtonExpired);
+    };
+    if record.chat != chat || record.pane != pane {
+        tracing::warn!(
+            chat,
+            pane,
+            recorded_chat = record.chat,
+            recorded_pane = %record.pane,
+            "a tap did not match the question written down for its message — refused"
+        );
+        return Tap::Refuse(Reason::ButtonExpired);
+    }
+    let Ok(i) = position.parse::<usize>() else {
+        return Tap::Refuse(Reason::ButtonExpired);
+    };
+    let Some(label) = record.options.get(i) else {
+        return Tap::Refuse(Reason::ButtonExpired);
+    };
+    Tap::Answer {
+        pane: PaneId::new(record.pane.clone()),
+        label: label.clone(),
+        drawn_from: record.options.clone(),
+        seq: record.seq,
+    }
+}
+
+/// Telegram shows the answer to a tap as a small plain-text toast, so the markup a chat message
+/// carries has to come out or the operator reads the tags. Also short: the toast is capped.
+fn toast(html: &str) -> String {
+    render::plain_text(html).chars().take(190).collect()
+}
+
+/// Is the session still on the question those buttons were drawn for?
+///
+/// The only evidence there is: where the herd said the session's run of work stood when the buttons
+/// were drawn, against where it says it stands now. A tapped button is evidence about the past and
+/// nothing else — it stays tappable for as long as its message exists — and this is the one check
+/// that catches a tap landing on a LATER question whose options happen to read the same.
+///
+/// So a herd that does not report that at all leaves the check with nothing to stand on, and the
+/// answer is no. Comparing two absences as though they were the same number is how this guard used
+/// to pass for every pane and every question on such a herd, silently and invisibly.
+fn still_the_same_question(now: Option<u64>, drawn_at: Option<u64>) -> bool {
+    match (now, drawn_at) {
+        (Some(now), Some(drawn_at)) => now == drawn_at,
+        _ => false,
+    }
+}
+
+/// Answer one tapped button, after proving the question it was drawn for is still the one being
+/// asked.
+///
+/// "The operator tapped it" is evidence about the past and nothing else — a Telegram button stays
+/// tappable for as long as its message exists. So three separate things have to still be true, and
+/// each of them refuses rather than guesses:
+///
+/// 1. the session is still at the same point in its work as when the buttons were drawn,
+/// 2. the menu on screen still reads exactly as the buttons did, and
+/// 3. the tapped label still names exactly one option on it.
+///
+/// Checks 2 and 3 belong to [`deliver::choose`], which looks at the pane itself; this function owns
+/// the first, and owns the rule that nothing is pressed that could not be written down first.
+async fn answer_dialog(
+    ctx: &Ctx,
+    chat_id: i64,
+    pane: &PaneId,
+    label: &str,
+    drawn_from: &[String],
+    seq: Option<u64>,
+) -> String {
+    let at = timestamp();
+    match ctx.client.agents().await {
+        Err(e) => {
+            tracing::warn!(error = %e, "could not look at the herd for a tapped button");
+            let _ = ctx
+                .audit
+                .refused(&at, chat_id, pane, "the herd was unreachable");
+            return voice::nothing_sent(Reason::HerdUnreachable);
+        }
+        Ok(agents) => match agents.iter().find(|a| a.pane_id == *pane) {
+            None => {
+                let _ = ctx
+                    .audit
+                    .refused(&at, chat_id, pane, "that session has left the herd");
+                return voice::nothing_sent(Reason::TargetGone);
+            }
+            Some(a) if !still_the_same_question(a.state_change_seq, seq) => {
+                let stood =
+                    |s: Option<u64>| s.map_or_else(|| "unknown".to_string(), |n| n.to_string());
+                let _ = ctx.audit.refused(
+                    &at,
+                    chat_id,
+                    pane,
+                    &format!(
+                        "could not prove that session is still on the question those buttons were \
+                         drawn for (drawn at {}, now {})",
+                        stood(seq),
+                        stood(a.state_change_seq)
+                    ),
+                );
+                return voice::nothing_sent(match (a.state_change_seq, seq) {
+                    (Some(_), Some(_)) => Reason::PromptChanged,
+                    _ => Reason::CannotTellIfMovedOn,
+                });
+            }
+            Some(_) => {}
+        },
+    }
+
+    // Written once every check has passed and immediately before the keys, so a record that stands
+    // alone means the bridge died mid-write and nothing else. And this bridge does not press a key
+    // it cannot write down — the typed path has always refused here; this one used to shrug and
+    // press anyway.
+    if let Err(e) = ctx
+        .audit
+        .sent(&at, chat_id, pane, &format!("[button] {label}"))
+    {
+        tracing::error!(error = %e, "could not write the record of what was about to be pressed; refusing");
+        return voice::nothing_sent(Reason::NoAudit);
+    }
+
+    match deliver::choose(
+        &*ctx.client,
+        pane,
+        deliver::Choice::Button { label, drawn_from },
+        Settle::default(),
+        |d| Box::pin(tokio::time::sleep(d)),
     )
-    .await;
+    .await
+    {
+        Ok(Ok(c)) => {
+            let _ = ctx.audit.outcome(&timestamp(), &c.delivery);
+            // The label a settled read showed highlighted just before the confirm key — and it is
+            // the agent's own words, so it is escaped before it reaches a message.
+            escape_html(&c.delivery.detail)
+        }
+        Ok(Err(why)) => {
+            let _ = ctx
+                .audit
+                .refused(&timestamp(), chat_id, pane, &format!("{why:?}"));
+            voice::nothing_sent(refusal_reason(why))
+        }
+        Err(e) => {
+            let _ = ctx.audit.failed(&timestamp(), pane, &e.to_string());
+            tracing::error!(error = %e, "the tapped answer failed to send");
+            voice::nothing_sent(Reason::HerdUnreachable)
+        }
+    }
 }
 
 /// A button tap: choose a dialog option, or aim replies at a pane.
@@ -369,47 +581,47 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     };
 
     let reply = match data.split('|').collect::<Vec<_>>().as_slice() {
+        // This also answers taps on buttons still sitting in the group's history from before the
+        // topic became the aim.
+        ["t", _] if !sticky_offered(ctx.forum, ChatId(chat_id)) => escape_html(TOPIC_IS_THE_AIM),
         ["t", pane] => {
             let p = PaneId::new(*pane);
             let mut r = ctx.routing.lock().await;
             r.set_sticky(chat_id, &p);
             let _ = r.save(&Routing::default_path());
-            format!("📌 Replies now go to {pane}")
+            format!("📌 Replies now go to {}", escape_html(pane))
         }
-        ["c", pane, idx] => {
-            let p = PaneId::new(*pane);
-            let want = idx.to_string();
-            // `choose` re-parses the dialog from a fresh read, so the arrow count comes from the
-            // selection as it is NOW. The index is 0-based here; match_option takes 1-based.
-            let one_based = idx.parse::<usize>().map(|i| i + 1).unwrap_or(0).to_string();
-            let at = timestamp();
-            let _ = ctx
-                .audit
-                .sent(&at, chat_id, &p, &format!("[button] option {want}"));
-            match deliver::choose(&*ctx.client, &p, &one_based, Settle::default(), |d| {
-                Box::pin(tokio::time::sleep(d))
-            })
-            .await
-            {
-                Ok(Ok(d)) => {
-                    let _ = ctx.audit.outcome(&timestamp(), &d);
-                    d.detail
-                }
-                Ok(Err(why)) => why,
-                Err(e) => {
-                    let _ = ctx.audit.failed(&timestamp(), &p, &e.to_string());
-                    format!("failed: {e}")
-                }
+        ["c", pane, position] => {
+            let on_message = q.message.as_ref().map(|m| m.id().0 as i64);
+            // Cloned, and the lock dropped, before anything that waits: this is the only thing
+            // held while the answer goes out to a terminal.
+            let recalled = match on_message {
+                Some(id) => ctx.routing.lock().await.prompt_for(chat_id, id).cloned(),
+                None => None,
+            };
+            match resolve_tap(recalled.as_ref(), chat_id, pane, position) {
+                Tap::Refuse(reason) => voice::nothing_sent(reason),
+                Tap::Answer {
+                    pane,
+                    label,
+                    drawn_from,
+                    seq,
+                } => answer_dialog(&ctx, chat_id, &pane, &label, &drawn_from, seq).await,
             }
         }
         _ => "I don't recognise that button".to_string(),
     };
 
     // Answer the query first, or Telegram leaves a spinner on the button.
-    let _ = bot.answer_callback_query(q.id.clone()).text(&reply).await;
+    let _ = bot
+        .answer_callback_query(q.id.clone())
+        .text(toast(&reply))
+        .await;
     if let Some(msg) = q.message.as_ref() {
+        // `reply` is written for the chat and already carries this bridge's markup; anything an
+        // agent wrote inside it was escaped where it was put in.
         let _ = bot
-            .send_message(msg.chat().id, escape_html(&reply))
+            .send_message(msg.chat().id, &reply)
             .parse_mode(ParseMode::Html)
             .await;
     }
@@ -459,7 +671,13 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
             Err(e) => escape_html(&format!("herdr unreachable: {e}")),
         },
         Command::Target(ref raw) => {
-            set_target(&ctx.client, &ctx.routing, chat_id, raw.trim()).await
+            if sticky_offered(ctx.forum, msg.chat.id) {
+                set_target(&ctx.client, &ctx.routing, chat_id, raw.trim()).await
+            } else {
+                escape_html(&format!(
+                    "{TOPIC_IS_THE_AIM} /target aims replies in the direct chat."
+                ))
+            }
         }
         Command::Doctor => match ctx.client.handshake().await {
             Ok(h) => escape_html(&format!(
@@ -490,6 +708,20 @@ async fn panes_switcher(bot: &Bot, ctx: &Ctx, chat: ChatId) -> anyhow::Result<()
             return Ok(());
         }
     };
+    if !sticky_offered(ctx.forum, chat) {
+        reply(
+            bot,
+            chat,
+            &format!(
+                "{}\n\n<i>{}</i>",
+                fit(render::herd_telegram(&snap)),
+                escape_html(TOPIC_IS_THE_AIM)
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
     let labels: std::collections::BTreeMap<_, _> = snap
         .workspaces
         .iter()
@@ -581,6 +813,58 @@ fn fit(html: String) -> String {
     format!("{kept}\n… truncated to fit Telegram's {TELEGRAM_MAX_CHARS}-character limit.")
 }
 
+/// What a reply is allowed to do to a pane.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyPath {
+    /// A menu we resolved: answer it with keys, never with words.
+    Choice(crate::permission::Prompt),
+    /// Write nothing at all, and say why.
+    Refuse(Reason),
+    /// Ordinary output. The text path is safe.
+    Text,
+}
+
+/// Decide the path from what the pane looks like. `None` means the look itself failed.
+///
+/// Fails CLOSED in both directions. A pane the bridge could not look at is not evidence of ordinary
+/// output, and a menu it could not read is not evidence of ordinary output either — on either,
+/// words go nowhere and the confirm key after them presses whatever is highlighted, which on a
+/// permission prompt is a grant the operator never made.
+fn reply_path(ansi: Option<&str>) -> ReplyPath {
+    let Some(ansi) = ansi else {
+        // Say the true thing: the bridge could not reach the pane. Telling the operator about a
+        // menu it never saw would be a guess dressed up as an observation.
+        return ReplyPath::Refuse(Reason::HerdUnreachable);
+    };
+    match crate::permission::classify(ansi) {
+        Screen::Dialog(p) => ReplyPath::Choice(p),
+        Screen::UnreadableControl => ReplyPath::Refuse(Reason::UnreadablePrompt),
+        Screen::Prose => ReplyPath::Text,
+    }
+}
+
+/// Say, in the operator's words, why nothing was confirmed.
+///
+/// Every arm means the same thing about the answer — no option was confirmed — and differs in what
+/// the operator can do about it. It does NOT follow that the terminal was left untouched: the
+/// highlight may have been moved before the bridge stopped, which is what `keys_sent` carries. An
+/// operator told "nothing was typed into that terminal" about a menu whose highlight moved goes to
+/// their keyboard expecting it where they left it.
+fn refusal_reason(refused: deliver::ChoiceRefused) -> Reason {
+    match refused {
+        deliver::ChoiceRefused::NotADialog => Reason::NoLongerAsking,
+        // Still asking, still unreadable. Saying it stopped asking would be false, and the advice
+        // that goes with it — "have a look at what it is showing now" — is not the advice that
+        // applies here.
+        deliver::ChoiceRefused::Unreadable => Reason::UnreadablePrompt,
+        deliver::ChoiceRefused::Unclear { options } => Reason::UnclearChoice(options),
+        deliver::ChoiceRefused::Changed { .. } => Reason::PromptChanged,
+        deliver::ChoiceRefused::NotConfirmed { why, keys_sent } => {
+            Reason::ChoiceNotConfirmed { why, keys_sent }
+        }
+    }
+}
+
 /// Route a reply, deliver it, audit it, and tell the operator exactly what was observed.
 ///
 /// The confirmation is the product's honesty surface. It names the pane, names *why* that pane was
@@ -604,10 +888,11 @@ async fn route_and_deliver(
     };
 
     let pl = place(ctx);
-    let target = routing
-        .lock()
-        .await
-        .resolve(chat_id, reply_to, thread_id, &snap);
+    let target =
+        routing
+            .lock()
+            .await
+            .resolve(chat_id, ctx.forum.map(|c| c.0), reply_to, thread_id, &snap);
     let (pane, _why) = match target {
         Target::Pane { pane, why } => (pane, why),
         // PLAN.md's failure table: never silently reroute a dead target.
@@ -629,41 +914,58 @@ async fn route_and_deliver(
         .unwrap_or_else(|| pane.as_str().to_string());
     let ws = ws_owned.as_str();
 
-    // Is that pane showing a choice dialog? If so the reply is a CHOICE, never text — text goes
-    // nowhere and the Enter after it confirms whatever is highlighted, which on a permission prompt
-    // is a grant the operator did not make.
-    let is_dialog = match client.read_visible_ansi(&pane).await {
-        Ok(r) => crate::permission::parse(&r.text),
-        Err(_) => None,
-    };
-    if let Some(prompt) = is_dialog {
-        let at = timestamp();
-        if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
-            tracing::error!(error = %e, "could not write the audit record; refusing to send");
-            return voice::nothing_sent(Reason::NoAudit);
+    // What is that pane showing? A menu is answered with keys, never with words: words go nowhere
+    // against a menu, and the confirm key after them presses whatever is highlighted — which on a
+    // permission prompt is a grant the operator did not make.
+    let read = client.read_visible_ansi(&pane).await;
+    if let Err(e) = &read {
+        tracing::warn!(
+            pane = %pane, error = %e,
+            "could not see the pane before replying; refusing to answer it blind"
+        );
+    }
+    match reply_path(read.as_ref().ok().map(|r| r.text.as_str())) {
+        // The menu itself is deliberately not carried into `choose`: this read is only evidence
+        // that words must not go into this pane. `choose` looks again for itself, twice, because
+        // the operator's own keyboard may have moved the highlight since.
+        ReplyPath::Choice(_) => {
+            let at = timestamp();
+            if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
+                tracing::error!(error = %e, "could not write the audit record; refusing to send");
+                return voice::nothing_sent(Reason::NoAudit);
+            }
+            return match deliver::choose(
+                client,
+                &pane,
+                deliver::Choice::Reply(text),
+                Settle::default(),
+                |d| Box::pin(tokio::time::sleep(d)),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    let _ = audit.outcome(&timestamp(), &c.delivery);
+                    // The label a settled read showed HIGHLIGHTED just before the confirm key went
+                    // out — never the one this function matched from its own earlier read. That
+                    // earlier read is the one the operator's own keyboard may have overtaken.
+                    voice::choice_made(pl, ws, &c.option, c.afterwards)
+                }
+                // Not an error — the operator was ambiguous, or the menu moved on. Say which,
+                // rather than typing into a terminal on a guess. The record above says an answer
+                // was about to go out, so this one has to say that it did not.
+                Ok(Err(r)) => {
+                    let _ = audit.refused(&timestamp(), chat_id, &pane, &format!("{r:?}"));
+                    voice::nothing_sent(refusal_reason(r))
+                }
+                Err(e) => {
+                    let _ = audit.failed(&timestamp(), &pane, &e.to_string());
+                    tracing::error!(error = %e, "the choice failed to send");
+                    voice::nothing_sent(Reason::HerdUnreachable)
+                }
+            };
         }
-        return match deliver::choose(client, &pane, text, Settle::default(), |d| {
-            Box::pin(tokio::time::sleep(d))
-        })
-        .await
-        {
-            Ok(Ok(d)) => {
-                let _ = audit.outcome(&timestamp(), &d);
-                let chosen = prompt
-                    .match_option(text)
-                    .and_then(|i| prompt.options.get(i).cloned())
-                    .unwrap_or_else(|| text.trim().to_string());
-                voice::choice_made(pl, ws, &chosen, !d.rung.needs_attention())
-            }
-            // Not an error — the operator was ambiguous, or the prompt moved on. Show the options
-            // again rather than typing into a terminal on a guess.
-            Ok(Err(_)) => voice::nothing_sent(Reason::UnclearChoice(prompt.options.clone())),
-            Err(e) => {
-                let _ = audit.failed(&timestamp(), &pane, &e.to_string());
-                tracing::error!(error = %e, "the choice failed to send");
-                voice::nothing_sent(Reason::HerdUnreachable)
-            }
-        };
+        ReplyPath::Refuse(reason) => return voice::nothing_sent(reason),
+        ReplyPath::Text => {}
     }
 
     let at = timestamp();
@@ -753,7 +1055,7 @@ async fn topic_for(
     pane: &PaneId,
     workspace: &str,
 ) -> Option<teloxide::types::ThreadId> {
-    if let Some(t) = ctx.routing.lock().await.topic_for(pane) {
+    if let Some(t) = ctx.routing.lock().await.topic_for(forum.0, pane) {
         return Some(teloxide::types::ThreadId(teloxide::types::MessageId(t)));
     }
     let name = format!("{workspace} · {}", pane.as_str());
@@ -761,7 +1063,7 @@ async fn topic_for(
         Ok(topic) => {
             let tid = topic.thread_id;
             let mut r = ctx.routing.lock().await;
-            r.bind_topic(tid.0.0, pane);
+            r.bind_topic(forum.0, tid.0.0, pane);
             let _ = r.save(&Routing::default_path());
             tracing::info!(pane = %pane, topic = tid.0.0, name = %name, "created a topic");
             Some(tid)
@@ -799,7 +1101,12 @@ async fn ensure_all_topics(bot: &Bot, ctx: &Ctx) {
         .iter()
         .filter(|p| p.agent.is_some() || p.display_agent.is_some())
     {
-        let already = ctx.routing.lock().await.topic_for(&p.pane_id).is_some();
+        let already = ctx
+            .routing
+            .lock()
+            .await
+            .topic_for(forum.0, &p.pane_id)
+            .is_some();
         if already {
             continue;
         }
@@ -916,6 +1223,21 @@ mod tests {
         assert!(!g.is_deaf());
     }
 
+    /// Pins the rule the four aiming affordances share, in the only shape this module can test
+    /// without a live Bot: in the group with topics there is nothing to aim, so nothing offers to.
+    #[test]
+    fn the_sticky_affordance_is_never_offered_in_the_forum_chat() {
+        let forum = ChatId(-100200300);
+        let dm = ChatId(878);
+        assert!(!sticky_offered(Some(forum), forum));
+        assert!(sticky_offered(Some(forum), dm));
+        assert!(sticky_offered(None, dm));
+        assert!(
+            sticky_offered(None, forum),
+            "with no group configured for topics, that chat is an ordinary one"
+        );
+    }
+
     #[test]
     fn html_metacharacters_cannot_break_out_of_a_message() {
         let hostile = "<b>bold</b> & <script>alert(1)</script>";
@@ -1007,5 +1329,167 @@ mod tests {
                 "{w} must not be a command in slice 2"
             );
         }
+    }
+
+    /// The blocker this closes: a pane showing a menu must never take the text path. Words go
+    /// nowhere against a menu, and the confirm key after them presses whatever is highlighted —
+    /// which on a permission prompt is a grant the operator never made.
+    #[test]
+    fn a_pane_that_looks_like_a_control_never_takes_the_text_path() {
+        const REAL: &str = include_str!("../tests/fixtures/opencode-permission.ansi");
+        assert!(
+            matches!(reply_path(Some(REAL)), ReplyPath::Choice(_)),
+            "the captured dialog must be answered with keys"
+        );
+
+        let unreadable = "\u{1b}[48;5;1mAllow once\u{1b}[0m \u{1b}[48;5;1mReject\u{1b}[0m  \u{1b}[0m⇆ select  enter confirm";
+        assert_eq!(
+            reply_path(Some(unreadable)),
+            ReplyPath::Refuse(Reason::UnreadablePrompt),
+            "a menu nobody can read must be refused, not typed at"
+        );
+
+        assert_eq!(
+            reply_path(Some("agent: done, 3 files changed\n> ")),
+            ReplyPath::Text,
+            "only a screen positively judged ordinary output may be typed into"
+        );
+    }
+
+    use crate::deliver::fake::MenuPane;
+
+    fn drawn(chat: i64, pane: &str, options: &[&str]) -> PromptRecord {
+        PromptRecord {
+            chat,
+            pane: pane.to_string(),
+            seq: Some(198),
+            options: options.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    fn no_sleep(_: std::time::Duration) -> futures_core::future::BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+
+    /// The guard that catches a stale tap on a LATER question whose options read the same was
+    /// silently inert on any herd that does not report where a session's run of work stands: both
+    /// sides were flattened to zero before the comparison, so it passed for every pane and every
+    /// question. Its failure mode was invisible — no log, no refusal, nothing to notice.
+    ///
+    /// A check with no evidence must answer no. The cost is that button taps are refused on such a
+    /// herd and the operator replies with the option's name instead; the alternative is a keypress
+    /// into a question nobody read.
+    #[test]
+    fn a_session_that_cannot_say_where_it_stands_is_never_assumed_to_have_stood_still() {
+        assert!(
+            still_the_same_question(Some(198), Some(198)),
+            "a herd that reports the same point must still be answerable"
+        );
+        assert!(!still_the_same_question(Some(199), Some(198)));
+        assert!(
+            !still_the_same_question(None, None),
+            "two absences are not evidence that nothing changed"
+        );
+        assert!(!still_the_same_question(None, Some(198)));
+        assert!(!still_the_same_question(Some(198), None));
+    }
+
+    /// THE test of the tapped button, end to end bar the herd.
+    ///
+    /// The push drew `Allow once · Allow always · Reject` and the operator tapped the third. By the
+    /// time the tap arrives the agent has asked again with the options in a different order, so the
+    /// third one on screen is now `Allow always`. The tap must be answered by the label the button
+    /// showed, which is not on that menu in that place — so nothing is pressed.
+    #[tokio::test]
+    async fn a_tap_answers_the_label_its_button_showed_or_nothing_at_all() {
+        let record = drawn(42, "wA:p1", &["Allow once", "Allow always", "Reject"]);
+        let Tap::Answer {
+            pane,
+            label,
+            drawn_from,
+            seq,
+        } = resolve_tap(Some(&record), 42, "wA:p1", "2")
+        else {
+            panic!("a tap on a menu that was written down must be answerable");
+        };
+        assert_eq!(
+            label, "Reject",
+            "the position is read against what was drawn"
+        );
+        assert_eq!(drawn_from, record.options);
+        assert_eq!(
+            seq,
+            Some(198),
+            "the point the session was at is carried too"
+        );
+
+        let io = MenuPane::showing(&["Reject", "Allow once", "Allow always"]);
+        let r = deliver::choose(
+            &io,
+            &pane,
+            deliver::Choice::Button {
+                label: &label,
+                drawn_from: &drawn_from,
+            },
+            Settle::default(),
+            no_sleep,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            r.is_err(),
+            "the third button confirmed the third option of a menu that reordered: confirmed={:?} \
+             keys={:?}",
+            io.confirmed(),
+            io.keys()
+        );
+        assert!(io.keys().is_empty(), "not one key may reach it");
+        assert_eq!(io.confirmed(), None);
+    }
+
+    /// Every button drawn before this bridge started writing the labels down, and every one whose
+    /// record has since aged out. They refuse; they never guess which question they were.
+    #[test]
+    fn a_tap_with_nothing_written_down_sends_nothing() {
+        assert_eq!(
+            resolve_tap(None, 42, "wA:p1", "0"),
+            Tap::Refuse(Reason::ButtonExpired)
+        );
+    }
+
+    /// The cross-checks. Each of these means the tap and the record are about different things, and
+    /// there is no version of that where pressing a key is right.
+    #[test]
+    fn a_tap_that_does_not_match_what_was_written_down_is_refused() {
+        let record = drawn(42, "wA:p1", &["Allow once", "Reject"]);
+        for (chat, pane, position, what) in [
+            (7, "wA:p1", "0", "a tap from a chat the push never went to"),
+            (42, "wB:p9", "0", "a payload naming a different session"),
+            (
+                42,
+                "wA:p1",
+                "9",
+                "a position past the end of what was drawn",
+            ),
+            (42, "wA:p1", "one", "a position that is not a number"),
+        ] {
+            assert_eq!(
+                resolve_tap(Some(&record), chat, pane, position),
+                Tap::Refuse(Reason::ButtonExpired),
+                "{what} was answered instead of refused"
+            );
+        }
+    }
+
+    /// A read that failed says nothing about what is on the screen, and the screen might be a
+    /// permission prompt. The old code turned that silence into "not a dialog".
+    #[test]
+    fn a_read_that_failed_is_not_evidence_of_prose() {
+        assert_eq!(
+            reply_path(None),
+            ReplyPath::Refuse(Reason::HerdUnreachable),
+            "a pane the bridge could not look at must not be typed into"
+        );
     }
 }

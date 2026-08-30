@@ -76,8 +76,13 @@ pub struct Ask {
     pub pane: PaneId,
     pub workspace: String,
     pub agent: String,
-    /// The dedupe key. Stable while the pane stays blocked.
-    pub seq: u64,
+    /// Where the pane's run of work stands, as the herd reports it — the dedupe key, stable while
+    /// the pane stays blocked.
+    ///
+    /// `None` when the herd does not report it at all. Kept as an option rather than flattened to
+    /// zero because a tap on this ask's buttons is checked against it later, and "the herd cannot
+    /// tell me" has to be distinguishable there from "it is still at the same point".
+    pub seq: Option<u64>,
     /// The tail of the pane: what the agent is actually asking.
     ///
     /// Empty when the read failed — a push with no excerpt is still worth sending, because the
@@ -397,7 +402,7 @@ pub async fn recheck(client: &HerdrClient, pane: &PaneId) -> Option<Ask> {
         pane: pane.clone(),
         workspace: info.workspace_id.as_str().to_string(),
         agent: info.agent.clone().unwrap_or_else(|| "agent".into()),
-        seq: info.state_change_seq.unwrap_or(0),
+        seq: info.state_change_seq,
         excerpt,
         options,
     })
@@ -419,7 +424,9 @@ pub fn agent_panes(snapshot: &herdr_client::SessionSnapshot) -> BTreeSet<String>
 /// different things to say, and keying on the pane alone would silently swallow the second.
 fn key_of(b: &Beat) -> (String, u64) {
     match b {
-        Beat::Asked(a) => (format!("{}|ask", a.pane.as_str()), a.seq),
+        // A herd that does not report a sequence dedupes on the pane alone, which is what it did
+        // before this became an option: the same behaviour, now visibly a fallback.
+        Beat::Asked(a) => (format!("{}|ask", a.pane.as_str()), a.seq.unwrap_or(0)),
         Beat::Finished { pane, seq, .. } => (format!("{}|done", pane.as_str()), *seq),
         Beat::Resumed { pane, .. } => (format!("{}|resumed", pane.as_str()), 0),
     }
@@ -666,7 +673,7 @@ mod tests {
             pane: PaneId::new(pane),
             workspace: "w1".into(),
             agent: "opencode".into(),
-            seq,
+            seq: Some(seq),
             excerpt: String::new(),
             options: Vec::new(),
         }
@@ -951,7 +958,7 @@ mod persistence_tests {
             pane: PaneId::new("wA:p1"),
             workspace: "wA".into(),
             agent: "opencode".into(),
-            seq: 198,
+            seq: Some(198),
             excerpt: String::new(),
             options: Vec::new(),
         };
@@ -968,7 +975,10 @@ mod persistence_tests {
         );
 
         // A genuinely new question on that pane still gets through.
-        let newer = Ask { seq: 199, ..ask };
+        let newer = Ask {
+            seq: Some(199),
+            ..ask
+        };
         assert!(after.should_push(key_of(&Beat::Asked(newer))));
     }
 

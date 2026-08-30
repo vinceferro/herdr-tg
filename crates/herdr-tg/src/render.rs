@@ -353,6 +353,28 @@ pub fn escape_html(s: &str) -> String {
     out
 }
 
+/// Strip Telegram's markup back to what a plain-text surface can show.
+///
+/// The little grey toast on a tapped button is plain text, so a message body written for the chat —
+/// which carries `<i>` and `<b>` and `&amp;` — reaches the operator as literal tags unless it comes
+/// out first.
+pub fn plain_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    // After the tags, the entities: &amp; goes last so "&amp;lt;" survives as the text "&lt;".
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +608,20 @@ mod tests {
         snap.workspaces.clear();
         let out = herd_telegram(&snap);
         assert!(out.contains("(no panes)"), "{out}");
+    }
+
+    /// A refusal is written for the chat, in Telegram's markup. The toast on the button is not, so
+    /// the operator would otherwise read the tags.
+    #[test]
+    fn a_button_toast_carries_no_markup() {
+        assert_eq!(
+            plain_text("✅ <b>Reject.</b>\n<i>a &amp; b</i>"),
+            "✅ Reject.\na & b"
+        );
+        assert_eq!(
+            plain_text("&lt;not a tag&gt;"),
+            "<not a tag>",
+            "text the agent wrote that merely looks like markup must survive as text"
+        );
     }
 }
