@@ -17,7 +17,7 @@
 //! So the walk now starts at the WORKSPACE ROOT and scans every `.rs` file it finds, skipping only
 //! REAL cargo build directories (a `target/` beside a Cargo.toml) and `.git/`. A crate added
 //! tomorrow is covered the day it is added rather than the day someone remembers to add it here.
-//! Three properties make that real rather than nominal:
+//! Four properties make that real rather than nominal:
 //!
 //! 1. **An unreadable directory or file FAILS.** The old walk had `Err(_) => continue`, so a
 //!    permission error read as "nothing to see". A guard that cannot see must not report green.
@@ -26,6 +26,13 @@
 //! 3. **The exemptions are a short explicit list of FILES, asserted to exist.** Not a directory
 //!    prefix, not a pattern. If `wire.rs` is renamed its exemption goes stale, the new file gets
 //!    scanned, and the suite goes red — the safe direction.
+//! 4. **The walk's coverage is cross-checked against a source of truth it had no hand in.** Rules
+//!    that decide what NOT to look at have now been wrong three times here — an allowlist of two
+//!    directories, a member list nobody verified, a bare-name `target` skip. Each round fixed the
+//!    instance and left the class open, because nothing outside the walk could contradict the
+//!    walk. `every_git_tracked_rust_file_is_actually_walked` compares what was scanned against the
+//!    git index, which is by definition what ships, so the NEXT silent skip is loud on the commit
+//!    that introduces it rather than in the review after it.
 //!
 //! # The three rules
 //!
@@ -200,6 +207,59 @@ fn workspace_members(root: &Path) -> Vec<String> {
         );
     }
     members
+}
+
+/// The paths git holds in its index for `root`, or `None` if there is no index to ask.
+///
+/// This is the second opinion the guard has never had. Every hole found in it so far was the same
+/// shape — the scan believed it had covered more than it had, and nothing outside the scan could
+/// say otherwise. `git ls-files` is a source of truth this file had no hand in building: it is, by
+/// definition, the set of files that ship.
+///
+/// `None` means exactly one thing: there is no `.git` beside `root`, as in a vendored tarball.
+/// EVERY other failure panics — git not on PATH, a non-zero exit, a non-UTF-8 path, an empty
+/// listing. A second opinion the guard could not obtain must never read as agreement.
+///
+/// `-z` is load-bearing: without it git quotes non-ASCII paths, and a path containing a newline
+/// would split into two rows. Shelling to git is safe where shelling to cargo was not (see
+/// [`workspace_members`]): this reads `.git/index`, takes no lock, and inside the pre-commit hook
+/// it reads exactly the index that is about to be committed, which is the set we want.
+fn git_tracked(root: &Path) -> Option<Vec<String>> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "-z", "--cached"])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "git could not be run in {} ({e}). There is a .git here, so this cross-check is \
+                 meant to run; a build environment with an index but no git is incoherent, and \
+                 fixing the environment is the answer rather than softening this.",
+                root.display()
+            )
+        });
+    assert!(
+        out.status.success(),
+        "`git ls-files` failed in {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let listing =
+        String::from_utf8(out.stdout).expect("the tracked paths in this repository are UTF-8");
+    let files: Vec<String> = listing
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "git tracks nothing in {} — the cross-check would hold the scan against an empty set and \
+         agree with absolutely anything",
+        root.display()
+    );
+    Some(files)
 }
 
 /// The 0-based line numbers that sit inside a `#[cfg(test)]` module.
@@ -511,6 +571,10 @@ fn no_write_call_site_anywhere_outside_cfg_test() {
         "a write method is called from code that is not `#[cfg(test)]`. These three RPCs type real \
          keystrokes into the operator's real terminals; slice 1 has no live call site, by design \
          (D3). If this is deliberate, it is a decision for the operator, not a test to delete. \
+         If a path below is not a file git tracks, it is scratch that landed in-tree (see the \
+         `%h/` note in .gitignore) — delete it, and do NOT add it to the skip list: a scan that \
+         skips whatever .gitignore hides turns .gitignore into a one-line bypass for this guard, \
+         and the binary the operator runs is built from the working tree, ignored files included. \
          Found:\n  {}",
         offenders.join("\n  ")
     );
@@ -832,5 +896,101 @@ fn the_walk_sees_a_source_module_named_target_and_still_skips_build_dirs() {
         Some("send_text"),
         "the planted line is one the scanner already knows how to catch — reaching it was the only \
          thing ever missing"
+    );
+}
+
+/// The scan's own coverage, held against a set it did not compute.
+///
+/// This is the general form of the bug that has now been fixed three times in this file. Each
+/// round fixed one way of looking at too little — two hardcoded directories, an unverified member
+/// list, a bare-name `target` skip — and each round left the class open, because every check the
+/// guard had was computed from the same walk it was supposed to be checking. A guard that cannot
+/// tell you it scanned nothing is not a guard.
+///
+/// The direction is one-way on purpose: every tracked `.rs` must be walked, but the walk may hold
+/// more. Scanning extra files has never been the failure; a shipped file nobody opened is.
+///
+/// Tracked paths are filtered to ones that exist on disk, so a file staged for deletion is not
+/// blamed on the walk. That is not a way out for a skipped directory — its files are all still
+/// sitting there.
+#[test]
+fn every_git_tracked_rust_file_is_actually_walked() {
+    let root = workspace_root();
+    let Some(tracked) = git_tracked(&root) else {
+        eprintln!(
+            "no .git under {} — walk cross-check skipped",
+            root.display()
+        );
+        return;
+    };
+
+    let ships: Vec<String> = tracked
+        .into_iter()
+        .filter(|p| p.ends_with(".rs") && root.join(p).is_file())
+        .collect();
+    assert!(
+        ships.len() > 10,
+        "only {} tracked .rs files under {} — an oracle that finds almost nothing agrees with \
+         almost anything, which is a broken oracle rather than a pass",
+        ships.len(),
+        root.display()
+    );
+
+    let walked: BTreeSet<String> = rust_files(&root).iter().map(|f| rel(&root, f)).collect();
+    let missed: Vec<&str> = ships
+        .iter()
+        .filter(|p| !walked.contains(*p))
+        .map(String::as_str)
+        .collect();
+
+    assert!(
+        missed.is_empty(),
+        "{} of {} git-tracked .rs files were never opened by the scan. These files SHIP, and this \
+         guard did not read a line of them — a write into the operator's real terminals can sit in \
+         any of them with the whole suite green. Fix the WALK. Do not add an exemption for them, \
+         and do not relax this assertion. Never opened:\n  {}",
+        missed.len(),
+        ships.len(),
+        missed.join("\n  ")
+    );
+}
+
+/// The other input rule 1 trusts: the list of crates it is going to look at.
+///
+/// Rule 1 only ever examines declared workspace members, so a crate the manifest parser fails to
+/// see is a crate that may name a write method as freely as it likes. Same shape as the walk's
+/// blind spot, different input — which is why it gets the same treatment: hold the parsed list
+/// against the crates git actually carries, rather than against itself.
+#[test]
+fn every_crate_that_ships_is_a_declared_workspace_member() {
+    let root = workspace_root();
+    let Some(tracked) = git_tracked(&root) else {
+        eprintln!(
+            "no .git under {} — member cross-check skipped",
+            root.display()
+        );
+        return;
+    };
+
+    let declared: BTreeSet<String> = workspace_members(&root).into_iter().collect();
+    // The root manifest has no `/` before it and drops out of this on its own.
+    let shipped: BTreeSet<String> = tracked
+        .iter()
+        .filter_map(|p| p.strip_suffix("/Cargo.toml"))
+        .map(str::to_owned)
+        .collect();
+
+    let undeclared: Vec<&str> = shipped.difference(&declared).map(String::as_str).collect();
+    assert!(
+        undeclared.is_empty(),
+        "these crates ship but are not in the member list this guard scans, so rule 1 never looks \
+         at them: {undeclared:?}"
+    );
+
+    let phantom: Vec<&str> = declared.difference(&shipped).map(String::as_str).collect();
+    assert!(
+        phantom.is_empty(),
+        "the member list names crates that ship no Cargo.toml: {phantom:?}. Either a crate moved \
+         and the scan is now looking at nothing, or the manifest parse picked up the wrong list."
     );
 }
