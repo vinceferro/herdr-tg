@@ -137,10 +137,19 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
 
     let routing_path = Routing::default_path();
     let audit = Arc::new(Audit::new(Audit::default_path()));
+
+    // A state file written before routing was filed by chat is re-filed as it is read. Write it
+    // back straight away: until something saves, the move lives only in memory, so every restart
+    // would do it again and repeat its warnings.
+    let routing = Routing::load(&routing_path, config.forum_chat_id);
+    if let Err(e) = routing.save(&routing_path) {
+        tracing::warn!(error = %e, "could not write the routing state back after re-filing it by chat");
+    }
+
     let ctx = Ctx {
         client: Arc::new(client),
         gate: Arc::new(gate),
-        routing: Arc::new(Mutex::new(Routing::load(&routing_path))),
+        routing: Arc::new(Mutex::new(routing)),
         audit: Arc::clone(&audit),
         submit: config.submit_key.clone(),
         workspace: config.workspace.clone(),
@@ -269,6 +278,18 @@ fn place(ctx: &Ctx) -> Place {
     }
 }
 
+/// What the operator is told when they try to aim replies inside the group that has topics.
+const TOPIC_IS_THE_AIM: &str =
+    "In this group each session has its own topic — open the one you want and reply there.";
+
+/// Whether "send my replies here" means anything in this chat.
+///
+/// In the group with topics it does not: the topic is the aim, and a message typed outside one now
+/// gets a picker. Offering the button there would promise an aim nothing honours.
+fn sticky_offered(forum: Option<ChatId>, chat: ChatId) -> bool {
+    forum != Some(chat)
+}
+
 /// Send into a pane's topic, creating it if this pane has never had one.
 ///
 /// Returns the chat and message id of everything that actually went out, so a caller that drew
@@ -298,7 +319,7 @@ async fn say_in_topic(
         match req.await {
             Ok(sent) => {
                 let mut r = ctx.routing.lock().await;
-                r.record_push(sent.id.0 as i64, pane);
+                r.record_push(forum.0, sent.id.0 as i64, pane);
                 let _ = r.save(&Routing::default_path());
                 sent_to.push((forum.0, sent.id.0 as i64));
             }
@@ -315,7 +336,7 @@ async fn say_in_topic(
         }
         if let Ok(sent) = req.await {
             let mut r = ctx.routing.lock().await;
-            r.record_push(sent.id.0 as i64, pane);
+            r.record_push(*chat, sent.id.0 as i64, pane);
             let _ = r.save(&Routing::default_path());
             sent_to.push((*chat, sent.id.0 as i64));
         }
@@ -336,31 +357,26 @@ async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
         !ask.options.is_empty(),
         gist.as_deref(),
     );
+    // The menu buttons are drawn wherever the push lands. The "send my replies here" button is
+    // not: in the group with topics it would aim at something nothing reads.
     let keyboard = if ask.options.is_empty() {
-        InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
-            "📌 Send my replies here",
-            format!("t|{}", ask.pane.as_str()),
-        )]])
+        ctx.forum.is_none().then(|| {
+            InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
+                "📌 Send my replies here",
+                format!("t|{}", ask.pane.as_str()),
+            )]])
+        })
     } else {
-        InlineKeyboardMarkup::new([ask
+        Some(InlineKeyboardMarkup::new([ask
             .options
             .iter()
             .enumerate()
             .map(|(i, o)| {
                 InlineKeyboardButton::callback(o.clone(), format!("c|{}|{i}", ask.pane.as_str()))
             })
-            .collect::<Vec<_>>()])
+            .collect::<Vec<_>>()]))
     };
-    let sent_to = say_in_topic(
-        bot,
-        ctx,
-        chats,
-        &ask.pane,
-        &ask.workspace,
-        &body,
-        Some(keyboard),
-    )
-    .await;
+    let sent_to = say_in_topic(bot, ctx, chats, &ask.pane, &ask.workspace, &body, keyboard).await;
 
     // The buttons carry a position, which means nothing once the menu redraws. The labels they
     // showed are written down here, beside the message they are attached to, and a tap is answered
@@ -369,7 +385,7 @@ async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
     if !ask.options.is_empty() && !sent_to.is_empty() {
         let mut r = ctx.routing.lock().await;
         for (chat, message_id) in &sent_to {
-            r.record_prompt(*message_id, *chat, &ask.pane, ask.seq, &ask.options);
+            r.record_prompt(*chat, *message_id, &ask.pane, ask.seq, &ask.options);
         }
         let _ = r.save(&Routing::default_path());
     }
@@ -541,6 +557,9 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     };
 
     let reply = match data.split('|').collect::<Vec<_>>().as_slice() {
+        // This also answers taps on buttons still sitting in the group's history from before the
+        // topic became the aim.
+        ["t", _] if !sticky_offered(ctx.forum, ChatId(chat_id)) => escape_html(TOPIC_IS_THE_AIM),
         ["t", pane] => {
             let p = PaneId::new(*pane);
             let mut r = ctx.routing.lock().await;
@@ -553,7 +572,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
             // Cloned, and the lock dropped, before anything that waits: this is the only thing
             // held while the answer goes out to a terminal.
             let recalled = match on_message {
-                Some(id) => ctx.routing.lock().await.prompt_for(id).cloned(),
+                Some(id) => ctx.routing.lock().await.prompt_for(chat_id, id).cloned(),
                 None => None,
             };
             match resolve_tap(recalled.as_ref(), chat_id, pane, position) {
@@ -628,7 +647,13 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
             Err(e) => escape_html(&format!("herdr unreachable: {e}")),
         },
         Command::Target(ref raw) => {
-            set_target(&ctx.client, &ctx.routing, chat_id, raw.trim()).await
+            if sticky_offered(ctx.forum, msg.chat.id) {
+                set_target(&ctx.client, &ctx.routing, chat_id, raw.trim()).await
+            } else {
+                escape_html(&format!(
+                    "{TOPIC_IS_THE_AIM} /target aims replies in the direct chat."
+                ))
+            }
         }
         Command::Doctor => match ctx.client.handshake().await {
             Ok(h) => escape_html(&format!(
@@ -659,6 +684,20 @@ async fn panes_switcher(bot: &Bot, ctx: &Ctx, chat: ChatId) -> anyhow::Result<()
             return Ok(());
         }
     };
+    if !sticky_offered(ctx.forum, chat) {
+        reply(
+            bot,
+            chat,
+            &format!(
+                "{}\n\n<i>{}</i>",
+                fit(render::herd_telegram(&snap)),
+                escape_html(TOPIC_IS_THE_AIM)
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
     let labels: std::collections::BTreeMap<_, _> = snap
         .workspaces
         .iter()
@@ -816,10 +855,11 @@ async fn route_and_deliver(
     };
 
     let pl = place(ctx);
-    let target = routing
-        .lock()
-        .await
-        .resolve(chat_id, reply_to, thread_id, &snap);
+    let target =
+        routing
+            .lock()
+            .await
+            .resolve(chat_id, ctx.forum.map(|c| c.0), reply_to, thread_id, &snap);
     let (pane, _why) = match target {
         Target::Pane { pane, why } => (pane, why),
         // PLAN.md's failure table: never silently reroute a dead target.
@@ -982,7 +1022,7 @@ async fn topic_for(
     pane: &PaneId,
     workspace: &str,
 ) -> Option<teloxide::types::ThreadId> {
-    if let Some(t) = ctx.routing.lock().await.topic_for(pane) {
+    if let Some(t) = ctx.routing.lock().await.topic_for(forum.0, pane) {
         return Some(teloxide::types::ThreadId(teloxide::types::MessageId(t)));
     }
     let name = format!("{workspace} · {}", pane.as_str());
@@ -990,7 +1030,7 @@ async fn topic_for(
         Ok(topic) => {
             let tid = topic.thread_id;
             let mut r = ctx.routing.lock().await;
-            r.bind_topic(tid.0.0, pane);
+            r.bind_topic(forum.0, tid.0.0, pane);
             let _ = r.save(&Routing::default_path());
             tracing::info!(pane = %pane, topic = tid.0.0, name = %name, "created a topic");
             Some(tid)
@@ -1028,7 +1068,12 @@ async fn ensure_all_topics(bot: &Bot, ctx: &Ctx) {
         .iter()
         .filter(|p| p.agent.is_some() || p.display_agent.is_some())
     {
-        let already = ctx.routing.lock().await.topic_for(&p.pane_id).is_some();
+        let already = ctx
+            .routing
+            .lock()
+            .await
+            .topic_for(forum.0, &p.pane_id)
+            .is_some();
         if already {
             continue;
         }
@@ -1143,6 +1188,21 @@ mod tests {
         assert!(!g.admit(878839304), "an id one digit off must be refused");
         assert!(!g.admit(0));
         assert!(!g.is_deaf());
+    }
+
+    /// Pins the rule the four aiming affordances share, in the only shape this module can test
+    /// without a live Bot: in the group with topics there is nothing to aim, so nothing offers to.
+    #[test]
+    fn the_sticky_affordance_is_never_offered_in_the_forum_chat() {
+        let forum = ChatId(-100200300);
+        let dm = ChatId(878);
+        assert!(!sticky_offered(Some(forum), forum));
+        assert!(sticky_offered(Some(forum), dm));
+        assert!(sticky_offered(None, dm));
+        assert!(
+            sticky_offered(None, forum),
+            "with no group configured for topics, that chat is an ordinary one"
+        );
     }
 
     #[test]
