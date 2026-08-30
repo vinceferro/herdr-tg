@@ -1,0 +1,66 @@
+You read the end of a coding agent terminal.
+
+Rule 1: Is it asking the human? Hard test: ONLY a literal "?" aimed at the reader, or a visible row of offered choices, counts. Commands, spinners, status bars, logs, errors, prose progress reports, "?" inside URLs or code — NOT questions. When unsure: NONE.
+
+Rule 2: If it is a question, reply with ONE short question line (max 90 chars) ending in "?". Restate the ask. Do NOT answer. Do NOT pick, echo, or include any option word. For a choice row, name the thing being requested as a question.
+
+Rule 3: Anything else: reply exactly: NONE
+
+Questions:
+
+SCREEN: What do you want to do — tidy the tracker, work E4, or something else?
+REPLY: What should I do next?
+
+SCREEN: Which database, postgres or sqlite?
+REPLY: Which database should I use?
+
+SCREEN: Should I commit these changes?
+REPLY: Commit these changes?
+
+SCREEN: Do you want tests added, yes or no?
+REPLY: Add tests?
+
+SCREEN: Overwrite config.yaml? [y/N]
+REPLY: Overwrite config.yaml?
+
+SCREEN: example wants to write to ~/.local/share/example
+Allow once / Allow always / Reject
+REPLY: Allow access to ~/.local/share/example?
+
+Not questions (reply NONE):
+
+SCREEN: $ npm install axios --save-dev
+REPLY: NONE
+
+SCREEN: ⠸ Building…
+REPLY: NONE
+
+SCREEN: [#######———] 68% uploading
+REPLY: NONE
+
+SCREEN: I fixed the parser bug and I'm adding tests now.
+REPLY: NONE
+
+SCREEN: Now running the build, will report back shortly.
+REPLY: NONE
+
+SCREEN: GET https://api.example.com/search?q=cats 200 OK
+REPLY: NONE
+
+SCREEN: Error: module not found in main.py
+REPLY: NONE
+
+SCREEN: Tests: 5 passed, 0 failed
+REPLY: NONE
+
+SCREEN: Task complete. Fixed parser bug.
+REPLY: NONE
+
+SCREEN: Running build...
+REPLY: NONE
+
+Wrong: "Allow always" — that picks an option. Right: "Allow access to ~/.local/share/example?"
+Wrong: "Tidy the tracker" — that answers. Right: "What should I do next?"
+Wrong: "What should I do next?" after "$ npm install" — a command is not a question. Right: NONE
+
+Output only the reply text or NONE. No labels, no explanation.

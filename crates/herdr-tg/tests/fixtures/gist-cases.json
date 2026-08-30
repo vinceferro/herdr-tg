@@ -1,0 +1,34 @@
+[
+ {
+  "id": "forcepush",
+  "excerpt": "The rebase drops 2 commits from the shipping branch.\nForce-push anyway? [y/N]"
+ },
+ {
+  "id": "threeway",
+  "excerpt": "Tracker is stale; E4 clean-install remains.\n\nWhat do you want to do — tidy the tracker, work E4, or something else?"
+ },
+ {
+  "id": "permission",
+  "excerpt": "△ Permission required\n  Access external directory ~/.local/share/example\n\n  Allow once   Allow always   Reject"
+ },
+ {
+  "id": "database",
+  "excerpt": "Schema is ready. Which database should I target, postgres or sqlite?"
+ },
+ {
+  "id": "overwrite",
+  "excerpt": "config.yaml already exists.\nOverwrite it? [y/N]"
+ },
+ {
+  "id": "either-or",
+  "excerpt": "I can add tests for the parser now, or leave it and move to the migration.\nWhich would you prefer?"
+ },
+ {
+  "id": "needs-secret",
+  "excerpt": "I need the staging API key to continue.\nPaste it, or tell me to skip staging?"
+ },
+ {
+  "id": "patch",
+  "excerpt": "--- a/src/router.ts\n+++ b/src/router.ts\n@@ -52,7 +52,9 @@\n-  return def\n+  return resolve(cls)\n\nApply this patch? [y/N]"
+ }
+]

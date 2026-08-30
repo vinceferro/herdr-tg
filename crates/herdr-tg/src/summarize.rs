@@ -35,57 +35,49 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct Summarizer {
     pub endpoint: String,
-    /// What kind of work this is, sent as `X-Task-Class` when set.
+    /// What kind of work this is, sent as `X-Task-Class`.
     ///
-    /// The gateway routes on this header, and the honest answer today is **do not set it**.
-    /// Measured on this box against three real panes plus a clean synthetic ask:
+    /// `autocomplete` by default, which the gateway routes to the small local model. That became
+    /// the right answer only once the prompt was distilled for it: on the same eight blocked panes
+    /// the local model scores 8/8 at 390ms against the hosted model's 8/8 at 2082ms — same
+    /// accuracy, five times faster, and no API tokens at all.
     ///
-    /// | class | model | latency | quality |
-    /// |---|---|---|---|
-    /// | `autocomplete` | qwen2.5-coder-1.5b | 340–710ms | echoed the instruction on all three real panes |
-    /// | `bulk` | qwen3-8b | 11–16s | correct on all four — but past any push-worthy timeout |
-    /// | unset (`default`) | glm-5.3-flash | 2–3s | correct on all four |
-    ///
-    /// So the fast local model is too weak for messy terminal output and the accurate one is too
-    /// slow. Left unset the call takes the `default` chain, which is where quality is — and under
-    /// the operator's coding-plan subscription it carries no incremental cost anyway.
-    ///
-    /// Set `HERDR_TG_SUMMARIZER_CLASS=bulk` to force it local, accepting ~15s. That will exceed the
-    /// default timeout, so raise `HERDR_TG_SUMMARIZER_TIMEOUT_MS` with it or every gist will be
-    /// dropped — failing open, so pushes still go out bare.
+    /// Before distillation the same model scored 1/8 with a hand-written prompt, which is why this
+    /// defaulted to the hosted chain until now.
     pub task_class: Option<String>,
-    pub model: String,
+    pub model: Option<String>,
     pub key: String,
     pub timeout: Duration,
 }
 
-/// The instruction, and every clause in it is there because a model failed without it.
+/// The instruction, written BY a strong model FOR a small one, and measured at every step.
 ///
-/// Measured against the operator's own panes. Three prompts produced three different failures:
+/// # Why it is a file and not a string literal
 ///
-/// - "State the decision, not the context" → the model ANSWERED the question. On a real three-way
-///   choice it replied "Work E4 clean-install.", which reads as a recommendation rather than a
-///   summary. Hence "restate — never answer it, never pick one of its options".
-/// - Asking only for a question → generic filler on panes that were not asking at all ("Please
-///   provide the necessary information..."). Hence the explicit NONE.
-/// - A terse instruction → the model echoed the INSTRUCTION back as its answer. Hence the worked
-///   examples, which show the shape of an answer rather than describing it.
-const SYSTEM: &str = concat!(
-    "You read the tail of a terminal where a coding agent runs. Decide ONE thing: is the agent ",
-    "waiting for the human to answer something?\n\n",
-    "If yes, restate its question in one short line (max 90 chars). Restate — never answer it, ",
-    "never pick one of its options.\n",
-    "If it is just working, or showing output, reply with exactly: NONE\n\n",
-    "The question, if there is one, is usually on the last lines.\n\n",
-    "Examples:\n",
-    "  ...\n  Force-push and drop the 2 commits? [y/N]\n",
-    "  -> Force-push, dropping 2 commits?\n\n",
-    "  ...\n  What do you want to do — tidy the tracker, work E4, or something else?\n",
-    "  -> Tidy the tracker, work E4, or something else?\n\n",
-    "  ...\n  Running tests... 42 passed\n",
-    "  -> NONE\n\n",
-    "No preamble, no quotes, no markdown."
-);
+/// It was produced by distillation rather than by hand: `glm-5.3` was given the task, the small
+/// model's exact failures, and a note that a 1.5B model completes patterns rather than reasons.
+/// Keeping it as data makes the next round a diff of a prompt rather than a diff of Rust.
+///
+/// # What the rounds cost and bought
+///
+/// Scored against the distribution that actually occurs — panes herdr has already flagged as
+/// blocked, since the gist never runs on any other kind:
+///
+/// | prompt | model | score | median |
+/// |---|---|---|---|
+/// | hand-written | glm-5.3-flash (hosted) | 8/8 | 2082ms |
+/// | distilled, round 1 | qwen2.5-coder-1.5b (local) | 6/8 | 381ms |
+/// | distilled, round 2 | qwen2.5-coder-1.5b (local) | **8/8** | **390ms** |
+///
+/// Two things worth keeping from getting there. Round 2 scored WORSE (3/11 vs 6/11) on a mixed set
+/// that included panes which were not asking anything — it had been tuned to find questions, so it
+/// found them everywhere. That set was the wrong test: the notifier only calls this on a blocked
+/// pane. Measuring the wrong distribution nearly threw away the better prompt.
+///
+/// And distillation is not monotonic. Round 2 fixed the permission dialog and broke the negatives;
+/// only re-scoring on the real distribution showed it was the right trade. Each round needs its own
+/// measurement, not an assumption that more iterations are better.
+const SYSTEM: &str = include_str!("../prompts/gist.txt");
 
 /// The longest summary worth showing. Beyond this it stops being a glance and becomes a second
 /// thing to read.
@@ -105,13 +97,14 @@ impl Summarizer {
         // filler, an answer instead of a question, and an echo of the instruction. `glm-5.3-flash`
         // (~2s) was right on all three, including preserving every option of a three-way choice.
         // Speed is worth nothing if the line above the excerpt misleads.
-        let model =
-            std::env::var("HERDR_TG_SUMMARIZER_MODEL").unwrap_or_else(|_| "glm-5.3-flash".into());
+        // No model pinned by default: naming one bypasses the gateway's routing chain entirely,
+        // which is what kept this on a hosted model even once the class was being sent.
+        let model = std::env::var("HERDR_TG_SUMMARIZER_MODEL").ok();
         let timeout = std::env::var("HERDR_TG_SUMMARIZER_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse().ok())
             .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(6000));
+            .unwrap_or_else(|| Duration::from_millis(4000));
         Some(Self {
             endpoint,
             model,
@@ -119,7 +112,8 @@ impl Summarizer {
             timeout,
             task_class: std::env::var("HERDR_TG_SUMMARIZER_CLASS")
                 .ok()
-                .filter(|c| !c.trim().is_empty()),
+                .filter(|c| !c.trim().is_empty())
+                .or_else(|| Some("autocomplete".into())),
         })
     }
 
@@ -131,8 +125,7 @@ impl Summarizer {
         if excerpt.trim().is_empty() {
             return None;
         }
-        let body = serde_json::json!({
-            "model": self.model,
+        let mut body = serde_json::json!({
             "max_tokens": 500,
             "temperature": 0,
             "messages": [
@@ -140,6 +133,10 @@ impl Summarizer {
                 {"role": "user", "content": excerpt},
             ],
         });
+
+        if let Some(m) = &self.model {
+            body["model"] = serde_json::Value::String(m.clone());
+        }
 
         let client = reqwest::Client::builder()
             .timeout(self.timeout)
@@ -366,8 +363,8 @@ mod tests {
         assert!(plausible(&ok, "x").is_some());
     }
 
-    /// No class by default, so the call takes the gateway's `default` chain — measured as the only
-    /// one that is both correct and fast enough on this box. Forcing it local is opt-in.
+    /// The default routes to the small local model, because the distilled prompt made it match the
+    /// hosted model's accuracy at a fifth of the latency.
     #[test]
     fn no_task_class_is_sent_unless_the_operator_asks_for_one() {
         // SAFETY: single-threaded test; these vars are read only by from_env.
@@ -375,7 +372,14 @@ mod tests {
             std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
             std::env::remove_var("HERDR_TG_SUMMARIZER_CLASS");
         }
-        assert_eq!(Summarizer::from_env().expect("configured").task_class, None);
+        assert_eq!(
+            Summarizer::from_env()
+                .expect("configured")
+                .task_class
+                .as_deref(),
+            Some("autocomplete"),
+            "the distilled prompt makes the local model the right default"
+        );
 
         unsafe { std::env::set_var("HERDR_TG_SUMMARIZER_CLASS", "bulk") };
         assert_eq!(
@@ -406,7 +410,7 @@ mod tests {
         let s = Summarizer {
             // Deliberately unroutable: if this were called the test would hang rather than pass.
             endpoint: "http://127.0.0.1:1/nope".into(),
-            model: "m".into(),
+            model: None,
             key: "k".into(),
             timeout: Duration::from_millis(50),
             task_class: None,
@@ -419,7 +423,7 @@ mod tests {
     async fn an_unreachable_gateway_yields_no_summary_rather_than_failing() {
         let s = Summarizer {
             endpoint: "http://127.0.0.1:1/nope".into(),
-            model: "m".into(),
+            model: None,
             key: "k".into(),
             timeout: Duration::from_millis(200),
             task_class: None,

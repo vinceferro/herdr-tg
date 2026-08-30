@@ -147,7 +147,11 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
         gist: crate::summarize::Summarizer::from_env().map(Arc::new),
     };
     match &ctx.gist {
-        Some(g) => tracing::info!(model = %g.model, "a one-line gist will be added above each ask"),
+        Some(g) => tracing::info!(
+            model = g.model.as_deref().unwrap_or("routed by class"),
+            class = g.task_class.as_deref().unwrap_or("default"),
+            "a one-line gist will be added above each ask"
+        ),
         None => tracing::debug!("no summarizer configured; asks go out as-is"),
     }
     match ctx.forum {
@@ -189,7 +193,17 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
         let ctx2 = ctx.clone();
         let bot2 = bot.clone();
         tokio::spawn(async move {
-            ensure_all_topics(&bot2, &ctx2).await;
+            // Once at startup, then on a slow timer. A herd changes shape while the bridge runs —
+            // a workspace opens, an agent starts in a fresh pane — and doing this only at startup
+            // meant a new session had no conversation until it first got stuck. Which is exactly
+            // the session you would want to pick up early.
+            //
+            // Idempotent and cheap: one snapshot, then a map lookup per pane. A pane that already
+            // has a topic keeps it, so this never multiplies topics however often it runs.
+            loop {
+                ensure_all_topics(&bot2, &ctx2).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
         });
     }
 
