@@ -35,8 +35,10 @@
 //! reads itself backwards: the highlight is taken for the panel, and the one remaining option, the
 //! one the operator is refusing, is reported as selected. It is deterministic, so a second read
 //! agrees, and every guard downstream nods it through to a confirm key. So the panel is measured
-//! from the parts of the row that are NOT options — preferring the keybind footer, which is the one
-//! stretch no harness draws inside a highlight bar.
+//! from the parts of the row that are NOT options, and it is measured twice — from the keybind
+//! footer, which is the one stretch no harness draws inside a highlight bar, and from the padding
+//! around the options. Two witnesses that disagree mean neither is the panel, and nothing is
+//! answered.
 //!
 //! # Which row, when two of them look like controls
 //!
@@ -324,12 +326,18 @@ impl ControlRow {
     /// the panel and the one remaining option — the one the operator was refusing — was reported as
     /// selected. Deterministically, so every re-read agreed and every later guard nodded it through.
     ///
-    /// The keybind footer is preferred over the padding because it is the one stretch of the row
-    /// that no harness draws inside a highlight bar: padding immediately around a selected option
-    /// often carries the bar's own colour, and a harness that pads generously could outweigh a
-    /// short panel the same way a long label did.
+    /// The row is asked twice, and both witnesses have to say the same thing. The keybind footer
+    /// is the stronger one — no harness draws it inside a highlight bar, whereas the padding
+    /// immediately around a selected option often carries the bar's own colour — but a harness that
+    /// painted its footer on the selection colour would hand back the highlight as the panel, and a
+    /// two-option row would read backwards again with nothing left to catch it. Two witnesses that
+    /// disagree mean neither is the panel, so nothing is answered.
     fn panel(&self) -> Option<String> {
-        widest(&self.footer).or_else(|| widest(&self.padding))
+        match (widest(&self.footer), widest(&self.padding)) {
+            (Some(footer), Some(padding)) if footer != padding => None,
+            (Some(footer), _) => Some(footer),
+            (None, padding) => padding,
+        }
     }
 
     /// Which option is highlighted?
@@ -881,6 +889,36 @@ mod tests {
             ["Right"],
             "refusing a dialog that is sitting on the grant must move the highlight off it"
         );
+    }
+
+    /// The same inversion in its last shape. Measuring the panel from the keybind footer is right
+    /// for every render anyone has captured — but a harness that painted the footer on the
+    /// selection colour would hand back the highlight as the panel, and a two-option row would read
+    /// backwards again with nothing to catch it.
+    ///
+    /// So the row is asked twice — the footer, and the padding around the options — and when the
+    /// two witnesses disagree neither is the panel. Refusing costs the operator a trip to their
+    /// keyboard; believing the wrong witness confirms an option they never chose.
+    #[test]
+    fn a_row_whose_two_witnesses_disagree_about_the_panel_is_refused() {
+        /// The affordance, painted on the SELECTION colour rather than the panel.
+        const FOOTER_ON_THE_HIGHLIGHT: &str =
+            "\u{1b}[0m\u{1b}[38;2;10;14;26m\u{1b}[48;2;255;225;77m\u{2191}/\u{2193} select";
+
+        for selected in 0..2 {
+            let row = render_dialog_with(&["Yes", "No"], selected, FOOTER_ON_THE_HIGHLIGHT);
+            assert_eq!(
+                classify(&row),
+                Screen::UnreadableControl,
+                "the highlight was taken for the panel, so the highlight read backwards"
+            );
+        }
+
+        // The witnesses agreeing is the ordinary case, and it still resolves.
+        assert!(matches!(
+            classify(&render_dialog_with(&["Yes", "No"], 0, SHORT_FOOTER)),
+            Screen::Dialog(_)
+        ));
     }
 
     /// A live modal whose buttons are named Confirm, Cancel or Select is still a modal. Those are
