@@ -28,6 +28,24 @@
 //! "exactly one background occurs exactly once" — it holds for a dialog with only two options,
 //! where each background occurs exactly once and there is no odd one out to find.
 //!
+//! # Where the panel colour is measured, and why it is not the whole row
+//!
+//! Measured across the whole row, the panel is whichever background covers the most columns — and
+//! on a two-option dialog with a long selected label, that is the HIGHLIGHT BAR. The rule then
+//! reads itself backwards: the highlight is taken for the panel, and the one remaining option, the
+//! one the operator is refusing, is reported as selected. It is deterministic, so a second read
+//! agrees, and every guard downstream nods it through to a confirm key. So the panel is measured
+//! from the parts of the row that are NOT options — preferring the keybind footer, which is the one
+//! stretch no harness draws inside a highlight bar.
+//!
+//! # Which row, when two of them look like controls
+//!
+//! A modal is the last thing drawn, so the scan runs bottom-up: agent prose above a dialog used to
+//! hide it. But a TUI status bar drawn BELOW a live dialog has the same shape as a menu, and
+//! reading it as the dialog offers the operator buttons labelled with status-bar segments — whose
+//! first arrow key goes into the dialog that really has focus. Nothing here can tell which of two
+//! control rows holds the keyboard, so neither is answered.
+//!
 //! # A control we cannot read is not prose
 //!
 //! A dialog that stops being recognised used to fall back to being treated as prose, which is the
@@ -170,25 +188,50 @@ pub enum Screen {
 }
 
 /// Classify an ANSI pane read.
+///
+/// Scans BOTTOM-UP, because a modal is the last thing drawn and the agent's own transcript — which
+/// it writes, and which can contain the words "select" and "confirm" — sits above it. Taking the
+/// first match from the top let one sentence of agent prose hide a live dialog.
+///
+/// But bottom-most is not the same as "the one holding the keyboard". A TUI status bar drawn BELOW
+/// a live dialog has the shape of a menu — segments on their own backgrounds, one of them
+/// highlighted, the words "select" and "confirm" in it — and reading it as the dialog offers the
+/// operator buttons labelled with status-bar segments, whose first arrow key goes into the dialog
+/// that really has focus. So when TWO rows on one screen both read as live controls, neither is
+/// answered: nothing here can tell which one has the keyboard, and the wrong guess types into a
+/// terminal. That costs the operator a trip to their keyboard; the alternative costs them a
+/// keypress they never chose.
 pub fn classify(ansi: &str) -> Screen {
-    // BOTTOM-UP. A modal is the last thing drawn, and the agent's own transcript — which it writes,
-    // and which can contain the words "select" and "confirm" — sits above it. Taking the first
-    // match from the top let one sentence of agent prose hide a live dialog.
+    let mut resolved: Option<Prompt> = None;
+    let mut resolved_rows = 0usize;
+    let mut lowest = true;
+
     for line in ansi.lines().rev() {
-        let Some(options) = option_runs(line) else {
+        let Some(row) = control_row(line) else {
             continue;
         };
-        return match selected_index(&options, line) {
-            Some(selected) => Screen::Dialog(Prompt {
-                options: options.into_iter().map(|(t, _)| t).collect(),
-                selected,
-            }),
-            // The bottom-most control row decides. Looking further up for something resolvable
-            // would drive keys at a row that is not the one holding focus.
-            None => Screen::UnreadableControl,
-        };
+        let read = row.read();
+        if lowest {
+            lowest = false;
+            // The bottom-most control row is the one a modal would be. If its highlight cannot be
+            // resolved, nothing above it may be driven instead — that row is not the one with
+            // focus.
+            if read.is_none() {
+                return Screen::UnreadableControl;
+            }
+        }
+        if let Some(p) = read {
+            resolved_rows += 1;
+            resolved.get_or_insert(p);
+        }
     }
-    Screen::Prose
+
+    match resolved {
+        Some(p) if resolved_rows == 1 => Screen::Dialog(p),
+        // Two rows that both look like live controls: see the note above.
+        Some(_) => Screen::UnreadableControl,
+        None => Screen::Prose,
+    }
 }
 
 /// Parse a choice dialog out of an ANSI pane read, or `None` if none could be resolved.
@@ -203,69 +246,134 @@ pub fn parse(ansi: &str) -> Option<Prompt> {
     }
 }
 
-/// The `(text, background)` of the option runs on this row, or `None` if it is not a control row.
+/// One row that is shaped like a control, split into the parts that mean different things.
+struct ControlRow {
+    /// The runs that are candidates for options: `(text, background)`.
+    options: Vec<(String, String)>,
+    /// The keybind footer: `(background, columns)`, from the first hint run to the end of the row.
+    ///
+    /// Kept apart from everything else because the footer is the one place on the row that is
+    /// never part of a highlight bar — see [`ControlRow::panel`].
+    footer: Vec<(String, usize)>,
+    /// Separators and padding around the options, `(background, columns)`.
+    padding: Vec<(String, usize)>,
+}
+
+/// Split a row into options, padding and footer, or `None` if it is not shaped like a control.
 ///
-/// A control row carries the affordance footer AND at least two separately coloured runs before it.
-/// Prose that merely mentions the words is one uncoloured run, and is skipped.
-fn option_runs(line: &str) -> Option<Vec<(String, String)>> {
+/// A control row carries the affordance footer AND at least two separately rendered runs. Prose
+/// that merely mentions the words is one uncoloured run, and is skipped — but a row with two runs
+/// is treated as a control whether or not its options can be read out of it. That second half is
+/// the point: a modal whose buttons happen to be labelled `Confirm` and `Cancel` collides with the
+/// words a footer uses, and the option scan ends up empty. Falling through to prose there types
+/// the operator's words into a modal that swallows them.
+fn control_row(line: &str) -> Option<ControlRow> {
     if !is_option_row(line) {
         return None;
     }
-    let mut options: Vec<(String, String)> = Vec::new();
+    let mut row = ControlRow {
+        options: Vec::new(),
+        footer: Vec::new(),
+        padding: Vec::new(),
+    };
+    let mut candidates = 0usize;
+    let mut in_footer = false;
+
     for (sgr, text) in sgr_runs(line) {
+        let bg = background_of(&sgr);
+        let width = text.chars().count();
         let t = text.trim();
         if t.is_empty() || t.chars().all(|c| "│┃╹▀ ".contains(c)) {
+            if in_footer {
+                row.footer.push((bg, width));
+            } else {
+                row.padding.push((bg, width));
+            }
             continue;
         }
-        if is_hint(t) {
-            break; // the footer starts here
+        candidates += 1;
+        if in_footer || is_hint(t) {
+            in_footer = true;
+            row.footer.push((bg, width));
+            continue;
         }
-        options.push((t.to_string(), background_of(&sgr)));
+        row.options.push((t.to_string(), bg));
     }
-    (options.len() >= 2).then_some(options)
+
+    (candidates >= 2).then_some(row)
 }
 
-/// Which option is highlighted?
-///
-/// Primary rule: the row is painted in the modal's own background — the panel — and the selected
-/// option is the one painted differently. That is well defined for TWO options, which "the
-/// background that occurs exactly once" is not: with Allow/Deny each background occurs exactly
-/// once, and the old rule therefore refused the commonest dialog shape there is.
-///
-/// Fallback, three options or more: the odd one out. It fires only where the modal rule is
-/// inconclusive — a harness that paints the panel in the highlight colour, say — and it is the rule
-/// this parser shipped with, so nothing that used to resolve stops resolving.
-fn selected_index(options: &[(String, String)], line: &str) -> Option<usize> {
-    if let Some(modal) = modal_background(line) {
-        let differ: Vec<usize> = options
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, bg))| *bg != modal)
-            .map(|(i, _)| i)
-            .collect();
-        if differ.len() == 1 {
-            return Some(differ[0]);
+impl ControlRow {
+    /// The dialog this row is showing, or `None` when its highlight cannot be resolved.
+    fn read(&self) -> Option<Prompt> {
+        if self.options.len() < 2 {
+            return None;
         }
+        let selected = self.selected_index()?;
+        Some(Prompt {
+            options: self.options.iter().map(|(t, _)| t.clone()).collect(),
+            selected,
+        })
     }
-    odd_one_out(options)
+
+    /// The background the modal panel is painted in, measured from the parts of the row that are
+    /// NOT options.
+    ///
+    /// Measuring it across the whole row is what inverted a two-option dialog: with a long selected
+    /// label the highlight bar IS the widest background on the row, so the highlight was taken for
+    /// the panel and the one remaining option — the one the operator was refusing — was reported as
+    /// selected. Deterministically, so every re-read agreed and every later guard nodded it through.
+    ///
+    /// The keybind footer is preferred over the padding because it is the one stretch of the row
+    /// that no harness draws inside a highlight bar: padding immediately around a selected option
+    /// often carries the bar's own colour, and a harness that pads generously could outweigh a
+    /// short panel the same way a long label did.
+    fn panel(&self) -> Option<String> {
+        widest(&self.footer).or_else(|| widest(&self.padding))
+    }
+
+    /// Which option is highlighted?
+    ///
+    /// Primary rule: the row is painted in the modal's own background — the panel — and the
+    /// selected option is the one painted differently. That is well defined for TWO options, which
+    /// "the background that occurs exactly once" is not: with Allow/Deny each background occurs
+    /// exactly once, and the old rule therefore refused the commonest dialog shape there is.
+    ///
+    /// Fallback, three options or more: the odd one out. It fires only where the panel rule is
+    /// inconclusive — a harness that paints the panel in the highlight colour, say — and it is the
+    /// rule this parser shipped with, so nothing that used to resolve stops resolving. The two
+    /// cannot contradict each other: the panel rule answers only when exactly one option differs
+    /// from the panel, which means the other n-1 all share it, which is the same odd one out.
+    fn selected_index(&self) -> Option<usize> {
+        if let Some(panel) = self.panel() {
+            let differ: Vec<usize> = self
+                .options
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, bg))| *bg != panel)
+                .map(|(i, _)| i)
+                .collect();
+            if differ.len() == 1 {
+                return Some(differ[0]);
+            }
+        }
+        odd_one_out(&self.options)
+    }
 }
 
-/// The background covering the most columns of the row, or `None` when two of them tie for it.
-///
-/// Counted over EVERY run of the row — separators, padding and the keybind footer included —
-/// because that is where the panel colour is unambiguous. Counted over the options alone it is not:
-/// with two of them there is no majority to find.
-fn modal_background(line: &str) -> Option<String> {
-    let mut width: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for (sgr, text) in sgr_runs(line) {
-        *width.entry(background_of(&sgr)).or_default() += text.chars().count();
+/// The background covering the most columns of these runs, or `None` when two of them tie for it
+/// or there are none at all. No dominant colour means there is nothing to measure against, and
+/// refusing is the safe answer.
+fn widest(runs: &[(String, usize)]) -> Option<String> {
+    let mut width: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (bg, columns) in runs {
+        *width.entry(bg.as_str()).or_default() += columns;
     }
-    let mut ranked: Vec<(String, usize)> = width.into_iter().collect();
+    let mut ranked: Vec<(&str, usize)> = width.into_iter().collect();
     ranked.sort_by_key(|a| std::cmp::Reverse(a.1));
     match ranked.as_slice() {
-        [(bg, _)] => Some(bg.clone()),
-        [(bg, n), (_, m), ..] if n > m => Some(bg.clone()),
-        // No dominant colour means there is no panel to measure against. Refuse rather than guess.
+        [(bg, _)] => Some((*bg).to_string()),
+        [(bg, n), (_, m), ..] if n > m => Some((*bg).to_string()),
         _ => None,
     }
 }
@@ -408,11 +516,24 @@ pub(crate) mod synthetic {
     /// The keybind footer, copied out of the capture so a synthetic row ends the way a real one does.
     pub(crate) const FOOTER: &str = "\u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70mctrl+f \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mfullscreen\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  \u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70m\u{21c6} \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mselect\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  \u{1b}[0m\u{1b}[38;2;232;236;255m\u{1b}[48;2;26;37;70menter \u{1b}[0m\u{1b}[38;2;164;164;164m\u{1b}[48;2;26;37;70mconfirm\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m   \u{1b}[0m\u{1b}[38;2;255;255;255m  \u{1b}[0m";
 
+    /// The whole affordance a row can carry and still be recognised: no keybind list, just the
+    /// arrows and the word. It is the geometry that leaves the LEAST panel colour on the row, which
+    /// is what makes a long selected label able to outweigh the panel.
+    pub(crate) const SHORT_FOOTER: &str =
+        "\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m\u{2191}/\u{2193} select";
+
     /// A dialog row for the option counts and selections nobody captured.
     ///
     /// A synthetic fixture is worth only what its faithfulness is worth, so `permission`'s own tests
     /// check it against the real capture before anything else leans on it.
     pub(crate) fn render_dialog(options: &[&str], selected: usize) -> String {
+        render_dialog_with(options, selected, FOOTER)
+    }
+
+    /// The same row, with the affordance footer the caller names. Harnesses differ in how much
+    /// they draw after the options, and how much they draw is exactly what the panel is measured
+    /// from — so the tests have to be able to vary it.
+    pub(crate) fn render_dialog_with(options: &[&str], selected: usize, footer: &str) -> String {
         let mut s = String::from(
             "\u{1b}[0m\u{1b}[38;2;255;255;255m  \u{1b}[0m\u{1b}[38;2;255;225;77m\u{1b}[48;2;21;29;55m\u{2503}\u{1b}[0m\u{1b}[38;2;255;255;255m\u{1b}[48;2;26;37;70m  ",
         );
@@ -425,7 +546,7 @@ pub(crate) mod synthetic {
                 s.push_str(&format!("{UNSEL}{o}{PANEL}   "));
             }
         }
-        s.push_str(FOOTER);
+        s.push_str(footer);
         s
     }
 }
@@ -718,6 +839,106 @@ mod tests {
         );
     }
 
+    /// The inversion, and the reason this lane stopped the service. On a two-option dialog the
+    /// SELECTED option's highlight bar can be the widest single background on the row — a long
+    /// label and a short affordance is all it takes — and the panel used to be measured across the
+    /// whole row, options included. The parser then took the panel to be the highlight colour, and
+    /// reported the highlight on the ONE remaining option: the one the operator was refusing.
+    ///
+    /// It is deterministic, so every later re-read agrees with it and every guard downstream nods
+    /// the misread through. A reply of "no" reads as "already there", the bare confirm key goes
+    /// out, and the terminal grants the permission while the operator is told they declined.
+    ///
+    /// Long label and short, both affordances, both selections: two options is the commonest
+    /// confirm shape there is and it has to be right in all of them.
+    #[test]
+    fn a_long_selected_label_does_not_invert_a_two_option_dialog() {
+        let long = "Yes, and don't ask again this session";
+        for footer in [FOOTER, SHORT_FOOTER] {
+            for pair in [[long, "No"], ["No", long], ["Yes", "No"]] {
+                for selected in 0..2 {
+                    let row = render_dialog_with(&pair, selected, footer);
+                    assert_eq!(
+                        parse(&row),
+                        Some(Prompt {
+                            options: pair.iter().map(|o| o.to_string()).collect(),
+                            selected,
+                        }),
+                        "{pair:?} with the highlight on {selected} was read backwards"
+                    );
+                }
+            }
+        }
+
+        // What the misread costs, stated as the keys: answering "no" to a dialog sitting on Yes
+        // has to MOVE the highlight. An empty move means the next key out is the bare confirm key,
+        // and it grants what is already highlighted.
+        let p = parse(&render_dialog_with(&[long, "No"], 0, SHORT_FOOTER)).expect("a dialog");
+        let no = p.match_option("no").expect("\"no\" names one option");
+        assert_eq!(p.options[no], "No");
+        assert_eq!(
+            p.move_to(no).unwrap(),
+            ["Right"],
+            "refusing a dialog that is sitting on the grant must move the highlight off it"
+        );
+    }
+
+    /// A live modal whose buttons are named Confirm, Cancel or Select is still a modal. Those are
+    /// ordinary button labels AND the words a keybind footer uses, and the scan for options used to
+    /// stop dead at the first one — leaving too few options to resolve, so the row fell through to
+    /// ordinary output. The operator's words then went into a modal that swallows them, and the
+    /// submit key after them pressed whatever was highlighted. That is this module's whole reason
+    /// for existing, still open for the commonest labels there are.
+    #[test]
+    fn a_modal_whose_buttons_are_named_like_hints_is_never_prose() {
+        for pair in [
+            ["Confirm", "Cancel"],
+            ["Cancel", "Confirm"],
+            ["Select", "Cancel"],
+            ["Yes", "Cancel"],
+        ] {
+            for selected in 0..2 {
+                let screen = format!(
+                    "agent: I need a decision before I go on.\n{}",
+                    render_dialog_with(&pair, selected, SHORT_FOOTER)
+                );
+                assert_ne!(
+                    classify(&screen),
+                    Screen::Prose,
+                    "{pair:?} is a modal; typing at it presses whatever is highlighted"
+                );
+            }
+        }
+    }
+
+    /// A status bar drawn BELOW a live dialog must not become the dialog. Scanning bottom-up fixed
+    /// agent prose hiding a dialog and opened this: a bar with one highlighted segment and the word
+    /// "select" in it has exactly the shape of a two-option menu, so the operator was offered
+    /// buttons labelled with status-bar segments — and a tap on one sent a real arrow key into the
+    /// dialog that actually had focus, moving what their own Enter would then confirm.
+    ///
+    /// Two rows on one screen both look like live controls; nothing here can tell which one holds
+    /// the keyboard. So neither is answered, and the operator is told to answer at the keyboard.
+    #[test]
+    fn a_status_bar_below_a_dialog_never_becomes_the_dialog() {
+        const BAR: &str = "\u{1b}[48;5;236m ready  \u{1b}[48;5;33m NORMAL \u{1b}[48;5;236m \u{2191}/\u{2193} select  enter confirm ";
+        let screen = format!("{REAL}\n{BAR}");
+        assert_eq!(
+            classify(&screen),
+            Screen::UnreadableControl,
+            "a status bar was answered as though it were the dialog"
+        );
+        assert_eq!(
+            parse(&screen),
+            None,
+            "no buttons may be drawn from a row that is not the one holding focus"
+        );
+
+        // The dialog on its own is still answered: this must not become a machine that refuses
+        // everything.
+        assert!(matches!(classify(REAL), Screen::Dialog(_)));
+    }
+
     /// The agent writes the transcript above its own dialog, and it can write the words the row
     /// detector looks for. One such sentence used to hide a live dialog completely.
     #[test]
@@ -774,19 +995,27 @@ mod tests {
             "\u{1b}[1;34m main \u{1b}[0m\u{1b}[2m 3 files \u{1b}[0m\u{1b}[33m select \u{1b}[0m";
         assert_eq!(classify(status), Screen::Prose);
 
-        // A word that stands alone as its own coloured run is read as part of a keybind footer,
-        // which narrows this a good deal: highlighted SQL keywords do not trip it.
-        assert_eq!(
-            classify("\u{1b}[36mSELECT\u{1b}[0m \u{1b}[37mid FROM confirmations\u{1b}[0m"),
-            Screen::Prose
-        );
+        // Two separately coloured runs on a row that says how to select and confirm is the shape
+        // of a control, and it is answered as one whether or not the options can be read out of
+        // it. A word that stands alone as its own run no longer buys prose treatment: `Confirm`
+        // and `Cancel` are footer words AND ordinary button labels, and letting them end the scan
+        // is what let a live modal be typed into. So a highlighted SQL keyword costs a reply too.
+        for sql in [
+            "\u{1b}[36mSELECT\u{1b}[0m \u{1b}[37mid FROM confirmations\u{1b}[0m",
+            "\u{1b}[36mSELECT id\u{1b}[0m \u{1b}[37mFROM confirmations\u{1b}[0m",
+        ] {
+            assert_eq!(
+                classify(sql),
+                Screen::UnreadableControl,
+                "the accepted price: an ordinary coloured line can cost a reply"
+            );
+        }
 
-        // But glue either word to its neighbours and the row is a control. This is the price, and
-        // it is real: the reply is refused until the screen redraws.
+        // The price stays bounded by the run count: ordinary uncoloured prose, however many of the
+        // words it uses, is one run and keeps the text path.
         assert_eq!(
-            classify("\u{1b}[36mSELECT id\u{1b}[0m \u{1b}[37mFROM confirmations\u{1b}[0m"),
-            Screen::UnreadableControl,
-            "the accepted price: an ordinary coloured line can cost a reply"
+            classify("I will select the first option and confirm it later"),
+            Screen::Prose
         );
     }
 }
