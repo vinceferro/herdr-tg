@@ -525,6 +525,22 @@ mod tests {
         assert_eq!(p.exact_option("deny"), None);
     }
 
+    /// Against the real captured menu: a button's label is matched character for character, which
+    /// is what makes it safe to carry one instead of a position.
+    #[test]
+    fn an_exact_label_resolves_and_a_near_miss_does_not() {
+        let p = parse(REAL).unwrap();
+        assert_eq!(p.exact_option("Allow once"), Some(0));
+        assert_eq!(p.exact_option("Reject"), Some(2));
+        assert_eq!(p.exact_option("reject"), None, "the case must match");
+        assert_eq!(p.exact_option("Allow"), None, "a prefix is not a label");
+        assert_eq!(
+            p.exact_option("Reject "),
+            None,
+            "both sides come out of this parser, which trims, so a stray space is a real difference"
+        );
+    }
+
     #[test]
     fn highlighted_names_the_option_this_read_saw_selected() {
         let p = parse(REAL).unwrap();

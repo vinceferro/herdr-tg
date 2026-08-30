@@ -269,10 +269,6 @@ pub enum Choice<'a> {
     Reply(&'a str),
     /// A button tap: the exact label the button displayed, and the whole list it was drawn from.
     /// Both must still match the dialog on screen, or nothing is pressed.
-    #[allow(
-        dead_code,
-        reason = "tapped through the callback payload, which lands with the label-carrying buttons"
-    )]
     Button {
         label: &'a str,
         drawn_from: &'a [String],
@@ -524,6 +520,97 @@ pub async fn choose<P: PaneIo>(
         },
         option: chosen,
     }))
+}
+
+/// A menu on a screen, and a record of every key that reached it, for the tests of modules that
+/// answer one.
+///
+/// It lives in THIS file because a fake pane has to name the write methods, and
+/// `no_live_write_call_site` permits that in exactly one file outside the client crate — which is
+/// the rule that keeps every real write on the read-back-and-audit path. A fake in another module's
+/// test would either fail that guard or force the exemption wider.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::cell::RefCell;
+
+    use herdr_client::{HerdrError, Key, PaneId};
+
+    use super::PaneIo;
+
+    pub(crate) struct MenuPane {
+        options: Vec<String>,
+        selected: RefCell<usize>,
+        keys: RefCell<Vec<String>>,
+        confirmed: RefCell<Option<String>>,
+    }
+
+    impl MenuPane {
+        /// A menu with the first option highlighted, as a freshly drawn one is.
+        pub(crate) fn showing(options: &[&str]) -> Self {
+            Self {
+                options: options.iter().map(|o| o.to_string()).collect(),
+                selected: RefCell::new(0),
+                keys: RefCell::new(Vec::new()),
+                confirmed: RefCell::new(None),
+            }
+        }
+
+        /// Every key that reached the pane, in order.
+        pub(crate) fn keys(&self) -> Vec<String> {
+            self.keys.borrow().clone()
+        }
+
+        /// The option the confirm key actually landed on — the ground truth a test compares what
+        /// the operator was told against.
+        pub(crate) fn confirmed(&self) -> Option<String> {
+            self.confirmed.borrow().clone()
+        }
+    }
+
+    impl PaneIo for MenuPane {
+        async fn read_visible(&self, _pane: &PaneId) -> Result<String, HerdrError> {
+            panic!("a menu must be read in colour, or which option is highlighted is invisible")
+        }
+        async fn send_input_text(&self, _pane: &PaneId, _text: &str) -> Result<(), HerdrError> {
+            panic!(
+                "a menu is never answered with words: the confirm key after them presses \
+                    whatever happens to be highlighted"
+            )
+        }
+        async fn send_submit_key(&self, _pane: &PaneId, _key: &Key) -> Result<(), HerdrError> {
+            panic!("the menu path sends its keys as a sequence, so all of them are recorded")
+        }
+        async fn read_visible_ansi(&self, _pane: &PaneId) -> Result<String, HerdrError> {
+            let refs: Vec<&str> = self.options.iter().map(String::as_str).collect();
+            Ok(crate::permission::synthetic::render_dialog(
+                &refs,
+                *self.selected.borrow(),
+            ))
+        }
+        async fn send_key_sequence(&self, _pane: &PaneId, keys: &[Key]) -> Result<(), HerdrError> {
+            for k in keys {
+                let name = k.to_string();
+                match name.as_str() {
+                    // Clamps at the ends, like the captured harness does.
+                    "Right" => {
+                        let at = *self.selected.borrow();
+                        *self.selected.borrow_mut() = (at + 1).min(self.options.len() - 1);
+                    }
+                    "Left" => {
+                        let at = *self.selected.borrow();
+                        *self.selected.borrow_mut() = at.saturating_sub(1);
+                    }
+                    "Enter" => {
+                        *self.confirmed.borrow_mut() =
+                            Some(self.options[*self.selected.borrow()].clone());
+                    }
+                    _ => {}
+                }
+                self.keys.borrow_mut().push(name);
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1115,6 +1202,101 @@ mod tests {
             .unwrap();
         assert_eq!(r.expect_err("there is no menu"), ChoiceRefused::NotADialog);
         assert!(gone.sent_keys.borrow().is_empty());
+    }
+
+    /// THE regression test for the tapped button.
+    ///
+    /// The buttons said `Allow once · Allow always · Reject` and the operator tapped the third. By
+    /// the time the tap arrives the menu has been redrawn in a different order, so the third option
+    /// is now `Allow always` — a reviewer made a button reading "Reject" grant the broadest
+    /// permission this way. Answering by position is what does it, and it is measurable: driving
+    /// this same screen with the position the button carried confirms "Allow always" and sends
+    /// `["Right", "Right", "Enter"]`.
+    #[tokio::test]
+    async fn a_button_never_resolves_by_position_when_the_menu_reordered() {
+        let drawn_from: Vec<String> = OPTIONS.iter().map(|o| o.to_string()).collect();
+        let io = DialogPane::new(&["Reject", "Allow once", "Allow always"], 0, Edge::Clamps);
+
+        let r = choose(
+            &io,
+            &pane(),
+            Choice::Button {
+                label: "Reject",
+                drawn_from: &drawn_from,
+            },
+            settle(),
+            no_sleep,
+        )
+        .await
+        .unwrap();
+
+        let ChoiceRefused::Changed { now } = r.expect_err("the menu is not the one that was drawn")
+        else {
+            panic!("a reordered menu must be refused, never answered by position");
+        };
+        assert_eq!(now, ["Reject", "Allow once", "Allow always"]);
+        assert!(
+            io.keys().is_empty(),
+            "not one key may reach a menu the buttons were not drawn for"
+        );
+        assert_eq!(io.confirmed(), None);
+    }
+
+    /// The same defect in its other shape: the agent asked again with one more option, so the third
+    /// button now points at `Allow all`. Nothing about the position says so; the labels do.
+    #[tokio::test]
+    async fn a_button_whose_menu_gained_an_option_presses_nothing() {
+        let drawn_from: Vec<String> = OPTIONS.iter().map(|o| o.to_string()).collect();
+        let io = DialogPane::new(
+            &["Allow once", "Allow always", "Allow all", "Reject"],
+            0,
+            Edge::Clamps,
+        );
+
+        let r = choose(
+            &io,
+            &pane(),
+            Choice::Button {
+                label: "Reject",
+                drawn_from: &drawn_from,
+            },
+            settle(),
+            no_sleep,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(r, Err(ChoiceRefused::Changed { .. })),
+            "a menu that grew an option must be refused: {r:?}"
+        );
+        assert!(io.keys().is_empty());
+        assert_eq!(io.confirmed(), None);
+    }
+
+    /// The other half of not being a false-refusal machine: a tap on the menu that IS on screen
+    /// still answers it, and it answers the label the button showed rather than its position.
+    #[tokio::test]
+    async fn a_button_on_the_menu_it_was_drawn_for_still_answers_it() {
+        let drawn_from: Vec<String> = OPTIONS.iter().map(|o| o.to_string()).collect();
+        let io = DialogPane::new(&OPTIONS, 0, Edge::Clamps);
+        let c = choose(
+            &io,
+            &pane(),
+            Choice::Button {
+                label: "Reject",
+                drawn_from: &drawn_from,
+            },
+            settle(),
+            no_sleep,
+        )
+        .await
+        .unwrap()
+        .expect("the menu on screen is the one those buttons were drawn for");
+
+        assert_eq!(c.option, "Reject");
+        assert_eq!(io.confirmed().as_deref(), Some("Reject"));
+        assert_eq!(io.keys(), ["Right", "Right", "Enter"]);
     }
 
     #[test]

@@ -286,6 +286,10 @@ pub fn nothing_sent(reason: Reason) -> String {
              alone.\n<i>Nothing was typed into that terminal. Reply again to see the choices as \
              they are now.</i>"
             .to_string(),
+        Reason::ButtonExpired => "That button is too old for me to be sure what it meant, so I \
+             didn't answer it.\n<i>Tap a button on the newest message for this session, or reply \
+             with the option's name.</i>"
+            .to_string(),
         // The account comes from `deliver`, which watched the menu; it is the only place that
         // knows which option ended up highlighted instead. It is escaped because the option names
         // in it are the agent's words, not this bridge's.
@@ -311,6 +315,10 @@ pub enum Reason {
     NoLongerAsking,
     /// A menu is up, but not the one the buttons were drawn for.
     PromptChanged,
+    /// Which menu that button belonged to is no longer remembered — it is old, or it came from
+    /// somewhere the bridge did not send it. Nothing may be answered on a guess about which
+    /// question it was.
+    ButtonExpired,
     /// The highlight could not be got onto the option the operator asked for, so nothing was
     /// confirmed. Carries `deliver`'s account of what it actually saw, which names the option it
     /// ended up on — that is the information, and only `deliver` has it.
@@ -378,6 +386,7 @@ mod tests {
             nothing_sent(Reason::UnreadablePrompt),
             nothing_sent(Reason::NoLongerAsking),
             nothing_sent(Reason::PromptChanged),
+            nothing_sent(Reason::ButtonExpired),
             nothing_sent(Reason::ChoiceNotConfirmed(
                 "I couldn't get the highlight onto \"Reject\" — it is on \"Allow once\". Nothing \
                  was confirmed; answer it at the keyboard."
@@ -502,6 +511,7 @@ mod tests {
             Reason::NoTarget,
             Reason::TargetGone,
             Reason::UnclearChoice(vec!["Allow once".into()]),
+            Reason::ButtonExpired,
         ] {
             let m = nothing_sent(r);
             assert!(

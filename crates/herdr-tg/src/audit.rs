@@ -18,6 +18,14 @@
 //! bridge is killed between them — which is exactly when the operator most wants to know what
 //! happened — the `sent` record still says what went into the pane. A single record written after
 //! the fact would lose precisely the case it exists for.
+//!
+//! # Why nothing can dangle
+//!
+//! A `sent` record with no ending is not a trail, it is a question. So `sent` is written only once
+//! every check has passed and the keys are about to go out, and every branch that deliberately
+//! sends nothing writes [`Audit::refused`] instead. Every attempt therefore ends in `outcome`,
+//! `failed` or `refused`, and a `sent` with no ending means the bridge died mid-write — which is
+//! the one thing it is supposed to mean.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -88,6 +96,22 @@ impl Audit {
             "{at}\tfailed\tpane={}\terror={}",
             pane.as_str(),
             escape(err)
+        );
+        self.append(&line)
+    }
+
+    /// Record an attempt that was deliberately NOT made.
+    ///
+    /// The counterpart to `sent`: it is what keeps a `sent` record from standing alone when a check
+    /// stopped the keys. `why` is written for the operator reading this file afterwards, so it says
+    /// what was seen, not which branch was taken.
+    pub fn refused(&self, at: &str, chat: i64, pane: &PaneId, why: &str) -> std::io::Result<()> {
+        let mut line = String::new();
+        let _ = write!(
+            line,
+            "{at}\trefused\tchat={chat}\tpane={}\twhy={}",
+            pane.as_str(),
+            escape(why)
         );
         self.append(&line)
     }
@@ -207,6 +231,31 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\tsent\t") && lines[0].contains("chat=42"));
         assert!(lines[1].contains("\toutcome\t") && lines[1].contains("rung=Echoed"));
+    }
+
+    /// The other half of the two-record shape: an attempt that was stopped ends here, so a `sent`
+    /// record with no ending can only mean the bridge died mid-write.
+    #[test]
+    fn an_attempt_that_was_stopped_leaves_a_record_of_its_own() {
+        let path = tmp("an_attempt_that_was_stopped_leaves_a_record_of_its_own");
+        let audit = Audit::new(&path);
+        audit
+            .refused(
+                "T",
+                42,
+                &PaneId::new("w1:p1"),
+                "that session moved on to a different question\nsecond line",
+            )
+            .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        let line = body.lines().next().unwrap();
+        assert!(line.contains("\trefused\t"), "not a refusal record: {line}");
+        assert!(line.contains("chat=42") && line.contains("pane=w1:p1"));
+        assert!(
+            line.contains("why=that session moved on to a different question\\nsecond line"),
+            "the reason was not written, or not escaped: {line}"
+        );
     }
 
     #[test]

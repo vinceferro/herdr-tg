@@ -54,6 +54,29 @@ pub enum Why {
     Sticky,
 }
 
+/// The menu a push's buttons were drawn for.
+///
+/// A Telegram button carries at most 64 bytes, stays tappable forever, and is evidence about a menu
+/// that was on screen at some point in the past. So the labels live HERE, next to the message the
+/// buttons are attached to, and a tap is answered against this record — never against whatever the
+/// pane happens to be showing when the tap arrives, which is how a button reading "Reject" came to
+/// confirm "Allow always".
+///
+/// Kept on disk deliberately: an outstanding ask is not pushed again after a restart, so its only
+/// live buttons are the ones on the message from before it. Forgetting the labels would make every
+/// one of those refuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptRecord {
+    /// The chat the push went to. A tap from any other chat is refused, never answered.
+    pub chat: i64,
+    pub pane: String,
+    /// Where the pane's run of work stood when the buttons were drawn — the same key the push
+    /// dedupe uses. A different value is a different question.
+    pub seq: u64,
+    /// The labels, left to right, exactly as the buttons showed them.
+    pub options: Vec<String>,
+}
+
 /// Per-chat routing state, persisted so a restart does not lose the operator's target.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Routing {
@@ -67,11 +90,18 @@ pub struct Routing {
     /// Bounded: Telegram message ids are monotonic per chat, so the oldest entries are the least
     /// useful, and an unbounded map in a long-running bridge is a slow leak.
     pushes: BTreeMap<i64, String>,
+    /// message id of a push that drew menu buttons → the menu they were drawn for.
+    #[serde(default)]
+    prompts: BTreeMap<i64, PromptRecord>,
 }
 
 /// How many push→pane mappings to remember. Beyond this the oldest are dropped.
 #[allow(dead_code, reason = "used by record_push, which the push loop calls")]
 const MAX_PUSH_MEMORY: usize = 500;
+
+/// How many drawn menus to remember. Lower than [`MAX_PUSH_MEMORY`] because each record carries a
+/// list of labels, and a button older than this is one nobody is going to tap.
+const MAX_PROMPT_MEMORY: usize = 200;
 
 impl Routing {
     /// Remember that `message_id` was a push about `pane`, so a reply to it routes there.
@@ -89,6 +119,38 @@ impl Routing {
             let oldest = *self.pushes.keys().next().expect("non-empty");
             self.pushes.remove(&oldest);
         }
+    }
+
+    /// Remember the menu the buttons on `message_id` were drawn for.
+    ///
+    /// Without this a tap has nothing to answer against and is refused — which is the point. A tap
+    /// must answer the question the operator actually read.
+    pub fn record_prompt(
+        &mut self,
+        message_id: i64,
+        chat: i64,
+        pane: &PaneId,
+        seq: u64,
+        options: &[String],
+    ) {
+        self.prompts.insert(
+            message_id,
+            PromptRecord {
+                chat,
+                pane: pane.as_str().to_string(),
+                seq,
+                options: options.to_vec(),
+            },
+        );
+        while self.prompts.len() > MAX_PROMPT_MEMORY {
+            let oldest = *self.prompts.keys().next().expect("non-empty");
+            self.prompts.remove(&oldest);
+        }
+    }
+
+    /// The menu remembered for a message, if it is still remembered.
+    pub fn prompt_for(&self, message_id: i64) -> Option<&PromptRecord> {
+        self.prompts.get(&message_id)
     }
 
     /// Bind a forum topic to a pane. One topic per pane, for the life of the pane.
@@ -405,6 +467,44 @@ mod tests {
         let back = Routing::load(&path);
         assert_eq!(back.sticky(878), Some(PaneId::new("wA:p1")));
         assert_eq!(back.pushes.get(&9).map(String::as_str), Some("wB:p1"));
+    }
+
+    /// A restart must not disarm every button the operator can still see, and a long run must not
+    /// grow this map without bound.
+    #[test]
+    fn a_drawn_menu_survives_a_restart_and_the_memory_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("herdr-tg-prompts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("routing.state.json");
+
+        let options = vec!["Allow once".to_string(), "Reject".to_string()];
+        let mut r = Routing::default();
+        r.record_prompt(9, 42, &PaneId::new("wB:p1"), 198, &options);
+        r.save(&path).unwrap();
+
+        let back = Routing::load(&path);
+        assert_eq!(
+            back.prompt_for(9),
+            Some(&PromptRecord {
+                chat: 42,
+                pane: "wB:p1".to_string(),
+                seq: 198,
+                options,
+            }),
+            "the labels a button showed must outlive a restart, or every live button refuses"
+        );
+        assert_eq!(back.prompt_for(10), None);
+
+        let mut many = Routing::default();
+        for i in 0..(MAX_PROMPT_MEMORY as i64 + 50) {
+            many.record_prompt(i, 42, &PaneId::new("wB:p1"), 1, &["Reject".to_string()]);
+        }
+        assert_eq!(many.prompts.len(), MAX_PROMPT_MEMORY);
+        assert!(
+            many.prompt_for(0).is_none(),
+            "the oldest must be dropped first"
+        );
+        assert!(many.prompt_for(MAX_PROMPT_MEMORY as i64 + 49).is_some());
     }
 
     #[test]
