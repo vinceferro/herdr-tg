@@ -78,6 +78,48 @@ pub struct Delivery {
     pub detail: String,
 }
 
+/// What became of the operator's words.
+///
+/// Two outcomes, not one, and the second is the whole point.
+///
+/// The moment the text write goes out, the bridge is past a point of no return: a timeout is the
+/// shape of a herd that took the bytes and never answered, so a failure from there on is not
+/// evidence that the terminal was left alone. Before that line an error means the pane was never
+/// touched, and saying "nothing was sent" is the truth. After it, the bridge does not know that
+/// nothing happened — it knows it cannot see what happened, and those are different sentences.
+///
+/// This is an enum rather than a field so that the difference cannot be dropped on the floor: a
+/// caller has to name both cases before it can say anything to the operator.
+#[derive(Debug, Clone)]
+pub enum Delivered {
+    /// Every read the bridge needed came back. [`Delivery`] says how far up the ladder it got.
+    Watched(Delivery),
+    /// Contact was lost after the operator's words had already left the bridge, so what they did
+    /// is simply unknown.
+    LostSight {
+        pane: PaneId,
+        /// The last thing that left the bridge before contact went.
+        reached: Reached,
+        /// Human-readable account of what was and was not observed. Goes to the audit log verbatim.
+        detail: String,
+    },
+}
+
+/// How far the writes had got when contact was lost.
+///
+/// Two, not four, though there are four moments this can happen at. A write whose RPC never
+/// answered and a write that was acked and then never checked need the SAME thing from the
+/// operator — a look at that terminal before they send the message again — and the bridge must not
+/// take the weaker reading of its own failure. So "the words may have gone out" and "the words did
+/// go out" are one case, named for what the operator has to assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reached {
+    /// The words went out. The submit key did not, so they may be sitting in the input box unsent.
+    TheWords,
+    /// The words went out and the submit key after them. The agent may already have the message.
+    TheWordsAndTheSubmitKey,
+}
+
 /// The pane operations delivery needs.
 ///
 /// A trait rather than a concrete client so the verification logic — which is the part that must
@@ -149,8 +191,18 @@ impl Default for Settle {
 
 /// Put `text` into `pane`, press `submit`, and report how far up the ladder we actually got.
 ///
-/// Never returns a rung it did not observe. A transport failure propagates — the operator must not
-/// be told anything about a write whose fate is unknown.
+/// Never returns a rung it did not observe.
+///
+/// # What an `Err` from here means
+///
+/// Exactly one thing: **nothing reached the pane**. The caller renders it as "I can't reach the
+/// herd right now, so nothing was sent", so that has to be a fact, not a guess. Only the look taken
+/// before the first write can produce it.
+///
+/// Everything after that write is past the point of no return, and a failure there is reported as
+/// [`Delivered::LostSight`] — the words went out, and what they did could not be seen. Reporting
+/// those as errors had the operator told nothing was sent about a message that was already typed
+/// and submitted; they sent it again, and the agent got it twice.
 pub async fn deliver<P: PaneIo>(
     io: &P,
     pane: &PaneId,
@@ -158,16 +210,50 @@ pub async fn deliver<P: PaneIo>(
     submit: &Key,
     settle: Settle,
     sleep: impl Fn(Duration) -> futures_core::future::BoxFuture<'static, ()>,
-) -> Result<Delivery, HerdrError> {
+) -> Result<Delivered, HerdrError> {
+    // The last read whose failure honestly means "nothing was sent". Nothing has been written yet.
     let before = io.read_visible(pane).await?;
 
-    io.send_input_text(pane, text).await?;
+    // THE POINT OF NO RETURN. Below this line no `?` may stand: a timeout is the shape of a herd
+    // that took the write and never answered, so from here the bridge can say what it could not
+    // see, and never that the terminal was left alone.
+    let lost = |reached: Reached, detail: String| Delivered::LostSight {
+        pane: pane.clone(),
+        reached,
+        detail,
+    };
+
+    if let Err(e) = io.send_input_text(pane, text).await {
+        tracing::warn!(error = %e, "lost contact with the herd as the operator's words went out");
+        return Ok(lost(
+            Reached::TheWords,
+            format!(
+                "lost contact as the words went out — I could not check whether they arrived, \
+                 and I did not press {submit}: {e}"
+            ),
+        ));
+    }
     let mut rung = Rung::Accepted;
     let mut detail = String::from("herdr accepted the text");
 
     // Rung 2: did the TUI actually render it? A distinctive slice of the operator's own text is the
     // probe — the whole message may be wrapped, indented, or truncated by the TUI.
-    let after_text = io.read_visible(pane).await?;
+    let after_text = match io.read_visible(pane).await {
+        Ok(s) => s,
+        // The words are in that terminal. What is unknown is whether they rendered — and the
+        // submit key is deliberately NOT sent on a screen nobody can see, because a modal that
+        // took focus would swallow the text and let the key press whatever is highlighted.
+        Err(e) => {
+            tracing::warn!(error = %e, "lost sight of the pane after the operator's words went in");
+            return Ok(lost(
+                Reached::TheWords,
+                format!(
+                    "the words went in, then I lost sight of that session before I could press \
+                     {submit}: {e}"
+                ),
+            ));
+        }
+    };
     let needle = echo_needle(text);
     let echoed = needle
         .as_deref()
@@ -182,13 +268,33 @@ pub async fn deliver<P: PaneIo>(
         );
     }
 
-    io.send_submit_key(pane, submit).await?;
+    if let Err(e) = io.send_submit_key(pane, submit).await {
+        tracing::warn!(error = %e, "lost contact with the herd as the submit key went out");
+        return Ok(lost(
+            Reached::TheWordsAndTheSubmitKey,
+            format!("the words went in and I lost contact as {submit} went out — {detail}: {e}"),
+        ));
+    }
 
     // Rung 3: did the submit key change anything? Compared against the post-text read, so the
     // change attributable to the submit key is isolated from the change caused by the text.
     for _ in 0..settle.attempts {
         sleep(settle.interval).await;
-        let now = io.read_visible(pane).await?;
+        let now = match io.read_visible(pane).await {
+            Ok(now) => now,
+            // The words and the submit key have both landed. The agent may well have the message
+            // already, so the one thing that must not be said is that nothing was sent.
+            Err(e) => {
+                tracing::warn!(error = %e, "lost sight of the pane after the submit key landed");
+                return Ok(lost(
+                    Reached::TheWordsAndTheSubmitKey,
+                    format!(
+                        "the words went in and {submit} went out, then I lost sight of that \
+                         session before I could see what it did: {e}"
+                    ),
+                ));
+            }
+        };
         if now != after_text {
             let cleared = needle.as_deref().is_none_or(|n| !tail_contains(&now, n));
             rung = Rung::Submitted;
@@ -212,11 +318,11 @@ pub async fn deliver<P: PaneIo>(
         );
     }
 
-    Ok(Delivery {
+    Ok(Delivered::Watched(Delivery {
         pane: pane.clone(),
         rung,
         detail,
-    })
+    }))
 }
 
 /// A distinctive slice of the operator's text to look for in the pane.
@@ -322,8 +428,15 @@ impl std::fmt::Display for ChoiceRefused {
 pub enum Afterwards {
     /// Ordinary output is on screen: the menu took the answer and closed.
     MenuClosed,
-    /// The menu is still up. It may not have registered.
+    /// The SAME menu is still up. It may not have registered.
     MenuStillUp,
+    /// That question is gone and the session is asking a different one.
+    ///
+    /// Kept apart from [`Afterwards::MenuStillUp`] because an agent that touches two files in a
+    /// row answers one prompt and draws the next in the same breath. Calling that "the prompt is
+    /// still up — it may not have registered" is false about an answer that landed, and the
+    /// operator's natural response to it is to answer again — into a question they never read.
+    AnotherQuestion,
     /// The pane could not be looked at again at all, so what the key did is simply unknown.
     NotSeen,
 }
@@ -428,6 +541,13 @@ fn to_keys(names: &[&str]) -> Vec<Key> {
 /// One window remains, between the last read and the confirm key, and it cannot be closed from
 /// outside herdr. What CAN be closed is the bridge claiming an option it never saw highlighted:
 /// [`Chosen::option`] is that label, and it is the only one the operator is ever told.
+///
+/// # What an `Err` from here means
+///
+/// The same one thing it means from [`deliver`]: **no key reached that terminal**. Only the look
+/// taken before the first key can produce it, because the caller renders it as "nothing was sent".
+/// Every failure after a key has gone out comes back as a [`Chosen`] or a
+/// [`ChoiceRefused::NotConfirmed`] that says so.
 pub async fn choose<P: PaneIo>(
     io: &P,
     pane: &PaneId,
@@ -627,11 +747,30 @@ pub async fn choose<P: PaneIo>(
         // Ordinary output is the ONLY evidence that the menu closed. "Nothing parsed" is not: a
         // menu the bridge merely failed to understand reads the same way, and answering it is
         // exactly what did not happen.
-        if crate::permission::classify(&now) == crate::permission::Screen::Prose {
-            rung = Rung::Submitted;
-            afterwards = Afterwards::MenuClosed;
-            detail = format!("chose \"{chosen}\" — the menu closed");
-            break;
+        match crate::permission::classify(&now) {
+            crate::permission::Screen::Prose => {
+                rung = Rung::Submitted;
+                afterwards = Afterwards::MenuClosed;
+                detail = format!("chose \"{chosen}\" — the menu closed");
+                break;
+            }
+            // A menu offering DIFFERENT options is not the one that was answered. The question
+            // this function confirmed is gone from the screen, which is the same evidence a blank
+            // screen would have given — an agent that touches two files in a row asks the next
+            // question in the same breath. Saying "the prompt is still up" here is false about an
+            // answer that landed.
+            //
+            // The same options are NOT enough: a question redrawn unchanged and a question never
+            // answered look identical, and the honest reading of that is the doubtful one.
+            crate::permission::Screen::Dialog(p) if p.options != aimed.options => {
+                rung = Rung::Submitted;
+                afterwards = Afterwards::AnotherQuestion;
+                detail = format!(
+                    "chose \"{chosen}\" — that question closed and the session is asking another"
+                );
+                break;
+            }
+            _ => {}
         }
     }
     detail = match afterwards {
@@ -639,6 +778,7 @@ pub async fn choose<P: PaneIo>(
         Afterwards::MenuStillUp => {
             format!("{detail}, but the menu is still on screen — it may not have taken")
         }
+        Afterwards::AnotherQuestion => detail,
         // Says only what is known: the key went out, and the pane could not be looked at again.
         Afterwards::NotSeen => format!(
             "{detail}, and then lost contact with that session before I could see what it did"
@@ -822,6 +962,21 @@ mod tests {
         }
     }
 
+    /// The delivery the bridge actually watched from beginning to end.
+    ///
+    /// A `LostSight` here would mean the fake pane stopped answering, which none of the tests that
+    /// use this stage — so it is a panic rather than a silent second path through the assertions.
+    fn watched(d: Delivered) -> Delivery {
+        match d {
+            Delivered::Watched(d) => d,
+            Delivered::LostSight { detail, .. } => {
+                panic!(
+                    "this pane never goes quiet, so nothing should have lost sight of it: {detail}"
+                )
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_clean_submit_reaches_the_submitted_rung() {
         let io = FakePane::new(&[
@@ -829,9 +984,11 @@ mod tests {
             "> ship it please",         // after the text
             "agent: working on it\n> ", // after the submit key
         ]);
-        let d = deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
-            .await
-            .unwrap();
+        let d = watched(
+            deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
+                .await
+                .unwrap(),
+        );
         assert_eq!(d.rung, Rung::Submitted);
         assert_eq!(io.sent_text.borrow().as_slice(), ["ship it please"]);
         assert_eq!(io.sent_keys.borrow().as_slice(), ["Enter"]);
@@ -848,9 +1005,11 @@ mod tests {
             "> ",               // before
             "> ship it please", // after the text — and it never changes again
         ]);
-        let d = deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
-            .await
-            .unwrap();
+        let d = watched(
+            deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
+                .await
+                .unwrap(),
+        );
         assert_eq!(d.rung, Rung::Echoed, "must not claim Submitted");
         assert!(
             d.detail.contains("submit key"),
@@ -865,9 +1024,11 @@ mod tests {
     #[tokio::test]
     async fn text_that_never_renders_stays_at_accepted() {
         let io = FakePane::new(&["> ", "> "]);
-        let d = deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
-            .await
-            .unwrap();
+        let d = watched(
+            deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
+                .await
+                .unwrap(),
+        );
         assert_eq!(d.rung, Rung::Accepted);
     }
 
@@ -880,9 +1041,11 @@ mod tests {
             "> ship it please",
             "spinner ⠙\n> ship it please", // changed, but the text is still at the tail
         ]);
-        let d = deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
-            .await
-            .unwrap();
+        let d = watched(
+            deliver(&io, &pane(), "ship it please", &key(), settle(), no_sleep)
+                .await
+                .unwrap(),
+        );
         assert_eq!(d.rung, Rung::Submitted);
         assert!(
             d.detail.contains("still appears"),
@@ -900,9 +1063,11 @@ mod tests {
             "Do you want to deploy? [y/N] ",
             "Do you want to deploy? [y/N] y",
         ]);
-        let d = deliver(&io, &pane(), "y", &key(), settle(), no_sleep)
-            .await
-            .unwrap();
+        let d = watched(
+            deliver(&io, &pane(), "y", &key(), settle(), no_sleep)
+                .await
+                .unwrap(),
+        );
         // No needle, so Echoed is unreachable — but the submit rung is still observable, and that
         // is what carries a short reply.
         assert!(d.rung <= Rung::Accepted || d.rung == Rung::Submitted);
@@ -949,6 +1114,9 @@ mod tests {
         Stays,
         /// Something menu-shaped is still there, but its highlight cannot be read.
         Unreadable,
+        /// The question that was answered is gone and the agent is asking the NEXT one. An agent
+        /// touching two files in a row does exactly this.
+        AsksAnother,
     }
 
     /// A row that is plainly a control and whose highlight nobody can resolve: every option shares
@@ -1099,6 +1267,9 @@ mod tests {
                     AfterConfirm::Closes => "agent: working on it\n> ".to_string(),
                     AfterConfirm::Stays => self.screen(*self.truth.borrow()),
                     AfterConfirm::Unreadable => UNREADABLE.to_string(),
+                    AfterConfirm::AsksAnother => {
+                        crate::permission::synthetic::render_dialog(&NEXT_QUESTION_REFS, 0)
+                    }
                 });
             }
             let frame = *self.rendered.borrow();
@@ -1156,6 +1327,11 @@ mod tests {
     }
 
     const OPTIONS: [&str; 3] = ["Allow once", "Allow always", "Reject"];
+
+    /// The question an agent asks straight after the one it just had answered. Deliberately a
+    /// different list of options: that difference is the only evidence anyone has that the first
+    /// question is gone.
+    const NEXT_QUESTION_REFS: [&str; 2] = ["Yes", "No"];
 
     /// THE regression test. The operator is at their keyboard and the phone is in their hand.
     ///
@@ -1651,5 +1827,207 @@ mod tests {
         };
         assert!(keys_sent, "keys went out toward that terminal");
         assert!(why.contains("Reject"), "{why}");
+    }
+
+    // ---- the text path, after the point of no return ------------------------------------------
+
+    /// Where the herd stops answering, on the path every ordinary typed reply takes.
+    ///
+    /// All but the first are moments AFTER the operator's words have already left the bridge. A
+    /// timeout is the shape of a herd that took the write and never answered, so none of those is
+    /// evidence that the terminal was left alone.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Drops {
+        /// The look taken BEFORE anything is written. The one failure that really does mean the
+        /// pane was never touched.
+        BeforeAnyWrite,
+        /// The send of the text itself. The words may well be in that terminal.
+        AsTheTextGoesOut,
+        /// The look that would have checked whether the words rendered.
+        LookingAfterTheText,
+        /// The send of the submit key, after the words went in.
+        AsTheSubmitKeyGoesOut,
+        /// The look after the submit key — the words are in and have been submitted.
+        LookingAfterTheSubmitKey,
+    }
+
+    /// A pane that takes the write and then goes quiet: a herd restart, or a dropped socket.
+    struct DroppingPane {
+        drops: Drops,
+        reads: RefCell<usize>,
+        text: RefCell<Vec<String>>,
+        keys: RefCell<Vec<String>>,
+    }
+
+    impl DroppingPane {
+        fn new(drops: Drops) -> Self {
+            Self {
+                drops,
+                reads: RefCell::new(0),
+                text: RefCell::new(Vec::new()),
+                keys: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn gone(method: &'static str) -> HerdrError {
+            HerdrError::Timeout {
+                method,
+                elapsed: Duration::from_secs(5),
+            }
+        }
+
+        /// The words that reached the terminal, whatever the RPC then reported.
+        fn text(&self) -> Vec<String> {
+            self.text.borrow().clone()
+        }
+
+        /// The keys that reached the terminal, whatever the RPC then reported.
+        fn keys(&self) -> Vec<String> {
+            self.keys.borrow().clone()
+        }
+    }
+
+    impl PaneIo for DroppingPane {
+        async fn read_visible(&self, _pane: &PaneId) -> Result<String, HerdrError> {
+            let n = {
+                let mut r = self.reads.borrow_mut();
+                *r += 1;
+                *r
+            };
+            match n {
+                1 if self.drops == Drops::BeforeAnyWrite => Err(Self::gone("pane.readVisible")),
+                1 => Ok("> ".to_string()),
+                2 if self.drops == Drops::LookingAfterTheText => {
+                    Err(Self::gone("pane.readVisible"))
+                }
+                2 => Ok("> please carry on and delete the branch".to_string()),
+                _ if self.drops == Drops::LookingAfterTheSubmitKey => {
+                    Err(Self::gone("pane.readVisible"))
+                }
+                _ => Ok("agent: on it\n> ".to_string()),
+            }
+        }
+        async fn send_input_text(&self, _pane: &PaneId, text: &str) -> Result<(), HerdrError> {
+            // Recorded BEFORE the failure on purpose: a herd that took the bytes and never
+            // answered has put the operator's words in that terminal either way.
+            self.text.borrow_mut().push(text.to_string());
+            if self.drops == Drops::AsTheTextGoesOut {
+                return Err(Self::gone("pane.sendInput"));
+            }
+            Ok(())
+        }
+        async fn send_submit_key(&self, _pane: &PaneId, key: &Key) -> Result<(), HerdrError> {
+            self.keys.borrow_mut().push(key.to_string());
+            if self.drops == Drops::AsTheSubmitKeyGoesOut {
+                return Err(Self::gone("pane.sendKeys"));
+            }
+            Ok(())
+        }
+        async fn read_visible_ansi(&self, _pane: &PaneId) -> Result<String, HerdrError> {
+            panic!("the text path reads without colour")
+        }
+        async fn send_key_sequence(&self, _pane: &PaneId, _keys: &[Key]) -> Result<(), HerdrError> {
+            panic!("the text path sends its submit key on its own")
+        }
+    }
+
+    const REPLY: &str = "please carry on and delete the branch";
+
+    /// The guarantee the choice path already keeps, on the path every ordinary reply takes.
+    ///
+    /// The operator's words are in that terminal — in two of these four they have been submitted as
+    /// well — and the only caller turns an error from `deliver` into "I can't reach the herd right
+    /// now, so nothing was sent". The operator then sends the message again, and the agent gets it
+    /// twice.
+    #[tokio::test]
+    async fn a_failure_after_the_words_went_out_is_never_reported_as_nothing_sent() {
+        for drops in [
+            Drops::AsTheTextGoesOut,
+            Drops::LookingAfterTheText,
+            Drops::AsTheSubmitKeyGoesOut,
+            Drops::LookingAfterTheSubmitKey,
+        ] {
+            let io = DroppingPane::new(drops);
+            let out = deliver(&io, &pane(), REPLY, &key(), settle(), no_sleep).await;
+            assert_eq!(
+                io.text(),
+                [REPLY],
+                "{drops:?}: the operator's words reached that terminal"
+            );
+            let Ok(Delivered::LostSight { reached, .. }) = out else {
+                panic!(
+                    "{drops:?}: this reaches the operator as \"nothing was sent\", about words \
+                     that are sitting in their terminal: {out:?}"
+                );
+            };
+            // What the operator has to assume, which is what decides what they are told.
+            let expected = match drops {
+                Drops::AsTheTextGoesOut | Drops::LookingAfterTheText => Reached::TheWords,
+                _ => Reached::TheWordsAndTheSubmitKey,
+            };
+            assert_eq!(reached, expected, "{drops:?}");
+            // The submit key is never sent onto a screen nobody could read: a modal that took
+            // focus would swallow the words and let the key press whatever is highlighted.
+            assert_eq!(
+                io.keys().is_empty(),
+                expected == Reached::TheWords,
+                "{drops:?}: {:?}",
+                io.keys()
+            );
+            for place in [crate::voice::Place::Topic, crate::voice::Place::Flat] {
+                let m = crate::voice::lost_sight(place, "omarchy-lab", reached);
+                assert!(!m.contains("nothing was sent"), "{drops:?}: {m:?}");
+                assert!(
+                    m.contains("look at that session"),
+                    "{drops:?}: the operator must be sent to look before they send it again: {m:?}"
+                );
+            }
+        }
+    }
+
+    /// The other half, and the reason the guarantee is worth anything: the ONE look that happens
+    /// before a single byte is written. Its failure really does mean nothing was sent, and the
+    /// operator must still be told so plainly.
+    #[tokio::test]
+    async fn a_failure_before_anything_is_written_is_still_an_error() {
+        let io = DroppingPane::new(Drops::BeforeAnyWrite);
+        let out = deliver(&io, &pane(), REPLY, &key(), settle(), no_sleep).await;
+        assert!(
+            out.is_err(),
+            "nothing was written, so \"nothing was sent\" is the truth and must stay reachable"
+        );
+        assert!(io.text().is_empty(), "nothing may have been typed");
+        assert!(io.keys().is_empty(), "no key may have gone out");
+    }
+
+    /// An agent that answers one permission prompt and immediately asks the NEXT one.
+    ///
+    /// The answer landed — the question it was for is gone from the screen — but a menu is still
+    /// drawn there, and "the prompt is still up, it may not have registered" is then a false
+    /// sentence about a permission that was granted. The operator's natural response is to answer
+    /// again, and that answer now goes to a different question.
+    #[tokio::test]
+    async fn the_next_question_is_not_reported_as_the_answer_not_registering() {
+        let io =
+            DialogPane::new(&OPTIONS, 0, Edge::Clamps).after_confirm(AfterConfirm::AsksAnother);
+        let c = choose(&io, &pane(), Choice::Reply("Reject"), settle(), no_sleep)
+            .await
+            .unwrap()
+            .expect("Reject names exactly one option");
+        assert_eq!(
+            io.confirmed().as_deref(),
+            Some("Reject"),
+            "the terminal really did confirm it"
+        );
+        assert_ne!(
+            c.afterwards,
+            Afterwards::MenuStillUp,
+            "the question that was answered is gone; the menu on screen is a different one"
+        );
+        assert!(
+            !c.delivery.detail.contains("may not have taken"),
+            "an answer that landed was written down as doubtful: {}",
+            c.delivery.detail
+        );
     }
 }

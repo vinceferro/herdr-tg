@@ -984,13 +984,27 @@ async fn route_and_deliver(
     .await;
 
     match outcome {
-        Ok(d) => {
+        Ok(deliver::Delivered::Watched(d)) => {
             let _ = audit.outcome(&timestamp(), &d);
             voice::reply_landed(pl, ws, &d)
         }
+        // The words are in that terminal and the bridge stopped being able to look. "Nothing was
+        // sent" is the one thing that must not be said about them: the operator would send the
+        // message again, and an agent that already had it would act on it twice.
+        Ok(deliver::Delivered::LostSight {
+            pane: wrote_to,
+            reached,
+            detail,
+        }) => {
+            let _ = audit.unseen(&timestamp(), &wrote_to, reached, &detail);
+            tracing::warn!(pane = %wrote_to, detail = %detail, "lost sight of a pane mid-reply");
+            voice::lost_sight(pl, ws, reached)
+        }
+        // By construction this is the look taken BEFORE any byte was written, so the pane really
+        // was left alone and the operator can be told so plainly.
         Err(e) => {
             let _ = audit.failed(&timestamp(), &pane, &e.to_string());
-            tracing::error!(error = %e, "the reply failed to send");
+            tracing::error!(error = %e, "the reply was not attempted: the herd could not be read");
             voice::nothing_sent(Reason::HerdUnreachable)
         }
     }

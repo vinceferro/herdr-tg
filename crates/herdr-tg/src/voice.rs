@@ -26,7 +26,7 @@
 //! 7. **Never claim more than was observed.** This is the one rule that outranks brevity: a
 //!    confirmation that overstates costs the operator the time the bridge exists to save.
 
-use crate::deliver::{Afterwards, Delivery, Rung};
+use crate::deliver::{Afterwards, Delivery, Reached, Rung};
 
 /// Where the message will appear, which decides how much context it must carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +234,32 @@ pub fn reply_landed(place: Place, workspace: &str, d: &Delivery) -> String {
     }
 }
 
+/// The words went into a terminal and the bridge then lost sight of that session.
+///
+/// The sentence this exists to prevent is "nothing was sent". Once the write has gone out the
+/// bridge does not know that nothing happened — it knows it cannot see what happened, and an
+/// operator told the first of those retypes a message the agent may already have, which is how an
+/// instruction gets carried out twice.
+///
+/// So both messages say the same two things: your words went in, and go and look before you send
+/// them again.
+pub fn lost_sight(place: Place, workspace: &str, reached: Reached) -> String {
+    let where_to = match place {
+        Place::Topic => String::new(),
+        Place::Flat => format!(" into {}", esc(workspace)),
+    };
+    match reached {
+        Reached::TheWords => format!(
+            "⚠️ <b>I typed that{where_to}, then lost contact.</b>\nI never got to send it, so it \
+             may be sitting in the input box. Have a look at that session before you send it again."
+        ),
+        Reached::TheWordsAndTheSubmitKey => format!(
+            "⚠️ <b>I typed that{where_to} and sent it, then lost contact.</b>\nI couldn't see what \
+             it did. Have a look at that session before you send it again — it may already have it."
+        ),
+    }
+}
+
 /// What happened to a tapped or named option.
 ///
 /// Three outcomes, not two. The confirm key can land and the look that would check it can then
@@ -247,6 +273,12 @@ pub fn choice_made(place: Place, workspace: &str, option: &str, after: Afterward
         Afterwards::MenuClosed => format!("✅ <b>{}{where_to}.</b>", esc(option)),
         Afterwards::MenuStillUp => format!(
             "⚠️ <b>{}{where_to} — but the prompt is still up.</b>\nIt may not have registered.",
+            esc(option)
+        ),
+        // The question that was answered is gone; a different one is on screen. Saying the prompt
+        // is still up would send the operator back to answer a question they have not read.
+        Afterwards::AnotherQuestion => format!(
+            "✅ <b>{}{where_to}.</b>\nIt's asking something else now.",
             esc(option)
         ),
         Afterwards::NotSeen => format!(
@@ -419,6 +451,9 @@ mod tests {
             choice_made(place, "omarchy-lab", "Reject", Afterwards::MenuClosed),
             choice_made(place, "omarchy-lab", "Reject", Afterwards::MenuStillUp),
             choice_made(place, "omarchy-lab", "Reject", Afterwards::NotSeen),
+            choice_made(place, "omarchy-lab", "Reject", Afterwards::AnotherQuestion),
+            lost_sight(place, "omarchy-lab", Reached::TheWords),
+            lost_sight(place, "omarchy-lab", Reached::TheWordsAndTheSubmitKey),
             nothing_sent(Reason::NoTarget),
             nothing_sent(Reason::TargetGone),
             nothing_sent(Reason::NoAudit),
@@ -490,6 +525,8 @@ mod tests {
             resumed(Place::Flat, "omarchy-lab"),
             reply_landed(Place::Flat, "omarchy-lab", &delivery(Rung::Submitted)),
             choice_made(Place::Flat, "omarchy-lab", "Reject", Afterwards::MenuClosed),
+            lost_sight(Place::Flat, "omarchy-lab", Reached::TheWords),
+            lost_sight(Place::Flat, "omarchy-lab", Reached::TheWordsAndTheSubmitKey),
         ] {
             assert!(m.contains("omarchy-lab"), "no session named in: {m:?}");
         }
@@ -793,5 +830,87 @@ mod tests {
             "nothing here was confirmed to have taken: {m}"
         );
         assert!(m.contains("lost contact"), "{m}");
+    }
+
+    /// Rule 7, on the path every ordinary typed reply takes.
+    ///
+    /// Once a write has gone out the bridge cannot know that nothing happened — only that it cannot
+    /// see what happened. An operator told the first of those sends the message again, and an agent
+    /// that already had it acts on it twice. So every message the bridge can produce with the
+    /// operator's words already in a terminal is held against that one sentence.
+    #[test]
+    fn nothing_said_after_a_write_went_out_claims_that_nothing_was_sent() {
+        for place in [Place::Topic, Place::Flat] {
+            let mut after_the_write = vec![
+                choice_made(place, "w", "Reject", Afterwards::NotSeen),
+                choice_made(place, "w", "Reject", Afterwards::MenuStillUp),
+                choice_made(place, "w", "Reject", Afterwards::AnotherQuestion),
+                nothing_sent(Reason::ChoiceNotConfirmed {
+                    why: "I moved the highlight toward \"Reject\" and then lost contact with that \
+                          session, so I did not press the confirm key."
+                        .into(),
+                    keys_sent: true,
+                }),
+            ];
+            for reached in [Reached::TheWords, Reached::TheWordsAndTheSubmitKey] {
+                after_the_write.push(lost_sight(place, "w", reached));
+            }
+            for m in after_the_write {
+                let low = m.to_lowercase();
+                assert!(
+                    !low.contains("nothing was sent") && !low.contains("nothing was typed"),
+                    "said nothing was sent about something that went out: {m:?}"
+                );
+            }
+        }
+    }
+
+    /// Losing sight of a session is not a success and must not read like one, and it must not read
+    /// like a plain failure either. It has one job: send the operator to look before they retype.
+    #[test]
+    fn losing_sight_of_a_session_says_the_words_went_in_and_sends_the_operator_to_look() {
+        for place in [Place::Topic, Place::Flat] {
+            for reached in [Reached::TheWords, Reached::TheWordsAndTheSubmitKey] {
+                let m = lost_sight(place, "w", reached);
+                assert!(
+                    m.starts_with("⚠️"),
+                    "a doubtful outcome read as clean: {m:?}"
+                );
+                assert!(m.contains("I typed that"), "{m:?}");
+                assert!(m.contains("lost contact"), "{m:?}");
+                assert!(
+                    m.contains("before you send it again"),
+                    "the operator was not warned off sending it twice: {m:?}"
+                );
+            }
+        }
+        // The submit key is the difference between the two, and it is what decides whether the
+        // agent may already have the message.
+        assert!(
+            lost_sight(Place::Topic, "w", Reached::TheWords).contains("input box"),
+            "unsubmitted words must be described as unsubmitted"
+        );
+        assert!(
+            lost_sight(Place::Topic, "w", Reached::TheWordsAndTheSubmitKey)
+                .contains("may already have it"),
+            "submitted words must be described as possibly delivered"
+        );
+    }
+
+    /// An agent that answers one prompt and asks the next in the same breath. The answer landed,
+    /// and saying the prompt is still up sends the operator back to answer a question they have
+    /// not read.
+    #[test]
+    fn a_prompt_replaced_by_the_next_one_is_not_reported_as_an_answer_that_did_not_register() {
+        let m = choice_made(Place::Topic, "w", "Reject", Afterwards::AnotherQuestion);
+        assert!(m.contains("Reject"), "{m:?}");
+        assert!(
+            !m.contains("still up") && !m.contains("may not have registered"),
+            "an answer that landed was reported as doubtful: {m:?}"
+        );
+        assert!(
+            m.contains("asking something else"),
+            "the operator must be told a different question is on screen: {m:?}"
+        );
     }
 }

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use herdr_client::PaneId;
 
-use crate::deliver::Delivery;
+use crate::deliver::{Delivery, Reached};
 
 /// An append-only audit log.
 #[derive(Debug, Clone)]
@@ -84,6 +84,29 @@ impl Audit {
             delivery.pane.as_str(),
             delivery.rung,
             escape(&delivery.detail)
+        );
+        self.append(&line)
+    }
+
+    /// Record writes that went out and could not be checked.
+    ///
+    /// Its own record kind, not `failed`. A `failed` line says the attempt came to nothing, and
+    /// the whole point of this one is that something DID go into that terminal — which is exactly
+    /// what someone reading this file after a herd restart needs to know before they conclude the
+    /// message never arrived.
+    pub fn unseen(
+        &self,
+        at: &str,
+        pane: &PaneId,
+        reached: Reached,
+        detail: &str,
+    ) -> std::io::Result<()> {
+        let mut line = String::new();
+        let _ = write!(
+            line,
+            "{at}\tunseen\tpane={}\treached={reached:?}\tdetail={}",
+            pane.as_str(),
+            escape(detail)
         );
         self.append(&line)
     }
@@ -290,5 +313,30 @@ mod tests {
         assert_eq!(escape("a\nb"), "a\\nb");
         // A literal backslash-n in the text must not be confused with a newline.
         assert_ne!(escape("a\\nb"), escape("a\nb"));
+    }
+
+    /// Reading this file after a herd restart, the question is "did my message get in?". A write
+    /// that went out and could not be checked must not be filed as one that came to nothing.
+    #[test]
+    fn writes_that_went_out_unseen_are_not_recorded_as_writes_that_failed() {
+        let path = tmp("writes_that_went_out_unseen_are_not_recorded_as_writes_that_failed");
+        let audit = Audit::new(&path);
+        let pane = PaneId::new("w1:p1");
+        audit
+            .unseen(
+                "T",
+                &pane,
+                Reached::TheWordsAndTheSubmitKey,
+                "the words went in and Enter went out, then I lost sight of that session",
+            )
+            .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let line = body.lines().next().unwrap();
+        assert!(line.contains("\tunseen\t"), "{line}");
+        assert!(!line.contains("\tfailed\t"), "{line}");
+        assert!(
+            line.contains("reached=TheWordsAndTheSubmitKey"),
+            "what went out is the whole point of the record: {line}"
+        );
     }
 }
