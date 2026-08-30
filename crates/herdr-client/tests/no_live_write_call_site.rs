@@ -107,6 +107,13 @@ fn workspace_root() -> PathBuf {
 /// `.git` is skipped on the name alone, and that is safe for a reason that is CHECKED rather than
 /// assumed: git refuses to track any path with a `.git` component, so this skip cannot hide a file
 /// that ships, and the git cross-check proves it on every run.
+///
+/// One hole is left open here deliberately: a `Cargo.toml` dropped beside a `src/target/` would
+/// buy the skip back. The rule stays this simple and this readable, and
+/// [`every_git_tracked_rust_file_is_actually_walked`] is the backstop — that module would be
+/// tracked and unwalked, and it fails. Read the two together; neither is enough on its own, and
+/// the oracle's own blind spot (a file that is neither tracked nor walked, which cannot ship but
+/// can be built locally) is what this rule closes. Deleting either half reopens the other's.
 fn is_skippable_dir(parent: &Path, name: &OsStr) -> bool {
     if name == OsStr::new(".git") {
         return true;
