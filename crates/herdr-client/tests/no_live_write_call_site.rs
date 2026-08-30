@@ -41,6 +41,15 @@
 //!    to its own second opinion at the same time. An oracle that shares its subject's blind spot
 //!    is not an oracle. It now judges a file by whether the guard READ it, not by what it is
 //!    called, and it fails rather than skipping when it cannot reach git at all.
+//! 6. **A lookup that comes up empty is a FAILURE, never a shrug.** Five distinct ways past this
+//!    guard have now been found, and most of them ended the same way: something the guard was
+//!    asked to resolve did not resolve, and the code quietly carried on. An `include!` it could
+//!    not parse. A `#[path]` resolved against the wrong directory, so the file rustc compiles was
+//!    never opened. A closing brace looked for at an indentation `#[rustfmt::skip]` had changed.
+//!    A git index it could not read — and, found while fixing those, a `git` question answered by
+//!    whatever repository `GIT_DIR` named instead of the one being guarded. Every one of those is
+//!    now loud, because a guard that says nothing when it does not understand the code is worse
+//!    than no guard: it is believed.
 //!
 //! # The three rules
 //!
@@ -193,7 +202,7 @@ fn normalise(p: &Path) -> PathBuf {
     out
 }
 
-/// The files a CODE-inclusion directive in `src` names, resolved against `file`'s directory.
+/// The files a CODE-inclusion directive in `src` names, resolved the way RUSTC resolves them.
 ///
 /// `include!("relay.inc")` and `#[path = "relay.txt"] mod relay;` both make a file that is not
 /// spelled `.rs` into code inside a crate. That is the hole a reviewer walked through: a tracked
@@ -201,8 +210,23 @@ fn normalise(p: &Path) -> PathBuf {
 /// the walk collecting only `.rs` files and BOTH git oracles filtering the index down to `.rs`
 /// as well — the oracle sharing the exact assumption it existed to contradict.
 ///
-/// The two directives are read with deliberately different strictness, because they are different
-/// words:
+/// # Where a `#[path]` points, and why getting that wrong was silent
+///
+/// The next reviewer walked through the RESOLUTION rather than the detection. A `#[path]` was
+/// resolved against the naming file's own directory, which is only right at the TOP LEVEL of a
+/// file. Written inside an inline `mod { }` block, rustc resolves it against the directory plus
+/// the inline module path — and in a file that is not a mod-rs file (`mod.rs`, `lib.rs`,
+/// `main.rs`), against the file's STEM as well: `<dir>/<stem>/<inline mods>/`. The guard probed a
+/// directory that does not exist, and because `path` was read loosely that miss was a silent
+/// `continue`. A tracked file, compiled into the shipped binary, holding a live `send_text`, that
+/// the guard never opened — with all five gates green.
+///
+/// So a redirect is now resolved against every base rustc could be using, and scanned wherever it
+/// lands. A file that is not `mod.rs`/`lib.rs`/`main.rs` may still be a crate root (a bin, a test,
+/// an example), where the stem is NOT inserted, so both spellings are probed. Probing more bases
+/// than rustc uses costs nothing: scanning an extra file has never been the failure here.
+///
+/// # The two directives are read with different strictness, because they are different words
 ///
 /// * **`include!` is unambiguous.** It names code and nothing else, so it is parsed strictly: all
 ///   three bracket shapes, then a plain string literal, then a file that exists inside the
@@ -210,11 +234,17 @@ fn normalise(p: &Path) -> PathBuf {
 ///   line, a path climbing out of the tree — is a hard FAIL. The guard saw a directive and could
 ///   not read it, and "I could not look" must never come out as "I looked and it was clean". This
 ///   is the same treatment a glob workspace member gets.
-/// * **`path` is an ordinary English word.** `let path = "…"` is not a module redirect, and
-///   `#[cfg_attr(…, path = "…")]` is one under another spelling, so it is detected loosely and
-///   judged by what it names: any `path = "literal"` whose file exists inside the workspace is
-///   scanned. Nothing that ships is missed by being lenient here, because a `#[path]` naming a
-///   file that does not exist does not compile.
+/// * **`path` is an ordinary English word**, so it is FOUND loosely and then judged by what it is
+///   attached to. `let path = "…"` is not a module redirect and never fails the guard. A
+///   `#[path = "…"]` — or `#[cfg_attr(…, path = "…")]`, the same thing under another spelling —
+///   sitting on a `mod` IS one: it names a file the compiler WILL read, so if no candidate base
+///   yields a file inside the workspace, the guard has not looked and it FAILS. The old doc argued
+///   that a `#[path]` naming a missing file cannot compile. That was only ever true of the one
+///   path the guard happened to probe.
+///
+/// A `#[path]` on an INLINE `mod name { … }` names a DIRECTORY, not a file: it replaces the
+/// component the module's own name would have contributed for everything nested inside it. It is
+/// tracked as that component, and any redirect nested under it is checked in the usual way.
 ///
 /// `include_str!` / `include_bytes!` are deliberately NOT followed: they produce DATA, not code,
 /// so the method name inside one cannot be a call site — and the crate's JSON schema fixture
@@ -222,102 +252,325 @@ fn normalise(p: &Path) -> PathBuf {
 /// name on the wire is [`the_request_trait_is_sealed_so_no_foreign_crate_can_choose_a_method`],
 /// not this function.
 fn code_includes(root: &Path, file: &Path, src: &str) -> Vec<PathBuf> {
+    let dir = file
+        .parent()
+        .expect("a scanned file has a parent directory")
+        .to_path_buf();
+    let stem = file
+        .file_stem()
+        .expect("a scanned file has a name")
+        .to_owned();
+    // The three names rustc treats as "this file speaks for its directory". Everything else adds
+    // its own stem as a directory for the modules nested inside it — unless it is a crate root
+    // (a bin, a test, an example), which the guard cannot tell apart from here. So it probes both.
+    let is_mod_rs = matches!(
+        file.file_name().and_then(OsStr::to_str),
+        Some("mod.rs" | "lib.rs" | "main.rs")
+    );
+
+    // Every directory rustc could be resolving `named` against, given the inline `mod` blocks we
+    // are currently inside, and which of them actually hold the file.
+    let resolve = |named: &str, blocks: &[(usize, String)]| -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut nested = dir.clone();
+        for (_, component) in blocks {
+            nested.push(component);
+        }
+        let mut bases = vec![nested];
+        if !blocks.is_empty() && !is_mod_rs {
+            let mut with_stem = dir.join(&stem);
+            for (_, component) in blocks {
+                with_stem.push(component);
+            }
+            bases.push(with_stem);
+        }
+        let mut hits = Vec::new();
+        let mut tried = Vec::new();
+        for base in bases {
+            let target = normalise(&base.join(named));
+            if target.starts_with(root) && target.is_file() {
+                hits.push(target.clone());
+            }
+            tried.push(target);
+        }
+        (hits, tried)
+    };
+
+    // The string literal at `line[at..]`, read out of the ORIGINAL line because `code_only`
+    // blanked its contents. Blanking preserves byte offsets, so the two agree on where it is.
+    let literal_at = |line: &str, at: usize| -> Option<(String, usize)> {
+        if line.as_bytes().get(at) != Some(&b'"') {
+            return None;
+        }
+        let body = at + 1;
+        let len = line[body..].find('"')?;
+        Some((line[body..body + len].to_owned(), body + len + 1))
+    };
+
     let mut out = Vec::new();
-    for line in src.lines() {
-        // Searched in the BLANKED line, so this file's own mentions of both directives — all of
-        // which live in strings and comments — cannot fire. The literal is then read out of the
-        // ORIGINAL line, which `code_only` guarantees is byte-for-byte the same length.
-        let code = code_only(line);
-        for marker in ["include!", "path"] {
-            let strict = marker == "include!";
-            let mut from = 0;
-            while let Some(off) = code[from..].find(marker) {
-                let at = from + off;
-                from = at + marker.len();
-                // `foo_include!` is a different macro; `filepath` is a different word.
-                if code[..at]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                    || code[from..]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                {
+    // The inline `mod` components we are inside, each with the brace depth it opened at.
+    let mut blocks: Vec<(usize, String)> = Vec::new();
+    let mut depth = 0usize;
+    // A `path = "…"` read out of an attribute, waiting to see what item it lands on.
+    let mut pending: Option<String> = None;
+    // A `mod NAME` waiting for the `;` or `{` that says whether it is a file or an inline block.
+    let mut opening: Option<(String, Option<String>)> = None;
+    // Bracket nesting inside a `#[ … ]`; 0 means we are not in an attribute.
+    let mut in_attr = 0usize;
+
+    // The whole-file view, so a directive written inside a multi-line string is prose and the
+    // brace counting that tracks the inline modules is not fooled by a `{` in one.
+    for (line, code) in src.lines().zip(code_lines(src)) {
+        let b = code.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if in_attr > 0 && (c == b'[' || c == b']') {
+                if c == b'[' {
+                    in_attr += 1;
+                } else {
+                    in_attr -= 1;
+                }
+                i += 1;
+                continue;
+            }
+            // `#[…]` and `#![…]` both open an attribute.
+            if c == b'#' {
+                let mut j = i + 1;
+                if b.get(j) == Some(&b'!') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'[') {
+                    in_attr = 1;
+                    i = j + 1;
                     continue;
                 }
-                let mut i = skip_ws(line, from);
-                let opener = line.as_bytes().get(i).copied();
-                let wanted: &[u8] = if strict { b"([{" } else { b"=" };
-                if !opener.is_some_and(|o| wanted.contains(&o)) {
-                    assert!(
-                        !strict,
-                        "`include!` in {} does not open with a bracket and a string literal on \
-                         the same line:\n  {}\nThis guard will not guess what it expands to. A \
-                         file the compiler pulls in is code in the operator's binary, so teach \
-                         this function the shape deliberately rather than letting the file \
-                         through unscanned.",
-                        file.display(),
-                        line.trim()
-                    );
-                    continue;
+                i += 1;
+                continue;
+            }
+            if in_attr > 0 && (c == b'{' || c == b'}') {
+                // An attribute's own braces are not module braces. Counting them would move the
+                // inline module path a `#[path]` below is resolved against.
+                i += 1;
+                continue;
+            }
+            if c == b'{' {
+                depth += 1;
+                if let Some((name, redirect)) = opening.take() {
+                    // A `#[path]` on an inline module renames the DIRECTORY its children resolve
+                    // through; without one, the module's own name is that directory.
+                    blocks.push((depth, redirect.unwrap_or(name)));
                 }
-                i = skip_ws(line, i + 1);
-                if line.as_bytes().get(i) != Some(&b'"') {
-                    assert!(
-                        !strict,
-                        "`include!` in {} names its target with something other than a plain \
-                         string literal:\n  {}\nThis guard will not guess what it expands to. A \
-                         file the compiler pulls in is code in the operator's binary, so teach \
-                         this function the shape deliberately rather than letting the file \
-                         through unscanned.",
-                        file.display(),
-                        line.trim()
-                    );
-                    continue;
+                i += 1;
+                continue;
+            }
+            if c == b'}' {
+                while blocks.last().is_some_and(|(d, _)| *d == depth) {
+                    blocks.pop();
                 }
-                let body = i + 1;
-                let Some(len) = line[body..].find('"') else {
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            if c == b';' {
+                if let Some((_, Some(named))) = opening.take() {
+                    // A file module the compiler WILL read. Not finding it means the guard has not
+                    // looked at code that ships, which is the one thing it must never do quietly.
+                    let (hits, tried) = resolve(&named, &blocks);
                     assert!(
-                        !strict,
-                        "unterminated path literal after `include!` in {}:\n  {}",
+                        !hits.is_empty(),
+                        "`#[path = \"{named}\"]` in {} redirects a module at a file this guard \
+                         cannot find. rustc would read it from one of:\n  {}\nNone of those is a \
+                         file inside the workspace, so the guard has NOT read code the compiler \
+                         compiles into the operator's binary. Fix the path, or teach this \
+                         function the shape deliberately — do not let it through unscanned.",
                         file.display(),
-                        line.trim()
+                        tried
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n  ")
                     );
-                    continue;
-                };
-                let named = &line[body..body + len];
-                let dir = file
-                    .parent()
-                    .expect("a scanned file has a parent directory");
-                let target = normalise(&dir.join(named));
-                if !target.starts_with(root) {
-                    assert!(
-                        !strict,
-                        "`include!` in {} names `{named}`, which resolves OUTSIDE the workspace \
-                         ({}). The guard scans the workspace; it cannot vouch for a file it will \
-                         never read.",
-                        file.display(),
-                        target.display()
-                    );
-                    continue;
+                    out.extend(hits);
                 }
-                if !target.is_file() {
-                    assert!(
-                        !strict,
-                        "`include!` in {} names `{named}`, and {} is not a file. Either the path \
-                         is stale, or it names a directory this guard does not know how to \
-                         expand — both are for a human to resolve, not for the guard to skip.",
-                        file.display(),
-                        target.display()
-                    );
-                    continue;
+                i += 1;
+                continue;
+            }
+            if !(c.is_ascii_alphanumeric() || c == b'_') {
+                i += 1;
+                continue;
+            }
+
+            // An identifier, consumed WHOLE — which is what tells `include!` from `include_str!`
+            // and `my_include!`, and `path` from `pathological`.
+            let mut end = i;
+            while b
+                .get(end)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            {
+                end += 1;
+            }
+            let word = &code[i..end];
+
+            if word == "include" && b.get(end) == Some(&b'!') {
+                out.push(strict_include_target(root, file, line, end + 1));
+                i = end + 1;
+                continue;
+            }
+            if word == "path" {
+                let mut j = skip_ws(line, end);
+                if line.as_bytes().get(j) == Some(&b'=') {
+                    j = skip_ws(line, j + 1);
+                    match literal_at(line, j) {
+                        Some((named, after)) => {
+                            // Loose: whatever it turns out to be attached to, a file it names
+                            // inside the workspace is a file worth reading.
+                            let (hits, _) = resolve(&named, &blocks);
+                            out.extend(hits);
+                            if in_attr > 0 {
+                                pending = Some(named);
+                            }
+                            i = after;
+                            continue;
+                        }
+                        // Inside an attribute, `path =` is the module-redirect vocabulary, and one
+                        // the guard cannot READ is the same hole the `include!` parser already
+                        // refuses: an attribute may put its literal on the next line, or compute
+                        // it. Outside an attribute it is an ordinary binding and means nothing.
+                        None => assert!(
+                            in_attr == 0,
+                            "`path =` in {} is not followed by a plain string literal on the same \
+                             line:\n  {}\nThis guard will not guess which file the module is \
+                             redirected to. A `#[path]` names code in the operator's binary, so \
+                             teach this function the shape deliberately rather than letting the \
+                             file through unscanned.",
+                            file.display(),
+                            line.trim()
+                        ),
+                    }
                 }
-                out.push(target);
+                i = end;
+                continue;
+            }
+            if in_attr > 0 {
+                // Every other word inside an attribute is the attribute's own vocabulary.
+                i = end;
+                continue;
+            }
+            match word {
+                "mod" => {
+                    let mut name_at = skip_ws(line, end);
+                    // `mod r#gen;` — the raw-identifier prefix is not part of the name, and the
+                    // name is the directory everything nested inside it resolves through.
+                    if line.get(name_at..).is_some_and(|r| r.starts_with("r#")) {
+                        name_at += 2;
+                    }
+                    let mut name_end = name_at;
+                    while b
+                        .get(name_end)
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                    {
+                        name_end += 1;
+                    }
+                    if name_end > name_at {
+                        opening = Some((code[name_at..name_end].to_owned(), pending.take()));
+                    }
+                    i = name_end;
+                }
+                // A visibility, and the `(crate)` / `(in path)` that may follow it, still has a
+                // `mod` behind it — so it must not be read as the item the attribute landed on.
+                "pub" => {
+                    let mut j = skip_ws(line, end);
+                    if b.get(j) == Some(&b'(') {
+                        let mut nesting = 0usize;
+                        while j < b.len() {
+                            match b[j] {
+                                b'(' => nesting += 1,
+                                b')' => {
+                                    nesting -= 1;
+                                    if nesting == 0 {
+                                        j += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                    }
+                    i = j;
+                }
+                // Any other item keyword: the attribute above it was not a module redirect.
+                _ => {
+                    pending = None;
+                    i = end;
+                }
             }
         }
     }
     out
+}
+
+/// The file an `include!` names, or a PANIC saying why the guard could not read the directive.
+///
+/// `at` is the byte offset just past the `!`, in a line whose blanked view told us this really is
+/// the macro. Everything after that is read out of the ORIGINAL line, which `code_only` guarantees
+/// is byte-for-byte the same length.
+///
+/// There is no lenient branch. `include!` names code and nothing else, so a shape this function
+/// cannot read is a file the compiler pulls into the operator's binary that the guard did not
+/// open — and "I could not look" must never come out as "I looked and it was clean".
+fn strict_include_target(root: &Path, file: &Path, line: &str, at: usize) -> PathBuf {
+    let mut i = skip_ws(line, at);
+    assert!(
+        line.as_bytes().get(i).is_some_and(|o| b"([{".contains(o)),
+        "`include!` in {} does not open with a bracket and a string literal on the same line:\n  \
+         {}\nThis guard will not guess what it expands to. A file the compiler pulls in is code \
+         in the operator's binary, so teach this function the shape deliberately rather than \
+         letting the file through unscanned.",
+        file.display(),
+        line.trim()
+    );
+    i = skip_ws(line, i + 1);
+    assert!(
+        line.as_bytes().get(i) == Some(&b'"'),
+        "`include!` in {} names its target with something other than a plain string literal:\n  \
+         {}\nThis guard will not guess what it expands to. A file the compiler pulls in is code \
+         in the operator's binary, so teach this function the shape deliberately rather than \
+         letting the file through unscanned.",
+        file.display(),
+        line.trim()
+    );
+    let body = i + 1;
+    let len = line[body..].find('"').unwrap_or_else(|| {
+        panic!(
+            "unterminated path literal after `include!` in {}:\n  {}",
+            file.display(),
+            line.trim()
+        )
+    });
+    let named = &line[body..body + len];
+    // An `include!` is resolved against the directory of the file it is written in, whatever
+    // inline module it sits in — unlike `#[path]`, which is why the two are resolved apart.
+    let dir = file
+        .parent()
+        .expect("a scanned file has a parent directory");
+    let target = normalise(&dir.join(named));
+    assert!(
+        target.starts_with(root),
+        "`include!` in {} names `{named}`, which resolves OUTSIDE the workspace ({}). The guard \
+         scans the workspace; it cannot vouch for a file it will never read.",
+        file.display(),
+        target.display()
+    );
+    assert!(
+        target.is_file(),
+        "`include!` in {} names `{named}`, and {} is not a file. Either the path is stale, or it \
+         names a directory this guard does not know how to expand — both are for a human to \
+         resolve, not for the guard to skip.",
+        file.display(),
+        target.display()
+    );
+    target
 }
 
 /// Every file the compiler can pull into a crate rooted at `from`: the `.rs` files under it, plus
@@ -421,6 +674,38 @@ fn workspace_members(root: &Path) -> Vec<String> {
     members
 }
 
+/// Strip the `GIT_*` variables that make a `git` command ask about a DIFFERENT repository than the
+/// directory it was handed.
+///
+/// `GIT_DIR` and friends are exported into every hook git runs, and they WIN over the working
+/// directory. Two things follow, and both bit. This guard's only second opinion stops being about
+/// the tree it is guarding — inside a hook it asks whatever `GIT_DIR` names, and an oracle about
+/// another repository agrees with anything. And the synthetic repository in
+/// [`a_workspace_root_below_the_repository_root_still_gets_its_second_opinion`] stopped being
+/// synthetic: its `git init` and `git add -A` landed on the REAL repository and replaced the index
+/// that was about to be committed. Ask about the directory, always.
+fn ask_about_this_directory(cmd: &mut std::process::Command) {
+    for leaked in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ] {
+        cmd.env_remove(leaked);
+    }
+}
+
+/// A `git` invocation that asks about `dir` and nothing else. See [`ask_about_this_directory`].
+fn git_in(dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(dir);
+    ask_about_this_directory(&mut cmd);
+    cmd
+}
+
 /// The paths git holds in its index for `root`, or `None` if there is no index to ask.
 ///
 /// This is the second opinion the guard has never had. Every hole found in it so far was the same
@@ -442,9 +727,8 @@ fn workspace_members(root: &Path) -> Vec<String> {
 /// [`workspace_members`]): this reads `.git/index`, takes no lock, and inside the pre-commit hook
 /// it reads exactly the index that is about to be committed, which is the set we want.
 fn git_tracked(root: &Path) -> Vec<String> {
-    let out = std::process::Command::new("git")
+    let out = git_in(root)
         .args(["ls-files", "-z", "--cached"])
-        .current_dir(root)
         .output()
         .unwrap_or_else(|e| {
             panic!(
@@ -478,18 +762,18 @@ fn git_tracked(root: &Path) -> Vec<String> {
     files
 }
 
-/// Which lines BEGIN inside a string, raw string or block comment that opened on an EARLIER line.
+/// Where real CODE resumes on each line: 0, or the byte offset just past a string, raw string or
+/// block comment that opened on an EARLIER line.
 ///
 /// [`code_only`] reads one line at a time, which is safe for the call rule — an unclosed literal
 /// only makes it blank more, and blanking more can only produce a false positive. It is NOT safe
-/// for [`test_line_span`], which decides what to SKIP: the two lines `#[cfg(test)]` and
-/// `mod tests {` written inside a multi-line raw string are prose, and a span opened on them runs
-/// on through real production code. So the one decision that can excuse code gets the whole-file
-/// view that the line-at-a-time scanner cannot give it.
+/// for the two decisions that EXCUSE and that RESOLVE: the lines `#[cfg(test)]` and `mod tests {`
+/// written inside a multi-line raw string are prose, and a span opened on them runs on through
+/// real production code; a `{` inside one would move the inline module a `#[path]` is read
+/// against. So both get the whole-file view that the line-at-a-time scanner cannot give them.
 ///
-/// This can only ever make the span refuse to open, never open one it otherwise would not — so a
-/// mistake here costs a false positive, which is the direction this file always errs in.
-fn carried_lines(src: &str) -> Vec<bool> {
+/// A line whose carry never closes yields its own length: there is no code on it at all.
+fn code_resume_offsets(src: &str) -> Vec<usize> {
     #[derive(Clone, Copy, PartialEq)]
     enum Carry {
         None,
@@ -501,7 +785,8 @@ fn carried_lines(src: &str) -> Vec<bool> {
     let mut out = Vec::new();
     let mut carry = Carry::None;
     for line in src.lines() {
-        out.push(carry != Carry::None);
+        let started = carry != Carry::None;
+        let mut resume: Option<usize> = None;
         let b = line.as_bytes();
         let mut i = 0;
         loop {
@@ -523,6 +808,9 @@ fn carried_lines(src: &str) -> Vec<bool> {
                     if !closed {
                         break;
                     }
+                    if started && resume.is_none() {
+                        resume = Some(i);
+                    }
                     carry = Carry::None;
                 }
                 Carry::Raw(hashes) => {
@@ -540,6 +828,9 @@ fn carried_lines(src: &str) -> Vec<bool> {
                     }
                     if !closed {
                         break;
+                    }
+                    if started && resume.is_none() {
+                        resume = Some(i);
                     }
                     carry = Carry::None;
                 }
@@ -566,6 +857,9 @@ fn carried_lines(src: &str) -> Vec<bool> {
                     if !closed {
                         carry = Carry::Comment(depth);
                         break;
+                    }
+                    if started && resume.is_none() {
+                        resume = Some(i);
                     }
                     carry = Carry::None;
                 }
@@ -621,68 +915,124 @@ fn carried_lines(src: &str) -> Vec<bool> {
                 }
             }
         }
+        out.push(if started {
+            resume.unwrap_or(line.len())
+        } else {
+            0
+        });
     }
     out
+}
+
+/// Every line of `src` with strings and comments blanked to spaces, WHOLE-FILE aware.
+///
+/// [`code_only`] alone starts every line in code mode, so the contents of a multi-line raw string
+/// read to it as code. That is harmless where blanking less only costs a false positive; it is not
+/// harmless for the two decisions that need to see the file the way rustc does — which lines a
+/// `#[cfg(test)] mod` covers, and which inline module a `#[path]` sits inside.
+///
+/// Byte offsets are preserved line for line, so a hit still maps back to the original text.
+fn code_lines(src: &str) -> Vec<String> {
+    src.lines()
+        .zip(code_resume_offsets(src))
+        .map(|(line, at)| {
+            if at == 0 {
+                return code_only(line);
+            }
+            let tail = line.get(at..).unwrap_or_else(|| {
+                panic!(
+                    "the D3 write guard lost the boundary between text and code on this line:\n  \
+                     {line}\nIt cannot tell which part is a string literal and which part is a \
+                     call, and a guard that cannot read a line must not excuse it."
+                )
+            });
+            let mut blanked = " ".repeat(at);
+            blanked.push_str(&code_only(tail));
+            blanked
+        })
+        .collect()
 }
 
 /// The 0-based line numbers that sit inside a `#[cfg(test)]` module.
 ///
 /// This function decides what the call rule is allowed to SKIP, so every ambiguity in it has to
-/// resolve towards excusing less. It did not, and a reviewer walked through the gap: the closing
-/// line was found by an EXACT match against `}` at the module's indentation, so a module that
-/// closed with `} // tests` was never found, and the span ran on to the next same-indent brace —
-/// or, failing that, to the end of the file — marking whole sibling modules of production code as
-/// test code. `cargo fmt` PRESERVES that trailing comment, so the "the tree is fmt-normalised"
-/// argument the old doc rested on was simply false.
+/// resolve towards excusing less. It has not, twice. First the closing line was found by an EXACT
+/// match against `}` at the module's indentation, so a module that closed `} // tests` was never
+/// found. Then the exact match became "the first line at that indentation whose CODE begins with
+/// `}`" — and the INDENTATION was still the evidence. That only ever worked because `cargo fmt`
+/// normalises indentation, and `#[rustfmt::skip]`, an ordinary one-line attribute, opts out of
+/// exactly that. Hand-indent the closing brace by two spaces and the search ran past it to the
+/// next brace that happened to line up, excusing every production line in between.
 ///
-/// Three rules keep the ambiguity pointed the safe way now:
+/// So indentation is no longer evidence at all. Four rules keep the ambiguity pointed the safe way:
 ///
-/// 1. The close is the first line at the module's indentation whose CODE — comments and strings
-///    blanked by [`code_only`] — begins with `}`. A trailing comment cannot hide it.
-/// 2. If no such line exists, NOTHING is excused. Running to the end of the file was the
-///    fail-open answer to "I could not find the end".
+/// 1. The close is found by COUNTING BRACES in the blanked text from the `mod` line — the same
+///    thing the compiler counts. Whitespace decides nothing.
+/// 2. If the braces do not balance, NOTHING is excused. Running to the end of the file was the
+///    fail-open answer to "I could not find the end"; so was trusting a brace that merely lined up.
 /// 3. The closing line itself is not excused, so anything written after the brace on that line is
 ///    still read as production code.
-/// 4. A `#[cfg(test)]` that is only TEXT — inside a multi-line string or comment, per
-///    [`carried_lines`] — opens nothing. It is the one place in this file that needs a whole-file
-///    view rather than a line at a time, because it is the one place that excuses code.
+/// 4. A `#[cfg(test)]` that is only TEXT — inside a multi-line string or comment — opens nothing,
+///    because [`code_lines`] has already blanked it away. It is the one place in this file that
+///    needs a whole-file view rather than a line at a time, because it is the one place that
+///    excuses code.
 fn test_line_span(src: &str) -> Vec<bool> {
-    let lines: Vec<&str> = src.lines().collect();
-    let mut in_test = vec![false; lines.len()];
-    let carried = carried_lines(src);
+    let code = code_lines(src);
+    let mut in_test = vec![false; code.len()];
 
     let mut i = 0;
-    while i < lines.len() {
-        // A `#[cfg(test)]` inside a multi-line string is TEXT. Opening a span on it excuses every
-        // line down to the next brace at that indentation, which is production code.
-        if lines[i].trim() == "#[cfg(test)]" && !carried[i] && !carried.get(i + 1).unwrap_or(&true)
-        {
-            let indent = lines[i].len() - lines[i].trim_start().len();
+    while i < code.len() {
+        // Read from the BLANKED view: a `#[cfg(test)]` written inside a multi-line string is
+        // prose, and there is nothing left of it here to open a span with.
+        if code[i].trim() == "#[cfg(test)]" {
             // The item it applies to. Only a `mod` opens a span worth tracking; a `#[cfg(test)]`
             // on a single `use` or `fn` covers no call sites we would otherwise excuse.
-            if let Some(open) = lines.get(i + 1)
+            if let Some(open) = code.get(i + 1)
                 && open.trim_start().starts_with("mod ")
-                && code_only(open).trim_end().ends_with('{')
+                && open.trim_end().ends_with('{')
+                && let Some(end) = block_close_line(&code, i + 1)
             {
-                let end = lines.iter().enumerate().skip(i + 2).find(|(_, l)| {
-                    let code = code_only(l);
-                    let body = code.trim_start();
-                    body.starts_with('}') && code.len() - body.len() == indent
-                });
-                // No closing brace found at this indentation: excuse NOTHING. The old code
-                // excused every remaining line in the file instead.
-                if let Some((end, _)) = end {
-                    for flag in in_test.iter_mut().take(end).skip(i) {
-                        *flag = true;
-                    }
-                    i = end + 1;
-                    continue;
+                for flag in in_test.iter_mut().take(end).skip(i) {
+                    *flag = true;
                 }
+                i = end + 1;
+                continue;
             }
         }
         i += 1;
     }
     in_test
+}
+
+/// The line on which the block opening on line `open` closes, counted in braces, or `None` if the
+/// braces never balance.
+///
+/// `None` is the fail-CLOSED answer and it is the important one: a module whose end this function
+/// cannot find excuses nothing, so its own test bodies come out as offenders and someone reads the
+/// failure. The alternative — guessing an end — is what excused live production code twice.
+///
+/// The text handed in is already blanked by [`code_lines`], so a `{` in a string, a comment, a
+/// `'{'` char literal or a multi-line raw string is not a brace here, exactly as it is not one to
+/// the compiler.
+fn block_close_line(code: &[String], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (n, line) in code.iter().enumerate().skip(open) {
+        for byte in line.bytes() {
+            match byte {
+                b'{' => depth += 1,
+                // More closes than opens: we are not reading this block the way rustc does, and a
+                // span we cannot account for is one we must not open.
+                b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(n);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// The line with every string-literal span and every trailing `//` comment blanked to spaces,
@@ -1392,9 +1742,15 @@ fn the_walk_sees_a_source_module_named_target_and_still_skips_build_dirs() {
 ///    whether the guard read it and by what is in it.
 ///
 /// Clause 2 stops at member directories because that is where crate sources live, and files
-/// further out are covered from the other side: [`scanned_sources`] FOLLOWS a code inclusion
-/// wherever it points, and [`code_includes`] hard-fails on an inclusion it cannot resolve from the
-/// source tree. There is no third way for a file to become code.
+/// further out are covered from the other side ONLY: [`scanned_sources`] FOLLOWS a code inclusion
+/// wherever it points, and [`code_includes`] hard-fails on an inclusion it cannot resolve. Read
+/// that as the load-bearing claim it is. A reviewer put a live `send_text` in a tracked
+/// `shared/relay.inc` — outside every member, so clause 2 skipped it; not `.rs`, so clause 1
+/// skipped it — and reached it with a `#[path]` the guard resolved against the wrong directory.
+/// Nothing here contradicted that, because this oracle cannot: a file outside every member is
+/// reachable to it only through the resolution in [`code_includes`]. That resolution now follows
+/// rustc's rules and fails loudly when it comes up empty, and that is the whole of what stands
+/// between this clause and a third way for a file to become code.
 ///
 /// The `.rs` direction is one-way on purpose: every tracked `.rs` must be scanned, but the scan
 /// may hold more. Scanning extra files has never been the failure; a shipped file nobody opened is.
@@ -1691,11 +2047,7 @@ fn a_workspace_root_below_the_repository_root_still_gets_its_second_opinion() {
     let tmp = tempfile::tempdir().expect("a tempdir to init a repository in");
     let repo = tmp.path();
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(repo)
-            .output()
-            .expect("git runs");
+        let out = git_in(repo).args(args).output().expect("git runs");
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
@@ -1865,5 +2217,255 @@ fn an_inclusion_the_guard_recognises_but_cannot_read_is_a_failure_not_a_shrug() 
     outcome.expect_err(
         "an `include!` whose argument is on the following line was skipped in silence. The guard \
          saw the directive and could not read it — that has to be loud.",
+    );
+}
+
+/// Regression: a `#[cfg(test)] mod` whose closing brace is HAND-INDENTED must not excuse the
+/// production code that follows it.
+///
+/// The close was found by matching the opener's own indentation, and that only ever worked
+/// because `cargo fmt` normalises indentation. `#[rustfmt::skip]` is an ordinary one-line
+/// attribute that opts a module out of exactly that. Push the closing brace two spaces in and it
+/// is no longer at the opener's indent, so the search ran past it to the next brace that was —
+/// the end of an unrelated function — and excused every production line in between. Two
+/// characters of whitespace decided whether the guard saw a live write.
+#[test]
+fn a_test_module_whose_closing_brace_is_hand_indented_does_not_excuse_the_code_after_it() {
+    let src = "\
+#[rustfmt::skip]
+pub mod keymap {
+        pub mod table {
+            #[cfg(test)]
+            mod tests {
+                #[test]
+                fn the_table_is_aligned() {}
+              }
+        }
+        pub mod write {
+            pub async fn poke(c: &crate::HerdrClient, p: &crate::PaneId) {
+                let _ = c.send_text(p, \"rm -rf ~\").await;
+            }
+        }
+}
+";
+    let in_test = test_line_span(src);
+    let live = src
+        .lines()
+        .position(|l| l.contains("c.send_text("))
+        .expect("the planted call is in the fixture");
+    assert!(
+        !in_test[live],
+        "the closing brace of `mod tests` is indented two spaces further than the `mod` that \
+         opened it, so the span never found it and ran on to excuse the live write on line {}. \
+         Indentation is not evidence — count braces.",
+        live + 1
+    );
+    let inside = src
+        .lines()
+        .position(|l| l.contains("fn the_table_is_aligned"))
+        .expect("the test fn is in the fixture");
+    assert!(
+        in_test[inside],
+        "the body of the `#[cfg(test)]` module must still be excused, or the fix is just \
+         `excuse nothing`"
+    );
+}
+
+/// Regression: a `#[path]` inside an INLINE `mod` block resolves against rustc's directory, not
+/// against the naming file's own.
+///
+/// rustc resolves a `#[path]` written inside an inline module block against
+/// `<dir>/<file stem>/<inline module path>/` when the naming file is not a mod-rs file. The guard
+/// resolved it against `<dir>/` alone, landed on a path that did not exist — often outside the
+/// workspace entirely — and the non-strict branch turned that miss into a silent `continue`. The
+/// file rustc compiles into the binary was never opened, which is the exact claim this file's
+/// design rests on being false.
+#[test]
+fn a_path_attribute_inside_an_inline_module_is_resolved_the_way_rustc_resolves_it() {
+    let tmp = tempfile::tempdir().expect("a tempdir to build the synthetic workspace in");
+    let root = tmp.path();
+    let put = |p: &str, body: &str| {
+        fs::create_dir_all(root.join(p).parent().expect("a parent"))
+            .expect("the synthetic workspace directories are creatable");
+        fs::write(root.join(p), body).expect("the synthetic workspace files are writable")
+    };
+    put("Cargo.toml", "[workspace]\nmembers = [\"crates/demo\"]\n");
+    put("crates/demo/Cargo.toml", "[package]\nname = \"demo\"\n");
+    put("crates/demo/src/lib.rs", "mod agents;\n");
+    // A NON-mod-rs file, so rustc's base is `src/agents/codex/` — the stem, then the inline path.
+    put(
+        "crates/demo/src/agents.rs",
+        "pub mod codex {\n    pub mod tools;\n    #[path = \
+         \"../../../../../shared/relay.inc\"]\n    pub mod relay;\n}\n",
+    );
+    put("crates/demo/src/agents/codex/tools.rs", "pub fn t() {}\n");
+    let plant = "pub async fn relay(c: &C, p: &P) { let _ = c.send_text(p, \"oops\").await; }\n";
+    put("shared/relay.inc", plant);
+
+    let seen: BTreeSet<String> = scanned_sources(root, root)
+        .iter()
+        .map(|f| rel(root, f))
+        .collect();
+
+    assert!(
+        seen.contains("shared/relay.inc"),
+        "rustc compiles `shared/relay.inc` into the binary — it resolves the attribute against \
+         `crates/demo/src/agents/codex/`. The guard resolved it against `crates/demo/src/` \
+         instead, found nothing there, and said nothing. Saw: {seen:?}"
+    );
+}
+
+/// The deny-by-default half of the `#[path]` fix: a module redirect the guard cannot resolve is a
+/// FAIL, and an ordinary English `path` is still just a word.
+///
+/// `path` was read loosely everywhere, so every way of getting its resolution wrong ended in the
+/// same silent `continue`. A `#[path]` on a `mod` names a file the compiler WILL read; if the
+/// guard cannot find that file it has not looked, and it must say so. The looseness that made
+/// this a shrug is still needed for `let path = "…"`, which is not a module redirect at all.
+#[test]
+fn a_path_module_redirect_the_guard_cannot_resolve_fails_but_an_ordinary_path_word_does_not() {
+    let tmp = tempfile::tempdir().expect("a tempdir for the synthetic crate");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).expect("the synthetic tree is creatable");
+
+    let scan = |body: &str| -> Result<BTreeSet<String>, String> {
+        fs::write(root.join("src/lib.rs"), body).expect("writable");
+        let hushed = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| {
+            scanned_sources(root, root)
+                .iter()
+                .map(|f| rel(root, f))
+                .collect::<BTreeSet<String>>()
+        });
+        std::panic::set_hook(hushed);
+        outcome.map_err(|e| {
+            e.downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "<non-string panic>".to_owned())
+        })
+    };
+
+    let refused = scan("#[path = \"nowhere.inc\"]\nmod gone;\n")
+        .expect_err("a `#[path]` naming a file the guard cannot find was skipped in silence");
+    assert!(
+        refused.contains("nowhere.inc"),
+        "the refusal must name the file it could not resolve, got: {refused}"
+    );
+
+    // The same deny-by-default the `include!` parser already had: an attribute may put its
+    // literal on the next line, and a `#[path]` the guard recognises but cannot READ is a file
+    // the compiler reads and the guard did not.
+    let unreadable = scan("#[path =\n    \"nowhere.inc\"]\nmod gone;\n")
+        .expect_err("a `#[path]` whose literal is on the following line was skipped in silence");
+    assert!(
+        unreadable.contains("will not guess"),
+        "a `#[path]` the guard cannot read must say why it is refused, got: {unreadable}"
+    );
+
+    // The same word, not a module redirect: an ordinary binding must not fail the guard.
+    let ordinary = scan("fn f() {\n    let path = \"nowhere.inc\";\n}\n")
+        .expect("`let path = \"…\"` is an English word, not a module redirect");
+    assert_eq!(
+        ordinary,
+        BTreeSet::from(["src/lib.rs".to_owned()]),
+        "an ordinary `path` binding must neither fail the guard nor pull in a file"
+    );
+}
+
+/// Regression: a brace inside a MULTI-LINE string must not stretch a `#[cfg(test)]` span over the
+/// production code that follows the module.
+///
+/// Counting braces is only as good as knowing which braces are code. Read one line at a time, the
+/// `{` on a line in the middle of a raw string is a brace like any other — it opens a level that
+/// never closes, so the module's real closing brace only brings the count back to one and the span
+/// runs on. That is the same fail-open the indentation search had, wearing the fix's clothes.
+#[test]
+fn a_brace_inside_a_multi_line_string_does_not_stretch_a_test_span() {
+    let src = "\
+mod a {
+    #[cfg(test)]
+    mod tests {
+        const SHAPE: &str = r#\"
+{
+\"#;
+        #[test]
+        fn nothing() {}
+    }
+    pub async fn probe(c: &crate::HerdrClient, p: &crate::PaneId) {
+        let _ = c.send_text(p, \"rm -rf ~\").await;
+    }
+}
+";
+    let in_test = test_line_span(src);
+    let live = src
+        .lines()
+        .position(|l| l.contains("c.send_text("))
+        .expect("the planted call is in the fixture");
+    assert!(
+        !in_test[live],
+        "the `{{` on line 5 is the CONTENTS of a raw string. Counted as code it leaves the brace \
+         depth one too high, so `mod tests` appears to close one brace later than it does and the \
+         span excused the live write on line {}.",
+        live + 1
+    );
+    let inside = src
+        .lines()
+        .position(|l| l.contains("fn nothing()"))
+        .expect("the test fn is in the fixture");
+    assert!(
+        in_test[inside],
+        "the body of the `#[cfg(test)]` module must still be excused"
+    );
+}
+
+/// Regression: a leaked `GIT_DIR` must not redirect the guard's second opinion — or its fixtures.
+///
+/// Every git hook exports `GIT_DIR`, and it WINS over a command's working directory. So inside the
+/// pre-commit hook that runs this suite, [`git_tracked`] was not asking about the workspace it was
+/// handed, and the synthetic repository in
+/// [`a_workspace_root_below_the_repository_root_still_gets_its_second_opinion`] was not synthetic:
+/// its `git init -q` and `git add -A` were executed against the REAL repository and replaced the
+/// index that was about to be committed. Observed, not theorised — that is how it was found.
+///
+/// The two halves are the same bug. An oracle that answers about another repository agrees with
+/// anything, which is a broken oracle wearing a passing test's clothes.
+#[test]
+fn a_leaked_git_dir_does_not_redirect_a_git_question_at_another_repository() {
+    let tmp = tempfile::tempdir().expect("a tempdir to init a repository in");
+    let repo = tmp.path();
+    git_in(repo)
+        .args(["init", "-q"])
+        .output()
+        .expect("git init runs");
+
+    let ask = |scrubbed: bool| {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(repo)
+            .env("GIT_DIR", "/nonexistent-repository.git")
+            .args(["rev-parse", "--absolute-git-dir"]);
+        if scrubbed {
+            ask_about_this_directory(&mut cmd);
+        }
+        cmd.output().expect("git runs")
+    };
+
+    // Unscrubbed, git obeys the environment and never looks at the directory it was given. This is
+    // the half that has to be true for the fix to be worth anything.
+    assert!(
+        !ask(false).status.success(),
+        "this test proves nothing unless a leaked `GIT_DIR` really does win over the working \
+         directory — and git just ignored it"
+    );
+
+    // Scrubbed, the same command asks about the directory it was handed.
+    let answered = ask(true);
+    assert!(
+        answered.status.success(),
+        "a `GIT_DIR` inherited from a hook redirected a question this guard asked about {} — so \
+         its second opinion, and every fixture repository it builds, belong to whatever repository \
+         the caller happened to be in. Stderr: {}",
+        repo.display(),
+        String::from_utf8_lossy(&answered.stderr).trim()
     );
 }
