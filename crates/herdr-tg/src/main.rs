@@ -39,6 +39,7 @@ mod bot;
 mod cmd;
 mod config;
 mod deliver;
+mod mirror;
 mod notify;
 mod permission;
 mod render;

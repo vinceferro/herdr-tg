@@ -142,6 +142,13 @@ pub fn excerpt_from(pane_text: &str) -> String {
 const BOX: &str = "─━│┃┄┅┆┇┈┉┊┋┌┐└┘├┤┬┴┼╭╮╯╰═║╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓╹╻╺╸▁▂▃▅▆▇⬝▣◇◆■";
 
 /// Remove the harness's furniture, leaving what it actually said.
+///
+/// Public wrapper for the mirror, which needs the same cleaning on a different cadence.
+pub fn strip_chrome_public(text: &str) -> String {
+    strip_chrome(text)
+}
+
+/// Remove the harness's furniture, leaving what it actually said.
 fn strip_chrome(text: &str) -> String {
     let mut lines: Vec<&str> = text.lines().collect();
 

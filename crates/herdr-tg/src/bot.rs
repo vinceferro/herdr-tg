@@ -40,6 +40,7 @@ use teloxide::utils::command::BotCommands;
 use crate::audit::Audit;
 use crate::config::Config;
 use crate::deliver::{self, Settle};
+use crate::mirror::Mirror;
 use crate::notify::{self, Ask, Beat, Timing};
 use crate::render::{self, escape_html};
 use crate::routing::{Routing, Target};
@@ -205,6 +206,15 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
+    }
+
+    // The mirror. Without it a topic is an alert channel that goes quiet exactly while you are
+    // working — you open it on a phone and see the last alarm, not the session. This is what makes
+    // walking away a non-event.
+    if ctx.forum.is_some() {
+        let ctx3 = ctx.clone();
+        let bot3 = bot.clone();
+        tokio::spawn(async move { mirror_loop(&bot3, &ctx3).await });
     }
 
     let handler = dptree::entry()
@@ -805,6 +815,75 @@ async fn ensure_all_topics(bot: &Bot, ctx: &Ctx) {
                 .unwrap_or("agent");
             let hello = voice::topic_opened(&ws, agent);
             say_in_topic(bot, ctx, &[], &p.pane_id, &ws, &hello, None).await;
+        }
+    }
+}
+
+/// How often each agent pane is read for new prose.
+///
+/// A `visible` read is cheap and cannot move the operator's screen, so the cost is one small RPC
+/// per pane per tick. The interval is also the debounce: [`Mirror`] only relays a screen that
+/// looked the same one tick earlier, so this is how long an agent's output must be still before it
+/// counts as something it finished saying.
+const MIRROR_TICK: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Watch every agent pane and relay what it says into that pane's topic.
+async fn mirror_loop(bot: &Bot, ctx: &Ctx) {
+    let mut mirror = Mirror::default();
+    let mut primed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    loop {
+        tokio::time::sleep(MIRROR_TICK).await;
+
+        let Ok(snap) = snapshot_for(&ctx.client, ctx.workspace.as_deref()).await else {
+            continue;
+        };
+        let labels: std::collections::BTreeMap<_, _> = snap
+            .workspaces
+            .iter()
+            .map(|w| (w.workspace_id.clone(), w.label.clone()))
+            .collect();
+
+        let alive: std::collections::BTreeSet<String> = snap
+            .panes
+            .iter()
+            .filter(|p| p.agent.is_some() || p.display_agent.is_some())
+            .map(|p| p.pane_id.as_str().to_string())
+            .collect();
+        mirror.retain(&alive);
+        primed.retain(|p| alive.contains(p));
+
+        for pane in snap
+            .panes
+            .iter()
+            .filter(|p| p.agent.is_some() || p.display_agent.is_some())
+        {
+            let id = pane.pane_id.as_str().to_string();
+            // `visible` only, always: a background read on a timer is exactly the case that must
+            // never reach for scrollback, because that scrolls the operator's real terminal.
+            let Ok(read) = ctx.client.read_visible(&pane.pane_id).await else {
+                continue;
+            };
+            let cleaned = notify::strip_chrome_public(&read.text);
+
+            // First sight of a pane seeds the baseline without relaying — otherwise a restart
+            // dumps a screenful of history into the topic as though it had just been said.
+            if !primed.contains(&id) {
+                mirror.prime(&id, &cleaned);
+                primed.insert(id);
+                continue;
+            }
+
+            let Some(fresh) = mirror.observe(&id, &cleaned) else {
+                continue;
+            };
+            let ws = labels
+                .get(&pane.workspace_id)
+                .cloned()
+                .unwrap_or_else(|| pane.workspace_id.as_str().to_string());
+            tracing::info!(pane = %pane.pane_id, chars = fresh.len(), "relaying");
+            let body = voice::said(place(ctx), &ws, &fresh);
+            say_in_topic(bot, ctx, &[], &pane.pane_id, &ws, &body, None).await;
         }
     }
 }

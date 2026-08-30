@@ -37,6 +37,17 @@ pub enum Place {
     Flat,
 }
 
+/// An agent said something, unprompted.
+///
+/// The plainest message the bridge sends: no marker, no header, nothing. In a session's topic this
+/// is simply the agent talking, and anything added would be the bridge talking over it.
+pub fn said(place: Place, workspace: &str, text: &str) -> String {
+    match place {
+        Place::Topic => body(text, None, ""),
+        Place::Flat => format!("<b>{}</b>\n{}", esc(workspace), body(text, None, "")),
+    }
+}
+
 /// An agent needs an answer.
 ///
 /// The body is the agent's own words wherever they are words. Only genuine terminal output — a
@@ -152,7 +163,7 @@ fn has_source_location(line: &str) -> bool {
 /// Prose gets sent as a message; output gets a code block. Judged on shape rather than content:
 /// output is dense in punctuation and path-like tokens and light on sentences, and its lines rarely
 /// end the way a sentence does.
-fn looks_like_prose(text: &str) -> bool {
+pub fn looks_like_prose(text: &str) -> bool {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim)
