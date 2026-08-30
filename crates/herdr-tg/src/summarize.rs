@@ -266,6 +266,19 @@ fn asks_something(excerpt: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that mutate the process environment.
+    ///
+    /// `set_var`/`remove_var` are process-wide, and the test harness runs tests on many threads.
+    /// One test sets `HERDR_TG_SUMMARIZER_KEY` while another removes it, so whichever lost the race
+    /// read the other's state — measured as 2 failures in 6 clean workspace runs, which is a coin
+    /// flip, not a rare flake. Every test that touches the environment takes this guard first.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panic in one env test must not poison the rest into failing for the wrong reason.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The shape the local model actually returned when this was measured.
     #[test]
     fn a_real_summary_survives() {
@@ -367,7 +380,9 @@ mod tests {
     /// hosted model's accuracy at a fifth of the latency.
     #[test]
     fn no_task_class_is_sent_unless_the_operator_asks_for_one() {
-        // SAFETY: single-threaded test; these vars are read only by from_env.
+        let _env = env_guard();
+        // SAFETY: `_env` holds ENV_LOCK, so no other test reads or writes these vars concurrently,
+        // and outside the tests they are read only by from_env.
         unsafe {
             std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
             std::env::remove_var("HERDR_TG_SUMMARIZER_CLASS");
@@ -399,7 +414,9 @@ mod tests {
     /// tools' credentials for a key it could use.
     #[test]
     fn the_gate_is_off_without_its_own_key() {
-        // SAFETY: single-threaded test, and the variable is read only by from_env.
+        let _env = env_guard();
+        // SAFETY: `_env` holds ENV_LOCK, so no other test reads or writes this var concurrently,
+        // and outside the tests it is read only by from_env.
         unsafe { std::env::remove_var("HERDR_TG_SUMMARIZER_KEY") };
         assert!(Summarizer::from_env().is_none());
     }
