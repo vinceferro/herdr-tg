@@ -49,6 +49,13 @@
 //!   routing chain can fall over halfway through a run. The first unrecognised answer switches
 //!   summaries off for the rest of the run and they do not come back on by themselves.
 //!
+//! A proved address is still only a string until something writes to a socket, and a HTTP client
+//! will happily pick the socket for you: a proxy variable in this service's environment, a redirect
+//! the gateway answers with, a name the resolver moves. Each of those once carried the excerpt off
+//! this machine with every gate above still passing. So the client is built with all three closed,
+//! and then the address it actually reached is read back off the connection and checked — on the
+//! probe, before any of the operator's text follows.
+//!
 //! Two variables widen this, and they are the only two. `HERDR_TG_SUMMARIZER_LOCAL_MODELS` replaces
 //! the list of responder names that count as local — for the operator whose own gateway answers to
 //! a name this crate has never heard of. `HERDR_TG_SUMMARIZER_ALLOW_REMOTE=1` is the operator
@@ -60,6 +67,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -103,13 +111,17 @@ const PROBE: &str = "Overwrite config.yaml? [y/N]";
 /// Is this address on this machine?
 ///
 /// Provable from inside this crate, which is the whole point — the old answer was inferred from a
-/// different program's configuration file that this crate never reads. A name that merely resolves
-/// to loopback is not enough either: resolution is not part of the address and can change under a
-/// running process.
+/// different program's configuration file that this crate never reads.
 ///
 /// Parsing is left to a real URL parser because the inputs that matter are the ones that look
 /// local. `http://127.0.0.1@evil.example/` is a request to evil.example with a username of
 /// 127.0.0.1, and reading it by eye or by prefix gets it wrong.
+///
+/// `localhost` is accepted even though a name is not an address and resolution can change under a
+/// running process. It is accepted because it is not left to resolution: [`loopback_pin`] fixes it
+/// to 127.0.0.1 and ::1 in the client, so a `/etc/hosts` line cannot move it, and the address the
+/// connection actually reached is checked afterwards regardless. Refusing the name would cost
+/// every operator who writes `localhost` their summaries and buy nothing the pin does not give.
 fn is_local_endpoint(raw: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(raw) else {
         return false;
@@ -126,15 +138,57 @@ fn is_local_endpoint(raw: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    match host.parse::<std::net::IpAddr>() {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => on_this_machine(ip),
+        Err(_) => false,
+    }
+}
+
+/// Is this address one of this machine's own?
+///
+/// One definition, used both for the endpoint the operator configured and for the address the
+/// connection actually reached, so those two can never drift apart.
+fn on_this_machine(ip: IpAddr) -> bool {
+    match ip {
         // `::ffff:127.0.0.1` reaches 127.0.0.1, but as an IPv6 address it is not itself loopback.
-        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => v4.is_loopback(),
             None => v6.is_loopback(),
         },
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => false,
+        IpAddr::V4(v4) => v4.is_loopback(),
     }
+}
+
+/// The host name whose resolution must be nailed to loopback, and the port it was configured with.
+///
+/// `None` when the endpoint is already a literal address — there is nothing for a resolver to
+/// decide — or when it does not parse at all, in which case no request will be made anyway.
+///
+/// The port is carried because the pin replaces resolution, and a name resolved to the wrong port
+/// would simply stop the gateway working.
+fn loopback_pin(endpoint: &str) -> Option<(String, u16)> {
+    let url = reqwest::Url::parse(endpoint).ok()?;
+    let host = url.host_str()?;
+    if host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok()
+    {
+        return None;
+    }
+    Some((host.to_string(), url.port_or_known_default()?))
+}
+
+/// The responder allowlist as a person reads it.
+///
+/// `{:?}` on a set renders braces and quotes, which is implementation vocabulary in a sentence
+/// written for whoever has to fix the configuration.
+fn as_prose(names: &BTreeSet<String>) -> String {
+    if names.is_empty() {
+        return "none at all, because the list is empty".to_string();
+    }
+    names.iter().cloned().collect::<Vec<_>>().join(", ")
 }
 
 /// Where to ask, what to ask, and what has been proved about the answer so far.
@@ -195,6 +249,28 @@ enum Setup {
     On(Summarizer),
     /// Switched on, and refused. The sentence names the variable and how to satisfy it.
     Refused(String),
+}
+
+/// What came back from one request, and — the part the operator's privacy rests on — where from.
+struct Answer {
+    /// The reply's top-level `model`: who says they answered.
+    responder: String,
+    content: String,
+    /// The address this crate's connection actually reached, read back off the connection rather
+    /// than taken from the configuration.
+    ///
+    /// `None` when it could not be read, which counts the same as an address off this machine: a
+    /// destination that cannot be shown to be here is not one the operator's screen may go to.
+    peer: Option<SocketAddr>,
+}
+
+/// Did the bytes go to a socket on this machine?
+///
+/// The startup gate proves something about a string. This is the only thing that can say what
+/// happened on the wire, and it is deliberately separate from who answered: an address off this
+/// machine is a leak whatever name the reply puts on itself.
+fn answer_came_from_this_machine(peer: Option<SocketAddr>) -> bool {
+    matches!(peer, Some(addr) if on_this_machine(addr.ip()))
 }
 
 /// The instruction, written BY a strong model FOR a small one, and measured at every step.
@@ -310,10 +386,11 @@ impl Summarizer {
             if !allow_remote && !listed {
                 return Setup::Refused(format!(
                     "HERDR_TG_SUMMARIZER_MODEL={pinned} names something that is not in \
-                     {LOCAL_MODELS_ENV} ({local_models:?}). Naming one skips the gateway's own \
+                     {LOCAL_MODELS_ENV}, which lists {}. Naming one skips the gateway's own \
                      routing entirely, which is exactly how pieces of the operator's screen \
                      reached a hosted provider before. Unset it, add {pinned} to \
-                     {LOCAL_MODELS_ENV} if it runs on this machine, or set {ALLOW_REMOTE_ENV}=1."
+                     {LOCAL_MODELS_ENV} if it runs on this machine, or set {ALLOW_REMOTE_ENV}=1.",
+                    as_prose(&local_models)
                 ));
             }
         }
@@ -341,13 +418,55 @@ impl Summarizer {
         })
     }
 
-    /// One request. Gives back who answered and what they said, or nothing at all.
+    /// The HTTP client, built so that the address this crate proved is the address the bytes go to.
     ///
-    /// The responder is the reply's top-level `model` — the one field in an OpenAI-shaped reply
-    /// that says who actually answered, as opposed to who was asked for. It comes back alongside
-    /// the content rather than being fished out at the call site, because a caller that can reach
-    /// the content without the responder is a caller that will forget to check.
-    async fn ask(&self, excerpt: &str, max_tokens: u32) -> Option<(String, String)> {
+    /// A client library decides the destination for you in three separate ways, and each of them
+    /// has carried a real excerpt past a passing address gate:
+    ///
+    /// - **A proxy.** reqwest reads `HTTP_PROXY` / `http_proxy` / `ALL_PROXY` out of the process
+    ///   environment by default, so one line in a systemd unit sends the excerpt AND the gateway
+    ///   key to whatever host it names, while the configured endpoint stays a loopback address that
+    ///   passes every check. [`no_proxy`](reqwest::ClientBuilder::no_proxy) is what refuses that.
+    /// - **A redirect.** The default policy follows up to ten hops and re-sends the POST body on
+    ///   307 and 308, which is exactly the shape of a routing chain falling through to a hosted
+    ///   provider. A gist gateway has no reason to redirect, so this follows none.
+    /// - **The resolver.** `localhost` is a name, and a `/etc/hosts` line can move it. Pinning it
+    ///   here means the socket matches the address that was proved.
+    ///
+    /// Only the pin is lifted by `HERDR_TG_SUMMARIZER_ALLOW_REMOTE=1`, and only because an
+    /// operator who has said their pane text may leave this machine has to be able to name a host
+    /// that is not on it. The other two hold either way: an environment variable and a redirect are
+    /// nobody's idea of consent, and an operator who means their text to go somewhere can say where
+    /// in the URL. The cost is real and worth naming — a machine that can only reach the outside
+    /// through a proxy cannot use a remote gateway at all — and it is the right way round, because
+    /// the failure it prevents is silent and this one is not.
+    fn client(&self) -> Option<reqwest::Client> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        if !self.allow_remote {
+            if let Some((host, port)) = loopback_pin(&self.endpoint) {
+                builder = builder.resolve_to_addrs(
+                    &host,
+                    &[
+                        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+                    ],
+                );
+            }
+        }
+        builder.build().ok()
+    }
+
+    /// One request. Gives back who answered, what they said, and where the connection went — or
+    /// nothing at all.
+    ///
+    /// The responder is the reply's top-level `model`, the one field in an OpenAI-shaped reply that
+    /// says who actually answered as opposed to who was asked for. It travels with the content, and
+    /// with the address that was reached, rather than being fished out at the call site: a caller
+    /// that can reach the content without those two is a caller that will forget to check them.
+    async fn ask(&self, excerpt: &str, max_tokens: u32) -> Option<Answer> {
         let mut body = serde_json::json!({
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -361,19 +480,22 @@ impl Summarizer {
             body["model"] = serde_json::Value::String(m.clone());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .ok()?;
+        let client = self.client()?;
         let mut req = client.post(&self.endpoint).bearer_auth(&self.key);
         if let Some(c) = &self.task_class {
             req = req.header("X-Task-Class", c);
         }
         let res = req.json(&body).send().await;
 
+        // Read off the connection before the body is consumed. This is the crate's own account of
+        // where it wrote to, and the only claim here that no configuration file can contradict.
+        let peer = res.as_ref().ok().and_then(|r| r.remote_addr());
+
         let text = match res {
             Ok(r) if r.status().is_success() => r.text().await.ok()?,
             Ok(r) => {
+                // A redirect arrives here rather than being followed, and is declined like any
+                // other status this bridge did not ask for.
                 tracing::debug!(status = %r.status(), "the summarizer declined; pushing without it");
                 return None;
             }
@@ -398,7 +520,24 @@ impl Summarizer {
             .unwrap_or("")
             .trim()
             .to_string();
-        Some((responder, content))
+        Some(Answer {
+            responder,
+            content,
+            peer,
+        })
+    }
+
+    /// May this answer be shown — and, before that, was the operator's screen shown to somebody
+    /// this bridge can prove is on this machine?
+    ///
+    /// Both halves, because either alone has been defeated: a recognised name is worthless if the
+    /// bytes went to a proxy, and a loopback socket is worthless if what is behind it is a tunnel
+    /// answering for a hosted provider.
+    fn answer_is_local(&self, answer: &Answer) -> bool {
+        if self.allow_remote {
+            return true;
+        }
+        answer_came_from_this_machine(answer.peer) && self.responder_ok(&answer.responder)
     }
 
     /// Is this somebody whose answer may be shown — and, before that, somebody the operator's
@@ -428,10 +567,13 @@ impl Summarizer {
     /// So a gateway whose routing falls through to a hosted provider is discovered with a public
     /// string instead of with the operator's terminal.
     ///
+    /// The probe proves two things, not one: who is answering, and — from the connection itself —
+    /// that the connection went to this machine.
+    ///
     /// Every later reply is checked the same way, because routing can fall over halfway through a
-    /// run. The first unrecognised answer switches summaries off for the rest of the run, so the
-    /// most that can ever go astray is one probe — and an excerpt only if the routing changes after
-    /// the probe has already been answered.
+    /// run. The first answer that fails either check switches summaries off for the rest of the
+    /// run, so the most that can ever go astray is one probe — and an excerpt only if the routing
+    /// changes after the probe has already been answered, which the journal then says plainly.
     ///
     /// Every failure path still returns `None` and the caller sends the excerpt alone. Nothing here
     /// can prevent a push.
@@ -446,48 +588,84 @@ impl Summarizer {
         if !self.armed.load(Ordering::SeqCst) {
             // Gateway down or answering nonsense: no summary this time, and still nothing proved,
             // so the next push probes again. Going without a summary costs the operator nothing.
-            let (responder, _) = self.ask(PROBE, 16).await?;
-            if !self.responder_ok(&responder) {
-                self.trip(&responder);
+            let answer = self.ask(PROBE, 16).await?;
+            if !self.answer_is_local(&answer) {
+                self.trip(&answer, false);
                 return None;
             }
             self.armed.store(true, Ordering::SeqCst);
             tracing::info!(
-                responder = %responder,
+                responder = %answer.responder,
                 "the summarizer is answered from this machine; summaries are on"
             );
         }
 
-        let (responder, content) = self.ask(excerpt, 500).await?;
-        if !self.responder_ok(&responder) {
-            self.trip(&responder);
+        let answer = self.ask(excerpt, 500).await?;
+        if !self.answer_is_local(&answer) {
+            // The excerpt is already on the wire by the time this reply can be inspected, and the
+            // journal has to say so rather than repeat the reassuring sentence from the probe.
+            self.trip(&answer, true);
             return None;
         }
 
-        plausible(&content, excerpt)
+        plausible(&answer.content, excerpt)
+    }
+
+    /// Why summaries stopped, as the sentence the journal gets.
+    ///
+    /// A value rather than only a log line, for the same reason [`Setup::Refused`] is one: this
+    /// sentence has to be readable back and testable. It is the one place the bridge tells the
+    /// operator what left the machine, and it is reached from two call sites — after the probe,
+    /// where nothing of theirs has gone, and after the excerpt, where it has. Saying the
+    /// comforting version in both is a false statement about a leak, so the caller passes in which
+    /// it is and this never guesses.
+    fn why_summaries_stopped(&self, answer: &Answer, screen_text_was_sent: bool) -> String {
+        let exposure = if screen_text_was_sent {
+            "a piece of the operator's screen had already been sent when this came back"
+        } else {
+            "nothing from the screen was sent"
+        };
+
+        if !answer_came_from_this_machine(answer.peer) {
+            let reached = match answer.peer {
+                Some(addr) => format!("at {addr}, which is not on this machine"),
+                None => "at an address this bridge could not read back".to_string(),
+            };
+            return format!(
+                "the summarizer answered {reached}, so summaries are OFF for the rest of this run \
+                 and {exposure}. The address it was told to use was {}. Look for a proxy setting \
+                 in this service's environment, or a gateway that answers with a redirect.",
+                self.endpoint
+            );
+        }
+
+        let who = if answer.responder.is_empty() {
+            "the reply did not say who answered".to_string()
+        } else {
+            format!("{} answered", answer.responder)
+        };
+        format!(
+            "{who}, which is not a name this bridge recognises, so summaries are OFF for the rest \
+             of this run and {exposure}. The names it recognises are {}. If that one does run on \
+             this machine, add it to {LOCAL_MODELS_ENV} and restart.",
+            as_prose(&self.local_models)
+        )
     }
 
     /// Switch summaries off for the rest of the run, and say so once in the journal — where naming
     /// who answered and what address they answered at is diagnosis, not disclosure.
     ///
+    /// `screen_text_was_sent` is the caller's answer to the only question the operator will have.
+    ///
     /// The journal is currently the only place this is said. Telling the operator in chat as well,
     /// so they do not sit wondering where their summaries went, is a deliberate follow-up: it needs
     /// a sentence in the module that owns the bridge's words, and that module is being changed
     /// elsewhere right now. Nothing about the safety of this waits on it.
-    fn trip(&self, responder: &str) {
+    fn trip(&self, answer: &Answer, screen_text_was_sent: bool) {
         if !self.off.swap(true, Ordering::SeqCst) {
             tracing::warn!(
-                responder = if responder.is_empty() {
-                    "<the reply did not say>"
-                } else {
-                    responder
-                },
-                endpoint = %self.endpoint,
-                local_models = ?self.local_models,
-                "the summarizer was answered by something this bridge does not recognise, so \
-                 summaries are OFF for the rest of this run and no screen text was sent. If that \
-                 name does run on this machine, add it to HERDR_TG_SUMMARIZER_LOCAL_MODELS and \
-                 restart."
+                "{}",
+                self.why_summaries_stopped(answer, screen_text_was_sent)
             );
         }
     }
@@ -773,14 +951,18 @@ mod tests {
         assert!(s.one_line("Force-push? [y/N]").await.is_none());
     }
 
-    /// A gateway on loopback that answers with exactly the bodies given, in order, and keeps every
-    /// request body it was sent.
+    /// Everything a recorder was sent, exactly as it arrived: request line, headers and body.
+    type Recorded = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A server on loopback that answers with exactly the raw responses given, in order, and keeps
+    /// every request it was sent.
+    ///
+    /// Raw rather than JSON-wrapped because two of the things worth proving are not replies at all:
+    /// a redirect that tries to move the excerpt elsewhere, and a proxy standing in the middle.
     ///
     /// A hand-rolled stand-in for reqwest would prove nothing here: the question is what this crate
     /// does with a real reply, and whether the operator's text was already on the wire by then.
-    async fn fake_gateway(
-        replies: Vec<&'static str>,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    async fn fake_server(responses: Vec<String>) -> (std::net::SocketAddr, Recorded) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -789,7 +971,7 @@ mod tests {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::clone(&seen);
         tokio::spawn(async move {
-            for reply in replies {
+            for response in responses {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
                 };
@@ -813,21 +995,39 @@ mod tests {
                             .and_then(|v| v.trim().parse::<usize>().ok())
                             .unwrap_or(0);
                         if got.len() >= end + 4 + want {
+                            // The whole request, head included: a proxy rewrites the request line
+                            // and carries the gateway key in a header, and both are worth reading.
                             sink.lock()
                                 .expect("the recorder is only ever locked here")
-                                .push(String::from_utf8_lossy(&got[end + 4..]).to_string());
+                                .push(String::from_utf8_lossy(&got).to_string());
                             break;
                         }
                     }
                 }
-                let res = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
-                    reply.len()
-                );
-                let _ = sock.write_all(res.as_bytes()).await;
+                let _ = sock.write_all(response.as_bytes()).await;
                 let _ = sock.shutdown().await;
             }
         });
+        (addr, seen)
+    }
+
+    /// A gateway on loopback answering with exactly these JSON bodies, in order.
+    async fn fake_gateway_at(replies: Vec<&str>) -> (std::net::SocketAddr, Recorded) {
+        let responses = replies
+            .iter()
+            .map(|reply| {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+            })
+            .collect();
+        fake_server(responses).await
+    }
+
+    /// The same gateway, given as the URL a summarizer would be pointed at.
+    async fn fake_gateway(replies: Vec<&str>) -> (String, Recorded) {
+        let (addr, seen) = fake_gateway_at(replies).await;
         (format!("http://{addr}/v1/chat/completions"), seen)
     }
 
@@ -1181,5 +1381,358 @@ mod tests {
                 "an explicit grant covers this: {anything:?}"
             );
         }
+    }
+
+    /// An ambient proxy in this service's environment must not be able to decide where the
+    /// operator's screen goes. One line in a systemd unit or a shell profile is all it takes, and
+    /// every startup gate still passes: the address was proved, and then a library sent the bytes
+    /// somewhere else entirely — with the gateway key attached.
+    ///
+    /// This has to run in a child process. reqwest reads the proxy variables once and caches the
+    /// answer for the life of the process, so a test that sets them after some other test has
+    /// already built a client would pass while proving nothing. The recorders stay here, in the
+    /// parent, because their ports have to be known before the child starts. Waiting for the child
+    /// blocks this thread, so the runtime needs another one to keep answering on those ports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ambient_proxy_must_not_be_able_to_reroute_the_gist() {
+        let (gateway, gateway_seen) = fake_gateway_at(vec![
+            r#"{"model":"local-coder","choices":[{"message":{"content":"Overwrite config.yaml?"}}]}"#,
+            r#"{"model":"local-coder","choices":[{"message":{"content":"Force-push and drop the 2 commits?"}}]}"#,
+        ])
+        .await;
+        let (proxy, proxy_seen) = fake_gateway_at(vec![
+            r#"{"model":"glm-5.3-flash","choices":[{"message":{"content":"Force-push?"}}]}"#,
+            r#"{"model":"glm-5.3-flash","choices":[{"message":{"content":"Force-push?"}}]}"#,
+        ])
+        .await;
+
+        let child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "summarize::tests::the_child_the_proxy_test_drives",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "HERDR_TG_TEST_GIST_ENDPOINT",
+                format!("http://{gateway}/v1/chat/completions"),
+            )
+            .env("http_proxy", format!("http://{proxy}"))
+            .env("HTTP_PROXY", format!("http://{proxy}"))
+            .env("all_proxy", format!("http://{proxy}"))
+            .env("ALL_PROXY", format!("http://{proxy}"))
+            // A machine that already excludes loopback from its proxy would hide the whole defect.
+            .env_remove("no_proxy")
+            .env_remove("NO_PROXY")
+            .output()
+            .expect("run the child");
+
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            child.status.success(),
+            "the summary did not come from the gateway on this machine:\n{said}"
+        );
+        assert!(
+            proxy_seen
+                .lock()
+                .expect("the recorder is free once the child has exited")
+                .is_empty(),
+            "an environment variable rerouted the excerpt and the gateway key to a host of its own \
+             choosing"
+        );
+        let sent = gateway_seen
+            .lock()
+            .expect("the recorder is free once the child has exited")
+            .clone();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the probe and the excerpt both go straight to the gateway"
+        );
+        assert!(sent[1].contains("SECRET-PANE-TEXT"));
+    }
+
+    /// Driven by [`an_ambient_proxy_must_not_be_able_to_reroute_the_gist`], which starts it with
+    /// the proxy variables already in the environment. Ignored so nothing else runs it.
+    #[tokio::test]
+    #[ignore = "started by the proxy test, which sets the environment it needs"]
+    async fn the_child_the_proxy_test_drives() {
+        let Ok(endpoint) = std::env::var("HERDR_TG_TEST_GIST_ENDPOINT") else {
+            eprintln!(
+                "this test is started by an_ambient_proxy_must_not_be_able_to_reroute_the_gist"
+            );
+            return;
+        };
+        let got = at(&endpoint, &["local-coder"])
+            .one_line("SECRET-PANE-TEXT force-push? [y/N]")
+            .await;
+        assert_eq!(
+            got.as_deref(),
+            Some("Force-push and drop the 2 commits?"),
+            "the summary has to have come from the gateway on this machine, not from the proxy"
+        );
+    }
+
+    /// A gist gateway has no business redirecting, and following one would hand the excerpt to
+    /// whatever host the redirect names — reqwest re-sends a POST body on 307 and 308.
+    #[tokio::test]
+    async fn a_gateway_that_redirects_is_not_followed_anywhere() {
+        let (elsewhere, elsewhere_seen) = fake_gateway_at(vec![
+            r#"{"model":"local-coder","choices":[{"message":{"content":"Overwrite config.yaml?"}}]}"#,
+            r#"{"model":"local-coder","choices":[{"message":{"content":"Force-push and drop the 2 commits?"}}]}"#,
+        ])
+        .await;
+        let (redirector, seen) = fake_server(vec![format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{elsewhere}/v1/chat/completions\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )])
+        .await;
+
+        let got = at(
+            &format!("http://{redirector}/v1/chat/completions"),
+            &["local-coder"],
+        )
+        .one_line("SECRET-PANE-TEXT force-push? [y/N]")
+        .await;
+
+        assert!(
+            got.is_none(),
+            "an answer reached through a redirect must not be shown: {got:?}"
+        );
+        assert!(
+            elsewhere_seen
+                .lock()
+                .expect("the recorder is free once the call returns")
+                .is_empty(),
+            "the gateway redirected and this bridge carried the request to the host it named"
+        );
+        let sent = seen
+            .lock()
+            .expect("the recorder is free once the call returns")
+            .clone();
+        assert_eq!(sent.len(), 1, "one probe, and nothing after the redirect");
+        assert!(!sent[0].contains("SECRET-PANE-TEXT"));
+    }
+
+    /// An answer built by hand, so the address the connection reached can be varied without needing
+    /// a machine that has one.
+    fn answered_by(responder: &str, peer: Option<&str>) -> Answer {
+        Answer {
+            responder: responder.into(),
+            content: "Force-push and drop the 2 commits?".into(),
+            peer: peer.map(|p| p.parse().expect("a test address")),
+        }
+    }
+
+    /// The gate the two blockers walked through: the endpoint was proved at startup and then a
+    /// library chose the socket. Whatever the reply calls itself, an address that is not on this
+    /// machine is a leak, and one this bridge could not read back is one it cannot vouch for.
+    #[tokio::test]
+    async fn an_answer_from_a_socket_that_is_not_on_this_machine_is_refused() {
+        let s = at(
+            "http://127.0.0.1:8090/v1/chat/completions",
+            &["local-coder"],
+        );
+
+        for here in [
+            "127.0.0.1:8090",
+            "[::1]:8090",
+            "[::ffff:127.0.0.1]:8090",
+            "127.9.9.9:1",
+        ] {
+            assert!(
+                s.answer_is_local(&answered_by("local-coder", Some(here))),
+                "this answer came from this machine: {here}"
+            );
+        }
+        for elsewhere in [
+            "192.168.178.155:18099",
+            "10.0.0.5:8090",
+            "100.64.30.5:443",
+            "[::ffff:192.168.178.155]:8090",
+            "[2001:db8::1]:8090",
+        ] {
+            assert!(
+                !s.answer_is_local(&answered_by("local-coder", Some(elsewhere))),
+                "the bytes went off this machine, and a familiar name does not undo that: \
+                 {elsewhere}"
+            );
+        }
+        assert!(
+            !s.answer_is_local(&answered_by("local-coder", None)),
+            "an address this bridge cannot read back is one it cannot vouch for"
+        );
+
+        // Consent replaces proof, here as everywhere else in this file.
+        let mut allowed = s.clone();
+        allowed.allow_remote = true;
+        assert!(
+            allowed.answer_is_local(&answered_by("glm-5.3-flash", Some("192.168.178.155:443")))
+        );
+    }
+
+    /// The bridge must never tell the operator a comforting thing that is not true. `trip` is
+    /// reached from two places and only one of them can say nothing of theirs was sent.
+    #[test]
+    fn the_journal_never_says_nothing_was_sent_once_the_excerpt_has_gone() {
+        let s = at(
+            "http://127.0.0.1:8090/v1/chat/completions",
+            &["local-coder", "local-qwen3"],
+        );
+        let stranger = answered_by("glm-5.3-flash", Some("127.0.0.1:8090"));
+
+        let after_the_probe = s.why_summaries_stopped(&stranger, false);
+        assert!(
+            after_the_probe.contains("nothing from the screen was sent"),
+            "after the probe nothing of theirs has gone, and the operator should be told so: \
+             {after_the_probe}"
+        );
+
+        let after_the_excerpt = s.why_summaries_stopped(&stranger, true);
+        assert!(
+            after_the_excerpt.contains("had already been sent"),
+            "the excerpt was on the wire before this reply could be read: {after_the_excerpt}"
+        );
+        assert!(
+            !after_the_excerpt.contains("nothing from the screen was sent"),
+            "the journal told the operator their screen was safe when it was already gone: \
+             {after_the_excerpt}"
+        );
+    }
+
+    /// A reply from off this machine is a different failure from a reply with an unfamiliar name,
+    /// and the sentence has to send the operator to the two settings that actually cause it.
+    #[test]
+    fn a_reply_from_off_this_machine_names_the_address_and_the_two_ways_it_happens() {
+        let s = at(
+            "http://127.0.0.1:8090/v1/chat/completions",
+            &["local-coder"],
+        );
+
+        let why = s.why_summaries_stopped(
+            &answered_by("local-coder", Some("192.168.178.155:18099")),
+            true,
+        );
+        assert!(
+            why.contains("192.168.178.155:18099"),
+            "which address? {why}"
+        );
+        assert!(
+            why.contains("127.0.0.1:8090"),
+            "and which one was configured? {why}"
+        );
+        assert!(
+            why.contains("proxy") && why.contains("redirect"),
+            "and where to look? {why}"
+        );
+        assert!(why.contains("had already been sent"), "{why}");
+
+        let unreadable = s.why_summaries_stopped(&answered_by("local-coder", None), false);
+        assert!(unreadable.contains("could not read back"), "{unreadable}");
+        assert!(
+            unreadable.contains("nothing from the screen was sent"),
+            "{unreadable}"
+        );
+    }
+
+    /// Every sentence the operator reads is prose. A set printed with `{:?}` renders braces and
+    /// quotes, which is this crate's vocabulary rather than theirs.
+    #[test]
+    fn the_operator_reads_the_allowlist_as_words_not_as_a_set_literal() {
+        let _env = env_guard();
+        let s = at(
+            "http://127.0.0.1:8090/v1/chat/completions",
+            &["local-coder", "local-qwen3"],
+        );
+        let why =
+            s.why_summaries_stopped(&answered_by("glm-5.3-flash", Some("127.0.0.1:8090")), false);
+        assert!(why.contains("local-coder, local-qwen3"), "{why}");
+
+        // SAFETY: `_env` holds ENV_LOCK, so no other test reads or writes these vars concurrently,
+        // and outside the tests they are read only by from_env.
+        unsafe {
+            std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
+            std::env::set_var("HERDR_TG_SUMMARIZER_MODEL", "glm-5.3-flash");
+        }
+        let Setup::Refused(refusal) = Summarizer::configure() else {
+            panic!("a hosted pin has to read as refused");
+        };
+        assert!(
+            refusal.contains("local-coder, local-qwen3, qwen2.5-coder-1.5b"),
+            "{refusal}"
+        );
+
+        for sentence in [&why, &refusal] {
+            for jargon in ['{', '}', '"', '[', ']'] {
+                assert!(
+                    !sentence.contains(jargon),
+                    "a person has to read this, and {jargon:?} is this crate's punctuation, \
+                     not theirs: {sentence}"
+                );
+            }
+        }
+    }
+
+    /// `localhost` is a name, and a name is resolved at connect time by something this crate does
+    /// not control. It is accepted anyway because the resolution is pinned rather than trusted —
+    /// so the pin has to cover every spelling the URL parser will hand over, and only those.
+    #[test]
+    fn the_name_localhost_is_pinned_to_loopback_rather_than_trusted_at_connect_time() {
+        assert_eq!(
+            loopback_pin("http://localhost:8090/v1/chat/completions"),
+            Some(("localhost".to_string(), 8090))
+        );
+        // The URL parser lowercases the host of an http URL, so the pin only ever sees one casing.
+        assert_eq!(
+            loopback_pin("http://LoCaLhOsT/v1"),
+            Some(("localhost".to_string(), 80))
+        );
+        assert_eq!(
+            loopback_pin("https://localhost/v1"),
+            Some(("localhost".to_string(), 443))
+        );
+        // The same name written as a fully qualified one is a different string to the resolver.
+        assert_eq!(
+            loopback_pin("http://localhost./v1"),
+            Some(("localhost.".to_string(), 80))
+        );
+        // A literal address is already an address; there is nothing for a resolver to decide.
+        for literal in [
+            "http://127.0.0.1:8090/v1",
+            "http://[::1]:8090/v1",
+            "not a url",
+        ] {
+            assert_eq!(loopback_pin(literal), None, "nothing to pin in {literal:?}");
+        }
+    }
+
+    /// Pinning replaces resolution, so it has to keep the port the operator configured — otherwise
+    /// the gate would be safe and the feature would simply never work.
+    #[tokio::test]
+    async fn a_gateway_reached_by_the_name_localhost_still_answers_on_its_own_port() {
+        let (addr, seen) = fake_gateway_at(vec![
+            r#"{"model":"local-coder","choices":[{"message":{"content":"Overwrite config.yaml?"}}]}"#,
+            r#"{"model":"local-coder","choices":[{"message":{"content":"Force-push and drop the 2 commits?"}}]}"#,
+        ])
+        .await;
+
+        let got = at(
+            &format!("http://localhost:{}/v1/chat/completions", addr.port()),
+            &["local-coder"],
+        )
+        .one_line("Force-push? [y/N]")
+        .await;
+
+        assert_eq!(got.as_deref(), Some("Force-push and drop the 2 commits?"));
+        assert_eq!(
+            seen.lock()
+                .expect("the recorder is free once the call returns")
+                .len(),
+            2,
+            "one probe, then the excerpt"
+        );
     }
 }
