@@ -17,7 +17,13 @@
 //! 3. **No implementation vocabulary.** The operator never sees "rung", "RPC", "pane_id", "seq",
 //!    "socket", "subscription". They are reading a message from an agent, not a log line.
 //! 4. **Say less when it went well.** A clean success is one word. Length is for problems.
-//! 5. **Never claim more than was observed.** This is the one rule that outranks brevity: a
+//! 5. **Relay words, not a screen.** An agent's prose is a message and is sent as one. A code
+//!    block is for things that are actually code — a diff, a command, a stack trace. Wrapping
+//!    prose in `<pre>` turns a sentence into a screenshot, and the operator's verdict on that was
+//!    that it "sends quoted code back to me, which isn't really a chat vibe".
+//! 6. **Say the standing instructions once.** "Reply here and I'll type it in" belongs in the
+//!    topic's opening message, not under every push. Repeated on each one it is furniture.
+//! 7. **Never claim more than was observed.** This is the one rule that outranks brevity: a
 //!    confirmation that overstates costs the operator the time the bridge exists to save.
 
 use crate::deliver::{Delivery, Rung};
@@ -32,6 +38,11 @@ pub enum Place {
 }
 
 /// An agent needs an answer.
+///
+/// The body is the agent's own words wherever they are words. Only genuine terminal output — a
+/// diff, a command line, a stack trace — goes in a code block, because that is the only kind of
+/// text a proportional font would ruin. A header and a footer are deliberately absent: in a
+/// session's own topic they say nothing the reader does not already know.
 pub fn asked(
     place: Place,
     workspace: &str,
@@ -39,37 +50,135 @@ pub fn asked(
     has_options: bool,
     gist: Option<&str>,
 ) -> String {
-    let mut m = match place {
-        Place::Topic => "🔴 <b>Needs you</b>".to_string(),
-        Place::Flat => format!("🔴 <b>{} needs you</b>", esc(workspace)),
-    };
-    // The gist goes ABOVE the excerpt and never replaces it: if a small model paraphrased the
-    // question wrongly, the real text is right underneath and the operator can see that.
-    if let Some(g) = gist.filter(|g| !g.trim().is_empty()) {
-        m.push_str(&format!("\n{}", esc(g.trim())));
+    let mut m = String::new();
+    // In flat mode nothing else says which session this is, so it is named. In a topic it is noise.
+    if place == Place::Flat {
+        m.push_str(&format!("🔴 <b>{}</b>\n", esc(workspace)));
     }
-    if !excerpt.is_empty() {
-        m.push_str(&format!("\n\n<pre>{}</pre>", esc(excerpt)));
+    m.push_str(&body(excerpt, gist, "🔴 "));
+    if has_options {
+        m.push_str("\n<i>Tap one below.</i>");
     }
-    m.push_str(if has_options {
-        "\n<i>Tap one below.</i>"
-    } else {
-        "\n<i>Reply here and I'll type it in.</i>"
-    });
     m
 }
 
 /// An agent finished and is waiting to be looked at.
 pub fn finished(place: Place, workspace: &str, excerpt: &str) -> String {
-    let mut m = match place {
-        Place::Topic => "✅ <b>Done</b>".to_string(),
-        Place::Flat => format!("✅ <b>{} is done</b>", esc(workspace)),
-    };
-    if !excerpt.is_empty() {
-        m.push_str(&format!("\n\n<pre>{}</pre>", esc(excerpt)));
+    let mut m = String::new();
+    if place == Place::Flat {
+        m.push_str(&format!("✅ <b>{}</b>\n", esc(workspace)));
     }
-    m.push_str("\n<i>Reply here with whatever's next.</i>");
+    m.push_str(&body(excerpt, None, "✅ "));
     m
+}
+
+/// Render what the agent left on screen as a message.
+///
+/// The gist, when there is one, IS the message — it is the agent's question in one line, which is
+/// what a person would have typed. The raw tail follows only when it adds something: as prose if it
+/// reads as prose, and in a code block only if it is genuinely output.
+fn body(excerpt: &str, gist: Option<&str>, mark: &str) -> String {
+    let tail = excerpt.trim();
+    let gist = gist.map(str::trim).filter(|g| !g.is_empty());
+
+    let mut m = String::new();
+    if let Some(g) = gist {
+        m.push_str(&format!("{mark}{}", esc(g)));
+        if tail.is_empty() || covered_by(g, tail) {
+            return m;
+        }
+        m.push('\n');
+        m.push('\n');
+    } else if tail.is_empty() {
+        return format!("{mark}<i>waiting on you</i>");
+    } else {
+        m.push_str(mark);
+    }
+
+    if looks_like_prose(tail) {
+        m.push_str(&esc(tail));
+    } else {
+        m.push_str(&format!("<pre>{}</pre>", esc(tail)));
+    }
+    m
+}
+
+/// Would repeating the tail just restate the gist?
+///
+/// A one-line ask summarised into one line is the same sentence twice. Cheap check: if the tail is
+/// short and shares most of its words with the gist, the gist alone says it.
+fn covered_by(gist: &str, tail: &str) -> bool {
+    if tail.lines().filter(|l| !l.trim().is_empty()).count() > 2 {
+        return false;
+    }
+    let words = |s: &str| -> std::collections::BTreeSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 3)
+            .map(str::to_string)
+            .collect()
+    };
+    let (g, t) = (words(gist), words(tail));
+    if t.is_empty() {
+        return true;
+    }
+    let shared = g.intersection(&t).count();
+    shared * 2 >= t.len()
+}
+
+/// Does the line carry a `file.ext:line` or `file.ext:line:col` reference?
+///
+/// A stack trace reads as prose by every other measure — mostly letters, few symbols — and the
+/// source location is what gives it away. Missed on the first pass, which sent a panic message as
+/// a chat message.
+fn has_source_location(line: &str) -> bool {
+    for tok in line.split_whitespace() {
+        let parts: Vec<&str> = tok.split(':').collect();
+        if parts.len() >= 2
+            && parts[0].contains('.')
+            && parts[1..]
+                .iter()
+                .take(2)
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is this the agent talking, or is it terminal output?
+///
+/// Prose gets sent as a message; output gets a code block. Judged on shape rather than content:
+/// output is dense in punctuation and path-like tokens and light on sentences, and its lines rarely
+/// end the way a sentence does.
+fn looks_like_prose(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    // Anything that opens like a shell, a diff or a log is output, whatever else it looks like.
+    for l in &lines {
+        if l.starts_with(['$', '+', '-', '#', '>', '|', '/'])
+            || l.contains("::")
+            || l.contains("@@")
+            || has_source_location(l)
+        {
+            return false;
+        }
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let letters = chars.iter().filter(|c| c.is_alphabetic()).count();
+    let symbols = chars
+        .iter()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace() && !",.'\"?!:;()-—…".contains(**c))
+        .count();
+    // Real sentences are mostly letters, and carry little of the punctuation code needs.
+    letters * 2 > chars.len() && symbols * 12 < chars.len()
 }
 
 /// An agent went back to work after being stuck.
@@ -83,7 +192,8 @@ pub fn resumed(place: Place, workspace: &str) -> String {
 /// The greeting in a freshly created topic.
 pub fn topic_opened(workspace: &str, agent: &str) -> String {
     format!(
-        "<b>{}</b> — {}\n<i>Anything you send here goes to this session.</i>",
+        "<b>{}</b> — {}\n<i>Anything you send here goes to this session. Reply to a message to \
+         answer it.</i>",
         esc(workspace),
         esc(agent)
     )
@@ -355,12 +465,17 @@ mod tests {
 
     /// The gist is a convenience, never a replacement. A wrong paraphrase must be visible against
     /// the real text, which is why the excerpt is always sent underneath it.
+    /// A gist never replaces content the tail carries and it does not.
+    ///
+    /// Its original tail was a one-line restatement of the gist, which the dedup rule now
+    /// (correctly) collapses — so this uses a tail that genuinely adds, and the collapse case has
+    /// its own test.
     #[test]
     fn a_gist_is_added_above_the_excerpt_and_never_instead_of_it() {
         let with = asked(
             Place::Topic,
             "ws",
-            "Force-push and drop the 2 commits? [y/N]",
+            "Checked all six themes; retro-82 collides.\nForce-push and drop the 2 commits? [y/N]",
             false,
             Some("Force-push, losing 2 commits?"),
         );
@@ -369,11 +484,11 @@ mod tests {
             "no gist: {with}"
         );
         assert!(
-            with.contains("Force-push and drop the 2 commits? [y/N]"),
+            with.contains("retro-82 collides"),
             "the excerpt was replaced by the gist: {with}"
         );
         let gist_at = with.find("Force-push, losing").unwrap();
-        let excerpt_at = with.find("<pre>").unwrap();
+        let excerpt_at = with.find("Checked all six").unwrap();
         assert!(gist_at < excerpt_at, "the gist must come first");
 
         // A gist the model returned as whitespace changes nothing.
@@ -392,6 +507,101 @@ mod tests {
             Some("<script>alert(1)</script>"),
         );
         assert!(!m.contains("<script>"));
+    }
+
+    // ── rule 5: words, not a screen ───────────────────────────────────────────────────────────
+
+    /// The operator's complaint: it "sends quoted code back to me, which isn't really a chat vibe".
+    /// An agent's prose must arrive as a message, not as a screenshot of a terminal.
+    #[test]
+    fn an_agents_prose_is_sent_as_a_message_not_a_code_block() {
+        let prose = "The rebase drops 2 commits from the shipping branch.\n\nForce-push anyway?";
+        let m = asked(Place::Topic, "ws", prose, false, None);
+        assert!(!m.contains("<pre>"), "prose was quoted as code: {m}");
+        assert!(m.contains("Force-push anyway?"));
+    }
+
+    /// The other half: real output still needs a monospace block, or a diff becomes soup.
+    #[test]
+    fn real_terminal_output_still_gets_a_code_block() {
+        for output in [
+            "--- a/src/router.ts\n+++ b/src/router.ts\n@@ -52,7 +52,9 @@",
+            "$ npm install axios\n  added 3 packages",
+            "thread 'main' panicked at src/lib.rs:42:9",
+        ] {
+            let m = asked(Place::Topic, "ws", output, false, None);
+            assert!(m.contains("<pre>"), "output was sent as prose: {output:?}");
+        }
+    }
+
+    /// Rule 6. Standing instructions belong in the topic's opening message; repeated under every
+    /// push they are furniture.
+    #[test]
+    fn the_standing_instruction_is_not_repeated_on_every_push() {
+        let m = asked(Place::Topic, "ws", "Force-push anyway?", false, None);
+        assert!(!m.contains("Reply here"), "instruction repeated: {m}");
+        assert!(!m.contains("Needs you"), "a status header survived: {m}");
+        // It IS said once, when the topic opens.
+        assert!(topic_opened("ws", "opencode").contains("Reply to a message"));
+    }
+
+    /// A one-line ask summarised into one line is the same sentence twice.
+    #[test]
+    fn a_gist_that_merely_restates_the_tail_does_not_print_it_twice() {
+        let m = asked(
+            Place::Topic,
+            "ws",
+            "Force-push anyway? [y/N]",
+            false,
+            Some("Force-push anyway?"),
+        );
+        assert_eq!(m.matches("Force-push").count(), 1, "said twice: {m}");
+    }
+
+    /// But a gist over a longer tail keeps both — the gist to read at a glance, the tail for detail.
+    #[test]
+    fn a_gist_over_real_context_keeps_both() {
+        let tail = "Checked all six themes for hue collisions.\nretro-82 has blue == magenta.\n                    No collision-free six-key set exists.\n\nChange the base hue, or drop to five?";
+        let m = asked(
+            Place::Topic,
+            "ws",
+            tail,
+            false,
+            Some("Change the base hue, or drop to five?"),
+        );
+        assert!(m.contains("retro-82"), "the detail was dropped: {m}");
+        assert!(m.find("Change the base").unwrap() < m.find("retro-82").unwrap());
+    }
+
+    #[test]
+    fn a_source_location_marks_a_line_as_output() {
+        assert!(has_source_location(
+            "thread 'main' panicked at src/lib.rs:42:9"
+        ));
+        assert!(has_source_location("  at bot.rs:110"));
+        assert!(!has_source_location(
+            "I finished at 3pm and it took 42 minutes"
+        ));
+        assert!(!has_source_location("ratio 3:1"));
+    }
+
+    #[test]
+    fn the_prose_test_is_not_fooled_by_either_side() {
+        assert!(looks_like_prose(
+            "I checked the themes and two of them collide."
+        ));
+        assert!(looks_like_prose("Done. 3 files changed, tests green."));
+        assert!(!looks_like_prose("$ cargo test --workspace"));
+        assert!(!looks_like_prose("+  return resolve(cls)"));
+        assert!(!looks_like_prose("herdr_tg::bot::serve at src/bot.rs:42"));
+        assert!(!looks_like_prose(""));
+    }
+
+    /// An empty tail with no gist must still say something rather than sending a bare marker.
+    #[test]
+    fn nothing_to_relay_still_reads_as_a_message() {
+        let m = asked(Place::Topic, "ws", "", false, None);
+        assert!(m.contains("waiting on you"), "{m}");
     }
 
     /// Agent-authored text is untrusted: a pane title can contain anything.
