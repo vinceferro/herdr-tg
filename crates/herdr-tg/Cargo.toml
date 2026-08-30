@@ -31,3 +31,10 @@ reqwest    = { workspace = true }
 # Supply-chain facts for the decision log: 0.17.0 dates from 2025-07-11 (13 months stale), MSRV 1.82,
 # and it pulls proc-macro-error2 v2.0.1 which cargo already flags future-incompatible.
 teloxide = { version = "0.17.0", default-features = false, features = ["rustls", "ctrlc_handler", "macros"] }
+
+[dev-dependencies]
+# The summarizer tests stand up a real HTTP server on loopback and read back what was sent to it.
+# What is under test is what this crate does with a REPLY — which responder answered, and whether
+# the operator's pane text was already on the wire by then — and a hand-rolled stand-in for reqwest
+# would prove nothing about that.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
