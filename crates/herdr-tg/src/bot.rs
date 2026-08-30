@@ -42,6 +42,7 @@ use crate::config::Config;
 use crate::deliver::{self, Settle};
 use crate::mirror::Mirror;
 use crate::notify::{self, Ask, Beat, Timing};
+use crate::permission::Screen;
 use crate::render::{self, escape_html};
 use crate::routing::{Routing, Target};
 use crate::voice::{self, Place, Reason};
@@ -581,6 +582,36 @@ fn fit(html: String) -> String {
     format!("{kept}\n… truncated to fit Telegram's {TELEGRAM_MAX_CHARS}-character limit.")
 }
 
+/// What a reply is allowed to do to a pane.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplyPath {
+    /// A menu we resolved: answer it with keys, never with words.
+    Choice(crate::permission::Prompt),
+    /// Write nothing at all, and say why.
+    Refuse(Reason),
+    /// Ordinary output. The text path is safe.
+    Text,
+}
+
+/// Decide the path from what the pane looks like. `None` means the look itself failed.
+///
+/// Fails CLOSED in both directions. A pane the bridge could not look at is not evidence of ordinary
+/// output, and a menu it could not read is not evidence of ordinary output either — on either,
+/// words go nowhere and the confirm key after them presses whatever is highlighted, which on a
+/// permission prompt is a grant the operator never made.
+fn reply_path(ansi: Option<&str>) -> ReplyPath {
+    let Some(ansi) = ansi else {
+        // Say the true thing: the bridge could not reach the pane. Telling the operator about a
+        // menu it never saw would be a guess dressed up as an observation.
+        return ReplyPath::Refuse(Reason::HerdUnreachable);
+    };
+    match crate::permission::classify(ansi) {
+        Screen::Dialog(p) => ReplyPath::Choice(p),
+        Screen::UnreadableControl => ReplyPath::Refuse(Reason::UnreadablePrompt),
+        Screen::Prose => ReplyPath::Text,
+    }
+}
+
 /// Route a reply, deliver it, audit it, and tell the operator exactly what was observed.
 ///
 /// The confirmation is the product's honesty surface. It names the pane, names *why* that pane was
@@ -629,41 +660,48 @@ async fn route_and_deliver(
         .unwrap_or_else(|| pane.as_str().to_string());
     let ws = ws_owned.as_str();
 
-    // Is that pane showing a choice dialog? If so the reply is a CHOICE, never text — text goes
-    // nowhere and the Enter after it confirms whatever is highlighted, which on a permission prompt
-    // is a grant the operator did not make.
-    let is_dialog = match client.read_visible_ansi(&pane).await {
-        Ok(r) => crate::permission::parse(&r.text),
-        Err(_) => None,
-    };
-    if let Some(prompt) = is_dialog {
-        let at = timestamp();
-        if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
-            tracing::error!(error = %e, "could not write the audit record; refusing to send");
-            return voice::nothing_sent(Reason::NoAudit);
+    // What is that pane showing? A menu is answered with keys, never with words: words go nowhere
+    // against a menu, and the confirm key after them presses whatever is highlighted — which on a
+    // permission prompt is a grant the operator did not make.
+    let read = client.read_visible_ansi(&pane).await;
+    if let Err(e) = &read {
+        tracing::warn!(
+            pane = %pane, error = %e,
+            "could not see the pane before replying; refusing to answer it blind"
+        );
+    }
+    match reply_path(read.as_ref().ok().map(|r| r.text.as_str())) {
+        ReplyPath::Choice(prompt) => {
+            let at = timestamp();
+            if let Err(e) = audit.sent(&at, chat_id, &pane, &format!("[choice] {text}")) {
+                tracing::error!(error = %e, "could not write the audit record; refusing to send");
+                return voice::nothing_sent(Reason::NoAudit);
+            }
+            return match deliver::choose(client, &pane, text, Settle::default(), |d| {
+                Box::pin(tokio::time::sleep(d))
+            })
+            .await
+            {
+                Ok(Ok(d)) => {
+                    let _ = audit.outcome(&timestamp(), &d);
+                    let chosen = prompt
+                        .match_option(text)
+                        .and_then(|i| prompt.options.get(i).cloned())
+                        .unwrap_or_else(|| text.trim().to_string());
+                    voice::choice_made(pl, ws, &chosen, !d.rung.needs_attention())
+                }
+                // Not an error — the operator was ambiguous, or the prompt moved on. Show the options
+                // again rather than typing into a terminal on a guess.
+                Ok(Err(_)) => voice::nothing_sent(Reason::UnclearChoice(prompt.options.clone())),
+                Err(e) => {
+                    let _ = audit.failed(&timestamp(), &pane, &e.to_string());
+                    tracing::error!(error = %e, "the choice failed to send");
+                    voice::nothing_sent(Reason::HerdUnreachable)
+                }
+            };
         }
-        return match deliver::choose(client, &pane, text, Settle::default(), |d| {
-            Box::pin(tokio::time::sleep(d))
-        })
-        .await
-        {
-            Ok(Ok(d)) => {
-                let _ = audit.outcome(&timestamp(), &d);
-                let chosen = prompt
-                    .match_option(text)
-                    .and_then(|i| prompt.options.get(i).cloned())
-                    .unwrap_or_else(|| text.trim().to_string());
-                voice::choice_made(pl, ws, &chosen, !d.rung.needs_attention())
-            }
-            // Not an error — the operator was ambiguous, or the prompt moved on. Show the options
-            // again rather than typing into a terminal on a guess.
-            Ok(Err(_)) => voice::nothing_sent(Reason::UnclearChoice(prompt.options.clone())),
-            Err(e) => {
-                let _ = audit.failed(&timestamp(), &pane, &e.to_string());
-                tracing::error!(error = %e, "the choice failed to send");
-                voice::nothing_sent(Reason::HerdUnreachable)
-            }
-        };
+        ReplyPath::Refuse(reason) => return voice::nothing_sent(reason),
+        ReplyPath::Text => {}
     }
 
     let at = timestamp();
@@ -1007,5 +1045,41 @@ mod tests {
                 "{w} must not be a command in slice 2"
             );
         }
+    }
+
+    /// The blocker this closes: a pane showing a menu must never take the text path. Words go
+    /// nowhere against a menu, and the confirm key after them presses whatever is highlighted —
+    /// which on a permission prompt is a grant the operator never made.
+    #[test]
+    fn a_pane_that_looks_like_a_control_never_takes_the_text_path() {
+        const REAL: &str = include_str!("../tests/fixtures/opencode-permission.ansi");
+        assert!(
+            matches!(reply_path(Some(REAL)), ReplyPath::Choice(_)),
+            "the captured dialog must be answered with keys"
+        );
+
+        let unreadable = "\u{1b}[48;5;1mAllow once\u{1b}[0m \u{1b}[48;5;1mReject\u{1b}[0m  \u{1b}[0m⇆ select  enter confirm";
+        assert_eq!(
+            reply_path(Some(unreadable)),
+            ReplyPath::Refuse(Reason::UnreadablePrompt),
+            "a menu nobody can read must be refused, not typed at"
+        );
+
+        assert_eq!(
+            reply_path(Some("agent: done, 3 files changed\n> ")),
+            ReplyPath::Text,
+            "only a screen positively judged ordinary output may be typed into"
+        );
+    }
+
+    /// A read that failed says nothing about what is on the screen, and the screen might be a
+    /// permission prompt. The old code turned that silence into "not a dialog".
+    #[test]
+    fn a_read_that_failed_is_not_evidence_of_prose() {
+        assert_eq!(
+            reply_path(None),
+            ReplyPath::Refuse(Reason::HerdUnreachable),
+            "a pane the bridge could not look at must not be typed into"
+        );
     }
 }

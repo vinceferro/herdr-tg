@@ -275,6 +275,10 @@ pub fn nothing_sent(reason: Reason) -> String {
         Reason::HerdUnreachable => "I can't reach the herd right now, so nothing was sent.\n<i>It \
              will reconnect on its own.</i>"
             .to_string(),
+        Reason::UnreadablePrompt => "I didn't type that: that session is showing a menu, and I \
+             can't tell which option is highlighted.\n<i>Answer it at the keyboard — anything I \
+             sent would press whatever is selected.</i>"
+            .to_string(),
     }
 }
 
@@ -286,6 +290,9 @@ pub enum Reason {
     UnclearChoice(Vec<String>),
     NoAudit,
     HerdUnreachable,
+    /// The pane is showing a menu whose highlight could not be read — or could not be looked at
+    /// at all. Nothing may be typed there, because the confirm key would press an unknown option.
+    UnreadablePrompt,
 }
 
 /// Escape the three characters Telegram's HTML mode treats as markup.
@@ -346,6 +353,7 @@ mod tests {
             nothing_sent(Reason::TargetGone),
             nothing_sent(Reason::NoAudit),
             nothing_sent(Reason::HerdUnreachable),
+            nothing_sent(Reason::UnreadablePrompt),
             nothing_sent(Reason::UnclearChoice(vec![
                 "Allow once".into(),
                 "Reject".into(),
@@ -641,5 +649,21 @@ mod tests {
         assert!(regex_lite_pane_id("sent to wA:p1 now"));
         assert!(regex_lite_pane_id("w9:p1"));
         assert!(!regex_lite_pane_id("nothing here"));
+    }
+
+    /// A refusal is only worth sending if it says what to do instead, and there is exactly one
+    /// safe answer here: go to the terminal, where the menu can be answered without guessing.
+    #[test]
+    fn an_unreadable_prompt_tells_the_operator_to_use_the_keyboard() {
+        let m = nothing_sent(Reason::UnreadablePrompt);
+        assert!(
+            m.starts_with("I didn't type"),
+            "the outcome must come first: {m:?}"
+        );
+        assert!(m.contains("keyboard"), "no way out was offered: {m:?}");
+        assert!(
+            !regex_lite_pane_id(&m),
+            "a pane id reached the operator: {m:?}"
+        );
     }
 }
