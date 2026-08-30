@@ -399,7 +399,9 @@ enum Tap {
         pane: PaneId,
         label: String,
         drawn_from: Vec<String>,
-        seq: u64,
+        /// Where the session stood when those buttons were drawn, as the herd reported it then.
+        /// `None` means it did not report it — see [`still_the_same_question`].
+        seq: Option<u64>,
     },
     /// Nothing may be pressed. Carries what the operator is told.
     Refuse(Reason),
@@ -446,6 +448,23 @@ fn toast(html: &str) -> String {
     render::plain_text(html).chars().take(190).collect()
 }
 
+/// Is the session still on the question those buttons were drawn for?
+///
+/// The only evidence there is: where the herd said the session's run of work stood when the buttons
+/// were drawn, against where it says it stands now. A tapped button is evidence about the past and
+/// nothing else — it stays tappable for as long as its message exists — and this is the one check
+/// that catches a tap landing on a LATER question whose options happen to read the same.
+///
+/// So a herd that does not report that at all leaves the check with nothing to stand on, and the
+/// answer is no. Comparing two absences as though they were the same number is how this guard used
+/// to pass for every pane and every question on such a herd, silently and invisibly.
+fn still_the_same_question(now: Option<u64>, drawn_at: Option<u64>) -> bool {
+    match (now, drawn_at) {
+        (Some(now), Some(drawn_at)) => now == drawn_at,
+        _ => false,
+    }
+}
+
 /// Answer one tapped button, after proving the question it was drawn for is still the one being
 /// asked.
 ///
@@ -465,7 +484,7 @@ async fn answer_dialog(
     pane: &PaneId,
     label: &str,
     drawn_from: &[String],
-    seq: u64,
+    seq: Option<u64>,
 ) -> String {
     let at = timestamp();
     match ctx.client.agents().await {
@@ -483,19 +502,24 @@ async fn answer_dialog(
                     .refused(&at, chat_id, pane, "that session has left the herd");
                 return voice::nothing_sent(Reason::TargetGone);
             }
-            // The session has moved on since those buttons were drawn. It may well be showing the
-            // same words again, and answering that would answer a question nobody read.
-            Some(a) if a.state_change_seq.unwrap_or(0) != seq => {
+            Some(a) if !still_the_same_question(a.state_change_seq, seq) => {
+                let stood =
+                    |s: Option<u64>| s.map_or_else(|| "unknown".to_string(), |n| n.to_string());
                 let _ = ctx.audit.refused(
                     &at,
                     chat_id,
                     pane,
                     &format!(
-                        "that session moved on to a different question (drawn at {seq}, now {})",
-                        a.state_change_seq.unwrap_or(0)
+                        "could not prove that session is still on the question those buttons were \
+                         drawn for (drawn at {}, now {})",
+                        stood(seq),
+                        stood(a.state_change_seq)
                     ),
                 );
-                return voice::nothing_sent(Reason::PromptChanged);
+                return voice::nothing_sent(match (a.state_change_seq, seq) {
+                    (Some(_), Some(_)) => Reason::PromptChanged,
+                    _ => Reason::CannotTellIfMovedOn,
+                });
             }
             Some(_) => {}
         },
@@ -826,6 +850,10 @@ fn reply_path(ansi: Option<&str>) -> ReplyPath {
 fn refusal_reason(refused: deliver::ChoiceRefused) -> Reason {
     match refused {
         deliver::ChoiceRefused::NotADialog => Reason::NoLongerAsking,
+        // Still asking, still unreadable. Saying it stopped asking would be false, and the advice
+        // that goes with it — "have a look at what it is showing now" — is not the advice that
+        // applies here.
+        deliver::ChoiceRefused::Unreadable => Reason::UnreadablePrompt,
         deliver::ChoiceRefused::Unclear { options } => Reason::UnclearChoice(options),
         deliver::ChoiceRefused::Changed { .. } => Reason::PromptChanged,
         deliver::ChoiceRefused::NotConfirmed(why) => Reason::ChoiceNotConfirmed(why),
@@ -1329,13 +1357,36 @@ mod tests {
         PromptRecord {
             chat,
             pane: pane.to_string(),
-            seq: 198,
+            seq: Some(198),
             options: options.iter().map(|o| o.to_string()).collect(),
         }
     }
 
     fn no_sleep(_: std::time::Duration) -> futures_core::future::BoxFuture<'static, ()> {
         Box::pin(async {})
+    }
+
+    /// The guard that catches a stale tap on a LATER question whose options read the same was
+    /// silently inert on any herd that does not report where a session's run of work stands: both
+    /// sides were flattened to zero before the comparison, so it passed for every pane and every
+    /// question. Its failure mode was invisible — no log, no refusal, nothing to notice.
+    ///
+    /// A check with no evidence must answer no. The cost is that button taps are refused on such a
+    /// herd and the operator replies with the option's name instead; the alternative is a keypress
+    /// into a question nobody read.
+    #[test]
+    fn a_session_that_cannot_say_where_it_stands_is_never_assumed_to_have_stood_still() {
+        assert!(
+            still_the_same_question(Some(198), Some(198)),
+            "a herd that reports the same point must still be answerable"
+        );
+        assert!(!still_the_same_question(Some(199), Some(198)));
+        assert!(
+            !still_the_same_question(None, None),
+            "two absences are not evidence that nothing changed"
+        );
+        assert!(!still_the_same_question(None, Some(198)));
+        assert!(!still_the_same_question(Some(198), None));
     }
 
     /// THE test of the tapped button, end to end bar the herd.
@@ -1361,7 +1412,11 @@ mod tests {
             "the position is read against what was drawn"
         );
         assert_eq!(drawn_from, record.options);
-        assert_eq!(seq, 198, "the point the session was at is carried too");
+        assert_eq!(
+            seq,
+            Some(198),
+            "the point the session was at is carried too"
+        );
 
         let io = MenuPane::showing(&["Reject", "Allow once", "Allow always"]);
         let r = deliver::choose(

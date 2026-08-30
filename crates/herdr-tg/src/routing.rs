@@ -90,7 +90,12 @@ pub struct PromptRecord {
     pub pane: String,
     /// Where the pane's run of work stood when the buttons were drawn — the same key the push
     /// dedupe uses. A different value is a different question.
-    pub seq: u64,
+    ///
+    /// `None` when the herd did not report it, and on a record written before this was recorded at
+    /// all. Either way the tap that reads it back cannot prove the session has not moved on, so it
+    /// is refused rather than answered.
+    #[serde(default)]
+    pub seq: Option<u64>,
     /// The labels, left to right, exactly as the buttons showed them.
     pub options: Vec<String>,
 }
@@ -164,7 +169,7 @@ impl Routing {
         chat: i64,
         message_id: i64,
         pane: &PaneId,
-        seq: u64,
+        seq: Option<u64>,
         options: &[String],
     ) {
         let per_chat = self.prompts.entry(chat).or_default();
@@ -861,7 +866,7 @@ mod tests {
 
         let options = vec!["Allow once".to_string(), "Reject".to_string()];
         let mut r = Routing::default();
-        r.record_prompt(DM, 9, &PaneId::new("wB:p1"), 198, &options);
+        r.record_prompt(DM, 9, &PaneId::new("wB:p1"), Some(198), &options);
         r.save(&path).unwrap();
 
         let back = Routing::load(&path, Some(FORUM));
@@ -870,7 +875,7 @@ mod tests {
             Some(&PromptRecord {
                 chat: DM,
                 pane: "wB:p1".to_string(),
-                seq: 198,
+                seq: Some(198),
                 options,
             }),
             "the labels a button showed must outlive a restart, or every live button refuses"
@@ -884,8 +889,20 @@ mod tests {
 
         let mut many = Routing::default();
         for i in 0..(MAX_PROMPT_MEMORY as i64 + 50) {
-            many.record_prompt(DM, i, &PaneId::new("wB:p1"), 1, &["Reject".to_string()]);
-            many.record_prompt(FORUM, i, &PaneId::new("wB:p1"), 1, &["Reject".to_string()]);
+            many.record_prompt(
+                DM,
+                i,
+                &PaneId::new("wB:p1"),
+                Some(1),
+                &["Reject".to_string()],
+            );
+            many.record_prompt(
+                FORUM,
+                i,
+                &PaneId::new("wB:p1"),
+                Some(1),
+                &["Reject".to_string()],
+            );
         }
         for chat in [DM, FORUM] {
             assert_eq!(

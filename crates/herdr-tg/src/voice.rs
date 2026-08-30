@@ -282,6 +282,12 @@ pub fn nothing_sent(reason: Reason) -> String {
         Reason::NoLongerAsking => "That session isn't asking that any more.\n<i>Nothing was typed \
              into it. Have a look at what it is showing now.</i>"
             .to_string(),
+        Reason::CannotTellIfMovedOn => {
+            "I can't tell whether that session has moved on since those \
+             buttons were drawn, so I left it alone.\n<i>Nothing was typed into that terminal. \
+             Reply with the option's name and I'll answer whatever it is showing now.</i>"
+                .to_string()
+        }
         Reason::PromptChanged => "That menu changed after those buttons were drawn, so I left it \
              alone.\n<i>Nothing was typed into that terminal. Reply again to see the choices as \
              they are now.</i>"
@@ -315,6 +321,9 @@ pub enum Reason {
     NoLongerAsking,
     /// A menu is up, but not the one the buttons were drawn for.
     PromptChanged,
+    /// Whether the session has moved on since those buttons were drawn cannot be established, so
+    /// nothing may be pressed on the assumption that it has not.
+    CannotTellIfMovedOn,
     /// Which menu that button belonged to is no longer remembered — it is old, or it came from
     /// somewhere the bridge did not send it. Nothing may be answered on a guess about which
     /// question it was.
@@ -386,6 +395,7 @@ mod tests {
             nothing_sent(Reason::UnreadablePrompt),
             nothing_sent(Reason::NoLongerAsking),
             nothing_sent(Reason::PromptChanged),
+            nothing_sent(Reason::CannotTellIfMovedOn),
             nothing_sent(Reason::ButtonExpired),
             nothing_sent(Reason::ChoiceNotConfirmed(
                 "I couldn't get the highlight onto \"Reject\" — it is on \"Allow once\". Nothing \

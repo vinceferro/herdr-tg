@@ -280,6 +280,12 @@ pub enum Choice<'a> {
 pub enum ChoiceRefused {
     /// The pane is not showing a menu any more.
     NotADialog,
+    /// It IS still showing something menu-shaped, but which option is highlighted cannot be read.
+    ///
+    /// Kept apart from [`ChoiceRefused::NotADialog`] because the two need opposite advice: a menu
+    /// that has gone is one to look at again, and a menu nobody can read is one to answer at the
+    /// keyboard. Telling the operator it stopped asking would be a plain untruth.
+    Unreadable,
     /// The reply named no option, or more than one. Carries the options as they are now, so the
     /// operator can be shown what they can actually pick.
     Unclear { options: Vec<String> },
@@ -296,6 +302,10 @@ impl std::fmt::Display for ChoiceRefused {
             ChoiceRefused::NotADialog => {
                 f.write_str("That session isn't showing a menu any more, so I pressed nothing.")
             }
+            ChoiceRefused::Unreadable => f.write_str(
+                "I can't tell which option that menu is on, so I pressed nothing. Answer it at \
+                 the keyboard.",
+            ),
             ChoiceRefused::Unclear { .. } => {
                 f.write_str("I didn't catch which one you meant, so I pressed nothing.")
             }
@@ -325,8 +335,10 @@ enum Look {
     Settled(crate::permission::Prompt),
     /// It kept changing for the whole budget — someone is driving it.
     Moving,
-    /// No menu could be read out of the pane.
+    /// Ordinary output: no menu at all.
     Gone,
+    /// Something menu-shaped is there, but its highlight cannot be resolved.
+    Unreadable,
 }
 
 /// Look at the menu until it holds still.
@@ -347,13 +359,25 @@ async fn settled_dialog<P: PaneIo, S>(
 where
     S: Fn(Duration) -> futures_core::future::BoxFuture<'static, ()>,
 {
-    let Some(mut prev) = crate::permission::parse(&io.read_visible_ansi(pane).await?) else {
-        return Ok(Look::Gone);
+    // `classify`, never `parse`: `parse` collapses "ordinary output" and "a menu I cannot read"
+    // into one answer, and those two need opposite things said to the operator.
+    fn look(ansi: &str) -> Result<crate::permission::Prompt, Look> {
+        match crate::permission::classify(ansi) {
+            crate::permission::Screen::Dialog(p) => Ok(p),
+            crate::permission::Screen::UnreadableControl => Err(Look::Unreadable),
+            crate::permission::Screen::Prose => Err(Look::Gone),
+        }
+    }
+
+    let mut prev = match look(&io.read_visible_ansi(pane).await?) {
+        Ok(p) => p,
+        Err(l) => return Ok(l),
     };
     for _ in 0..settle.attempts {
         sleep(settle.interval).await;
-        let Some(now) = crate::permission::parse(&io.read_visible_ansi(pane).await?) else {
-            return Ok(Look::Gone);
+        let now = match look(&io.read_visible_ansi(pane).await?) {
+            Ok(p) => p,
+            Err(l) => return Ok(l),
         };
         if now == prev {
             return Ok(Look::Settled(now));
@@ -401,6 +425,7 @@ pub async fn choose<P: PaneIo>(
     let start = match settled_dialog(io, pane, settle, &sleep).await? {
         Look::Settled(p) => p,
         Look::Gone => return Ok(Err(ChoiceRefused::NotADialog)),
+        Look::Unreadable => return Ok(Err(ChoiceRefused::Unreadable)),
         Look::Moving => {
             return Ok(Err(ChoiceRefused::NotConfirmed(
                 "That menu is moving — someone is answering it at the keyboard. I pressed nothing."
@@ -462,6 +487,13 @@ pub async fn choose<P: PaneIo>(
             Look::Gone => {
                 return Ok(Err(ChoiceRefused::NotConfirmed(
                     "That menu went away while I was answering it, so I confirmed nothing.".into(),
+                )));
+            }
+            Look::Unreadable => {
+                return Ok(Err(ChoiceRefused::NotConfirmed(
+                    "I lost track of which option that menu is on, so I confirmed nothing; \
+                     answer it at the keyboard."
+                        .into(),
                 )));
             }
             Look::Moving => {
@@ -1202,6 +1234,62 @@ mod tests {
             .unwrap();
         assert_eq!(r.expect_err("there is no menu"), ChoiceRefused::NotADialog);
         assert!(gone.sent_keys.borrow().is_empty());
+    }
+
+    /// The inversion, end to end. The parser read a two-option dialog backwards whenever the
+    /// selected option's highlight bar was the widest background on the row — a long label does it
+    /// — and the misread is deterministic, so the settled re-read and the gate both agreed with it.
+    /// No arrow key was sent, the bare confirm key went out, the terminal granted the permission,
+    /// and the operator was told they had refused it.
+    #[tokio::test]
+    async fn refusing_a_two_option_grant_never_confirms_the_grant() {
+        const GRANT: &str = "Yes, and don't ask me again for this directory in this session";
+        for edge in [Edge::Clamps, Edge::Wraps] {
+            let io = DialogPane::new(&[GRANT, "No"], 0, edge);
+            let r = choose(&io, &pane(), Choice::Reply("no"), settle(), no_sleep)
+                .await
+                .unwrap();
+            assert_ne!(
+                io.confirmed().as_deref(),
+                Some(GRANT),
+                "{edge:?}: refusing the dialog granted the permission"
+            );
+            match r {
+                Ok(c) => {
+                    assert_eq!(c.option, "No", "{edge:?}");
+                    assert_eq!(
+                        Some(c.option),
+                        io.confirmed(),
+                        "{edge:?}: the operator was told an option the terminal never confirmed"
+                    );
+                    assert_eq!(io.keys(), ["Right", "Enter"], "{edge:?}");
+                }
+                Err(_) => assert_eq!(io.confirmed(), None, "{edge:?}"),
+            }
+        }
+    }
+
+    /// A menu whose highlight cannot be read is still a menu. Calling it gone tells the operator
+    /// "that session isn't asking that any more" — which is false, it is still asking — and drops
+    /// the one piece of advice that applies: answer it at the keyboard.
+    #[tokio::test]
+    async fn a_menu_nobody_can_read_is_not_reported_as_gone() {
+        let io = FakePane::new(&[UNREADABLE]);
+        let r = choose(&io, &pane(), Choice::Reply("Reject"), settle(), no_sleep)
+            .await
+            .unwrap();
+        let why = r.expect_err("nothing may be pressed at a menu nobody can read");
+        assert_eq!(
+            why,
+            ChoiceRefused::Unreadable,
+            "a menu that cannot be read is not a menu that has gone away"
+        );
+        assert!(
+            why.to_string().contains("keyboard"),
+            "the one piece of advice that applies was dropped: {why}"
+        );
+        assert!(io.sent_keys.borrow().is_empty());
+        assert!(io.sent_text.borrow().is_empty());
     }
 
     /// THE regression test for the tapped button.
