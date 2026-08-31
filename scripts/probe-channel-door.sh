@@ -69,6 +69,11 @@ rc=$?
 # for that reason. Strip first, then read.
 PLAIN="$OUT.plain"
 sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b[()][A-Z0-9]//g' "$OUT" | tr -d '\r' | grep -v '^[[:space:]]*$' > "$PLAIN"
+# The pty rendering collapses inter-word spaces, so the banner reads "pluginnotinstalled" and not
+# "plugin not installed". Match against a whitespace-free copy — the fourth bug in this script and
+# the fourth of the same kind: matching text I assumed rather than the text that is actually there.
+SQUEEZED="$OUT.squeezed"
+tr -d '[:space:]' < "$PLAIN" > "$SQUEEZED"
 
 echo "── what it said about the channel ─────────────────────────────────────────"
 grep -i -m 12 -E '/rc|channel|harbor|marketplace|connect|plugin.*(skip|reject|unavailable|not currently)' "$PLAIN" \
@@ -76,37 +81,39 @@ grep -i -m 12 -E '/rc|channel|harbor|marketplace|connect|plugin.*(skip|reject|un
 echo
 
 verdict="UNCLEAR"
-if   grep -qi 'not currently available' "$PLAIN"; then
+# The session prints a real banner for --channels, marked with U+258E, and it names a reason per
+# spec. That banner IS the signal. Two earlier versions of this script looked for the word
+# "channel" and for "/rc" instead, and "/rc" turned out to be REMOTE CONTROL — it appears with no
+# --channels flag at all, proven by a control run. Do not read it as evidence about channels.
+if   grep -qi 'notcurrentlyavailable' "$SQUEEZED"; then
   verdict="DOOR SHUT — the master gate is off"
-  echo "  VERDICT: the channels feature is not available to this account."
-  echo "  No local setting reaches that gate. Slice 1 cannot be built until it changes."
-  echo "  The honest fallback is the one-day change: keep the read path, disable the write path."
-elif grep -qiE 'you asked for plugin:.*but the installed' "$PLAIN"; then
-  verdict="DOOR OPEN, wrong key"
-  echo "  VERDICT: the gate let us through and the MARKETPLACE check rejected the spec."
-  echo "  That is the good outcome: channels work, and the design's own warning about"
-  echo "  marketplace resolution is confirmed rather than theoretical."
-elif grep -qiE 'must be provided|--print' "$PLAIN"; then
-  verdict="PROBE BROKEN — no pty"
-  echo "  VERDICT: the probe failed, not the door. claude fell back to --print, which means it"
-  echo "  never had a terminal and never looked at --channels. The script is supposed to prevent"
-  echo "  this; if you see it, the script(1) wrapper is not working and this tells you nothing."
-elif grep -qiE '/rc|channel' "$PLAIN"; then
-  verdict="DOOR OPEN"
-  echo "  VERDICT: the channel subsystem engaged — the status line carries the remote-channel"
-  echo "  indicator and NOTHING was skipped or rejected. The master gate is on for this account"
-  echo "  and the mechanism slice 1 needs exists here."
+  echo "  VERDICT: the channels feature is not available to this account. No local setting reaches"
+  echo "  that gate. Slice 1 cannot be built until it changes, and the honest fallback is the"
+  echo "  one-day change: keep the read path, disable the write path."
+elif ! grep -q 'Channels' "$SQUEEZED"; then
+  verdict="NO ANSWER — the flag never took effect"
+  echo "  VERDICT: no channels banner appeared at all, so --channels did nothing. That is a broken"
+  echo "  probe, not a shut door — check the script(1) wrapper and the spec string."
+elif grep -qi 'notontheapprovedchannelsallowlist' "$SQUEEZED"; then
+  verdict="GATE ON, allowlist rejects this plugin"
+  echo "  VERDICT: the channels feature IS available — the banner rendered and named a reason."
+  echo "  This particular plugin is not on the approved allowlist. That is the org-policy gate the"
+  echo "  design proposes to configure, and it is behaving exactly as documented."
+elif grep -qi 'pluginnotinstalled' "$SQUEEZED"; then
+  verdict="DOOR OPEN — the plugin just is not installed here"
+  echo "  VERDICT: the channels feature IS available to this account, and the gate speaks clearly."
+  echo "  The only complaint is that this plugin is not installed for this repo — and NOT that it"
+  echo "  is off the allowlist, which means the official plugin is allowlisted by default, as the"
+  echo "  design assumed. The mechanism slice 1 needs works here."
   echo
-  echo "  What this does NOT prove: that a channel fully CONNECTED. The official telegram plugin"
-  echo "  needs a bot token this probe deliberately does not supply, so \"connecting…\" is the"
-  echo "  expected resting state. The gate was the question; the gate is open."
+  echo "  It also retires the design's Risk 1 fear of a SILENT skip: the refusal is a banner in the"
+  echo "  session, naming the spec and the reason, three lines from the top."
 else
-  echo "  VERDICT: unclear — the run said nothing about channels."
-  echo "  That is itself a finding: a silently skipped channel is the failure mode the"
-  echo "  design's Risk 1 names, and it looks exactly like this."
+  verdict="DOOR OPEN — channel resolved"
+  echo "  VERDICT: the banner rendered with no refusal. The channel resolved."
 fi
 
 echo
 echo "  exit code from claude: $rc   (124 = the timeout fired, which is expected and fine)"
-echo "  full capture: $OUT   (ANSI-stripped: $PLAIN)"
+echo "  full capture: $OUT   (stripped: $PLAIN)"
 echo "  verdict: $verdict"
