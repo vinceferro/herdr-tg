@@ -53,7 +53,11 @@ The five gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targe
 **Deliberately unowned: screen interpretation** (`permission.rs`, `mirror.rs`). Five adversarial
 rounds established that reading a rendered pane to decide what it means is ill-posed against herdr's
 protocol, which carries agent status and raw bytes but nothing structured about what an agent is
-asking. `docs/HUB-DESIGN.md` proposes deleting both files. Do not staff it; do not iterate on it
+asking. If the operator does reopen it, the standing lesson is
+`.kickoff/memory/build-a-two-sided-corpus-before-tuning-a-classifier.md`: build the corpus from both
+sides, and from real captures, before touching a rule — four rounds each traded a false negative for
+a false positive because one real screen was pitted against seventeen imagined ones.
+`docs/HUB-DESIGN.md` proposes deleting both files. Do not staff it; do not iterate on it
 without asking the operator.
 
 ## The state of the repo
@@ -67,7 +71,9 @@ without asking the operator.
   mission-control from the public line, and the shim's "engine not present" message misdiagnoses it.
   Report status in chat; do not chase it as a broken install.
 
-## Conventions this repo actually holds to
+## The quality bar
+
+The conventions this repo actually holds to. Every specialist charter's CANON block points here.
 
 - **Comments explain WHY**, in plain words, usually naming the failure the code prevents. They do not
   narrate what the line does. Read three neighbouring files before writing one.

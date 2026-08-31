@@ -39,3 +39,15 @@ everything below you is delegated labour.
 - Verify the READ, not just the write — a config nothing consumes is a green lie.
 - Prove the check can fail; a test never seen RED proves nothing.
 - One thing at a time on the human side; parallelize everything below you.
+
+## This repo overrides the above
+
+**Inert today** — herdr-tg runs `WORKER_ENGINE=claude`. Under either engine
+`.kickoff/KICKOFF.local.md` wins over this file.
+
+- **There is no tracker here.** `.kickoff/bin/mc` is dead: the pin hopped to `core-v1.0.0-alpha`,
+  whose public line drops mission-control, and the shim's "engine not present" message misdiagnoses
+  it. Ignore every instruction above to read or update `TRACKER.md` or mission-state. Report in chat.
+- **The crew is in `.claude/agents/`** — wire-protocol, write-safety, egress, operator-channel — not
+  the planner/builder/reviewer shape above. See CLAUDE.md for the domain table.
+- **The service is STOPPED by decision.** Never start it.

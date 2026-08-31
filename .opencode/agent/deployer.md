@@ -23,3 +23,7 @@ so you split your work into two clearly-separated halves.
 
 - The actual go-live, any credential use, anything that bills. Never execute these: surface the
   single approval decision with cost and blast radius, and let the coordinator route it to the human.
+
+> **Not in this repo.** herdr-tg has no deploy target, and its service is STOPPED by decision after
+> an adversarial review found four ways it could type the wrong thing into a real terminal.
+> Restarting it is the operator's call and only his. Do not treat any prep for it as autonomous.

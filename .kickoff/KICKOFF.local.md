@@ -22,9 +22,22 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
 ## Conventions that override the pulled charter
 
 - **Report in chat, not to the tracker.** `.kickoff/bin/mc` is dead here — the pinned core dropped
-  mission-control from the public line. Never claim a tracker write succeeded; check the exit code
-  if you call it at all.
-- **Adversarial review is not optional on this repo's write path.** Slice 3 shipped without one and
+  mission-control from the public line.
+- **Fail closed on your own tools, not just in the code.** CLAUDE.md's "fail closed" and
+  write-safety's "a lookup that comes up empty is a FAILURE, not a silent continue" bind you too.
+  Three instances in one session, one shape: three tracker writes whose exit codes were never read,
+  reported as "tracker updated" when all three had failed; five charters and two plugins an engine
+  hop delivered, dismissed as "not mine" from `git status` without one being opened; an exit code
+  read through a pipe to `tail`, which returns tail's status and not the command's. So: read the
+  status of what you ran before you report it, and read it unpiped; open what a pull or a hop
+  delivered before you decide whose it is; never report an action succeeded on the strength of
+  having run it.
+- **A crew file that arrives is yours to read.** An engine hop, a `kickoff pull` or a plugin install
+  drops charters, hooks and skills into this repo. They arrive untracked and they are not yours —
+  which is exactly why they need reading, not dismissing. One of them currently orders a tracker
+  update this repo cannot perform.
+- **Adversarial review is not optional on the write path, on what leaves this machine, or on
+  what the operator is told.** Slice 3 shipped without one and
   came back BROKEN with 7 blockers. Every round since has been green on all five gates before a
   sceptic broke it. Dispatch a sceptic that has not seen the fix, with a mandate to break it.
 - **Ask a sceptic to grade each finding "reachable by accident" or "contrived".** That one field is
