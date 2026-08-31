@@ -85,7 +85,11 @@ This repo does NOT contain the kickoff engine — the pinned core clone does (`K
 carried by `.kickoff/instance.env`). Always go through the recorded shims in `.kickoff/bin/`:
 
 - **Mission Control / tracker updates** → `.kickoff/bin/mc …` — never
-  `python3 mission-control/mc-update.py`, which does not exist in an adopter repo.
+  `python3 mission-control/mc-update.py`, which does not exist in an adopter repo. `mc` needs a
+  core that ships `mission-control/` (private line / self-hosted). On the public release line
+  the shim fails closed with **"does not ship Mission Control"** — write tracker updates into
+  the coordinator's own files instead; do NOT `kickoff pull` (it cannot deliver the component
+  on that line).
 - **Scanners (the quality gates)** → `.kickoff/bin/scan-secrets` and `.kickoff/bin/scan-structure`.
 - A shim printing **"kickoff engine not present"** means the pinned core clone is missing on this
   machine — run `kickoff pull`, then retry.

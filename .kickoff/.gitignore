@@ -43,8 +43,3 @@ bridge-escalated
 hop-blocked
 refresh-requested
 backups/
-
-# The identity denylist names the very things it protects, and THIS repo publishes .kickoff/
-# (KICKOFF.md, KICKOFF.local.md and bin/ are all tracked, unlike kickoff's own repo where the
-# whole directory is ignored). Committing it would publish the terms. Local only, by design.
-leak-denylist.txt

@@ -14,9 +14,17 @@ export REPO_DIR="$(cd "$_here/../.." && pwd)"
 # TRACKER.md). Explicit values written IN instance.env still win.
 unset MC_STATE_FILE MC_TRACKER_FILE MEMORY_DB MEMORY_HOOK_LOG MEMORY_INDEX GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 [ -f "$_here/../instance.env" ] && . "$_here/../instance.env"
-_engine="${KICKOFF_CORE_DIR:-}/mission-control/mc-update.py"
+_engine_dir="${KICKOFF_CORE_DIR:-}"
+_engine="$_engine_dir/mission-control/mc-update.py"
 if [ ! -f "$_engine" ]; then
-  printf 'kickoff engine not present — see .kickoff/README\n' >&2
+  if [ -n "$_engine_dir" ] && [ -d "$_engine_dir" ]; then
+    # The pinned core RESOLVES but does not carry this component: the ratified public release
+    # line ships WITHOUT mission-control/, so `kickoff pull` can NEVER fix this. Name the real
+    # state; never point the reader at a fix that cannot work. Still fails closed (rc 1).
+    printf 'this pinned core does not ship Mission Control (the public release line omits it) — MC status writes are unavailable through this shim; see .kickoff/README\n' >&2
+  else
+    printf 'kickoff engine not present — see .kickoff/README\n' >&2
+  fi
   exit 1
 fi
 exec python3 "$_engine" "$@"
