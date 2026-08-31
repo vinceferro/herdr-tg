@@ -26,6 +26,16 @@ pre-commit:
   commands:
     secret-scan:
       run: bash .kickoff/bin/scan-secrets --staged
+    # ── Why an identity scan sits beside the secret scan, added 2026-08-31 ────────────────────
+    # scan-secrets looks for CREDENTIAL SHAPES. It cannot know that a name, an internal hostname
+    # or a private project name is not supposed to be here — and this repo pushes to a public
+    # remote with ~170KB of pasted session transcripts already in docs/. Added lines only, so it
+    # judges what you are committing rather than nagging about what is already in.
+    # The denylist is deliberately gitignored: it names the things it protects.
+    identity-scan:
+      # instance.env is sourced inline: the hook runner does not carry KICKOFF_CORE_DIR, and an
+      # unset one would silently resolve to /scripts/scan-identity.sh and pass on every commit.
+      run: . .kickoff/instance.env && bash "$KICKOFF_CORE_DIR/scripts/scan-identity.sh" --staged
     rust-fmt:
       run: env -u RUSTUP_TOOLCHAIN PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all --check
     rust-clippy:
