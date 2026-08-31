@@ -1,6 +1,6 @@
 ---
 name: mission-control-left-the-public-core
-description: The .kickoff/bin/mc tracker shim is permanently dead in this repo — the pin hopped to core-v1.0.0-alpha, whose public line deliberately drops mission-control — and the shim's "engine not present" message misdiagnoses it as a missing clone
+description: RESOLVED 2026-08-31 — the mc tracker shim was dead in this repo for about ten hours — the pin hopped to core-v1.0.0-alpha, whose public line deliberately drops mission-control — and the shim's "engine not present" message misdiagnoses it as a missing clone
 metadata:
   type: project
 ---
@@ -21,3 +21,18 @@ still holds everything written up to its last successful write — `updated_at` 
 through the seam. Report status in chat instead — and never claim a tracker write succeeded without checking its
 exit code, which is exactly the mistake that surfaced this. Reported upstream via agent-mail on
 2026-08-31.
+
+---
+
+**RESOLVED, same day.** The finding was reported upstream by agent-mail; claude-kickoff confirmed it
+was fleet-wide (rc=1 across ten orgs), fixed the shim's message at `f4c878b`, and repinned orgs to a
+line that ships the component. This repo's pin moved again to
+`~/kickoff-versions/core-v1.0.1-alpha`, which DOES carry `mission-control/mc-update.py`.
+
+Verified by running it, not by reading the changelog: `.kickoff/bin/mc show` exits 0 and prints the
+board. `scan-secrets` and `scan-structure` still exit 0.
+
+**So the tracker works here again.** What survives as a durable lesson is not "MC is missing" — it is
+the shape: a pin can move under a running session (twice in one day, at 02:24 and again later), and
+what a shim reports about its own absence may misdiagnose the cause. Check the exit code, and check
+which core you are actually pinned to, before concluding anything about a seam.
