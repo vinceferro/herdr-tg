@@ -1,5 +1,11 @@
 # Slice 3 — adversarial review, 2026-08-30
 
+> **STATUS, 2026-08-31 — this review has been worked. All 7 blockers are closed and merged; the
+> suite is 352 tests, not the 232 quoted throughout below. The screen parser is still open and its
+> fix is unmerged. Read `docs/SLICE-3-FIXES.md` first — it records what closed, what is accepted as
+> known, and what remains. Test counts and "still live" claims in the text below are as of the
+> review, not as of today.**
+
 > Verdicts: **BROKEN / FIX-FIRST / FIX-FIRST** · 7 blockers · 16 majors.
 > Three reviewers, each given the live service, the real herd, and a mandate to break it.
 > Every finding below carries a reproduction the reviewer ran. **The service was stopped when
