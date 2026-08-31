@@ -126,6 +126,11 @@ So the same rules live in the charter canon as well. `scripts/wire-canon-into-ch
 writes them into every agent charter. Run that script after you change this file, or the
 two drift apart.
 
+The end-of-chain handoff recap has its own shape (theme line → outcomes → in-flight →
+"your taps" → detail pointer, 12-line ceiling): see the `clear-report` skill, which is the
+cross-engine carrier (output styles bind this conversation only; the skill binds every
+agent that reports, on both engines).
+
 ---
 
 *Design credit: this style was written by a sibling org's coordinator (ELI5 frame,
