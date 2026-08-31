@@ -262,6 +262,13 @@ Do **not** flip `routing.default` globally. opencode runs on it with a $20 cap.
 
 ## 8. The trust boundary, as rules
 
+**Two places, one agent, no race.** The operator works at his laptop in herdr's TUI and from his
+phone at the same time — that is the product, not an edge case. Today it is the catastrophe: review
+blocker #4 was exactly this shape, a relative key move computed from a selection that moved
+underneath it, and the bridge reporting "Reject" after confirming "Allow once". The hub does not type.
+A reply arrives as a message in the agent's own turn, so the TUI and the phone stop being two writers
+fighting over one keyboard. The two-writer race is not mitigated here; it has no mechanism.
+
 **Inbound Telegram content SELECTS. It never NAMES.**
 
 You may pick from a list the machine already knows. You may never supply a path, a repo, a project id, a command, a model, or an allowlist entry. `callback_data` is 64 bytes and carries an opaque id, never a decision.
@@ -345,7 +352,9 @@ Nothing is deleted. `permission.rs`, `deliver.rs`, `mirror.rs` and `herdr-client
 
 - **Flat mode.** No `/target`, `/panes`, sticky, or the switcher. The forum is mandatory. The DM keeps `/status` and nothing else. Aiming should be a tap you never make.
 - **The transcript.** No mirror, no live relay. Telegram carries asks, decisions and completions. At the old 4-second tick that was 15 msg/min per project — over the shared 20/min ceiling at **two** projects. If you want the running transcript it is a Tailscale page.
-- **herdr itself.** After this, a thing is visible in the forum if and only if it is a kickoff project with a bridge. You lose the pane view. Keeping the protocol alive for one command costs ~5,300 lines.
+- **Telegram visibility of panes that are not kickoff projects.** After this, a thing is visible in the FORUM if and only if it is a kickoff project with a bridge. Keeping the protocol alive for one command costs ~5,300 lines.
+
+  **This is not losing herdr, and an earlier draft of this line read as though it were.** Slice 2 deletes `herdr-client` — our client for its protocol — not herdr, which stays the operator's TUI running his panes and agents exactly as now. He steers from the terminal through herdr and from his phone through the hub. That is the intended shape, not a casualty of it.
 - **Absorbing kickoff's alarms.** `announce_restart` and `tg_send_tokenless` keep their own tokens and their own curl. They are the only channel that works when the worker — or the hub — is broken.
 - **Deleting `bridge-reap.sh` or any per-project token** before slice 4.
 - **Private-chat topics.** Strictly the better shape — no supergroup, no admin grant, no General ambiguity. Blocked: pinned teloxide 0.17.0 targets Bot API 9.1, nothing newer on crates.io, so it means raw HTTP alongside teloxide. The surface is ~8 months old and already regressed once in production. Revisit when teloxide catches up.
