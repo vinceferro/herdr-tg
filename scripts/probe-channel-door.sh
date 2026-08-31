@@ -28,7 +28,10 @@ set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 SPEC="plugin:telegram@claude-plugins-official"
-OUT="${TMPDIR:-/tmp}/channel-door-probe.$$"
+# NOT $TMPDIR: this box hands agent sessions the literal string "%h/.cache/tmp", an unexpanded
+# systemd specifier that resolves relative to wherever you happen to be. The first version of this
+# script used it and wrote its capture into the repo. See .kickoff/memory/cargo-needs-a-real-tmpdir.md.
+OUT="$(mktemp -t channel-door-probe.XXXXXX)"
 SECS=25
 
 command -v claude >/dev/null 2>&1 || { echo "claude is not on PATH — run this from a shell that has it" >&2; exit 2; }
@@ -44,13 +47,21 @@ fi
 echo "  probing with $SPEC for ${SECS}s — nothing is written, nothing is sent"
 echo
 
-# stdin that never EOFs, exactly as session-run.sh does: an interactive --channels session exits
-# immediately on a closed stdin, and that exit would read as a channel failure when it is not one.
-timeout "$SECS" claude \
-  --channels "$SPEC" \
-  "${PLUGIN_ARGS[@]}" \
-  --permission-mode default \
-  < <(tail -f /dev/null) > "$OUT" 2>&1
+# TWO things a real worker has that a naive invocation does not, and BOTH are load-bearing:
+#
+#   1. A PTY. Without one, claude decides it is non-interactive and falls back to --print, which
+#      needs a prompt and errors out before it ever looks at --channels. The first version of this
+#      script hit exactly that and reported "unclear" about a question it never asked.
+#      session-run.sh:422 re-execs itself through script(1) for this reason.
+#   2. Stdin that never EOFs. An interactive session exits the moment stdin closes, and that exit
+#      would read as a channel failure when it is not one.
+#
+# So: script(1) supplies the pty, `tail -f /dev/null` supplies the never-ending stdin.
+CMD="claude --channels '$SPEC'"
+for a in ${PLUGIN_ARGS+"${PLUGIN_ARGS[@]}"}; do CMD="$CMD '$a'"; done
+CMD="$CMD --permission-mode default"
+
+timeout "$SECS" script -qfe -c "$CMD" /dev/null < <(tail -f /dev/null) > "$OUT" 2>&1
 rc=$?
 
 echo "── what it said about the channel ─────────────────────────────────────────"
@@ -69,6 +80,11 @@ elif grep -qiE 'you asked for plugin:.*but the installed' "$OUT"; then
   echo "  VERDICT: the gate let us through and the MARKETPLACE check rejected the spec."
   echo "  That is the good outcome: channels work, and the design's own warning about"
   echo "  marketplace resolution is confirmed rather than theoretical."
+elif grep -qiE 'must be provided|--print' "$OUT"; then
+  verdict="PROBE BROKEN — no pty"
+  echo "  VERDICT: the probe failed, not the door. claude fell back to --print, which means it"
+  echo "  never had a terminal and never looked at --channels. The script is supposed to prevent"
+  echo "  this; if you see it, the script(1) wrapper is not working and this tells you nothing."
 elif grep -qi 'channel' "$OUT"; then
   verdict="DOOR OPEN"
   echo "  VERDICT: a channel was resolved. The mechanism slice 1 needs works here."
