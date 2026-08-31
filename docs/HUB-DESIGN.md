@@ -132,7 +132,7 @@ I read the gate in `claude 2.1.250`.
 
 **The door is the plugin allowlist**, and the machinery already exists on this box:
 
-- `~/.claude/plugins/known_marketplaces.json` already registers `kickoff-local` → `/home/thev/kickoff-versions/core-v1.0.0-alpha/plugin`
+- `~/.claude/plugins/known_marketplaces.json` already registers `kickoff-local` → `~/kickoff-versions/<pinned-core>/plugin`
 - `kickoff@kickoff-local` is already installed at project scope for herdr-tg and eight others
 
 So: add **one plugin**, `kickoff-channel`, to the existing `kickoff-local` marketplace. `kickoff adopt` installs it the way it already installs `kickoff`. Then, in `/etc/claude-code/managed-settings.json`:
@@ -169,7 +169,7 @@ Free finding while I was in there: `bridge_present()` and `bridge-reap.sh:_br_cm
 
 **The key is the project id**, minted once at enrolment from the canonical repo path. Never a counter. Counters get recycled, and a recycled id silently inheriting a dead agent's topic is already a confirmed defect here.
 
-**Title = repo basename**, sanitised to `[A-Za-z0-9._-]`, clipped to 48 chars. `herdr-tg`, `llm-gateway`, `bliz-monorepo`. Collisions between distinct paths get a 6-hex suffix. Overridable at the terminal, never over the wire. Zero naming decisions for you.
+**Title = repo basename**, sanitised to `[A-Za-z0-9._-]`, clipped to 48 chars. `herdr-tg`, `llm-gateway`, and the other repos on this box. Collisions between distinct paths get a 6-hex suffix. Overridable at the terminal, never over the wire. Zero naming decisions for you.
 
 `icon_color` = `hash(project) % 6` over the six permitted values. Six projects colour-coded, free, stable forever.
 
