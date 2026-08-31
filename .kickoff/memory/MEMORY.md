@@ -10,3 +10,5 @@
 - [Mission Control left the public core](mission-control-left-the-public-core.md) — the mc shim is dead here and its error message sends you the wrong way.
 - [The opencode crew set is inert](the-opencode-crew-set-is-inert.md) — five charters a hop delivered, unreconciled, and one of them mandates the dead tracker.
 - [opencode has a public server API](opencode-has-a-public-server-api.md) — serve + /doc + /event, so the bridge needs no plugin and no patch there.
+- [A proof staged in /tmp proves nothing under PrivateTmp](a-proof-staged-in-tmp-proves-nothing-under-privatetmp.md) — the unit sees an empty dir, does the right thing, and the pass means nothing.
+- [curl needs -q or ~/.curlrc can capture the token](curl-needs-q-or-curlrc-can-capture-the-token.md) — `-K -` keeps it off argv; only `-q` keeps it out of the config file.
