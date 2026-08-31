@@ -16,7 +16,8 @@ The message is a wrong diagnosis: the engine is present, one component is not, a
 will never fix it.
 
 **How to apply:** do not chase this as a broken install. `.kickoff/state/mission-control/mission-state.json`
-still holds everything written up to 2026-08-31 ~17:00 and is simply no longer writable through the
-seam. Report status in chat instead — and never claim a tracker write succeeded without checking its
+still holds everything written up to its last successful write — `updated_at` reads
+2026-08-31T00:23:19Z, mtime 02:23 local, minutes before the hop — and is simply no longer writable
+through the seam. Report status in chat instead — and never claim a tracker write succeeded without checking its
 exit code, which is exactly the mistake that surfaced this. Reported upstream via agent-mail on
 2026-08-31.

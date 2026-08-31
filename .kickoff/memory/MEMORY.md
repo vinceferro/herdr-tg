@@ -8,3 +8,4 @@
 - [Write guard stays a scanner](write-guard-stays-a-scanner.md) — the operator's call: fix accident-reachable evasions, write contrived ones down.
 - [Build a two-sided corpus before tuning a classifier](build-a-two-sided-corpus-before-tuning-a-classifier.md) — one real capture and seventeen imagined ones is how four rounds traded one error for the other.
 - [Mission Control left the public core](mission-control-left-the-public-core.md) — the mc shim is dead here and its error message sends you the wrong way.
+- [The opencode crew set is inert](the-opencode-crew-set-is-inert.md) — five charters a hop delivered, unreconciled, and one of them mandates the dead tracker.
