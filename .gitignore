@@ -45,3 +45,7 @@ config/herdr-tg.toml
 
 # opencode workspace config — carries a provider apiKey; never commit it
 opencode.json
+
+# The hub token minted by `herdr-tg enroll` (HUB-DESIGN slice 1). `.kickoff/` is a PUBLISHED
+# directory in this repo, and a gitignore line added after the fact cannot untrack a committed file.
+.kickoff/hub.token
