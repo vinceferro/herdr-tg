@@ -25,8 +25,13 @@
 //!    topic's opening message, not under every push. Repeated on each one it is furniture.
 //! 7. **Never claim more than was observed.** This is the one rule that outranks brevity: a
 //!    confirmation that overstates costs the operator the time the bridge exists to save.
+//! 8. **A summary may sit above what the agent said; it may never stand in for it.** Reading what
+//!    the agent actually said is the whole product, and what the operator reads is what they answer
+//!    into a real terminal. A model's one-line paraphrase is an addition and nothing more — see
+//!    [`is_the_same_text`], which is the only reason the agent's own words are ever left out, and
+//!    which leaves them out only when the line above is the same text character for character.
 
-use crate::deliver::{Afterwards, Delivery, Rung};
+use crate::deliver::{Afterwards, Delivery, Reached, Rung};
 
 /// Where the message will appear, which decides how much context it must carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +78,22 @@ pub fn asked(
     m
 }
 
+/// Said once in a run, on the push that lost its summary, and never again.
+///
+/// The bridge can switch its own summaries off mid-run — it does that when it cannot show that the
+/// helper writing them is the one on this machine. Until now that was said only in the journal,
+/// which the operator does not have on their phone, so a refusal that exists to keep their screen
+/// off the network looked exactly like a helper that had simply gone quiet.
+///
+/// Two different refusals arrive here and the operator's question is the same in both: where did my
+/// summaries go, and is the text I am reading still my terminal? So the line answers that, and the
+/// journal keeps the detail — which address answered, and to what name.
+pub const SUMMARIES_OFF: &str = concat!(
+    "\n\n<i>No more one-line summaries this run \u{2014} I couldn't confirm the helper that ",
+    "writes them is the one on this machine, so I stopped sending it your screen. Everything ",
+    "above is your terminal, exactly as it came.</i>"
+);
+
 /// An agent finished and is waiting to be looked at.
 pub fn finished(place: Place, workspace: &str, excerpt: &str) -> String {
     let mut m = String::new();
@@ -85,9 +106,10 @@ pub fn finished(place: Place, workspace: &str, excerpt: &str) -> String {
 
 /// Render what the agent left on screen as a message.
 ///
-/// The gist, when there is one, IS the message — it is the agent's question in one line, which is
-/// what a person would have typed. The raw tail follows only when it adds something: as prose if it
-/// reads as prose, and in a code block only if it is genuinely output.
+/// The agent's own text is the message. A gist, when there is one, is one line above it — never
+/// in place of it, and the only case where the tail is left out is the case where printing it
+/// would print the identical sentence twice. As prose if it reads as prose, and in a code block
+/// only if it is genuinely output.
 fn body(excerpt: &str, gist: Option<&str>, mark: &str) -> String {
     let tail = excerpt.trim();
     let gist = gist.map(str::trim).filter(|g| !g.is_empty());
@@ -95,7 +117,7 @@ fn body(excerpt: &str, gist: Option<&str>, mark: &str) -> String {
     let mut m = String::new();
     if let Some(g) = gist {
         m.push_str(&format!("{mark}{}", esc(g)));
-        if tail.is_empty() || covered_by(g, tail) {
+        if tail.is_empty() || is_the_same_text(g, tail) {
             return m;
         }
         m.push('\n');
@@ -114,27 +136,36 @@ fn body(excerpt: &str, gist: Option<&str>, mark: &str) -> String {
     m
 }
 
-/// Would repeating the tail just restate the gist?
+/// Is the gist the tail, word for word?
 ///
-/// A one-line ask summarised into one line is the same sentence twice. Cheap check: if the tail is
-/// short and shares most of its words with the gist, the gist alone says it.
-fn covered_by(gist: &str, tail: &str) -> bool {
-    if tail.lines().filter(|l| !l.trim().is_empty()).count() > 2 {
-        return false;
-    }
-    let words = |s: &str| -> std::collections::BTreeSet<String> {
-        s.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() > 3)
-            .map(str::to_string)
-            .collect()
+/// This is the ONLY reason the agent's own text is ever left out of a message, and the bar is
+/// deliberately absolute: the two have to be the same text, character for character, once the
+/// padding a terminal adds to the end of a line is ignored. Then leaving one out loses the
+/// operator nothing, because both copies say the same thing.
+///
+/// It used to be a word-overlap heuristic — a tail of two lines or fewer was dropped whenever it
+/// shared half its longer words with the gist — and that quietly turned a convenience into a
+/// substitution. Two ways, both real:
+///
+/// - An honest summary of a short ask deleted the ask. "Overwrite config.yaml?" over "Overwrite
+///   config.yaml? [y/N]" covered it three words for three, and the operator lost `[y/N]` — which
+///   is the half that says what happens if they just press Enter.
+/// - The helper that writes the gist is handed the excerpt, so a compromised one knows exactly
+///   which words to echo back to delete the operator's screen from the message and leave only its
+///   own sentence standing. The operator then answers, into a real terminal, a question nobody
+///   asked.
+///
+/// A paraphrase may sit above what the agent actually said. It may never stand in for it: seeing
+/// what the agent actually said is the whole product.
+fn is_the_same_text(gist: &str, tail: &str) -> bool {
+    let flatten = |s: &str| {
+        s.trim()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
     };
-    let (g, t) = (words(gist), words(tail));
-    if t.is_empty() {
-        return true;
-    }
-    let shared = g.intersection(&t).count();
-    shared * 2 >= t.len()
+    flatten(gist) == flatten(tail)
 }
 
 /// Does the line carry a `file.ext:line` or `file.ext:line:col` reference?
@@ -234,6 +265,32 @@ pub fn reply_landed(place: Place, workspace: &str, d: &Delivery) -> String {
     }
 }
 
+/// The words went into a terminal and the bridge then lost sight of that session.
+///
+/// The sentence this exists to prevent is "nothing was sent". Once the write has gone out the
+/// bridge does not know that nothing happened — it knows it cannot see what happened, and an
+/// operator told the first of those retypes a message the agent may already have, which is how an
+/// instruction gets carried out twice.
+///
+/// So both messages say the same two things: your words went in, and go and look before you send
+/// them again.
+pub fn lost_sight(place: Place, workspace: &str, reached: Reached) -> String {
+    let where_to = match place {
+        Place::Topic => String::new(),
+        Place::Flat => format!(" into {}", esc(workspace)),
+    };
+    match reached {
+        Reached::TheWords => format!(
+            "⚠️ <b>I typed that{where_to}, then lost contact.</b>\nI never got to send it, so it \
+             may be sitting in the input box. Have a look at that session before you send it again."
+        ),
+        Reached::TheWordsAndTheSubmitKey => format!(
+            "⚠️ <b>I typed that{where_to} and sent it, then lost contact.</b>\nI couldn't see what \
+             it did. Have a look at that session before you send it again — it may already have it."
+        ),
+    }
+}
+
 /// What happened to a tapped or named option.
 ///
 /// Three outcomes, not two. The confirm key can land and the look that would check it can then
@@ -247,6 +304,12 @@ pub fn choice_made(place: Place, workspace: &str, option: &str, after: Afterward
         Afterwards::MenuClosed => format!("✅ <b>{}{where_to}.</b>", esc(option)),
         Afterwards::MenuStillUp => format!(
             "⚠️ <b>{}{where_to} — but the prompt is still up.</b>\nIt may not have registered.",
+            esc(option)
+        ),
+        // The question that was answered is gone; a different one is on screen. Saying the prompt
+        // is still up would send the operator back to answer a question they have not read.
+        Afterwards::AnotherQuestion => format!(
+            "✅ <b>{}{where_to}.</b>\nIt's asking something else now.",
             esc(option)
         ),
         Afterwards::NotSeen => format!(
@@ -419,6 +482,9 @@ mod tests {
             choice_made(place, "omarchy-lab", "Reject", Afterwards::MenuClosed),
             choice_made(place, "omarchy-lab", "Reject", Afterwards::MenuStillUp),
             choice_made(place, "omarchy-lab", "Reject", Afterwards::NotSeen),
+            choice_made(place, "omarchy-lab", "Reject", Afterwards::AnotherQuestion),
+            lost_sight(place, "omarchy-lab", Reached::TheWords),
+            lost_sight(place, "omarchy-lab", Reached::TheWordsAndTheSubmitKey),
             nothing_sent(Reason::NoTarget),
             nothing_sent(Reason::TargetGone),
             nothing_sent(Reason::NoAudit),
@@ -490,6 +556,8 @@ mod tests {
             resumed(Place::Flat, "omarchy-lab"),
             reply_landed(Place::Flat, "omarchy-lab", &delivery(Rung::Submitted)),
             choice_made(Place::Flat, "omarchy-lab", "Reject", Afterwards::MenuClosed),
+            lost_sight(Place::Flat, "omarchy-lab", Reached::TheWords),
+            lost_sight(Place::Flat, "omarchy-lab", Reached::TheWordsAndTheSubmitKey),
         ] {
             assert!(m.contains("omarchy-lab"), "no session named in: {m:?}");
         }
@@ -651,17 +719,79 @@ mod tests {
         assert!(topic_opened("ws", "opencode").contains("Reply to a message"));
     }
 
-    /// A one-line ask summarised into one line is the same sentence twice.
+    /// A one-line ask summarised into the SAME one line is the same sentence twice. The bar is
+    /// word-for-word: anything less and the tail is carrying something the gist is not.
     #[test]
-    fn a_gist_that_merely_restates_the_tail_does_not_print_it_twice() {
+    fn a_gist_that_repeats_the_tail_word_for_word_does_not_print_it_twice() {
         let m = asked(
             Place::Topic,
             "ws",
-            "Force-push anyway? [y/N]",
+            "  Force-push anyway? [y/N]  ",
             false,
-            Some("Force-push anyway?"),
+            Some("Force-push anyway? [y/N]"),
         );
         assert_eq!(m.matches("Force-push").count(), 1, "said twice: {m}");
+    }
+
+    /// THE property this whole feature is bounded by: a model's paraphrase may sit ABOVE the
+    /// operator's screen and may never stand in for it.
+    ///
+    /// The gateway is handed the excerpt, so a hostile one knows exactly which words to echo back.
+    /// The old rule dropped the tail whenever the gist shared half its long words, which let one
+    /// sentence from the gateway delete the operator's terminal from the message entirely — and
+    /// the operator then answers, into a real pane, the question the gateway invented.
+    #[test]
+    fn a_gist_that_shares_words_with_the_screen_never_deletes_the_screen() {
+        let m = asked(
+            Place::Topic,
+            "ws",
+            "Delete the production database? [y/N]",
+            true,
+            Some("Delete the stale production cache to reclaim disk? [y/N]"),
+        );
+        assert!(
+            m.contains("Delete the production database? [y/N]"),
+            "the operator's real screen is not in the message at all: {m}"
+        );
+    }
+
+    /// The same hole with nobody hostile in it: an accurate summary of a short ask used to delete
+    /// the ask. `[y/N]` says which answer the agent takes if you just press Enter, and it went
+    /// missing on every ordinary one-line question.
+    #[test]
+    fn an_honest_summary_of_a_short_ask_still_shows_what_the_terminal_said() {
+        let m = asked(
+            Place::Topic,
+            "ws",
+            "Overwrite config.yaml? [y/N]",
+            false,
+            Some("Overwrite config.yaml?"),
+        );
+        assert!(m.contains("[y/N]"), "the default answer was dropped: {m}");
+    }
+
+    /// The note is said in the operator's words, and it does not leave them wondering whether what
+    /// they are reading is still their own terminal.
+    #[test]
+    fn the_note_about_summaries_stopping_says_the_screen_is_still_the_screen() {
+        assert!(SUMMARIES_OFF.contains("summaries"), "{SUMMARIES_OFF}");
+        assert!(
+            SUMMARIES_OFF.contains("terminal"),
+            "the note must say the text above is still the terminal: {SUMMARIES_OFF}"
+        );
+        for jargon in [
+            "gateway",
+            "summarizer",
+            "latch",
+            "endpoint",
+            "loopback",
+            "responder",
+        ] {
+            assert!(
+                !SUMMARIES_OFF.to_lowercase().contains(jargon),
+                "implementation vocabulary in a message to the operator: {jargon}"
+            );
+        }
     }
 
     /// But a gist over a longer tail keeps both — the gist to read at a glance, the tail for detail.
@@ -793,5 +923,87 @@ mod tests {
             "nothing here was confirmed to have taken: {m}"
         );
         assert!(m.contains("lost contact"), "{m}");
+    }
+
+    /// Rule 7, on the path every ordinary typed reply takes.
+    ///
+    /// Once a write has gone out the bridge cannot know that nothing happened — only that it cannot
+    /// see what happened. An operator told the first of those sends the message again, and an agent
+    /// that already had it acts on it twice. So every message the bridge can produce with the
+    /// operator's words already in a terminal is held against that one sentence.
+    #[test]
+    fn nothing_said_after_a_write_went_out_claims_that_nothing_was_sent() {
+        for place in [Place::Topic, Place::Flat] {
+            let mut after_the_write = vec![
+                choice_made(place, "w", "Reject", Afterwards::NotSeen),
+                choice_made(place, "w", "Reject", Afterwards::MenuStillUp),
+                choice_made(place, "w", "Reject", Afterwards::AnotherQuestion),
+                nothing_sent(Reason::ChoiceNotConfirmed {
+                    why: "I moved the highlight toward \"Reject\" and then lost contact with that \
+                          session, so I did not press the confirm key."
+                        .into(),
+                    keys_sent: true,
+                }),
+            ];
+            for reached in [Reached::TheWords, Reached::TheWordsAndTheSubmitKey] {
+                after_the_write.push(lost_sight(place, "w", reached));
+            }
+            for m in after_the_write {
+                let low = m.to_lowercase();
+                assert!(
+                    !low.contains("nothing was sent") && !low.contains("nothing was typed"),
+                    "said nothing was sent about something that went out: {m:?}"
+                );
+            }
+        }
+    }
+
+    /// Losing sight of a session is not a success and must not read like one, and it must not read
+    /// like a plain failure either. It has one job: send the operator to look before they retype.
+    #[test]
+    fn losing_sight_of_a_session_says_the_words_went_in_and_sends_the_operator_to_look() {
+        for place in [Place::Topic, Place::Flat] {
+            for reached in [Reached::TheWords, Reached::TheWordsAndTheSubmitKey] {
+                let m = lost_sight(place, "w", reached);
+                assert!(
+                    m.starts_with("⚠️"),
+                    "a doubtful outcome read as clean: {m:?}"
+                );
+                assert!(m.contains("I typed that"), "{m:?}");
+                assert!(m.contains("lost contact"), "{m:?}");
+                assert!(
+                    m.contains("before you send it again"),
+                    "the operator was not warned off sending it twice: {m:?}"
+                );
+            }
+        }
+        // The submit key is the difference between the two, and it is what decides whether the
+        // agent may already have the message.
+        assert!(
+            lost_sight(Place::Topic, "w", Reached::TheWords).contains("input box"),
+            "unsubmitted words must be described as unsubmitted"
+        );
+        assert!(
+            lost_sight(Place::Topic, "w", Reached::TheWordsAndTheSubmitKey)
+                .contains("may already have it"),
+            "submitted words must be described as possibly delivered"
+        );
+    }
+
+    /// An agent that answers one prompt and asks the next in the same breath. The answer landed,
+    /// and saying the prompt is still up sends the operator back to answer a question they have
+    /// not read.
+    #[test]
+    fn a_prompt_replaced_by_the_next_one_is_not_reported_as_an_answer_that_did_not_register() {
+        let m = choice_made(Place::Topic, "w", "Reject", Afterwards::AnotherQuestion);
+        assert!(m.contains("Reject"), "{m:?}");
+        assert!(
+            !m.contains("still up") && !m.contains("may not have registered"),
+            "an answer that landed was reported as doubtful: {m:?}"
+        );
+        assert!(
+            m.contains("asking something else"),
+            "the operator must be told a different question is on screen: {m:?}"
+        );
     }
 }
