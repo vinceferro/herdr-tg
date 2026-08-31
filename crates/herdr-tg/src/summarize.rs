@@ -13,6 +13,12 @@
 //! the real text is right there. A gate that *replaced* the excerpt would let a bad paraphrase send
 //! them to answer a question nobody asked, and they would never know.
 //!
+//! That is asserted here and enforced in `voice::is_the_same_text`, which is the only thing that
+//! ever leaves the agent's own words out of a message. It was once asserted here and enforced
+//! nowhere: the message builder dropped the excerpt whenever the summary shared enough words with
+//! it, so an accurate summary of a short ask deleted the ask, and a gateway handed the excerpt knew
+//! exactly which words to echo to leave only its own sentence standing.
+//!
 //! Three more rules follow from the same thinking:
 //!
 //! - **Fail open, always.** Gateway down, slow, or answering strangely → the push goes out with no
@@ -268,6 +274,11 @@ pub struct Summarizer {
     /// Set the first time something unrecognised answers, and never cleared. A routing chain that
     /// fell over once will fall over again, and the operator has not been asked about it yet.
     off: Arc<AtomicBool>,
+    /// Set once the operator has been told, in chat, that summaries stopped. See
+    /// [`Summarizer::newly_off`].
+    announced: Arc<AtomicBool>,
+    /// One permit, so at most one request is ever in flight. See [`Summarizer::one_line`].
+    turn: Arc<tokio::sync::Semaphore>,
 }
 
 impl fmt::Debug for Summarizer {
@@ -509,6 +520,8 @@ impl Summarizer {
             // Under an explicit grant there is nothing left to prove, so no probe is spent.
             armed: Arc::new(AtomicBool::new(allow_remote)),
             off: Arc::new(AtomicBool::new(false)),
+            announced: Arc::new(AtomicBool::new(false)),
+            turn: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -696,6 +709,19 @@ impl Summarizer {
             return None;
         }
 
+        // One at a time. `off` is read once, above, so a second summary already past that read
+        // would send the operator's screen to a destination the first has just proved foreign —
+        // one leak per call in flight. That could not happen while the summariser sat on the push
+        // path, because pushes were serialised by the very wait that made asks arrive late; taking
+        // it off that path is what makes it reachable, so the property is held here instead.
+        //
+        // Refused rather than queued: waiting would pile every blocked pane up behind a gateway
+        // that may be wedged, and a summary is a convenience. Going without one costs nothing.
+        let Ok(_turn) = Arc::clone(&self.turn).try_acquire_owned() else {
+            tracing::debug!("a summary was already being written; pushing this ask without one");
+            return None;
+        };
+
         if !self.armed.load(Ordering::SeqCst) {
             // Gateway down or answering nonsense: no summary this time, and still nothing proved,
             // so the next push probes again. Going without a summary costs the operator nothing.
@@ -720,6 +746,21 @@ impl Summarizer {
         }
 
         plausible(&answer.content, excerpt)
+    }
+
+    /// Have summaries just switched themselves off, with the operator not yet told?
+    ///
+    /// True at most once in a run, for the caller that is about to put a message on the operator's
+    /// phone. The latch is a refusal made on their behalf — their screen was about to go somewhere
+    /// this bridge could not vouch for — and until this existed the only place it was ever said was
+    /// the journal, which is not on the phone they are reading. A refusal that protects them and a
+    /// gateway that has merely gone quiet then look identical from the outside: summaries simply
+    /// stop, and nothing says why or that they are not coming back.
+    ///
+    /// One-shot, because the answer is the same on every later push and a line repeated under every
+    /// ask is furniture. The caller must actually show it: whoever takes the `true` owns saying it.
+    pub fn newly_off(&self) -> bool {
+        self.off.load(Ordering::SeqCst) && !self.announced.swap(true, Ordering::SeqCst)
     }
 
     /// Why summaries stopped, as the sentence the journal gets.
@@ -754,10 +795,11 @@ impl Summarizer {
     ///
     /// `screen_text_was_sent` is the caller's answer to the only question the operator will have.
     ///
-    /// The journal is currently the only place this is said. Telling the operator in chat as well,
-    /// so they do not sit wondering where their summaries went, is a deliberate follow-up: it needs
-    /// a sentence in the module that owns the bridge's words, and that module is being changed
-    /// elsewhere right now. Nothing about the safety of this waits on it.
+    /// The journal gets the diagnosis — who answered, at what address. The operator gets one line
+    /// on their phone, once, through [`Summarizer::newly_off`] and `voice::SUMMARIES_OFF`, so they
+    /// do not sit wondering where their summaries went. Both are needed: the detail here would be
+    /// noise in a chat, and a chat with nothing in it left a leak-prevention refusal looking
+    /// exactly like a quiet gateway.
     fn trip(&self, answer: &Answer, screen_text_was_sent: bool) {
         self.trip_saying(self.why_summaries_stopped(answer, screen_text_was_sent));
     }
@@ -1206,6 +1248,74 @@ mod tests {
         (format!("http://{addr}/v1/chat/completions"), seen)
     }
 
+    /// The latch reads `off` once, when a summary starts. Two summaries in flight at the same time
+    /// can therefore both be past that read when the first one proves the destination foreign, and
+    /// the second sends the operator's screen there anyway — one leak per call in flight.
+    ///
+    /// Until now that could not happen: pushes were serialised by the summariser sitting on the
+    /// push path, which is the same thing that made asks arrive late. Taking it off that path is
+    /// what makes this reachable, so the property is kept here on purpose rather than quietly lost.
+    /// One at a time, and a summary that finds one already running simply does not happen — a
+    /// summary is a convenience, and the alternative is a queue behind a gateway that may be wedged.
+    #[tokio::test]
+    async fn only_one_summary_is_ever_asked_for_at_a_time() {
+        let listener = tokio::net::TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind the recorder");
+        let addr = listener.local_addr().expect("local addr");
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tally = Arc::clone(&connections);
+        // Accepts and never answers: the shape of a gateway that has wedged, which is the state
+        // that leaves a summary in flight long enough for a second one to start.
+        let gateway = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                tally.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+
+        let s = Summarizer {
+            timeout: Duration::from_secs(5),
+            // Armed: the state every run is in once one good probe has been answered, and the only
+            // state in which the operator's screen goes out at all.
+            armed: Arc::new(AtomicBool::new(true)),
+            ..at(
+                &format!("http://{addr}/v1/chat/completions"),
+                &["local-coder"],
+            )
+        };
+
+        let held_open = {
+            let s = s.clone();
+            tokio::spawn(async move { s.one_line("SECRET-PANE-TEXT force-push? [y/N]").await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        let second = s
+            .one_line("ANOTHER-SECRET overwrite config.yaml? [y/N]")
+            .await;
+        let waited = started.elapsed();
+        held_open.abort();
+        gateway.abort();
+
+        assert!(
+            second.is_none(),
+            "a wedged gateway cannot summarise anything"
+        );
+        assert!(
+            waited < Duration::from_millis(200),
+            "the second summary queued behind the first for {waited:?}"
+        );
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "two summaries were in flight at once, and the latch that switches them off cannot \
+             stop the second one once it is past its own read of `off`"
+        );
+    }
+
     /// A summarizer aimed at a test gateway, with the shipped defaults everywhere else.
     fn at(endpoint: &str, local_models: &[&str]) -> Summarizer {
         Summarizer {
@@ -1218,6 +1328,8 @@ mod tests {
             allow_remote: false,
             armed: Arc::new(AtomicBool::new(false)),
             off: Arc::new(AtomicBool::new(false)),
+            announced: Arc::new(AtomicBool::new(false)),
+            turn: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 

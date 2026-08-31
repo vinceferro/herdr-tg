@@ -344,19 +344,96 @@ async fn say_in_topic(
     sent_to
 }
 
-async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
-    // Best-effort, and bounded: a failure here must never stop a push.
-    let gist = match &ctx.gist {
-        Some(g) => g.one_line(&ask.excerpt).await,
-        None => None,
-    };
-    let body = voice::asked(
-        place(ctx),
+/// What the summariser eventually had to say about one ask — if it ever answered at all.
+#[derive(Debug, Default)]
+struct Summary {
+    /// The one line to put above the agent's own text. `None` covers every refusal: nothing
+    /// configured, gateway down, an answer that was not a one-line summary.
+    line: Option<String>,
+    /// Summaries have just switched themselves off for the rest of this run, and the operator has
+    /// not been told yet. See [`crate::summarize::Summarizer::newly_off`].
+    stopped: bool,
+}
+
+/// Put one ask on the operator's phone, and let a summary catch up with it afterwards.
+///
+/// # Why the summariser is not on the way to the phone
+///
+/// It used to be: ask the gateway for a one-line gist, wait for it, then build the message, then
+/// send it. The push loop is a single task, so a gateway that accepted the connection and never
+/// answered held up every pane's ask for its whole timeout — with three panes blocked at once the
+/// last question reached the phone three timeouts late, which is exactly the failure `notify::watch`
+/// spawns its debounce timers to avoid. An ask that arrives late is the failure this bridge exists
+/// to prevent. A one-line summary is a convenience.
+///
+/// So the ask goes out first, with the agent's own words in it, and the summary — if one ever
+/// arrives — is added above it by rewriting that same message. The operator's phone buzzes once
+/// either way, and a summariser that is down, slow or wedged costs nothing but the summary.
+///
+/// Nothing is rewritten when there is nothing to add, so the ordinary run with no summariser
+/// configured writes to Telegram exactly once, as before.
+///
+/// The send and the rewrite are passed in rather than reached for, so the ordering this function
+/// exists to guarantee is testable without a bot token — the same reason `notify::watch` takes its
+/// callback instead of a `Bot`.
+///
+/// Returns where the ask landed, which is what the caller writes its menu down against.
+async fn push_ask_with<S, SFut, G, GFut, R, RFut>(
+    place: Place,
+    ask: &Ask,
+    send: S,
+    summarize: Option<G>,
+    redraw: R,
+) -> Vec<(i64, i64)>
+where
+    S: FnOnce(String) -> SFut,
+    SFut: std::future::Future<Output = Vec<(i64, i64)>>,
+    G: FnOnce(String) -> GFut + Send + 'static,
+    GFut: std::future::Future<Output = Summary> + Send + 'static,
+    R: FnOnce(String, Vec<(i64, i64)>) -> RFut + Send + 'static,
+    RFut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let has_options = !ask.options.is_empty();
+    let landed = send(voice::asked(
+        place,
         &ask.workspace,
         &ask.excerpt,
-        !ask.options.is_empty(),
-        gist.as_deref(),
-    );
+        has_options,
+        None,
+    ))
+    .await;
+
+    // A send that failed left no message to add a line to, and nothing for the operator to read it
+    // on. Asking the summariser anyway would spend the run's one notice on a message nobody has.
+    if landed.is_empty() {
+        return landed;
+    }
+
+    if let Some(summarize) = summarize {
+        let (workspace, excerpt) = (ask.workspace.clone(), ask.excerpt.clone());
+        let where_it_landed = landed.clone();
+        tokio::spawn(async move {
+            let summary = summarize(excerpt.clone()).await;
+            if summary.line.is_none() && !summary.stopped {
+                return;
+            }
+            let mut body = voice::asked(
+                place,
+                &workspace,
+                &excerpt,
+                has_options,
+                summary.line.as_deref(),
+            );
+            if summary.stopped {
+                body.push_str(voice::SUMMARIES_OFF);
+            }
+            redraw(body, where_it_landed).await;
+        });
+    }
+    landed
+}
+
+async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
     // The menu buttons are drawn wherever the push lands. The "send my replies here" button is
     // not: in the group with topics it would aim at something nothing reads.
     let keyboard = if ask.options.is_empty() {
@@ -376,7 +453,55 @@ async fn push_ask(bot: &Bot, ctx: &Ctx, chats: &[i64], ask: Ask) {
             })
             .collect::<Vec<_>>()]))
     };
-    let sent_to = say_in_topic(bot, ctx, chats, &ask.pane, &ask.workspace, &body, keyboard).await;
+    // Best-effort and off the critical path: a summariser that is slow, wedged or gone must not
+    // delay the question itself. It also carries the one thing the operator cannot see from their
+    // phone — that the bridge has switched its own summaries off — and whoever takes that `true`
+    // owns saying it, which is why it is read here, beside the message that will carry it.
+    let summarize = ctx.gist.clone().map(|g| {
+        move |excerpt: String| async move {
+            let line = g.one_line(&excerpt).await;
+            let stopped = g.newly_off();
+            Summary { line, stopped }
+        }
+    });
+    let redraw = {
+        let (bot, keyboard) = (bot.clone(), keyboard.clone());
+        move |body: String, landed: Vec<(i64, i64)>| async move {
+            for (chat, message_id) in landed {
+                let mut req = bot
+                    .edit_message_text(
+                        ChatId(chat),
+                        teloxide::types::MessageId(message_id as i32),
+                        body.clone(),
+                    )
+                    .parse_mode(ParseMode::Html);
+                // The same buttons go back on: an edit without them takes them off the message,
+                // and the operator would be left reading an ask they can no longer tap.
+                if let Some(k) = keyboard.clone() {
+                    req = req.reply_markup(k);
+                }
+                if let Err(e) = req.await {
+                    tracing::debug!(
+                        error = %e,
+                        "could not add the summary to an ask that is already on the phone"
+                    );
+                }
+            }
+        }
+    };
+
+    // Borrowed, not moved: the ask is still needed below to write the menu down.
+    let (pane, workspace) = (&ask.pane, &ask.workspace);
+    let sent_to = push_ask_with(
+        place(ctx),
+        &ask,
+        |body: String| async move {
+            say_in_topic(bot, ctx, chats, pane, workspace, &body, keyboard).await
+        },
+        summarize,
+        redraw,
+    )
+    .await;
 
     // The buttons carry a position, which means nothing once the menu redraws. The labels they
     // showed are written down here, beside the message they are attached to, and a tap is answered
@@ -1504,6 +1629,160 @@ mod tests {
             reply_path(None),
             ReplyPath::Refuse(Reason::HerdUnreachable),
             "a pane the bridge could not look at must not be typed into"
+        );
+    }
+
+    // ── the ask and the summary that may follow it ────────────────────────────────────────────
+
+    /// One blocked agent, as the loop hands it over.
+    fn an_ask() -> Ask {
+        Ask {
+            pane: PaneId::new("wA:p1"),
+            workspace: "wA".into(),
+            agent: "opencode".into(),
+            seq: Some(198),
+            excerpt: "Delete the production database? [y/N]".into(),
+            options: Vec::new(),
+        }
+    }
+
+    /// THE property of this path: an ask reaches the phone whatever the summariser is doing.
+    ///
+    /// A gateway that accepts the connection and never answers used to hold the push for the whole
+    /// timeout — and the push loop is one task, so every other pane's ask queued behind it. An ask
+    /// that arrives late is the failure this bridge exists to prevent; a summary is a convenience.
+    #[tokio::test]
+    async fn a_summariser_that_never_answers_does_not_hold_up_the_ask() {
+        let ask = an_ask();
+        let sent: Arc<Mutex<Option<(String, std::time::Duration)>>> = Arc::new(Mutex::new(None));
+        let recorder = Arc::clone(&sent);
+        let started = std::time::Instant::now();
+
+        push_ask_with(
+            Place::Topic,
+            &ask,
+            move |body: String| async move {
+                *recorder.lock().await = Some((body, started.elapsed()));
+                vec![(7, 9)]
+            },
+            Some(|_excerpt: String| async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Summary::default()
+            }),
+            |_body, _landed| async {},
+        )
+        .await;
+
+        let (body, waited) = sent.lock().await.clone().expect("the ask never went out");
+        assert!(
+            waited < std::time::Duration::from_millis(250),
+            "the ask waited {waited:?} on the summariser before reaching the phone"
+        );
+        assert!(
+            body.contains("Delete the production database? [y/N]"),
+            "the ask went out without the agent's own words: {body}"
+        );
+    }
+
+    /// A summary that does arrive is added above the ask that already went out — never instead of
+    /// it, and never as a second buzz on the operator's phone.
+    #[tokio::test]
+    async fn a_summary_that_arrives_late_is_added_above_the_ask_it_belongs_to() {
+        let ask = an_ask();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        push_ask_with(
+            Place::Topic,
+            &ask,
+            |_body: String| async { vec![(7, 9)] },
+            Some(|_excerpt: String| async {
+                Summary {
+                    line: Some("Delete the live database?".into()),
+                    stopped: false,
+                }
+            }),
+            move |body, landed| async move {
+                let _ = tx.send((body, landed));
+            },
+        )
+        .await;
+
+        let (body, landed) = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the summary never reached the message it belongs to")
+            .expect("the redraw was dropped");
+        assert_eq!(landed, vec![(7, 9)], "redrawn somewhere the ask never went");
+        assert!(
+            body.contains("Delete the live database?"),
+            "the summary is missing: {body}"
+        );
+        assert!(
+            body.find("Delete the live database?") < body.find("Delete the production database?"),
+            "the summary must sit above the agent's own words, which must still be there: {body}"
+        );
+    }
+
+    /// The bridge can switch its own summaries off mid-run to keep the operator's screen off the
+    /// network. Said only in the journal, that refusal looked exactly like a gateway gone quiet —
+    /// so it is said once on the phone, on the push that lost its summary.
+    #[tokio::test]
+    async fn the_push_that_lost_its_summary_says_summaries_have_stopped() {
+        let ask = an_ask();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        push_ask_with(
+            Place::Topic,
+            &ask,
+            |_body: String| async { vec![(7, 9)] },
+            Some(|_excerpt: String| async {
+                Summary {
+                    line: None,
+                    stopped: true,
+                }
+            }),
+            move |body, _landed| async move {
+                let _ = tx.send(body);
+            },
+        )
+        .await;
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("the operator was never told summaries stopped")
+            .expect("the redraw was dropped");
+        assert!(
+            body.contains("No more one-line summaries this run"),
+            "nothing on the phone says summaries switched themselves off: {body}"
+        );
+        assert!(
+            body.contains("Delete the production database? [y/N]"),
+            "the note must sit under the agent's own words, not replace them: {body}"
+        );
+    }
+
+    /// A summary that never came is not worth a second write to the message. Nothing to add means
+    /// nothing is touched.
+    #[tokio::test]
+    async fn an_ask_with_no_summary_to_add_is_left_alone() {
+        let ask = an_ask();
+        let redrawn = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&redrawn);
+
+        push_ask_with(
+            Place::Topic,
+            &ask,
+            |_body: String| async { vec![(7, 9)] },
+            Some(|_excerpt: String| async { Summary::default() }),
+            move |_body, _landed| async move {
+                *flag.lock().await = true;
+            },
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !*redrawn.lock().await,
+            "the message was rewritten with nothing new to say"
         );
     }
 }
