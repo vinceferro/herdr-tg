@@ -51,12 +51,31 @@
 //!    now loud, because a guard that says nothing when it does not understand the code is worse
 //!    than no guard: it is believed.
 //!
+//! # Known and accepted: this guard does not read a member's Cargo.toml
+//!
+//! Its model of "what is code" is (every `.rs` under the root) ∪ (whatever an `include!` or a
+//! `#[path]` names). It never reads a workspace member's own manifest, so a Cargo TARGET PATH —
+//! `[[bin]]`, `[lib]`, `[[example]]`, `[[test]]` with a `path = …` — is a third way for a file to
+//! become code that nothing here models. A file that is BOTH outside every member directory AND
+//! not spelled `.rs` is invisible to every check at once: the walk filters on the extension, and
+//! the git oracle's extension-blind clause only reaches inside member directories.
+//!
+//! That gap is KNOWN and ACCEPTED — a decision, not an oversight. This guard stays a source
+//! scanner; it does not grow a second manifest parser to chase it. What it costs is bounded on
+//! purpose: BOTH textual rules walk from the workspace ROOT, so an out-of-tree target that is
+//! spelled `.rs` — the ordinary shared-tooling layout — is read like any other file, whatever
+//! directory it sits in. The residue is the out-of-tree target that is also not `.rs`. It is
+//! written down here so the next reader neither believes the guard covers it nor re-derives it
+//! from scratch.
+//!
 //! # The three rules
 //!
-//! 1. **No workspace member except `herdr-client` may so much as NAME the three methods.** Not a
-//!    call, not an import, not a clap subcommand, not a `//` TODO that a later session turns into
-//!    one. Those crates are what a timer, a cron job or (from slice 2) a Telegram message can
-//!    reach; the client crate, which defines them, is not.
+//! 1. **No file outside `herdr-client` may so much as NAME the three methods.** Not a call, not an
+//!    import, not a clap subcommand, not a `//` TODO that a later session turns into one.
+//!    Everything outside the defining crate is what a timer, a cron job or (from slice 2) a
+//!    Telegram message can reach; the client crate, which defines them, is not. Scoped by the
+//!    DEFINING crate rather than by a list of member directories, because a member's source file
+//!    need not live inside its own directory.
 //! 2. **A *call* may appear nowhere in the workspace outside `#[cfg(test)]`** — including via UFCS
 //!    (`HerdrClient::send_text(c, p, …)`), which the old `.send_text(`-only spelling missed.
 //! 3. **`Request` must stay SEALED.** The seal is what makes rules 1 and 2 more than a grep: an
@@ -417,8 +436,23 @@ fn code_includes(root: &Path, file: &Path, src: &str) -> Vec<PathBuf> {
                 continue;
             }
             if word == "path" {
-                let mut j = skip_ws(line, end);
-                if line.as_bytes().get(j) == Some(&b'=') {
+                // Read the blanked view for what FOLLOWS the word, so a comment sitting between it
+                // and the `=` is not mistaken for the thing it is attached to. Offsets are shared.
+                let mut j = skip_ws(&code, end);
+                assert!(
+                    j < code.len() || in_attr == 0,
+                    "`path` inside an attribute in {} is the last thing on its line:\n  {}\nThe \
+                     `=` and the file it names are on the NEXT line, and this guard will not guess \
+                     which file the module is redirected to. A `#[path]` names code in the \
+                     operator's binary, so teach this function the shape deliberately rather than \
+                     letting the file through unscanned.",
+                    file.display(),
+                    line.trim()
+                );
+                if code.as_bytes().get(j) == Some(&b'=') {
+                    // Back to the ORIGINAL line for the literal itself: the blanked view has its
+                    // body — and its opening quote — replaced by spaces, so skipping whitespace
+                    // there would walk straight past the thing we are looking for.
                     j = skip_ws(line, j + 1);
                     match literal_at(line, j) {
                         Some((named, after)) => {
@@ -875,18 +909,9 @@ fn code_resume_offsets(src: &str) -> Vec<usize> {
                         i += len;
                         continue;
                     }
-                    // A raw-string opener: `r"`, `r#"`, `br##"`, … The body is then left to the
-                    // Raw arm, which closes it on this line or carries it to the next.
-                    let prefix = if b[i] == b'r' {
-                        Some(i + 1)
-                    } else if b[i] == b'b' && b.get(i + 1) == Some(&b'r') {
-                        Some(i + 2)
-                    } else {
-                        None
-                    };
-                    if let Some(first) = prefix
-                        && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-                    {
+                    // A raw-string opener: `r"`, `r#"`, `br##"`, `cr#"`, … The body is then left
+                    // to the Raw arm, which closes it on this line or carries it to the next.
+                    if let Some(first) = raw_string_prefix(b, i) {
                         let mut j = first;
                         while b.get(j) == Some(&b'#') {
                             j += 1;
@@ -1132,23 +1157,40 @@ fn code_only(line: &str) -> String {
     out
 }
 
-/// Length in bytes of the raw string literal starting at `bytes[start]`, or `None` if nothing
-/// starts one there. Covers `r"…"`, `r#"…"#`, `r##"…"##` and the `br…` byte-string spellings.
+/// The byte just past a raw-string PREFIX at `bytes[start]`, or `None` if none starts there.
 ///
-/// An `r` or `b` that is only the tail of an identifier (`for`, `char`) opens nothing — checked on
-/// the byte before it, so a name is never mistaken for a prefix.
+/// The three Rust accepts are `r`, `br` and `cr`. `cr` — the C raw string, stable since 1.77 and
+/// legal in this edition-2024 workspace — was the one missing, and missing it was worse than not
+/// knowing the spelling: the boundary rule here rejected the `r` in `cr#"` because a `c` sits in
+/// front of it, so the opener was read as a bare quote and the literal tracked as a PLAIN string.
+/// A body carrying an odd number of quotes then left the scanner inside a string for the rest of
+/// the line — and, in the whole-file view, for the rest of the FILE, blanking away every code
+/// inclusion after it. Ordinary modern Rust, and the guard quietly stops guarding.
+///
+/// `b"…"` and `c"…"` are deliberately absent: their quote opens and closes exactly like a plain
+/// string's, which is what the callers already do with it. Only a RAW prefix changes the rules.
+///
+/// An `r` that is only the tail of an identifier (`for`, `char`) opens nothing — checked on the
+/// byte before it, so a name is never mistaken for a prefix.
+fn raw_string_prefix(bytes: &[u8], start: usize) -> Option<usize> {
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        return None;
+    }
+    match bytes[start] {
+        b'r' => Some(start + 1),
+        b'b' | b'c' if bytes.get(start + 1) == Some(&b'r') => Some(start + 2),
+        _ => None,
+    }
+}
+
+/// Length in bytes of the raw string literal starting at `bytes[start]`, or `None` if nothing
+/// starts one there. Covers `r"…"`, `r#"…"#`, `r##"…"##` and the `br…` / `cr…` spellings, via
+/// [`raw_string_prefix`].
 ///
 /// An unterminated literal consumes the rest of the line. That is not a concession: if the closing
 /// delimiter is not on this line then the rest of this line really is string content.
 fn raw_string_len(bytes: &[u8], start: usize) -> Option<usize> {
-    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
-        return None;
-    }
-    let mut i = match bytes[start] {
-        b'r' => start + 1,
-        b'b' if bytes.get(start + 1) == Some(&b'r') => start + 2,
-        _ => return None,
-    };
+    let mut i = raw_string_prefix(bytes, start)?;
     let first_hash = i;
     while bytes.get(i) == Some(&b'#') {
         i += 1;
@@ -1278,19 +1320,20 @@ fn write_reach_on(line: &str) -> Option<&'static str> {
     None
 }
 
-/// Rule 1 — no workspace member except the defining crate may NAME a write method, anywhere.
+/// Rule 1's offenders in the workspace rooted at `root`, and how many files it read to find them.
 ///
-/// Scoped to whole members rather than to `crates/herdr-tg/src`, so a crate added in slice 2 is
-/// covered on the commit that adds it. Comments and string literals count: a `//` TODO naming the
-/// method is one session away from being a call.
-#[test]
-fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
-    let root = workspace_root();
-    let members = workspace_members(&root);
-    let mut offenders = Vec::new();
-    let mut checked = 0usize;
-
-    for member in members.iter().filter(|m| m.as_str() != DEFINING_MEMBER) {
+/// Scoped by the DEFINING crate and walked from the ROOT — not `crates/herdr-tg/src`, and no
+/// longer a list of member directories. A crate added in slice 2 is covered on the commit that
+/// adds it, and so is a member's own source file that a Cargo target path parks outside the
+/// member's directory. Comments and string literals count: a `//` TODO naming the method is one
+/// session away from being a call.
+///
+/// Split out of the test so the rule can be pointed at a synthetic tree that reproduces a shape
+/// this repository does not currently have — see
+/// [`a_source_file_outside_every_member_directory_still_may_not_name_a_write_method`].
+fn names_a_write_outside_the_defining_crate(root: &Path) -> (usize, Vec<String>) {
+    let members = workspace_members(root);
+    for member in &members {
         let dir = root.join(member);
         assert!(
             dir.is_dir(),
@@ -1298,23 +1341,52 @@ fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
              guard cannot scan it and will not pretend it did",
             dir.display()
         );
-        let files = scanned_sources(&root, &dir);
+    }
+
+    // From the ROOT, not from each member directory in turn. A member's own source file does not
+    // have to live inside it — a Cargo target path (`[[bin]] path = "../../tools/relay.rs"`) puts
+    // real crate source anywhere in the tree — and this rule is the one that catches a MENTION,
+    // which is what such a file was free to carry while the walk started at the member directory.
+    let all = scanned_sources(root, root);
+    let scanned: BTreeSet<String> = all.iter().map(|f| rel(root, f)).collect();
+    for member in members.iter().filter(|m| m.as_str() != DEFINING_MEMBER) {
+        let prefix = format!("{member}/");
         assert!(
-            !files.is_empty(),
-            "workspace member `{member}` yielded ZERO .rs files. A vacuous scan is not a pass."
+            scanned.iter().any(|f| f.starts_with(&prefix)),
+            "workspace member `{member}` contributed ZERO scanned files. A vacuous scan is not a \
+             pass."
         );
-        for file in files {
-            checked += 1;
-            let src = fs::read_to_string(&file).expect("a source file in this repo is readable");
-            for (n, line) in src.lines().enumerate() {
-                for name in WRITE_NAMES {
-                    if line.contains(name) && rel(&root, &file) != AUDITED_WRITE_PATH {
-                        offenders.push(format!("{}:{}: {}", rel(&root, &file), n + 1, line.trim()));
-                    }
+    }
+
+    // The DEFINING crate is excused by where its code lives, which is the one thing this rule can
+    // still say without reading a manifest. Everything else in the tree is a caller.
+    let defining = format!("{DEFINING_MEMBER}/");
+    let mut offenders = Vec::new();
+    let mut checked = 0usize;
+    for file in &all {
+        let relp = rel(root, file);
+        if relp.starts_with(&defining) {
+            continue;
+        }
+        checked += 1;
+        let src = fs::read_to_string(file).expect("a source file in this repo is readable");
+        for (n, line) in src.lines().enumerate() {
+            for name in WRITE_NAMES {
+                if line.contains(name) && relp != AUDITED_WRITE_PATH {
+                    offenders.push(format!("{relp}:{}: {}", n + 1, line.trim()));
                 }
             }
         }
     }
+
+    (checked, offenders)
+}
+
+/// Rule 1 — no file outside the defining crate may NAME a write method, anywhere in the tree.
+#[test]
+fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
+    let root = workspace_root();
+    let (checked, offenders) = names_a_write_outside_the_defining_crate(&root);
 
     assert!(
         checked > 0,
@@ -2467,5 +2539,168 @@ fn a_leaked_git_dir_does_not_redirect_a_git_question_at_another_repository() {
          the caller happened to be in. Stderr: {}",
         repo.display(),
         String::from_utf8_lossy(&answered.stderr).trim()
+    );
+}
+
+/// Regression: a crate's source file does not have to live INSIDE the crate's directory.
+///
+/// Rule 1 used to walk `root.join(member)` for each declared member, so its reach was the member
+/// DIRECTORY rather than the member's code. A Cargo target path is an ordinary way for the two to
+/// come apart — `[[bin]] path = "../../tools/relay.rs"`, the shared-tooling layout — and a file
+/// parked out there was outside rule 1 entirely. Rule 2 still catches an actual call, because it
+/// walks from the root; what escaped is exactly the class rule 1 exists for, the mention that is
+/// one session away from a call: the clap subcommand, the string constant, the TODO.
+///
+/// So rule 1 walks from the ROOT too, and judges a file by whether it is inside the DEFINING crate
+/// rather than by which member directory it happens to sit in. The guard still does not read
+/// member manifests (see the note at the top of this file); it no longer needs to for this rule.
+#[test]
+fn a_source_file_outside_every_member_directory_still_may_not_name_a_write_method() {
+    let tmp = tempfile::tempdir().expect("a tempdir to build the synthetic workspace in");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("crates/demo/src")).expect("the synthetic tree is creatable");
+    fs::create_dir_all(root.join("tools")).expect("the synthetic tree is creatable");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/demo\"]\n",
+    )
+    .expect("writable");
+    // An ordinary shared-tooling layout: a second binary of a member crate, kept outside it.
+    fs::write(
+        root.join("crates/demo/Cargo.toml"),
+        "[package]\nname = \"demo\"\n\n[[bin]]\nname = \"demo-relay\"\npath = \
+         \"../../tools/relay.rs\"\n",
+    )
+    .expect("writable");
+    fs::write(root.join("crates/demo/src/lib.rs"), "pub fn hello() {}\n").expect("writable");
+    fs::write(
+        root.join("tools/relay.rs"),
+        "//! An extra bot binary whose source lives outside the crate directory.\n\n/// TODO: wire \
+         this up to client.send_text once the audit story lands.\nconst SUBCOMMAND: &str = \
+         \"send_text\";\n\nfn main() {\n    println!(\"{SUBCOMMAND}\");\n}\n",
+    )
+    .expect("writable");
+
+    let (checked, offenders) = names_a_write_outside_the_defining_crate(root);
+
+    assert!(
+        checked >= 2,
+        "rule 1 read {checked} files; the synthetic workspace has two"
+    );
+    assert_eq!(
+        offenders.len(),
+        2,
+        "rule 1 did not see a member's own source file because it sits outside the member \
+         DIRECTORY. Every mention out there — a clap subcommand, a string constant, a TODO — is \
+         invisible to the one rule written to catch mentions. Found:\n  {}",
+        offenders.join("\n  ")
+    );
+    assert!(
+        offenders.iter().all(|o| o.starts_with("tools/relay.rs:")),
+        "the offenders must be the two lines of the out-of-tree binary, got:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// Regression: every literal prefix Rust accepts is read as ONE token.
+///
+/// `code_only` and `code_resume_offsets` knew `r`, `br` and `b` but not `cr`, the C raw string,
+/// stable since Rust 1.77 and legal in this edition-2024 workspace. Worse than not knowing it:
+/// [`raw_string_len`]'s own left-boundary guard — an `r` preceded by an alphanumeric opens nothing,
+/// so `for` is not a prefix — actively rejects the `r` in `cr#"`, so the opener was read as a bare
+/// quote and the literal tracked as a PLAIN string.
+///
+/// A body with an odd number of quotes in it then leaves the scanner inside a phantom string: on
+/// one line that swallows a real call after it, and across the file it swallows every code
+/// inclusion that follows — never parsed, never resolved, never asserted on. A guard that stops
+/// guarding because somebody wrote ordinary modern Rust.
+///
+/// `b"…"` and `c"…"` need no entry of their own: their quote opens and closes exactly like a plain
+/// string's, which is what the scanner already does with it.
+#[test]
+fn every_raw_string_prefix_rust_accepts_is_read_as_one_token() {
+    for prefix in ["r", "br", "cr"] {
+        // One line: the literal's own closing quote must not open a span over the code after it.
+        let line = format!("let s = {prefix}#\"an inch \" of rope\"#; c.send_text(p, s);");
+        assert_eq!(
+            write_reach_on(&line),
+            Some("send_text"),
+            "a `{prefix}` raw string hid a live call on the same line from the scanner:\n  {line}"
+        );
+
+        // Whole file: the literal must not blank the rest of the file away.
+        let src =
+            format!("const ROPE: &T = {prefix}#\"6\" of rope\"#;\ninclude!(\"relay.inc\");\n");
+        let code = code_lines(&src);
+        assert!(
+            code[1].contains("include!"),
+            "a `{prefix}` raw string left the whole-file scanner inside a string, so the code \
+             inclusion on the next line was blanked away before anything could resolve it. The \
+             file the compiler pulls in is never opened, and the guard reports green. Saw:\n  {}",
+            code[1]
+        );
+    }
+}
+
+/// Regression: `path` at the end of a line inside an attribute is refused, like its literal is.
+///
+/// The sweep already hard-fails on `#[path =` with the string literal on the next line. One
+/// character to the left, the same shape fell straight through: with the `=` itself on the
+/// following line, the lookup for it came up empty and the code did `i = end; continue` with no
+/// assert. The `mod` below was then read as an ordinary file module with no redirect, and the file
+/// rustc compiles was never opened — a silent continue of exactly the class this file says is
+/// closed.
+///
+/// A bare `path` word with more attribute after it on the same line is not that shape: there is no
+/// `=` to be looking for, so it stays quiet.
+#[test]
+fn a_path_attribute_whose_equals_sign_is_on_the_next_line_fails_rather_than_being_skipped() {
+    let tmp = tempfile::tempdir().expect("a tempdir for the synthetic crate");
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).expect("the synthetic tree is creatable");
+
+    let scan = |body: &str| -> Result<BTreeSet<String>, String> {
+        fs::write(root.join("src/lib.rs"), body).expect("writable");
+        let hushed = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| {
+            scanned_sources(root, root)
+                .iter()
+                .map(|f| rel(root, f))
+                .collect::<BTreeSet<String>>()
+        });
+        std::panic::set_hook(hushed);
+        outcome.map_err(|e| {
+            e.downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "<non-string panic>".to_owned())
+        })
+    };
+
+    let wrapped = scan("#[path\n    = \"nowhere.inc\"]\nmod gone;\n").expect_err(
+        "a `#[path]` whose `=` is on the following line was skipped in silence — the module below \
+         it is then read as an ordinary file module and the file rustc compiles is never opened",
+    );
+    assert!(
+        wrapped.contains("will not guess"),
+        "a `#[path]` the guard cannot read must say why it is refused, got: {wrapped}"
+    );
+
+    // The same word with the attribute continuing after it: nothing to look for, nothing to fail.
+    let bare = scan("#[cfg_attr(unix,\n    doc = \"path here\")]\nfn f() {}\n")
+        .expect("an attribute that merely mentions paths is not a module redirect");
+    assert_eq!(
+        bare,
+        BTreeSet::from(["src/lib.rs".to_owned()]),
+        "an ordinary attribute must neither fail the guard nor pull in a file"
+    );
+
+    // And outside an attribute the word is English: a binding split over two lines means nothing.
+    let ordinary = scan("fn f() {\n    let path\n        = \"nowhere.inc\";\n}\n")
+        .expect("`let path = \"…\"` is an English word, not a module redirect");
+    assert_eq!(
+        ordinary,
+        BTreeSet::from(["src/lib.rs".to_owned()]),
+        "an ordinary `path` binding must neither fail the guard nor pull in a file"
     );
 }
