@@ -180,7 +180,7 @@ $ herdr api snapshot | python3 -c "..."
   wA ['wA:p1']  wB ['wB:p1']  wC ['wC:p2']  wE ['wE:p1', 'wE:p4']
 
 The anchor that is already available and unused:
-w9:p1 | terminal_id= term_65a1dfd2070331 | cwd= $HOME/Projects/bliz-monorepo
+w9:p1 | terminal_id= term_65a1dfd2070331 | cwd= $HOME/Projects/<a private repo>
 ```
 
 **Fix** — Store `{pane_id, terminal_id}` (or cwd) in the topics and sticky maps and require BOTH to match at resolve time; a mismatch is `Target::Gone`, which already produces the picker. Cheapest interim: stamp the routing state with the herd's identity at write time and clear `topics`/`sticky` when it changes.
@@ -580,7 +580,7 @@ $ journalctl --user -u herdr-tg -o cat | grep -c workspace
 $ journalctl --user -u herdr-tg -o cat | grep relaying | sed -E 's/.*pane=(w.):.*/\1/' | sort -u | tr '\n' ' '
 w9 wA wC wE       <- 4 distinct workspaces mirrored
 $ ./target/debug/herdr-tg status
-  w9:p1  bliz-monorepo   ... wA:p1  omarchy-lab ... wC:p2  llm-gateway ... wE:p1  herdr-tg
+  w9:p1  <private repo> ... wA:p1  omarchy-lab ... wC:p2  llm-gateway ... wE:p1  herdr-tg
 $ journalctl ... | grep 'relaying pane=wE:p1' | wc -l  ->  5 relays, 7566 chars
 ```
 

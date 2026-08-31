@@ -206,7 +206,7 @@ impl HerdrClient {
     ///
     /// **The env var is PANE-INJECTED ONLY** — verified: a stripped child sees no `HERDR_*` at all.
     /// So the production `systemd --user` unit WILL take the `$HOME` fallback, and that fallback is
-    /// the path proof gate 2 exercises. The socket is `srw------- thev:thev`, so filesystem
+    /// the path proof gate 2 exercises. The socket is `srw------- <user>:<user>`, so filesystem
     /// permissions ARE the auth layer; there is no token to configure.
     pub fn from_env() -> Result<Self, HerdrError> {
         let path = resolve_socket_path(

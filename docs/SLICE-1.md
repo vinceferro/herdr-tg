@@ -1,7 +1,7 @@
 # Slice 1 — herdr-client crate (revised build spec)
 
 > Target repo: `$HOME/Projects/herdr-tg` · branch `main` · supersedes the slice-1 row of `PLAN.md:143`.
-> Every fact below was re-verified live against **herdr 0.8.2 / protocol 20** on thev-lap on 2026-08-28,
+> Every fact below was re-verified live against **herdr 0.8.2 / protocol 20** on the laptop on 2026-08-28,
 > read-only, and every crate version against crates.io the same day. Where this document and
 > `HERDR_API.md` (protocol 16) disagree, this document wins.
 
@@ -84,7 +84,7 @@ cd $HOME/Projects/herdr-tg && \
 ### Expected result
 
 `cargo test --workspace` green with **no herdr running and no network** (that is what makes the crate
-gateable on thev-box, D6), then seven gate lines and exit 0:
+gateable on the build box, D6), then seven gate lines and exit 0:
 
 ```
 gate 0  reference sane         ok    session_snapshot, protocol 20, herdr 0.8.2
@@ -757,7 +757,7 @@ impl HerdrClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self;               // 2 s connect, 10 s request
     /// $HERDR_SOCKET_PATH, else $HOME/.config/herdr/herdr.sock. The env var is PANE-INJECTED ONLY
     /// (verified: a stripped child sees no HERDR_* at all), so a `systemd --user` unit WILL take the
-    /// fallback. The socket is srw------- thev:thev, so filesystem permissions ARE the auth layer.
+    /// fallback. The socket is srw------- <user>:<user>, so filesystem permissions ARE the auth layer.
     /// Proof gate 2 exercises exactly this path.
     pub fn from_env() -> Result<Self, HerdrError>;
     pub fn with_timeouts(self, connect: Duration, request: Duration) -> Self;
@@ -1013,7 +1013,7 @@ herd: 6 workspaces, 6 panes   (herdr 0.8.2, protocol 20)
 Every test below runs **offline** — no herdr socket, no network, no `HERDR_*` env — against
 `tests/support::MockHerdr` (a real `UnixListener` in a `tempfile::TempDir` that answers one request per
 connection **and closes**, mirroring the real server) and NDJSON fixtures captured from the live herd. That is
-structural, not stylistic: D6 puts pushes on thev-box, which has no herdr socket, so a client testable only
+structural, not stylistic: D6 puts pushes on the build box, which has no herdr socket, so a client testable only
 against a live herd could not be gated at all.
 
 ### `tests/events.rs` — the highest-value file
@@ -1058,7 +1058,7 @@ against a live herd could not be gated at all.
 
 | Test | What it proves |
 |---|---|
-| `snapshot_roundtrip_loses_nothing` | Deserialize the real 9,442-byte `fixtures/snapshot.json`, re-serialize into the envelope, compare as `serde_json::Value`. **Zero field loss.** This is gate 3 made offline and deterministic, so a modelling omission fails at `cargo test` on thev-box instead of only at the live proof on the lap. Expect one or two iterations here — that is the test doing its job. It is also where `terminal_title` / `terminal_title_stripped` decoding is proven, since normalize.jq drops them from the live diff. |
+| `snapshot_roundtrip_loses_nothing` | Deserialize the real 9,442-byte `fixtures/snapshot.json`, re-serialize into the envelope, compare as `serde_json::Value`. **Zero field loss.** This is gate 3 made offline and deterministic, so a modelling omission fails at `cargo test` on the build box instead of only at the live proof on the lap. Expect one or two iterations here — that is the test doing its job. It is also where `terminal_title` / `terminal_title_stripped` decoding is proven, since normalize.jq drops them from the live diff. |
 | `absent_optional_fields_do_not_serialize_as_null` | A pane with no `label`/`title`/`tokens`/`state_labels`/`display_agent` round-trips **without** those keys, and `state_labels: None` must not become `{}`. |
 | `agent_status_unrecognized_round_trips_verbatim` | `"reticulating"` → `AgentStatus::Unrecognized("reticulating")` → re-serializes as `"reticulating"`, and is `!=` `AgentStatus::Unknown`. **Verified that `#[serde(other)]` fails this** — it emits `"unrecognized"`. |
 | `pane_read_revision_is_zero_while_pane_info_revision_is_not` | Pins the asymmetry from the fixtures so a later reader cannot get it backwards. |
@@ -1085,7 +1085,7 @@ field, on the operator's terms, instead of a missed ask at 2 a.m.
 
 ### Live-herd only (not `cargo test`)
 
-`scripts/proof-slice1.sh` gates 0–6, and `scripts/proof-selftest.sh`. Both run on thev-lap by hand at the
+`scripts/proof-slice1.sh` gates 0–6, and `scripts/proof-selftest.sh`. Both run on the laptop by hand at the
 slice's done-boundary. Mark this split in PLAN.md so a green `cargo test` is never read as a green proof.
 
 ---
@@ -1262,7 +1262,7 @@ slice's done-boundary. Mark this split in PLAN.md so a green `cargo test` is nev
 - **Two scratch artifacts are traps for a builder who copies instead of reading.**
   `$HOME/.cache/tmp/proof/normalize.jq` keeps `terminal_title_stripped` (live-volatile) and
   `.../scratchpad/final-lefthook.yml` uses the hardcoded `$HOME/.cargo/bin/cargo` form that does **not**
-  unset `RUSTUP_TOOLCHAIN` and breaks on thev-box. Use the corrected versions named in this spec.
+  unset `RUSTUP_TOOLCHAIN` and breaks on the build box. Use the corrected versions named in this spec.
 
 ### Out of scope
 
@@ -1302,7 +1302,7 @@ slice's done-boundary. Mark this split in PLAN.md so a green `cargo test` is nev
 - **~82 of the 92 wire methods**, `events.wait` (supports only agent-status matches and reports timeout as an
   error), `strip_ansi` (no observable effect on `pane.read` output), `pane.report_agent`, and anything that
   mutates the herd's shape.
-- **Live-herd tests inside `cargo test`** — structurally excluded, so the crate is gateable on thev-box.
+- **Live-herd tests inside `cargo test`** — structurally excluded, so the crate is gateable on the build box.
 - **Greening the lap's kickoff gates beyond the three cargo gates** (D6: real but separate work), and the four
   cosmetic `grep: warning: stray \ before -` lines `scan-structure` emits (pre-existing engine noise — worth a
   one-line note upstream to claude-kickoff so it is not later misread as a herdr-tg regression).

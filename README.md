@@ -39,7 +39,7 @@ kickoff adopt --dir ~/Projects/herdr-tg   # wires .kickoff/, engine parity, gate
 kickoff verify --dir ~/Projects/herdr-tg  # one-shot health check (needs no Telegram)
 ```
 
-Per-instance wiring to carry into `.kickoff/instance.env` (modeled on the bliz instance):
+Per-instance wiring to carry into `.kickoff/instance.env` (modeled on an existing instance):
 
 ```bash
 export MEMORY_DIR="$HOME/obsidian-vault/Memory"          # shared vault corpus — NOT a repo-local one

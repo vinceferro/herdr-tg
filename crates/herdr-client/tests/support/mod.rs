@@ -11,7 +11,7 @@
 //!
 //! Nothing here reads `$HOME`, `$HERDR_SOCKET_PATH`, or
 //! `~/.config/herdr/herdr.sock`: the whole offline suite is structurally incapable of
-//! touching the operator's live herd, which is what makes the crate gateable on thev-box (D6).
+//! touching the operator's live herd, which is what makes the crate gateable on the build box (D6).
 
 // Each test target compiles the whole module and uses a different slice of it.
 #![allow(dead_code)]
