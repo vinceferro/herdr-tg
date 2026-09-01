@@ -26,7 +26,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use herdr_client::Key;
 use serde::Deserialize;
 
 /// The environment variable carrying the bot token. Written by `scripts/setup-token.sh`.
@@ -66,15 +65,6 @@ pub struct Config {
     /// [`crate::bot::Gate`] — because two implementations of a fail-closed check are two places
     /// for it to drift open, and only one of them will have the test.
     pub allowed_chat_ids: BTreeSet<i64>,
-    pub workspace: Option<String>,
-    pub socket: Option<PathBuf>,
-    /// The key pressed after the operator's text to submit it.
-    ///
-    /// `Enter` for `opencode` is confirmed on the wire. For `claude` it is **operator-supplied
-    /// knowledge, not a probed fact** (`docs/SLICE-3-PROBE.md`, "still open"). That is survivable
-    /// only because delivery is verified by reading the pane back: a wrong key shows up as
-    /// [`crate::deliver::Rung::Echoed`] and the operator is told, rather than being told "sent".
-    pub submit_key: Key,
     /// A forum-enabled supergroup, if one is configured.
     ///
     /// When set, each pane gets its own topic and a reply inside a topic routes to that pane — no
@@ -130,21 +120,26 @@ impl Config {
             }
         }
 
-        let submit_raw = file.submit_key.as_deref().unwrap_or("Enter");
-        let submit_key = Key::parse(submit_raw).map_err(|e| {
-            anyhow::anyhow!(
-                "submit_key `{submit_raw}` is not a key herdr accepts: {e}. Note the chord form is \
-                 `ctrl+c`, not `C-c` — the tmux form is refused for every chord except `c-c`, which \
-                 herdr special-cases (docs/SLICE-3-PROBE.md P2)."
-            )
-        })?;
+        // `workspace`, `socket` and `submit_key` are still ACCEPTED in the file and ignored, so an
+        // existing herdr-tg.toml does not become a startup error on upgrade. They configured the
+        // path that watched panes and typed into them, and that path no longer exists.
+        for (name, present) in [
+            ("workspace", file.workspace.is_some()),
+            ("socket", file.socket.is_some()),
+            ("submit_key", file.submit_key.is_some()),
+        ] {
+            if present {
+                tracing::info!(
+                    setting = name,
+                    "this setting configured the old pane path, which has been removed. It is \
+                     ignored, and you can delete the line."
+                );
+            }
+        }
 
         Ok(Self {
             token: token.trim().to_string(),
             allowed_chat_ids: allowed,
-            workspace: file.workspace,
-            socket: file.socket,
-            submit_key,
             forum_chat_id: std::env::var("HERDR_TG_FORUM_CHAT_ID")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
@@ -208,9 +203,6 @@ mod tests {
         Config {
             token: "t".into(),
             allowed_chat_ids: ids.iter().copied().collect(),
-            workspace: None,
-            socket: None,
-            submit_key: Key::parse("Enter").expect("Enter is valid"),
             forum_chat_id: None,
         }
     }

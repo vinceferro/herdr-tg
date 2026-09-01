@@ -479,6 +479,15 @@ pub struct Hub<S: Surface> {
     /// Whose turn it is to send. Held for the whole of one send's pacing wait, so that projects
     /// queue for the rhythm instead of racing for it — see `send_into` for what racing cost.
     send_permit: Arc<Mutex<()>>,
+    /// The one-line gist put above a question, when one is configured.
+    ///
+    /// `None` unless the operator has set it up, and that default matters: a gist is the only thing
+    /// in this binary that sends an agent's words to a model, so it is off until someone says
+    /// otherwise. `summarize.rs` proves the endpoint is on this machine before a single character
+    /// of the agent's text is on the wire.
+    ///
+    /// One call site, agent to operator, never the reverse.
+    gist: Option<Arc<crate::summarize::Summarizer>>,
     /// Which chats this bot answers. Checked first, before any state is touched.
     allowed_chats: Arc<Vec<i64>>,
     /// The one forum every topic lives in. Routing is a single rule — topic, inside this chat —
@@ -504,6 +513,7 @@ impl<S: Surface> Hub<S> {
             claims: Arc::new(Mutex::new(BTreeMap::new())),
             budgets: Arc::new(Mutex::new(crate::queue::Budgets::default())),
             send_permit: Arc::new(Mutex::new(())),
+            gist: crate::summarize::Summarizer::from_env().map(Arc::new),
             allowed_chats: Arc::new(allowed_chats),
             forum_chat,
             settle: DEFAULT_SETTLE,
@@ -739,20 +749,6 @@ impl<S: Surface> Hub<S> {
     #[cfg(test)]
     pub async fn is_claimed(&self, project: &ProjectId) -> bool {
         self.claims.lock().await.contains_key(project)
-    }
-
-    /// Which project owns a topic, if any.
-    ///
-    /// The hub's topics and the older pane path's topics live in the same forum, so a message typed
-    /// into one has to be told apart from a message typed into the other before anything tries to
-    /// route it.
-    pub async fn project_for_topic(&self, topic_id: i32) -> Option<ProjectId> {
-        self.registry
-            .lock()
-            .await
-            .all()
-            .find(|p| p.topic_id == Some(topic_id))
-            .map(|p| p.id.clone())
     }
 
     /// The topic a project's messages go in, created and greeted on first use.
@@ -1208,6 +1204,34 @@ impl<S: Surface> Hub<S> {
                 options,
             } => {
                 let options = options.unwrap_or_default();
+
+                // A one line summary above the question, when one is configured. The operator reads
+                // this on a phone and a long question is a wall of text he has to open before he
+                // can decide; the gist is what makes the notification itself useful.
+                //
+                // It NEVER replaces the question. A summary standing in for what was actually said
+                // is a defect this repo has already shipped once, and the eight voice rules that
+                // came out of it start with that one.
+                let text = match &self.gist {
+                    None => text,
+                    Some(g) => {
+                        let summarised = g.one_line(&text).await;
+                        // The trip-off is ONE WAY and it has to be said out loud, once. Until this
+                        // existed the only place it was ever said was the journal, which is not on
+                        // the phone he is reading — so a refusal that protected him and a gateway
+                        // that had merely gone quiet looked identical from the outside: summaries
+                        // simply stopped, with nothing saying why or that they were not coming back.
+                        if g.newly_off() {
+                            let _ = self
+                                .say(project, "I have stopped summarising. Questions still reach you in full.", &[])
+                                .await;
+                        }
+                        match summarised {
+                            None => text,
+                            Some(line) => format!("{line}\n\n{text}"),
+                        }
+                    }
+                };
 
                 // Telegram gives a button 64 bytes of `callback_data` and no more. The option id is
                 // minted by the BRIDGE, so it is agent-authored and arbitrary: too long and the API

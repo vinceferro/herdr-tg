@@ -34,24 +34,17 @@
 //! `5` herdr protocol error. Proof gate 6 asserts **3** (missing socket) and **4** (a server
 //! speaking protocol 19) exactly, and PLAN.md's failure table branches on them.
 
-mod audit;
 mod bot;
 mod cmd;
 mod config;
-mod deliver;
 mod heartbeat;
 mod hub;
 mod lock;
-mod mirror;
-mod notify;
-mod permission;
 mod queue;
 mod registry;
 mod render;
-mod routing;
 mod summarize;
 mod surface;
-mod voice;
 
 use std::io::{IsTerminal, Write};
 use std::num::NonZeroU32;
@@ -220,7 +213,8 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let socket_override = cli.socket.clone();
+    // Only the read-only commands need a herdr connection now. `serve` used to take one too,
+    // because the bot watched panes and could type into them; that path is gone.
     let client = connect(cli.socket)?;
     match cli.cmd {
         Cmd::Status { json, workspace } => {
@@ -250,13 +244,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let hub_lock = lock::HubLock::acquire(lock::state_dir())?;
             tracing::debug!(lock = %hub_lock.path().display(), "this process holds the hub lock");
             let cfg = config::Config::load(config.as_deref())?;
-            // `--socket` still wins; the config's socket is the next fallback, so a probe session
-            // can be targeted from the file the unit already reads.
-            let client = match (&socket_override, &cfg.socket) {
-                (None, Some(path)) => HerdrClient::new(path.clone()),
-                _ => client,
-            };
-            let outcome = bot::serve(cfg, client).await;
+            // `serve` takes no herdr client. It used to: the bot watched panes and could type into
+            // them. That whole path is deleted, so the bot's only inputs are Telegram and its own
+            // socket, and there is nothing for a herdr connection to do here.
+            let outcome = bot::serve(cfg).await;
             // Explicit, and not merely stylistic: the lock lives as long as this binding. Letting
             // it drop before `serve` returns would release it while the bot was still polling,
             // which is precisely the two-poller state it exists to prevent.

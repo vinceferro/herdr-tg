@@ -118,7 +118,25 @@ const DEFINING_MEMBER: &str = "crates/herdr-client";
 /// back, refuses to claim more than it observed, and writes an audit record.
 ///
 /// Widening this list is a decision about the operator's terminals. It should feel like one.
-const AUDITED_WRITE_PATH: &str = "crates/herdr-tg/src/deliver.rs";
+/// There is no longer ANY exempt file, and that is the point of this constant existing as a
+/// comment rather than a path.
+///
+/// The rule used to be "a write may appear in exactly one audited module", and the module was
+/// `crates/herdr-tg/src/deliver.rs`: it read the pane back after every write so that delivery was
+/// verified rather than assumed. Five review rounds could not make that safe, for a reason that
+/// was never about the code — herdr's protocol carries agent status and raw screen bytes and
+/// nothing about what an agent is ASKING, so anything answering a prompt is reconstructing
+/// structure that was already thrown away.
+///
+/// So the module is gone, and with it the exemption. The rule is now the stronger one it should
+/// always have been: **no file outside the defining crate may name a write method, at all.** An
+/// answer reaches an agent over the hub's socket, as a message in its own turn, and there is no
+/// code path from a Telegram message to a keyboard for a guard to have to police.
+///
+/// Re-introducing an exemption is re-introducing the class. If a write path is ever wanted again,
+/// it is a decision made deliberately, here, in this file, with a reviewer looking.
+#[allow(dead_code)]
+const NO_EXEMPT_FILE: () = ();
 
 /// The workspace root: `crates/herdr-client/` → up two.
 fn workspace_root() -> PathBuf {
@@ -1372,7 +1390,7 @@ fn names_a_write_outside_the_defining_crate(root: &Path) -> (usize, Vec<String>)
         let src = fs::read_to_string(file).expect("a source file in this repo is readable");
         for (n, line) in src.lines().enumerate() {
             for name in WRITE_NAMES {
-                if line.contains(name) && relp != AUDITED_WRITE_PATH {
+                if line.contains(name) {
                     offenders.push(format!("{relp}:{}: {}", n + 1, line.trim()));
                 }
             }
@@ -1395,9 +1413,11 @@ fn no_member_outside_the_client_crate_may_even_name_a_write_method() {
     assert!(
         offenders.is_empty(),
         "a workspace member outside `{DEFINING_MEMBER}` names a write method. These crates are \
-         what a timer, a cron job or a Telegram message can reach, so a write may appear in \
-         exactly ONE of their files: `{AUDITED_WRITE_PATH}`, which reads the pane back and audits. \
-         If this is a new legitimate write path, it belongs in that module, not beside it. \
+         what a timer, a cron job or a Telegram message can reach, and there is no longer any \
+         file among them where a write is allowed — the audited module that used to hold the one \
+         exemption has been deleted, because the problem it solved could not be solved. An answer \
+         reaches an agent over the hub's socket, in its own turn. If you are adding a write path, \
+         that is a decision to make deliberately in this file, not a line to slip past. \
          Found:\n  {}",
         offenders.join("\n  ")
     );
@@ -1441,7 +1461,7 @@ fn no_write_call_site_anywhere_outside_cfg_test() {
     let mut offenders = Vec::new();
     for file in &all {
         let relp = rel(&root, file);
-        if CALL_RULE_EXEMPT.contains(&relp.as_str()) || relp == AUDITED_WRITE_PATH {
+        if CALL_RULE_EXEMPT.contains(&relp.as_str()) {
             continue;
         }
         let src = fs::read_to_string(file).expect("a source file in this repo is readable");
@@ -1695,39 +1715,49 @@ fn char_literals_do_not_open_a_string_span() {
 /// 3. A second file is added to the list. That is a decision about the operator's terminals, and it
 ///    should require editing this assertion, not just appending a string.
 #[test]
-fn the_audited_write_path_exists_and_still_earns_its_exemption() {
+fn there_is_no_exempt_file_and_the_deleted_write_path_has_not_come_back() {
+    // The strongest form of this rule, and the one it should always have had.
+    //
+    // It used to say "a write may live in exactly one audited module". That module read the pane
+    // back after every write so delivery was verified rather than assumed, and it was excellent
+    // work against a problem that could not be solved: herdr's protocol carries agent status and
+    // raw screen bytes and nothing about what an agent is ASKING, so anything answering a prompt is
+    // reconstructing structure that was already discarded. Five review rounds proved that, and the
+    // module was deleted rather than mended.
+    //
+    // What this pins is that the deletion STAYS deleted. A file reappearing at that path would not
+    // be a compile error and would not be an exemption any more — it would simply be a new place
+    // for a keystroke to come from, and the two textual rules would catch it. This test is here so
+    // the failure names the history instead of reading as a mystery.
     let root = workspace_root();
-    let path = root.join(AUDITED_WRITE_PATH);
+    for gone in [
+        "crates/herdr-tg/src/deliver.rs",
+        "crates/herdr-tg/src/permission.rs",
+        "crates/herdr-tg/src/mirror.rs",
+    ] {
+        assert!(
+            !root.join(gone).is_file(),
+            "{gone} is back. It was deleted because reconstructing a prompt from a rendered screen \
+             could not be made safe — five rounds, and the last one still classified thirteen live \
+             controls as safe to type into. If a write path is genuinely wanted again, that is a \
+             decision to make deliberately, with a reviewer, not by restoring a file."
+        );
+    }
+
+    // And the exemption itself is gone from the rules above. A dangling exemption is worse than
+    // none: it looks like a guarantee and enforces nothing.
+    // The needles are assembled at run time. Written as literals they would appear in THIS file,
+    // and the test would find its own assertion and fail on the day it was written — which is
+    // exactly what happened the first time it ran.
+    let src = fs::read_to_string(root.join("crates/herdr-client/tests/no_live_write_call_site.rs"))
+        .expect("this file is readable");
+    let exempted = ["!=", "=="]
+        .iter()
+        .any(|op| src.contains(&format!("relp {op} AUDITED{}WRITE_PATH", "_")));
     assert!(
-        path.is_file(),
-        "AUDITED_WRITE_PATH points at {}, which does not exist. A dangling exemption is worse \
-         than none: it looks like a guarantee and enforces nothing.",
-        path.display()
-    );
-
-    let src = fs::read_to_string(&path).expect("the audited write path is readable");
-
-    // It must read the pane back. That is what distinguishes this module from any other caller and
-    // is the entire justification for letting writes live here.
-    assert!(
-        src.contains("read_visible"),
-        "{AUDITED_WRITE_PATH} no longer reads the pane back. Writes are permitted here ONLY \
-         because delivery is verified rather than assumed."
-    );
-
-    // It must not be able to claim delivery from an ack. The rung vocabulary is what keeps the
-    // operator's confirmation honest.
-    assert!(
-        src.contains("Rung::Acted"),
-        "{AUDITED_WRITE_PATH} no longer distinguishes what it observed from what it hopes. \
-         An `ok` from herdr means herdr took the bytes, never that the agent acted."
-    );
-
-    // Exactly one exemption. Widening this is a deliberate act.
-    assert_eq!(
-        AUDITED_WRITE_PATH, "crates/herdr-tg/src/deliver.rs",
-        "the audited write path moved. That is allowed — but update this assertion deliberately, \
-         because it is the only thing standing between a Telegram message and a keystroke."
+        !exempted,
+        "an exemption has been re-introduced into the write rules. That is allowed — but it is a \
+         deliberate act, and this assertion is the place to say so."
     );
 }
 
