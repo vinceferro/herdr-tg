@@ -16,3 +16,4 @@
 - [Cleanup after a `?` is cleanup that does not happen](cleanup-after-a-question-mark-is-cleanup-that-does-not-happen.md) — a socket's ordinary end is a read error, not EOF.
 - [The scratchpad lives inside this repo](the-scratchpad-lives-inside-this-repo.md) — subagent repo copies break the write guard and ate 8.8 GB.
 - [A sleep per caller is not a queue](a-sleep-per-caller-is-not-a-queue.md) — N sleepers wake together; one wins and the rest fall through to the failure branch.
+- [An edit script that aborts writes nothing](an-edit-script-that-aborts-writes-nothing.md) — the earlier replacements are lost too, and the commit message still claims them.
