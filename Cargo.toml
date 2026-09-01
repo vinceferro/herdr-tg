@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = ["crates/herdr-client", "crates/herdr-tg"]
+members  = ["crates/herdr-client", "crates/herdr-tg", "crates/hub-proto"]
 
 [workspace.package]
 edition      = "2024"

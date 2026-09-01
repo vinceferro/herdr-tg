@@ -1,0 +1,17 @@
+[package]
+name         = "hub-proto"
+version      = "0.1.0"
+edition      .workspace = true
+rust-version .workspace = true
+license      .workspace = true
+repository   .workspace = true
+description  = "The frames and the NDJSON framing spoken between the herdr-tg hub and a project's bridge."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+tokio      = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
