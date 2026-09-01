@@ -15,3 +15,4 @@
 - [A dev-dependency can keep a broken build green](a-dev-dependency-can-keep-a-broken-build-green.md) — cargo test sees features cargo build does not; check with `cargo check -p <crate>`.
 - [Cleanup after a `?` is cleanup that does not happen](cleanup-after-a-question-mark-is-cleanup-that-does-not-happen.md) — a socket's ordinary end is a read error, not EOF.
 - [The scratchpad lives inside this repo](the-scratchpad-lives-inside-this-repo.md) — subagent repo copies break the write guard and ate 8.8 GB.
+- [A sleep per caller is not a queue](a-sleep-per-caller-is-not-a-queue.md) — N sleepers wake together; one wins and the rest fall through to the failure branch.

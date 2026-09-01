@@ -82,6 +82,10 @@ pub enum EnrolError {
     /// The system refused to give us random bytes. Fail closed: a predictable token is worse than
     /// no token, and quietly falling back to a weaker source is how that happens.
     NoRandomness,
+    /// The existing registry cannot be read, so enrolling would replace every other project with
+    /// this one. Refused — and told how to recover, because refusing without a way forward turns a
+    /// bad byte into a locked door.
+    Unreadable { path: PathBuf, why: String },
 }
 
 impl std::fmt::Display for EnrolError {
@@ -96,6 +100,15 @@ impl std::fmt::Display for EnrolError {
             Self::NoRandomness => write!(
                 f,
                 "this machine would not give me random bytes, so I will not invent a secret"
+            ),
+            Self::Unreadable { path, why } => write!(
+                f,
+                "I cannot read the list of enrolled projects at {}, so enrolling now would replace \
+                 every other project with this one. Move that file aside and enrol them all again:\n\
+                 \n    mv {} {}.broken\n\nWhat went wrong reading it: {why}",
+                path.display(),
+                path.display(),
+                path.display()
             ),
         }
     }
@@ -132,6 +145,18 @@ impl Registry {
         // refuses to write, because a registry that cannot be read is exactly the state in which
         // nothing should be written over it.
         match read_projects(&self.path) {
+            // A file that has DISAPPEARED is not an empty registry. For `load` it is — nothing has
+            // been enrolled yet — but on a handle that already holds projects it is a loss, and
+            // adopting it would un-enrol everything and then write the emptiness back.
+            Ok(projects) if projects.is_empty() && !self.projects.is_empty() => {
+                Err(EnrolError::Io {
+                    what: "the registry".to_owned(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the registry file is gone or empty, but this process knows of enrolled projects",
+                    ),
+                })
+            }
             Ok(projects) => {
                 self.projects = projects;
                 Ok(())
@@ -198,9 +223,11 @@ impl Registry {
 
     /// Remember which topic a project's messages go to.
     pub fn bind_topic(&mut self, id: &ProjectId, topic_id: i32) -> Result<(), EnrolError> {
-        // Read-modify-write, never write-what-I-remember. Writing the in-memory map would put this
-        // process's snapshot back over anything enrolled at the terminal since it started — and a
-        // read that FAILED must abandon the write entirely rather than write what it could not read.
+        // Read-modify-write under the lock, never write-what-I-remember. Writing the in-memory map
+        // would put this process's snapshot back over anything enrolled at the terminal since it
+        // started — and a read that FAILED must abandon the write rather than write what it could
+        // not read.
+        let _held = self.hold()?;
         self.reread()?;
         if let Some(p) = self.projects.get_mut(id) {
             p.topic_id = Some(topic_id);
@@ -215,6 +242,7 @@ impl Registry {
     /// once and deliberately — never retried as if it were a transient network error, which would
     /// swallow the project's messages forever.
     pub fn unbind_topic(&mut self, id: &ProjectId) -> Result<(), EnrolError> {
+        let _held = self.hold()?;
         self.reread()?;
         if let Some(p) = self.projects.get_mut(id) {
             p.topic_id = None;
@@ -231,7 +259,11 @@ impl Registry {
         // binds topics while it runs. Enrolling must not undo that, and must not proceed at all if
         // the existing registry cannot be read: enrolling over a file we could not parse would
         // replace every other project with this one.
-        self.reread()?;
+        let _held = self.hold()?;
+        self.reread().map_err(|e| EnrolError::Unreadable {
+            path: self.path.clone(),
+            why: e.to_string(),
+        })?;
         let repo = repo.canonicalize().map_err(|_| EnrolError::NoSuchRepo {
             repo: repo.to_path_buf(),
         })?;
@@ -303,6 +335,37 @@ impl Registry {
         format!("{}-{suffix}", &base[..base.len().min(room)])
     }
 
+    /// Hold the registry's lock for a read-modify-write.
+    ///
+    /// Two processes write this file — the running hub, binding topics, and `herdr-tg enroll` at a
+    /// terminal — and temp-and-rename is only atomic against a reader, not against another
+    /// read-modify-write. Without this an enrolment the operator was told had succeeded could be
+    /// overwritten by a topic binding that had read the file a moment earlier.
+    ///
+    /// Blocking, deliberately. The hold is one small read and one rename, and a lock that could
+    /// fail would put the caller straight back into the race it was taken to prevent.
+    fn hold(&self) -> Result<fs::File, EnrolError> {
+        let path = self.path.with_extension("lock");
+        let io = |source| EnrolError::Io {
+            what: "the registry lock".to_owned(),
+            source,
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(io)?;
+        }
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(io)?;
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| io(std::io::Error::from(e)))?;
+        Ok(f)
+    }
+
     /// Atomic temp-and-rename at 0600.
     ///
     /// The state must survive a kill at any instant: a half-written registry that replaced a good
@@ -319,7 +382,12 @@ impl Registry {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir).map_err(io("the state directory"))?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        // A temp name per process. Both writers — the running hub and `herdr-tg enroll` at a
+        // terminal — used the SAME `projects.json.tmp`, so two saves could interleave inside one
+        // file and the rename that followed published whatever the loser had written.
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
         let body = serde_json::to_vec_pretty(&self.projects).map_err(|e| EnrolError::Io {
             what: "the registry".into(),
             source: e.into(),

@@ -47,6 +47,23 @@ impl Telegram {
     }
 }
 
+/// Compose the body a retired question is left showing.
+///
+/// The NOTE is the part that must always survive, so room is reserved for it and the QUESTION is
+/// what gets clipped. Clipping the composed string did the opposite: on exactly the long question
+/// this was written for, the clip ate the note off the end and the operator watched the keyboard
+/// vanish with no word of what had happened to it.
+///
+/// Escaping happens after clipping and can lengthen — `&` becomes five characters — so the reserve
+/// is measured on the escaped note, and the escaped body is clipped again as a backstop.
+fn retirement_body(original: &str, note: &str) -> String {
+    let note_room = escape_html(note).len() + 8;
+    let room = crate::queue::MAX_TEXT.saturating_sub(note_room);
+    let head = crate::queue::fit(original, room).0;
+    let body = escape_html(&format!("{head}\n\n\u{2713} {note}"));
+    crate::queue::fit(&body, crate::queue::MAX_TEXT).0
+}
+
 /// Does this error mean the topic is gone, as opposed to anything else?
 ///
 /// Deliberately narrow. A broad match here would turn an ordinary network failure into a topic
@@ -139,8 +156,14 @@ impl Surface for Telegram {
         // note adds length and escaping can multiply it — `&amp;` is five characters where one was.
         // An edit whose body is over Telegram's limit FAILS, and a failed edit leaves the answered
         // keyboard live, still offering a choice that has already been made.
-        let composed = format!("{original}\n\n\u{2713} {note}");
-        let body = escape_html(&crate::queue::fit(&composed, crate::queue::MAX_TEXT).0);
+        // The NOTE is the part that must always survive, so room is reserved for it and the
+        // QUESTION is what gets clipped. Clipping the composed string did the opposite: on exactly
+        // the long question this was written for, the clip ate the note off the end and the operator
+        // watched the keyboard vanish with no word of what happened to it.
+        //
+        // Escaping happens after, and can lengthen — `&` becomes five characters — so the reserve
+        // is measured on the escaped note and the escaped body is clipped again as a backstop.
+        let body = retirement_body(original, note);
         self.bot
             .edit_message_text(self.forum, MessageId(raw), body)
             .parse_mode(ParseMode::Html)
@@ -158,6 +181,41 @@ impl Surface for Telegram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_question_keeps_its_note_when_its_keyboard_is_retired() {
+        // The note is the whole point of the retirement. Clipping the COMPOSED string ate it off
+        // the end on exactly the long question the clip was written for, so the operator watched a
+        // keyboard vanish with no word of what had happened to it — which reads as the bot losing
+        // the question, the opposite of the reassurance this exists to give.
+        let long = "q".repeat(crate::queue::MAX_TEXT * 2);
+        let body = retirement_body(&long, "answered from your phone — Yes");
+        assert!(
+            body.contains("answered from your phone"),
+            "the note was clipped off the end: {}",
+            &body[body.len().saturating_sub(120)..]
+        );
+        assert!(
+            body.chars().count() <= crate::queue::MAX_TEXT,
+            "{}",
+            body.chars().count()
+        );
+        assert!(
+            body.starts_with("qqq"),
+            "the question was thrown away instead of clipped"
+        );
+    }
+
+    #[test]
+    fn a_retirement_body_escapes_the_question_and_the_note() {
+        let body = retirement_body("rm -rf <dir> && echo \"done\"", "answered — Yes & no");
+        assert!(
+            !body.contains("<dir>"),
+            "an unescaped tag reached an HTML message: {body}"
+        );
+        assert!(body.contains("&lt;dir&gt;"), "{body}");
+        assert!(body.contains("&amp;"), "{body}");
+    }
 
     #[test]
     fn every_colour_the_hub_can_pick_is_one_telegram_accepts() {

@@ -928,6 +928,183 @@ async fn a_retirement_that_fails_keeps_the_record_so_it_can_be_retired_later() {
 }
 
 #[tokio::test]
+async fn a_question_answered_once_can_never_be_answered_twice() {
+    // The defect the previous round's own fix created. Keeping the record after a failed
+    // retirement was right — the keyboard still needs taking away — but the record's PRESENCE was
+    // the authorisation, so the question stayed re-tappable on a keyboard the operator is still
+    // looking at. A second tap delivered a second, contradicting answer into a live agent.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite it?".into(),
+            options: Some(vec![
+                AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                },
+                AskOption {
+                    option_id: OptionId::new("n"),
+                    label: "No".into(),
+                },
+            ]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    // The retirement fails, which is what a 429, a network blip, or a message past its edit window
+    // all look like — so the keyboard is still there.
+    *h.fake.retire_fails.lock().await = true;
+    let msg = MsgId::new("m2");
+    let (project, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the first tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &project,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id,
+                    option_id: option,
+                }
+            )
+            .await
+    );
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+
+    // The record survives, so the keyboard can still be retired later.
+    assert!(
+        h.hub.ledger.lock().await.get(ALLOWED_CHAT, &msg).is_some(),
+        "the record was dropped, so the live keyboard can never be retired"
+    );
+
+    // And the still-live keyboard answers nothing.
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("n"))
+        .await
+        .expect_err("a second, contradicting answer reached the agent");
+    assert_eq!(refused, TapRefusal::AlreadyAnswered);
+    assert!(
+        refused.say().contains("already been answered"),
+        "{}",
+        refused.say()
+    );
+
+    // Not even the same answer again — one tap, one Choice.
+    assert!(
+        h.hub
+            .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_frame_the_hub_cannot_read_before_the_pong_does_not_kill_the_connection() {
+    // The post-pong loop was taught to survive a frame it cannot decode — which is exactly what a
+    // bridge one version ahead sends — and the settling window was not. It ended the connection and
+    // then audited it as "connected but never answered", blaming the bridge for the hub's own
+    // strictness on the one path where a bridge has not yet had a chance to say anything.
+    let h = harness().await;
+    let stream = tokio::net::UnixStream::connect(&h.sock)
+        .await
+        .expect("connect");
+    let (r, mut w) = stream.into_split();
+    let mut reader = FrameReader::new(r);
+
+    write_frame(
+        &mut w,
+        &Envelope::new(
+            FrameId::new("b1"),
+            BridgeFrame::Hello {
+                project_id: ProjectId::new("whatever"),
+                token: h.secret.clone(),
+                instance: "i1".into(),
+                repo: "/wherever".into(),
+                pid: std::process::id(),
+            },
+        ),
+    )
+    .await
+    .expect("hello");
+
+    let welcome = reader
+        .next::<HubFrame>()
+        .await
+        .expect("read")
+        .expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+
+    // A line this build cannot decode, before the pong.
+    tokio::io::AsyncWriteExt::write_all(
+        &mut w,
+        b"{\"v\":1,\"id\":\"x\",\"t\":\"say\",\"text\":12345}\n",
+    )
+    .await
+    .expect("write garbage");
+
+    let ping = reader
+        .next::<HubFrame>()
+        .await
+        .expect("read")
+        .expect("a ping");
+    assert!(matches!(ping.payload, HubFrame::Ping), "{:?}", ping.payload);
+    write_frame(
+        &mut w,
+        &Envelope::new(FrameId::new("b2"), BridgeFrame::Pong { r#ref: ping.id }),
+    )
+    .await
+    .expect("pong");
+
+    // The connection survived the bad frame and became live.
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    assert!(
+        h.hub.is_claimed(&h.project).await,
+        "one undecodable frame killed a connection that went on to answer"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_talks_before_answering_is_stopped_rather_than_buffered_without_limit() {
+    // The buffer that keeps a question asked before the pong was an unbounded Vec — one connection
+    // could hand the hub as much as it could write in the settling window, before it had proved it
+    // was there at all.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    let welcome = bridge.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+
+    // Well past the 64-frame bound, and never a pong.
+    for n in 0..200 {
+        bridge
+            .send(BridgeFrame::Say {
+                text: format!("flood {n}"),
+                hint: None,
+            })
+            .await;
+    }
+
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+    assert!(
+        h.fake.topics.lock().await.is_empty(),
+        "a bridge that never answered was given a topic"
+    );
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        audit.contains("more before answering"),
+        "the flood was reported as ordinary silence, which sends the operator the wrong way:\n{audit}"
+    );
+}
+
+#[tokio::test]
 async fn a_tap_on_a_button_nobody_wrote_down_is_refused() {
     let h = harness().await;
     let refused = h

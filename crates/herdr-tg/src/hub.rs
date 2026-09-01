@@ -158,6 +158,18 @@ pub struct AskRecord {
     /// Which run of the worker asked. A tap on a menu drawn for a session that has since restarted
     /// is refused with a reason, rather than answered into a process that never asked.
     pub instance: String,
+    /// What was already answered, if anything.
+    ///
+    /// The record's presence used to BE the authorisation, which was fine only while the record was
+    /// deleted the instant a tap landed. Once a failed retirement started keeping the record — so
+    /// the keyboard could be retired later — presence stopped meaning "unanswered", and the still
+    /// live keyboard on the operator's phone became re-tappable: a second tap delivered a second,
+    /// contradicting `Choice` into an agent that had already been answered. Worse the other way
+    /// round, an agent that answered at its own terminal could still be sent a phone tap.
+    ///
+    /// So authorisation is this field, and the record's presence is only retirement bookkeeping.
+    #[serde(default)]
+    pub answered: Option<OptionId>,
 }
 
 /// Why a tap did not become an answer. Every one of these is said out loud in the topic.
@@ -171,6 +183,9 @@ pub enum TapRefusal {
     NotConnected,
     /// It asked, then restarted. The question belongs to a process that no longer exists.
     Restarted,
+    /// It has already been answered — from the phone or at the terminal — and the keyboard is only
+    /// still there because taking it away failed.
+    AlreadyAnswered,
     /// The tap came from a chat this bot does not answer.
     NotYours,
 }
@@ -188,6 +203,9 @@ impl TapRefusal {
             }
             Self::Restarted => {
                 "That question belonged to a session that has since restarted. Ask again and it will come back."
+            }
+            Self::AlreadyAnswered => {
+                "That one has already been answered. I have not sent anything."
             }
             Self::NotYours => "",
         }
@@ -260,6 +278,21 @@ impl AskLedger {
 
     pub fn get(&self, chat_id: i64, msg_id: &MsgId) -> Option<&AskRecord> {
         self.records.get(&ledger_key(chat_id, msg_id))
+    }
+
+    /// Write down that a question has been answered, so it cannot be answered again.
+    ///
+    /// The record stays — the keyboard may still need retiring — but it stops authorising anything.
+    pub fn mark_answered(
+        &mut self,
+        chat_id: i64,
+        msg_id: &MsgId,
+        option_id: &OptionId,
+    ) -> std::io::Result<()> {
+        if let Some(r) = self.records.get_mut(&ledger_key(chat_id, msg_id)) {
+            r.answered = Some(option_id.clone());
+        }
+        self.save()
     }
 
     /// Forget a question that has been answered or withdrawn.
@@ -574,13 +607,41 @@ impl<S: Surface> Hub<S> {
         if !record.options.iter().any(|o| &o.option_id == option_id) {
             return Err(TapRefusal::NotAnOption);
         }
+        if record.answered.is_some() {
+            return Err(TapRefusal::AlreadyAnswered);
+        }
 
-        let claims = self.claims.lock().await;
-        let Some(claim) = claims.get(&record.project) else {
-            return Err(TapRefusal::NotConnected);
-        };
-        if claim.instance != record.instance {
-            return Err(TapRefusal::Restarted);
+        // The connection is checked BEFORE the record is marked, so a tap that could not be
+        // delivered leaves the question answerable — refusing it and then closing it would burn the
+        // operator's only way to answer.
+        {
+            let claims = self.claims.lock().await;
+            let Some(claim) = claims.get(&record.project) else {
+                return Err(TapRefusal::NotConnected);
+            };
+            if claim.instance != record.instance {
+                return Err(TapRefusal::Restarted);
+            }
+        }
+
+        // Marked HERE, under the ledger lock, as part of resolving. Doing it after the caller has
+        // delivered would leave a window in which a second tap resolves too — and the window is
+        // exactly as long as a Telegram round trip, on a keyboard the operator is still looking at.
+        {
+            let mut ledger = self.ledger.lock().await;
+            match ledger.get(chat_id, msg_id) {
+                None => return Err(TapRefusal::NoRecord),
+                Some(fresh) if fresh.answered.is_some() => {
+                    return Err(TapRefusal::AlreadyAnswered);
+                }
+                Some(_) => {}
+            }
+            if let Err(e) = ledger.mark_answered(chat_id, msg_id, option_id) {
+                // Fail closed: if the answer cannot be written down, it must not be sent. An
+                // unrecorded answer is one that can be given again.
+                tracing::error!(error = %e, "could not write down that a question was answered");
+                return Err(TapRefusal::NoRecord);
+            }
         }
         Ok((record.project, record.ask_id, option_id.clone()))
     }
@@ -711,7 +772,17 @@ impl<S: Surface> Hub<S> {
             return Ok(id);
         }
         let id = self.surface.create_topic(&title, colour).await?;
-        self.registry.lock().await.bind_topic(project, id)?;
+        // A bind that fails must not be reported as a topic. Returning Ok here meant the next
+        // message created ANOTHER topic, and the one before it was orphaned — one new empty topic
+        // per message, for as long as the registry stayed unreadable, with every message dropped.
+        if let Err(e) = self.registry.lock().await.bind_topic(project, id) {
+            tracing::error!(
+                project = %project, topic = id, error = %e,
+                "made a topic and could not write it down; it is orphaned and no message will be \
+                 sent until the registry is readable again"
+            );
+            return Err(e.into());
+        }
         // Greeted immediately, in the same breath as being created — the greeting is what makes the
         // topic appear in the list at all. Through the SAME budgeted, audited path as everything
         // else: a greeting that skipped the budget was a writer the ceiling could not see, and one
@@ -753,8 +824,18 @@ impl<S: Surface> Hub<S> {
         // sender waits its own turn once instead of racing the others for one token. The deadline
         // bounds the whole thing, because this is called from the connection's read loop and a
         // bridge whose socket goes unread for minutes is a bridge whose `bye` is missed.
-        let _turn = self.send_permit.lock().await;
+        // The deadline starts BEFORE the permit is acquired, because the queue is most of the wait.
+        // Starting it afterwards bounded only the sleep, so a bridge behind nine others could sit in
+        // the read loop for a minute and then still be told it was too fast.
         let give_up_at = std::time::Instant::now() + MAX_PACE_WAIT;
+        let turn = match tokio::time::timeout(MAX_PACE_WAIT, self.send_permit.lock()).await {
+            Ok(t) => t,
+            Err(_) => {
+                let outcome = SendOutcome::TooFast(MAX_PACE_WAIT);
+                let _ = self.audit.outcome(project, &outcome);
+                return outcome;
+            }
+        };
         loop {
             let verdict = {
                 let mut budgets = self.budgets.lock().await;
@@ -776,6 +857,11 @@ impl<S: Surface> Hub<S> {
                 }
             }
         }
+
+        // The permit is released HERE, before the network call. It exists to order the waiting, not
+        // to serialise Telegram: holding it across `surface.send` made one slow round trip a pause
+        // for every other project's read loop.
+        drop(turn);
 
         // Clipped here rather than by the surface, because whether anything was lost is a fact the
         // BRIDGE has to be told, and only this side is holding the ack.
@@ -952,6 +1038,8 @@ impl<S: Surface> Hub<S> {
         // sitting blocked on an answer that could never come. Buffered here and replayed the
         // moment the project is live.
         let mut waiting: Vec<Envelope<BridgeFrame>> = Vec::new();
+        let mut waiting_bytes = 0usize;
+        let mut overflowed = false;
         let live = tokio::time::timeout(self.settle, async {
             loop {
                 match reader.next::<BridgeFrame>().await {
@@ -961,7 +1049,24 @@ impl<S: Surface> Hub<S> {
                         {
                             return true;
                         }
+                        // BOUNDED, by count and by bytes. An unbounded Vec here let one connection
+                        // hand the hub as much as it could write in the settling window — measured
+                        // at 18 MB in 450 ms — before it had proved it was even there. The count
+                        // matches the outbox's own 64.
+                        waiting_bytes += frame_cost(&frame.payload);
+                        if waiting.len() >= 64 || waiting_bytes > 4 * hub_proto::MAX_FRAME_BYTES {
+                            overflowed = true;
+                            return false;
+                        }
                         waiting.push(frame);
+                    }
+                    // A line this build cannot DECODE is one bad frame, not a dead peer — and it is
+                    // exactly what a bridge one version ahead sends. The post-pong loop survives it;
+                    // this one used to end the connection and then audit it as "never answered",
+                    // which blames the bridge for the hub's own strictness.
+                    Err(hub_proto::ProtoError::Decode { source, len }) => {
+                        tracing::warn!(len, error = %source, "a frame this build cannot read, before the pong; ignoring it");
+                        continue;
                     }
                     _ => return false,
                 }
@@ -971,11 +1076,17 @@ impl<S: Surface> Hub<S> {
         .unwrap_or(false);
 
         if !live {
-            tracing::warn!(
-                project = %project,
-                "a bridge connected and did not answer; it is probably not allowed to talk to me"
-            );
-            let _ = self.audit.refused(&project, "connected but never answered");
+            // Two different failures, said differently. A bridge that filled the buffer is talking
+            // too much before it has proved it is there; one that said nothing is probably a channel
+            // plugin that is not allowlisted, which boots and exits in about a tenth of a second.
+            // Reporting the first as the second sends the operator looking in the wrong place.
+            let why = if overflowed {
+                "sent more before answering than the hub will hold for it"
+            } else {
+                "connected but never answered; it is probably not allowed to talk to me"
+            };
+            tracing::warn!(project = %project, why, "a bridge did not become live");
+            let _ = self.audit.refused(&project, why);
             self.release(&project, pid).await;
             writer.abort();
             return Ok(());
@@ -1040,9 +1151,14 @@ impl<S: Surface> Hub<S> {
                     // bridge told its frame was too big can split it; one handed a dead socket can
                     // only guess. Dropping `tx` ends the writer's loop; the timeout is there
                     // because a peer that has stopped reading must not hold this open forever.
+                    // Released FIRST. Waiting on the writer while still holding the claim meant a
+                    // bridge doing the documented thing — split the frame, reconnect — was refused
+                    // `already_claimed` for two seconds by the connection it had just been told to
+                    // abandon. And releasing drops the claim's own `Sender`, so the writer's channel
+                    // really closes and it ends at once rather than at the timeout.
+                    self.release(&project, pid).await;
                     drop(tx);
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
-                    self.release(&project, pid).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -1152,6 +1268,7 @@ impl<S: Surface> Hub<S> {
                         // Telegram's 4096 is an edit that fails, which leaves the answered keyboard
                         // live and still offering choices that have already been made.
                         text: crate::queue::fit(&text, crate::queue::MAX_TEXT).0,
+                        answered: None,
                     };
                     if let Err(e) = self
                         .ledger
@@ -1295,6 +1412,20 @@ impl<S: Surface> Hub<S> {
                 ),
             }
         }
+    }
+}
+
+/// Roughly what one buffered frame costs to hold, for the pre-pong bound.
+///
+/// The text is the whole of it in practice; the rest is a fixed handful of bytes. Exact accounting
+/// would mean encoding a frame this side is about to hand straight to `handle`, which is a cost
+/// paid on every frame to make a bound slightly tighter.
+fn frame_cost(frame: &BridgeFrame) -> usize {
+    match frame {
+        BridgeFrame::Say { text, .. }
+        | BridgeFrame::Done { text }
+        | BridgeFrame::Ask { text, .. } => text.len() + 64,
+        _ => 64,
     }
 }
 
