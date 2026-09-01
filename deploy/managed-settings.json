@@ -1,0 +1,7 @@
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "herdr-tg-local", "plugin": "kickoff-channel" },
+    { "marketplace": "claude-plugins-official", "plugin": "telegram" }
+  ]
+}

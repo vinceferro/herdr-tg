@@ -59,3 +59,7 @@ opencode.json
 .kickoff/leak-denylist.txt
 # Left behind by the repin's manifest reclassification.
 .kickoff/adopt-manifest.json.pre-reclass-*
+
+# The channel plugin resolves its own dependencies with `bun install` at start; 28 MB of them
+# do not belong in a public repo. bun.lock IS committed, so the resolve is reproducible.
+node_modules/
