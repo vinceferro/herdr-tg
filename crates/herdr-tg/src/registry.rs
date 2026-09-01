@@ -120,9 +120,27 @@ impl Registry {
     /// It is a few kilobytes, and it is read on admission and before every write, both of which are
     /// rare. Cheap enough that a cache would be an optimisation nobody asked for and a staleness
     /// bug somebody eventually finds.
-    pub fn reread(&mut self) {
-        let fresh = Self::load(&self.path);
-        self.projects = fresh.projects;
+    pub fn reread(&mut self) -> Result<(), EnrolError> {
+        // Adopted ONLY on a clean read. The first version of this called `load`, which reports an
+        // unreadable or corrupt file by returning an EMPTY map — correct for a constructor, and
+        // catastrophic here: one transient failed read un-enrolled every project in the shared
+        // handle, and the very next `save()` wrote that emptiness over the file. The hub would have
+        // erased the enrolments it exists to protect, then refused every project, with nothing
+        // anywhere saying why.
+        //
+        // A read that fails leaves what was already in memory alone and says so. The caller then
+        // refuses to write, because a registry that cannot be read is exactly the state in which
+        // nothing should be written over it.
+        match read_projects(&self.path) {
+            Ok(projects) => {
+                self.projects = projects;
+                Ok(())
+            }
+            Err(source) => Err(EnrolError::Io {
+                what: "the registry".to_owned(),
+                source,
+            }),
+        }
     }
 
     /// Read the registry, or start empty.
@@ -133,21 +151,14 @@ impl Registry {
     /// re-enrolling. Neither is good, and the loud line is what stops the bad one being silent.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let projects = match fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<BTreeMap<ProjectId, Project>>(&raw) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e, path = %path.display(),
-                        "the project registry could not be read, so NO project can connect until \
-                         it is re-enrolled. The old file has been left exactly as it is."
-                    );
-                    BTreeMap::new()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        let projects = match read_projects(&path) {
+            Ok(p) => p,
             Err(e) => {
-                tracing::error!(error = %e, path = %path.display(), "the project registry is unreadable");
+                tracing::error!(
+                    error = %e, path = %path.display(),
+                    "the project registry could not be read, so NO project can connect until it is \
+                     re-enrolled. The file has been left exactly as it is."
+                );
                 BTreeMap::new()
             }
         };
@@ -188,8 +199,9 @@ impl Registry {
     /// Remember which topic a project's messages go to.
     pub fn bind_topic(&mut self, id: &ProjectId, topic_id: i32) -> Result<(), EnrolError> {
         // Read-modify-write, never write-what-I-remember. Writing the in-memory map would put this
-        // process's snapshot back over anything enrolled at the terminal since it started.
-        self.reread();
+        // process's snapshot back over anything enrolled at the terminal since it started — and a
+        // read that FAILED must abandon the write entirely rather than write what it could not read.
+        self.reread()?;
         if let Some(p) = self.projects.get_mut(id) {
             p.topic_id = Some(topic_id);
         }
@@ -203,7 +215,7 @@ impl Registry {
     /// once and deliberately — never retried as if it were a transient network error, which would
     /// swallow the project's messages forever.
     pub fn unbind_topic(&mut self, id: &ProjectId) -> Result<(), EnrolError> {
-        self.reread();
+        self.reread()?;
         if let Some(p) = self.projects.get_mut(id) {
             p.topic_id = None;
         }
@@ -216,8 +228,10 @@ impl Registry {
     /// process can read it back.
     pub fn enrol(&mut self, repo: &Path) -> Result<(Project, String), EnrolError> {
         // Another process may have written since this handle was made — including the hub, which
-        // binds topics while it runs. Enrolling must not undo that.
-        self.reread();
+        // binds topics while it runs. Enrolling must not undo that, and must not proceed at all if
+        // the existing registry cannot be read: enrolling over a file we could not parse would
+        // replace every other project with this one.
+        self.reread()?;
         let repo = repo.canonicalize().map_err(|_| EnrolError::NoSuchRepo {
             repo: repo.to_path_buf(),
         })?;
@@ -352,6 +366,20 @@ fn write_token_file(repo: &Path, secret: &str) -> Result<(), EnrolError> {
     // which only applies at creation. A token that was once 0644 would stay 0644 forever.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
         .map_err(io("the project's token file"))
+}
+
+/// Read the registry file. An ABSENT file is an empty registry; anything else is an error.
+///
+/// The distinction is the whole point. "Not there yet" and "there and unreadable" look identical
+/// once both become an empty map, and treating the second as the first is how a registry gets
+/// erased by the process that was meant to be protecting it.
+fn read_projects(path: &Path) -> std::io::Result<BTreeMap<ProjectId, Project>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e),
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

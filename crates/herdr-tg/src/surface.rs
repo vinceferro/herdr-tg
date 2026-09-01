@@ -135,11 +135,12 @@ impl Surface for Telegram {
         // opposite of the reassurance this exists to give. `edit_message_text` sent without a
         // reply_markup both replaces the text and removes the buttons, so there is no window where
         // one has happened and the other has not.
-        let body = format!(
-            "{}\n\n\u{2713} {}",
-            escape_html(original),
-            escape_html(note)
-        );
+        // Re-clipped AFTER composing. `original` is already the clipped text that was sent, but the
+        // note adds length and escaping can multiply it — `&amp;` is five characters where one was.
+        // An edit whose body is over Telegram's limit FAILS, and a failed edit leaves the answered
+        // keyboard live, still offering a choice that has already been made.
+        let composed = format!("{original}\n\n\u{2713} {note}");
+        let body = escape_html(&crate::queue::fit(&composed, crate::queue::MAX_TEXT).0);
         self.bot
             .edit_message_text(self.forum, MessageId(raw), body)
             .parse_mode(ParseMode::Html)

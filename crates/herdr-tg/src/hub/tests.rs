@@ -32,6 +32,9 @@ struct FakeTelegram {
     next_msg: AtomicI64,
     /// Set to make the next send report the topic as deleted, for the rebinding test.
     topic_gone_once: AsyncMutex<bool>,
+    /// Set to make retiring a keyboard fail, which is what an edit past Telegram's limit, or on a
+    /// message older than 48 hours, actually does.
+    retire_fails: AsyncMutex<bool>,
 }
 
 impl Surface for FakeTelegram {
@@ -64,6 +67,9 @@ impl Surface for FakeTelegram {
         original: &str,
         note: &str,
     ) -> anyhow::Result<()> {
+        if *self.retire_fails.lock().await {
+            anyhow::bail!("the edit was refused");
+        }
         // Both halves are recorded, because a retirement that drops the question is exactly the
         // defect this signature grew a parameter to close.
         self.retired
@@ -780,6 +786,145 @@ async fn a_tap_answered_from_the_phone_takes_the_keyboard_away() {
         "the question was thrown away instead of kept beside its answer: {body}"
     );
     assert!(body.contains("answered from your phone"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn several_projects_sending_at_once_all_get_through() {
+    // The half of the pacing fix that a single-sender test cannot see, and it was open.
+    //
+    // The first version let each sender sleep ONCE and then shed. With more than one project every
+    // waiter sleeps the same second, they all wake together, one wins the token, and the rest have
+    // already spent their single sleep and fall through to the shed. Measured on the real code:
+    // ten projects saying one thing each produced two sends and eight sheds, with sixteen of the
+    // eighteen per-minute tokens unspent. Six bridges opening with a question left five agents
+    // blocked and four topics bound-but-empty.
+    //
+    // Real budget, no `with_budget`: what is under test is the rhythm itself.
+    let h = harness().await;
+    let hub = Arc::new(Hub::new(
+        Arc::clone(&h.fake),
+        Registry::load(h.dir.path().join("projects.json")),
+        AskLedger::load(h.dir.path().join("asks4.json")),
+        HubAudit::new(h.dir.path().join("hub4.audit.log")),
+        vec![ALLOWED_CHAT],
+        ALLOWED_CHAT,
+    ));
+    // Bind the topic first so the greeting is not part of what is being counted.
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.project, 1001)
+        .expect("bind");
+
+    const SENDERS: usize = 6;
+    let mut tasks = Vec::new();
+    for n in 0..SENDERS {
+        let hub = Arc::clone(&hub);
+        let project = h.project.clone();
+        tasks.push(tokio::spawn(async move {
+            hub.say(&project, &format!("project {n} says something"), &[])
+                .await
+        }));
+    }
+
+    let mut sent = 0;
+    let mut shed = Vec::new();
+    for t in tasks {
+        match t.await.expect("a sender") {
+            SendOutcome::Sent(_) | SendOutcome::Clamped(_) => sent += 1,
+            other => shed.push(other),
+        }
+    }
+    assert_eq!(
+        sent,
+        SENDERS,
+        "{} of {SENDERS} messages were shed while the per-minute ceiling was nowhere near: {shed:?}",
+        shed.len()
+    );
+}
+
+#[tokio::test]
+async fn a_registry_that_cannot_be_read_is_never_written_over() {
+    // A fix that introduced a worse defect than the one it closed. `reread` called `load`, which
+    // reports an unreadable file by returning an EMPTY map — right for a constructor, catastrophic
+    // here: one failed read un-enrolled every project in the shared handle, and the very next save
+    // wrote that emptiness to disk. The hub would have erased the enrolments it exists to protect.
+    let d = tempfile::tempdir().expect("tmp");
+    let path = d.path().join("projects.json");
+    let repo = d.path().join("herdr-tg");
+    std::fs::create_dir_all(&repo).expect("repo");
+
+    let mut registry = Registry::load(&path);
+    let (project, secret) = registry.enrol(&repo).expect("enrols");
+    let good = std::fs::read_to_string(&path).expect("readable");
+
+    // The file becomes unreadable while the hub is running — a truncated write, a bad byte, a disk
+    // that answered badly once.
+    std::fs::write(&path, "{ not json at all").expect("corrupt it");
+
+    assert!(
+        registry.bind_topic(&project.id, 99).is_err(),
+        "the hub wrote to a registry it could not read"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("still there"),
+        "{ not json at all",
+        "the unreadable file was overwritten — the only copy of what was enrolled"
+    );
+    assert!(
+        registry.resolve(&secret).is_some(),
+        "a failed read emptied the in-memory registry, so every project was refused"
+    );
+
+    // And once the file is good again, everything works and nothing was lost.
+    std::fs::write(&path, good).expect("restore");
+    registry
+        .bind_topic(&project.id, 99)
+        .expect("binds once readable");
+    assert_eq!(
+        Registry::load(&path)
+            .get(&project.id)
+            .and_then(|p| p.topic_id),
+        Some(99)
+    );
+}
+
+#[tokio::test]
+async fn a_retirement_that_fails_keeps_the_record_so_it_can_be_retired_later() {
+    // Fail closed: the order is "the buttons are gone, therefore the record may go", never the
+    // reverse. Forgetting first left a live keyboard with nothing behind it — still tappable, still
+    // offering a choice already made, and the next tap answered "I have no record of that question".
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite it?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    *h.fake.retire_fails.lock().await = true;
+    h.hub
+        .answered_from_phone(ALLOWED_CHAT, &MsgId::new("m2"), "Yes")
+        .await;
+
+    assert!(
+        h.hub
+            .ledger
+            .lock()
+            .await
+            .get(ALLOWED_CHAT, &MsgId::new("m2"))
+            .is_some(),
+        "the record was forgotten even though the keyboard is still on the operator's phone"
+    );
 }
 
 #[tokio::test]

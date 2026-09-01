@@ -36,9 +36,29 @@ pub const MIN_GAP: Duration = Duration::from_millis(1000);
 /// cannot become one that is over it after rendering.
 pub const MAX_TEXT: usize = 3500;
 
-/// What a caller must do about a send that cannot go out yet.
+/// What a caller must do about a send that cannot go out yet — and WHICH limit refused it.
+///
+/// The two are not interchangeable and a caller that cannot tell them apart gets it wrong. The
+/// one-second gap is a rhythm: wait a beat and the message still goes. The per-minute ceiling is a
+/// real limit: waiting for it means waiting minutes, and the honest answer is to shed and say when
+/// to come back. An earlier version returned only a duration and guessed from its size, which held
+/// for one sender and failed the moment there were two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RetryAfter(pub Duration);
+pub enum Refusal {
+    /// Too soon after the last message. Waiting this long is enough.
+    Gap(Duration),
+    /// The per-minute budget is spent. This is a real ceiling.
+    Ceiling(Duration),
+}
+
+impl Refusal {
+    /// How long until it is worth trying again.
+    pub fn wait(self) -> Duration {
+        match self {
+            Self::Gap(d) | Self::Ceiling(d) => d,
+        }
+    }
+}
 
 /// One chat's outbound budget: a token bucket plus a minimum gap.
 #[derive(Debug)]
@@ -63,22 +83,22 @@ impl ChatBudget {
 
     /// Try to spend one send.
     ///
-    /// `Err(RetryAfter)` is a real instruction, not advice: sending anyway is how a bot earns a 429,
+    /// `Err(Refusal)` is a real instruction, not advice: sending anyway is how a bot earns a 429,
     /// and a 429 on a shared bot punishes every project rather than the one that caused it.
-    pub fn take(&mut self, now: Instant) -> Result<(), RetryAfter> {
+    pub fn take(&mut self, now: Instant) -> Result<(), Refusal> {
         self.refill(now);
 
         if let Some(last) = self.last_send {
             let since = now.saturating_duration_since(last);
             if since < self.min_gap {
-                return Err(RetryAfter(self.min_gap - since));
+                return Err(Refusal::Gap(self.min_gap - since));
             }
         }
         if self.tokens < 1.0 {
             // How long until one whole token exists again.
             let need = 1.0 - self.tokens;
             let per_sec = self.per_minute as f64 / 60.0;
-            return Err(RetryAfter(Duration::from_secs_f64(need / per_sec)));
+            return Err(Refusal::Ceiling(Duration::from_secs_f64(need / per_sec)));
         }
         self.tokens -= 1.0;
         self.last_send = Some(now);
@@ -125,7 +145,7 @@ impl Budgets {
         }
     }
 
-    pub fn take(&mut self, chat_id: i64, now: Instant) -> Result<(), RetryAfter> {
+    pub fn take(&mut self, chat_id: i64, now: Instant) -> Result<(), Refusal> {
         let (per_minute, min_gap) = (self.per_minute, self.min_gap);
         self.chats
             .entry(chat_id)
@@ -178,7 +198,8 @@ mod tests {
             for _project in 0..6 {
                 match budgets.take(chat, now) {
                     Ok(()) => allowed += 1,
-                    Err(RetryAfter(d)) => {
+                    Err(r) => {
+                        let d = r.wait();
                         refused += 1;
                         assert!(d > Duration::ZERO, "a refusal must say when to come back");
                         assert!(
@@ -208,9 +229,14 @@ mod tests {
         let mut b = ChatBudget::default();
         let now = Instant::now();
         assert!(b.take(now).is_ok());
-        let Err(RetryAfter(wait)) = b.take(now) else {
+        let Err(refusal) = b.take(now) else {
             panic!("two sends in one instant were both allowed");
         };
+        assert!(
+            matches!(refusal, Refusal::Gap(_)),
+            "the one-second rhythm was reported as the per-minute ceiling: {refusal:?}"
+        );
+        let wait = refusal.wait();
         assert!(wait <= MIN_GAP && wait > Duration::ZERO, "{wait:?}");
     }
 

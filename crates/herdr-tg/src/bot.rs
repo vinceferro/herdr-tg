@@ -840,7 +840,18 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     // Without it, every confirmation and every refusal lands in the forum's General topic, so the
     // answer to "what did I just send, and to which project" appears somewhere other than the
     // project it belongs to.
-    let mut reply_thread: Option<i32> = None;
+    // Seeded from the update itself, and only THEN overridden by the ledger.
+    //
+    // Taking it from the ledger alone meant that every reply which had no ledger record — which is
+    // all four refusals, and they are the most common outcome of a tap that goes wrong — landed in
+    // the forum's General topic instead of beside the question the operator was looking at. The
+    // callback's own message knows which thread it is in whether or not the hub remembers it.
+    let mut reply_thread: Option<i32> = q
+        .message
+        .as_ref()
+        .and_then(|m| m.regular_message())
+        .and_then(|m| m.thread_id)
+        .map(|t| t.0.0);
     let reply = match data.split('|').collect::<Vec<_>>().as_slice() {
         // This also answers taps on buttons still sitting in the group's history from before the
         // topic became the aim.
@@ -884,12 +895,15 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                 match msg_id {
                     None => escape_html("I cannot tell which question that button belongs to."),
                     Some(msg_id) => {
-                        reply_thread = hub
+                        if let Some(topic) = hub
                             .ledger
                             .lock()
                             .await
                             .get(chat_id, &msg_id)
-                            .map(|r| r.topic_id);
+                            .map(|r| r.topic_id)
+                        {
+                            reply_thread = Some(topic);
+                        }
                         match hub.resolve_tap(chat_id, &msg_id, &option_id).await {
                             Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
                             Err(why) => escape_html(why.say()),
@@ -977,11 +991,36 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
     };
 
     let Ok(cmd) = Command::parse(text, &ctx.username) else {
+        let thread = msg.thread_id.map(|t| t.0.0);
+
+        // A sentence typed into one of the HUB's topics must not fall through to the pane router.
+        // It found no pane, of course, and answered "I don't know which session you mean. Open a
+        // session's topic…" — to someone who was standing in a session's topic — and posted that
+        // into General, where he was not looking. Relaying typed replies to a bridge is a later
+        // slice; until then the refusal has to be true, and it has to appear where he typed.
+        if let (Some(hub), Some(thread)) = (&ctx.hub, thread)
+            && let Some(project) = hub.project_for_topic(thread).await
+        {
+            tracing::info!(chat_id, %project, "a typed reply in a hub topic; not relayed yet");
+            let mut out = bot
+                .send_message(
+                    msg.chat.id,
+                    escape_html(
+                        "I cannot pass typed replies through to this project yet — use the \
+                         buttons on its questions.",
+                    ),
+                )
+                .parse_mode(ParseMode::Html);
+            out = out.message_thread_id(ThreadId(MessageId(thread)));
+            let _ = out.await;
+            return Ok(());
+        }
+
         let body = route_and_deliver(
             &ctx,
             chat_id,
             msg.reply_to_message().map(|m| m.id.0 as i64),
-            msg.thread_id.map(|t| t.0.0),
+            thread,
             text,
         )
         .await;

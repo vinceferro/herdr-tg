@@ -57,6 +57,15 @@ use crate::registry::Registry;
 /// How long after `hello` the hub waits for a `pong` before calling a project live.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
 
+/// The longest a send will wait its turn in the pacing queue before shedding instead.
+///
+/// Not a rate limit — the rate limits live in `queue.rs`. This bounds how long the connection's
+/// read loop can be blocked behind its own outgoing message, because a bridge whose socket goes
+/// unread for minutes is a bridge whose `bye` is missed and whose claim lingers. Ten seconds is
+/// nine more than the one-second rhythm needs and far less than the per-minute ceiling implies, so
+/// a burst that fits under the ceiling drains and a genuine flood still sheds.
+pub const MAX_PACE_WAIT: Duration = Duration::from_secs(10);
+
 /// Telegram's own ceiling on a button's `callback_data`. Not ours to raise.
 ///
 /// The `h|` prefix comes out of this budget, which is why the check is `len + 2`.
@@ -434,6 +443,9 @@ pub struct Hub<S: Surface> {
     /// One outbound budget per chat, because Telegram's ceiling is per chat and forum topics do
     /// not get one of their own. Six busy projects share it.
     budgets: Arc<Mutex<crate::queue::Budgets>>,
+    /// Whose turn it is to send. Held for the whole of one send's pacing wait, so that projects
+    /// queue for the rhythm instead of racing for it — see `send_into` for what racing cost.
+    send_permit: Arc<Mutex<()>>,
     /// Which chats this bot answers. Checked first, before any state is touched.
     allowed_chats: Arc<Vec<i64>>,
     /// The one forum every topic lives in. Routing is a single rule — topic, inside this chat —
@@ -458,6 +470,7 @@ impl<S: Surface> Hub<S> {
             audit: Arc::new(audit),
             claims: Arc::new(Mutex::new(BTreeMap::new())),
             budgets: Arc::new(Mutex::new(crate::queue::Budgets::default())),
+            send_permit: Arc::new(Mutex::new(())),
             allowed_chats: Arc::new(allowed_chats),
             forum_chat,
             settle: DEFAULT_SETTLE,
@@ -506,7 +519,17 @@ impl<S: Surface> Hub<S> {
             // next connection, not on the next restart — otherwise rotating a LEAKED secret leaves
             // the leaked one working and locks the honest bridge out, which is the opposite of what
             // rotation is for.
-            registry.reread();
+            //
+            // A failed re-read leaves the previous map in place and admits against THAT. The
+            // alternative — refusing everyone because one read failed — turns a transient file
+            // error into a fleet-wide outage, and the alternative before that, adopting an empty
+            // map, silently un-enrolled every project.
+            if let Err(e) = registry.reread() {
+                tracing::error!(
+                    error = %e,
+                    "could not re-read the project registry; admitting against the last good copy"
+                );
+            }
             match registry.resolve(token) {
                 None => return Admission::Refused(RefusedReason::UnknownProject),
                 Some(p) => (p.id.clone(), p.enabled),
@@ -657,6 +680,20 @@ impl<S: Surface> Hub<S> {
         self.claims.lock().await.contains_key(project)
     }
 
+    /// Which project owns a topic, if any.
+    ///
+    /// The hub's topics and the older pane path's topics live in the same forum, so a message typed
+    /// into one has to be told apart from a message typed into the other before anything tries to
+    /// route it.
+    pub async fn project_for_topic(&self, topic_id: i32) -> Option<ProjectId> {
+        self.registry
+            .lock()
+            .await
+            .all()
+            .find(|p| p.topic_id == Some(topic_id))
+            .map(|p| p.id.clone())
+    }
+
     /// The topic a project's messages go in, created and greeted on first use.
     ///
     /// Created here rather than at `hello` for one reason: a topic with no messages is invisible in
@@ -698,20 +735,26 @@ impl<S: Surface> Hub<S> {
         text: &str,
         buttons: &[AskOption],
     ) -> SendOutcome {
-        // PACE, then shed. These are two different things and treating them as one loses messages.
+        // PACE, then shed — and pace in a QUEUE, not as a crowd.
         //
-        // Telegram's limit has two halves: no more than one message a second, and no more than
-        // about twenty a minute. The first is a rhythm — waiting a beat costs nothing and the
-        // message still arrives. The second is a real ceiling, and past it something has to give.
+        // Telegram's limit has two halves: no more than one message a second, and about twenty a
+        // minute. The first is a rhythm — wait a beat and the message still arrives — the second is
+        // a real ceiling. Only the ceiling should ever lose a message.
         //
-        // Shedding on the one-second gap made a project's FIRST question disappear: the greeting
-        // goes out the instant a bridge connects, and the question that follows lands inside the
-        // gap. The bridge was told `too-fast`, which is true and no use — the agent is blocked on
-        // an answer either way. Found by a test, not by reading.
+        // The first attempt at this let each sender sleep once and then shed. That reads fine and
+        // is wrong the moment there are two projects: every waiter sleeps the SAME second, they all
+        // wake together, one wins the token, and the rest have already used their single sleep and
+        // fall through to the shed. Measured on the real code: ten projects saying one thing each
+        // produced two sends and eight sheds, with sixteen of the eighteen per-minute tokens
+        // unspent. Six bridges opening with a question left five agents blocked and four topics
+        // bound-but-empty, which Telegram does not show in the topic list at all.
         //
-        // The lock is never held across the wait. Holding it would turn one project's pacing into
-        // every project's pause.
-        let mut waited = false;
+        // The permit is what makes it a queue. `tokio::sync::Mutex` hands it out in order, so each
+        // sender waits its own turn once instead of racing the others for one token. The deadline
+        // bounds the whole thing, because this is called from the connection's read loop and a
+        // bridge whose socket goes unread for minutes is a bridge whose `bye` is missed.
+        let _turn = self.send_permit.lock().await;
+        let give_up_at = std::time::Instant::now() + MAX_PACE_WAIT;
         loop {
             let verdict = {
                 let mut budgets = self.budgets.lock().await;
@@ -719,13 +762,15 @@ impl<S: Surface> Hub<S> {
             };
             match verdict {
                 Ok(()) => break,
-                Err(crate::queue::RetryAfter(wait)) if !waited && wait <= crate::queue::MIN_GAP => {
+                Err(crate::queue::Refusal::Gap(wait))
+                    if std::time::Instant::now() + wait <= give_up_at =>
+                {
                     tokio::time::sleep(wait).await;
-                    waited = true;
                 }
-                Err(crate::queue::RetryAfter(wait)) => {
-                    // A real ceiling, not a rhythm. Shed, and say when to come back.
-                    let outcome = SendOutcome::TooFast(wait);
+                Err(refusal) => {
+                    // Either the per-minute ceiling — a real limit — or a queue so long that
+                    // waiting longer would cost the connection more than the message is worth.
+                    let outcome = SendOutcome::TooFast(refusal.wait());
                     let _ = self.audit.outcome(project, &outcome);
                     return outcome;
                 }
@@ -989,7 +1034,16 @@ impl<S: Surface> Hub<S> {
                     let _ = self
                         .audit
                         .refused(&project, "a frame was over the size ceiling");
-                    break;
+                    // Queued is not sent. `break` used to fall straight into `writer.abort()`,
+                    // which destroyed this refusal before the writer task could put it on the wire
+                    // — so the bridge got the closed socket the refusal existed to replace. A
+                    // bridge told its frame was too big can split it; one handed a dead socket can
+                    // only guess. Dropping `tx` ends the writer's loop; the timeout is there
+                    // because a peer that has stopped reading must not hold this open forever.
+                    drop(tx);
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
+                    self.release(&project, pid).await;
+                    return Ok(());
                 }
                 Err(e) => {
                     tracing::debug!(project = %project, error = %e, "the bridge's connection ended");
@@ -1092,7 +1146,12 @@ impl<S: Surface> Hub<S> {
                         topic_id,
                         options,
                         instance: instance.to_owned(),
-                        text: text.clone(),
+                        // The CLIPPED text, because that is what the operator is actually looking
+                        // at. Storing the original meant the retirement rebuilt the message from
+                        // text longer than the one that was sent — and a retirement body over
+                        // Telegram's 4096 is an edit that fails, which leaves the answered keyboard
+                        // live and still offering choices that have already been made.
+                        text: crate::queue::fit(&text, crate::queue::MAX_TEXT).0,
                     };
                     if let Err(e) = self
                         .ledger
@@ -1168,18 +1227,33 @@ impl<S: Surface> Hub<S> {
     /// design went out of its way not to manufacture.
     pub async fn answered_from_phone(&self, chat_id: i64, msg_id: &MsgId, label: &str) {
         let record = { self.ledger.lock().await.get(chat_id, msg_id).cloned() };
-        if let Some(record) = record {
-            let _ = self
-                .surface
-                .retire_buttons(
-                    record.topic_id,
-                    msg_id,
-                    &record.text,
-                    &format!("answered from your phone — {label}"),
-                )
-                .await;
+        let Some(record) = record else {
+            let _ = self.ledger.lock().await.forget(chat_id, msg_id);
+            return;
+        };
+        let retired = self
+            .surface
+            .retire_buttons(
+                record.topic_id,
+                msg_id,
+                &record.text,
+                &format!("answered from your phone — {label}"),
+            )
+            .await;
+        // The record is forgotten only when the buttons are actually gone. Forgetting first left a
+        // live keyboard with nothing behind it: still tappable, still offering a choice already
+        // made, and the next tap answered "I have no record of that question". Fail closed — the
+        // order is "the buttons are gone, therefore the record may go", never the reverse.
+        match retired {
+            Ok(()) => {
+                let _ = self.ledger.lock().await.forget(chat_id, msg_id);
+            }
+            Err(e) => tracing::error!(
+                error = %e, project = %record.project,
+                "answered from the phone but the keyboard is still there; leaving the record so it \
+                 can be retired later"
+            ),
         }
-        let _ = self.ledger.lock().await.forget(chat_id, msg_id);
     }
 
     /// Strip a stale keyboard, because a screen could never tell you a question stopped being asked.
@@ -1201,13 +1275,25 @@ impl<S: Surface> Hub<S> {
             // The record carries both the topic and the question's own words, so the retirement
             // does not have to go back to the registry for one and cannot leave the other out.
             let record = { self.ledger.lock().await.get(chat, &msg).cloned() };
-            if let Some(record) = record {
-                let _ = self
-                    .surface
-                    .retire_buttons(record.topic_id, &msg, &record.text, &note)
-                    .await;
+            let retired = match &record {
+                Some(record) => {
+                    self.surface
+                        .retire_buttons(record.topic_id, &msg, &record.text, &note)
+                        .await
+                }
+                None => Ok(()),
+            };
+            // Same order as a tap: the record goes only once the keyboard has. A retirement that
+            // failed and forgot anyway leaves a menu that outlives the question it belonged to.
+            match retired {
+                Ok(()) => {
+                    let _ = self.ledger.lock().await.forget(chat, &msg);
+                }
+                Err(e) => tracing::error!(
+                    error = %e, project = %project,
+                    "a question stopped being asked but its keyboard is still there"
+                ),
             }
-            let _ = self.ledger.lock().await.forget(chat, &msg);
         }
     }
 }
