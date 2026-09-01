@@ -1104,6 +1104,138 @@ async fn a_bridge_that_talks_before_answering_is_stopped_rather_than_buffered_wi
     );
 }
 
+/// The two halves, meeting for the first time.
+///
+/// Everything else in this file tests the hub against a fake bridge, and
+/// `plugins/kickoff-channel/test-against-a-fake-hub.ts` tests the bridge against a fake hub. Both
+/// can pass while the two disagree about the wire — which is the failure a pair of fakes is
+/// structurally unable to catch, because each was written from the same reading of the spec.
+///
+/// This is the REAL plugin process, on bun, over a REAL socket, against the REAL hub. Only Telegram
+/// is faked, because a test that needed a bot token would never run.
+///
+/// Ignored by default: it needs bun and a `bun install`, which the Rust suite has no business
+/// requiring. Run it deliberately:
+///
+///     cargo test -p herdr-tg the_real_plugin -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
+async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
+    let h = harness().await;
+
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+
+    // The plugin reads its secret from <repo>/.kickoff/hub.token, exactly as a real project does.
+    let repo = h.dir.path().join("plugin-repo");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&plugin)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        .env("KICKOFF_CHANNEL_REPO", &repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout")).lines();
+
+    // The MCP handshake, so the tools and notifications are the real ones.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+
+    // The hub admits it, settles it, and gives it a topic — all through the real handshake.
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    {
+        let topics = h.fake.topics.lock().await;
+        assert_eq!(
+            topics.len(),
+            1,
+            "the real plugin did not get a topic: {topics:?}"
+        );
+        assert_eq!(
+            topics[0].0, "herdr-tg",
+            "the title did not come from the registry"
+        );
+    }
+
+    // The agent asks. The question has to reach Telegram with its buttons intact.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\",\"arguments\":{\"text\":\"Overwrite deploy/prod.yaml?\",\"options\":[{\"id\":\"y\",\"label\":\"Yes, overwrite\"},{\"id\":\"n\",\"label\":\"No, stop\"}]}}}\n")
+        .await
+        .expect("ask");
+
+    until(async || h.fake.sends.lock().await.len() >= 2).await;
+    let (topic, text, buttons) = h.fake.sends.lock().await[1].clone();
+    assert_eq!(
+        text, "Overwrite deploy/prod.yaml?",
+        "the agent's words changed on the way"
+    );
+    assert_eq!(buttons.len(), 2);
+    assert_eq!(buttons[0].label, "Yes, overwrite");
+    assert_eq!(topic, 1001);
+
+    // The operator taps. The answer has to arrive as a MESSAGE in the agent's turn — the whole
+    // safety story of this design — and it has to name the question it answers.
+    let msg = MsgId::new("m2");
+    let (project, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves against the real plugin's ask");
+    assert!(
+        h.hub
+            .deliver(
+                &project,
+                HubFrame::Choice {
+                    msg_id: msg,
+                    ask_id: ask_id.clone(),
+                    option_id: option
+                }
+            )
+            .await
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut got = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), stdout.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if line.contains("notifications/claude/channel") && line.contains("option_id") {
+                    got = Some(line);
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let got = got.expect("the answer never reached the agent as a channel message");
+    assert!(
+        got.contains(ask_id.as_str()),
+        "the answer did not name its question: {got}"
+    );
+    assert!(
+        got.contains("\"option_id\":\"y\""),
+        "the wrong option reached the agent: {got}"
+    );
+
+    let _ = child.kill().await;
+}
+
 #[tokio::test]
 async fn a_tap_on_a_button_nobody_wrote_down_is_refused() {
     let h = harness().await;

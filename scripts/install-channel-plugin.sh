@@ -37,6 +37,17 @@ say "Proving the bridge against a fake hub…"
 ( cd "$PLUGIN" && bun install --no-summary >/dev/null && bun test-against-a-fake-hub.ts ) \
   || die "the bridge failed its own test; not installing it"
 
+# And the other direction: the REAL bridge against the REAL hub, over a real socket, with only
+# Telegram faked. Both halves passing against a fake of the other proves less than it looks —
+# each fake was written from the same reading of the spec, so a shared misreading survives both.
+# It is `#[ignore]`d in the Rust suite because that suite has no business requiring bun, which
+# means this script is the thing that keeps it from rotting.
+say
+say "Proving the real bridge against the real hub…"
+( cd "$REPO" && env -u RUSTUP_TOOLCHAIN TMPDIR=/tmp PATH="$HOME/.cargo/bin:$PATH" \
+    cargo test -q -p herdr-tg the_real_plugin -- --ignored ) \
+  || die "the bridge and the hub disagree about the wire; not installing it"
+
 say
 claude plugin marketplace add "$REPO" 2>&1 | sed 's/^/  /' || true
 claude plugin install kickoff-channel@herdr-tg-local 2>&1 | sed 's/^/  /' || true

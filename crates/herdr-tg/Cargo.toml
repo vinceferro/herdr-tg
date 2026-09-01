@@ -43,4 +43,7 @@ tempfile = { workspace = true }
 # What is under test is what this crate does with a REPLY — which responder answered, and whether
 # the operator's pane text was already on the wire by then — and a hand-rolled stand-in for reqwest
 # would prove nothing about that.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# `process` is dev-only: `the_real_plugin_and_the_real_hub_agree_on_the_wire` spawns the real bun
+# bridge. The binary itself starts nothing, and this feature must not leak into it — the hub's whole
+# posture is that it supervises nothing and spawns nothing.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process"] }
