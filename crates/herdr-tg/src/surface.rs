@@ -82,19 +82,25 @@ impl Surface for Telegram {
             // `callback_data` is 64 bytes and carries an OPAQUE id, never a decision. What the id
             // means is written down in the hub's ledger beside the message; resolving a tap by the
             // button's position is how one reading "Reject" once confirmed "Allow always".
-            let row: Vec<InlineKeyboardButton> = buttons
+            // The label goes on RAW. A button's text is plain text, not HTML — escaping it makes
+            // the operator read `&amp;` and `&lt;` on the very thing he is about to press. The
+            // message BODY is still escaped, above, which is where escaping belongs.
+            //
+            // One option per row. A row of four is four unreadable slivers on a phone, and a button
+            // whose text you cannot read is worse than no button.
+            let rows: Vec<Vec<InlineKeyboardButton>> = buttons
                 .iter()
                 .map(|o| {
                     // `h|` marks it as the hub's. This chat already carries buttons from the older
                     // pane path, whose data starts `t|` or `c|`, and a tap must never be resolved
                     // by the wrong handler just because two schemes happened to overlap.
-                    InlineKeyboardButton::callback(
-                        escape_html(&o.label),
+                    vec![InlineKeyboardButton::callback(
+                        o.label.clone(),
                         format!("{CALLBACK_PREFIX}|{}", o.option_id.as_str()),
-                    )
+                    )]
                 })
                 .collect();
-            req = req.reply_markup(InlineKeyboardMarkup::new([row]));
+            req = req.reply_markup(InlineKeyboardMarkup::new(rows));
         }
 
         match req.await {
@@ -116,19 +122,27 @@ impl Surface for Telegram {
         &self,
         topic_id: i32,
         msg_id: &MsgId,
+        original: &str,
         note: &str,
     ) -> anyhow::Result<()> {
         let Ok(raw) = msg_id.as_str().parse::<i32>() else {
             anyhow::bail!("that message id is not one this bot wrote");
         };
-        let _ = topic_id; // the message id is enough to edit; the topic is context for the log
-        // Stripping the keyboard is the point. The appended line is what tells the operator why the
-        // buttons went away, so that a menu vanishing does not read as the bot losing the question.
+        // ONE call that rewrites the body and drops the keyboard together.
+        //
+        // An earlier version only cleared the markup and logged the note. The operator saw a menu
+        // vanish with no explanation, which reads as the bot having lost the question — the exact
+        // opposite of the reassurance this exists to give. `edit_message_text` sent without a
+        // reply_markup both replaces the text and removes the buttons, so there is no window where
+        // one has happened and the other has not.
+        let body = format!(
+            "{}\n\n\u{2713} {}",
+            escape_html(original),
+            escape_html(note)
+        );
         self.bot
-            .edit_message_reply_markup(self.forum, MessageId(raw))
-            .reply_markup(InlineKeyboardMarkup::new(
-                Vec::<Vec<InlineKeyboardButton>>::new(),
-            ))
+            .edit_message_text(self.forum, MessageId(raw), body)
+            .parse_mode(ParseMode::Html)
             .await?;
         tracing::info!(
             topic = topic_id,

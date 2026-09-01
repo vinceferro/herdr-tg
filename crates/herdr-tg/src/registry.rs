@@ -109,6 +109,22 @@ impl Registry {
         crate::lock::state_dir().join("projects.json")
     }
 
+    /// Re-read the file into this handle, discarding what was in memory.
+    ///
+    /// The registry is not the hub's private state: `herdr-tg enroll` writes it from a terminal
+    /// while the hub is running. A boot-time snapshot made two things wrong at once. Rotating a
+    /// leaked secret had no effect until a restart — the leaked one kept working and the honest
+    /// bridge was refused — and any write the hub made afterwards (binding a topic) put its stale
+    /// map back over the file, erasing a project the operator had just enrolled.
+    ///
+    /// It is a few kilobytes, and it is read on admission and before every write, both of which are
+    /// rare. Cheap enough that a cache would be an optimisation nobody asked for and a staleness
+    /// bug somebody eventually finds.
+    pub fn reread(&mut self) {
+        let fresh = Self::load(&self.path);
+        self.projects = fresh.projects;
+    }
+
     /// Read the registry, or start empty.
     ///
     /// A file that cannot be parsed starts empty **and says so loudly**. Refusing to boot on a
@@ -171,6 +187,9 @@ impl Registry {
 
     /// Remember which topic a project's messages go to.
     pub fn bind_topic(&mut self, id: &ProjectId, topic_id: i32) -> Result<(), EnrolError> {
+        // Read-modify-write, never write-what-I-remember. Writing the in-memory map would put this
+        // process's snapshot back over anything enrolled at the terminal since it started.
+        self.reread();
         if let Some(p) = self.projects.get_mut(id) {
             p.topic_id = Some(topic_id);
         }
@@ -184,6 +203,7 @@ impl Registry {
     /// once and deliberately — never retried as if it were a transient network error, which would
     /// swallow the project's messages forever.
     pub fn unbind_topic(&mut self, id: &ProjectId) -> Result<(), EnrolError> {
+        self.reread();
         if let Some(p) = self.projects.get_mut(id) {
             p.topic_id = None;
         }
@@ -195,6 +215,9 @@ impl Registry {
     /// Terminal-only. Returns the secret exactly once, because it is never stored anywhere this
     /// process can read it back.
     pub fn enrol(&mut self, repo: &Path) -> Result<(Project, String), EnrolError> {
+        // Another process may have written since this handle was made — including the hub, which
+        // binds topics while it runs. Enrolling must not undo that.
+        self.reread();
         let repo = repo.canonicalize().map_err(|_| EnrolError::NoSuchRepo {
             repo: repo.to_path_buf(),
         })?;

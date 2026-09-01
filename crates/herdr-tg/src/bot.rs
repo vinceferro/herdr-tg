@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 
 use herdr_client::{HerdrClient, PaneId, SessionSnapshot};
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ThreadId};
 use teloxide::utils::command::BotCommands;
 
 use crate::audit::Audit;
@@ -244,6 +244,19 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
             );
             None
         }
+        Some(forum) if !config.allowed_chat_ids.contains(&forum) => {
+            // Every question would go out and every tap would die in silence: the callback handler
+            // checks the allowlist first, so a forum that is not on it produces buttons that cannot
+            // be answered and say nothing about why. There is no configuration in which that is
+            // what someone meant, so it fails closed and names both numbers.
+            tracing::error!(
+                forum,
+                allowed = ?config.allowed_chat_ids,
+                "the forum chat is not on the allowlist, so every button in it would be dead. \
+                 Add it to HERDR_TG_ALLOWED_CHAT_IDS. The hub will not start."
+            );
+            None
+        }
         Some(forum) => {
             let surface = Arc::new(crate::surface::Telegram::new(bot.clone(), ChatId(forum)));
             let hub = Arc::new(crate::hub::Hub::new(
@@ -271,9 +284,11 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
                     );
                     let accept = Arc::clone(&hub);
                     tokio::spawn(async move {
+                        let mut backoff = std::time::Duration::from_millis(50);
                         loop {
                             match listener.accept().await {
                                 Ok((stream, _)) => {
+                                    backoff = std::time::Duration::from_millis(50);
                                     let hub = Arc::clone(&accept);
                                     tokio::spawn(async move {
                                         if let Err(e) = hub.serve_connection(stream).await {
@@ -281,9 +296,20 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
                                         }
                                     });
                                 }
+                                // A per-connection error must not end the loop. Running out of
+                                // file descriptors, or a peer that hangs up between the SYN and the
+                                // accept, is a transient squeeze — and `break` here meant the hub's
+                                // socket half was gone for the life of the process, with the
+                                // Telegram half still running and nothing anywhere saying the
+                                // bridges could no longer connect. That is this system's signature
+                                // failure: silence that looks exactly like health.
                                 Err(e) => {
-                                    tracing::error!(error = %e, "the hub's listener failed");
-                                    break;
+                                    tracing::warn!(
+                                        error = %e, backoff_ms = backoff.as_millis(),
+                                        "the hub could not accept a connection; retrying"
+                                    );
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
                                 }
                             }
                         }
@@ -809,6 +835,12 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         return Ok(());
     };
 
+    // Which topic the answer belongs in. `MaybeInaccessibleMessage` cannot tell us, so it comes
+    // from the record the hub already looked up — the same record that decided what the tap meant.
+    // Without it, every confirmation and every refusal lands in the forum's General topic, so the
+    // answer to "what did I just send, and to which project" appears somewhere other than the
+    // project it belongs to.
+    let mut reply_thread: Option<i32> = None;
     let reply = match data.split('|').collect::<Vec<_>>().as_slice() {
         // This also answers taps on buttons still sitting in the group's history from before the
         // topic became the aim.
@@ -851,40 +883,52 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                 let option_id = hub_proto::OptionId::new(*option);
                 match msg_id {
                     None => escape_html("I cannot tell which question that button belongs to."),
-                    Some(msg_id) => match hub.resolve_tap(chat_id, &msg_id, &option_id).await {
-                        Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
-                        Err(why) => escape_html(why.say()),
-                        Ok((project, ask_id, option_id)) => {
-                            let label = hub
-                                .ledger
-                                .lock()
-                                .await
-                                .get(chat_id, &msg_id)
-                                .and_then(|r| {
-                                    r.options
-                                        .iter()
-                                        .find(|o| o.option_id == option_id)
-                                        .map(|o| o.label.clone())
-                                })
-                                .unwrap_or_default();
-                            let sent = hub
-                                .deliver(
-                                    &project,
-                                    hub_proto::HubFrame::Choice {
-                                        msg_id: msg_id.clone(),
-                                        ask_id,
-                                        option_id,
-                                    },
-                                )
-                                .await;
-                            if sent {
-                                let _ = hub.ledger.lock().await.forget(chat_id, &msg_id);
-                                format!("Sent: {}", escape_html(&label))
-                            } else {
-                                escape_html(crate::hub::TapRefusal::NotConnected.say())
+                    Some(msg_id) => {
+                        reply_thread = hub
+                            .ledger
+                            .lock()
+                            .await
+                            .get(chat_id, &msg_id)
+                            .map(|r| r.topic_id);
+                        match hub.resolve_tap(chat_id, &msg_id, &option_id).await {
+                            Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
+                            Err(why) => escape_html(why.say()),
+                            Ok((project, ask_id, option_id)) => {
+                                let label = hub
+                                    .ledger
+                                    .lock()
+                                    .await
+                                    .get(chat_id, &msg_id)
+                                    .and_then(|r| {
+                                        r.options
+                                            .iter()
+                                            .find(|o| o.option_id == option_id)
+                                            .map(|o| o.label.clone())
+                                    })
+                                    .unwrap_or_default();
+                                let sent = hub
+                                    .deliver(
+                                        &project,
+                                        hub_proto::HubFrame::Choice {
+                                            msg_id: msg_id.clone(),
+                                            ask_id,
+                                            option_id,
+                                        },
+                                    )
+                                    .await;
+                                if sent {
+                                    // Retire the keyboard rather than only deleting the record.
+                                    // Forgetting alone left the menu live forever: the record the later
+                                    // `ask_resolved` needed was already gone, so nothing ever took the
+                                    // buttons away, and an answered question stayed tappable.
+                                    hub.answered_from_phone(chat_id, &msg_id, &label).await;
+                                    format!("Sent: {}", escape_html(&label))
+                                } else {
+                                    escape_html(crate::hub::TapRefusal::NotConnected.say())
+                                }
                             }
                         }
-                    },
+                    }
                 }
             }
         },
@@ -899,10 +943,18 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     if let Some(msg) = q.message.as_ref() {
         // `reply` is written for the chat and already carries this bridge's markup; anything an
         // agent wrote inside it was escaped where it was put in.
-        let _ = bot
+        //
+        // INTO THE SAME THREAD. Without the thread id every confirmation and every refusal lands in
+        // the forum's General topic — so the answer to "what did I just send, and to which project"
+        // appears somewhere other than the project, and General fills up with one-line replies that
+        // belong to ten different conversations.
+        let mut out = bot
             .send_message(msg.chat().id, &reply)
-            .parse_mode(ParseMode::Html)
-            .await;
+            .parse_mode(ParseMode::Html);
+        if let Some(thread) = reply_thread {
+            out = out.message_thread_id(ThreadId(MessageId(thread)));
+        }
+        let _ = out.await;
     }
     tracing::info!(chat_id, data = %data, "handled a button");
     Ok(())

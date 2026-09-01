@@ -105,14 +105,38 @@ impl Default for ChatBudget {
 }
 
 /// Every chat this hub sends into.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Budgets {
     chats: BTreeMap<i64, ChatBudget>,
+    per_minute: u32,
+    min_gap: Duration,
 }
 
 impl Budgets {
+    /// A budget with chosen limits.
+    ///
+    /// Tests use a short gap so that a flow test is not one second per message; the limits
+    /// themselves are still tested, at their real values, by the tests in this module.
+    pub fn new(per_minute: u32, min_gap: Duration) -> Self {
+        Self {
+            chats: BTreeMap::new(),
+            per_minute,
+            min_gap,
+        }
+    }
+
     pub fn take(&mut self, chat_id: i64, now: Instant) -> Result<(), RetryAfter> {
-        self.chats.entry(chat_id).or_default().take(now)
+        let (per_minute, min_gap) = (self.per_minute, self.min_gap);
+        self.chats
+            .entry(chat_id)
+            .or_insert_with(|| ChatBudget::new(per_minute, min_gap))
+            .take(now)
+    }
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self::new(PER_MINUTE, MIN_GAP)
     }
 }
 

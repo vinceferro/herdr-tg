@@ -12,3 +12,6 @@
 - [opencode has a public server API](opencode-has-a-public-server-api.md) — serve + /doc + /event, so the bridge needs no plugin and no patch there.
 - [A proof staged in /tmp proves nothing under PrivateTmp](a-proof-staged-in-tmp-proves-nothing-under-privatetmp.md) — the unit sees an empty dir, does the right thing, and the pass means nothing.
 - [curl needs -q or ~/.curlrc can capture the token](curl-needs-q-or-curlrc-can-capture-the-token.md) — `-K -` keeps it off argv; only `-q` keeps it out of the config file.
+- [A dev-dependency can keep a broken build green](a-dev-dependency-can-keep-a-broken-build-green.md) — cargo test sees features cargo build does not; check with `cargo check -p <crate>`.
+- [Cleanup after a `?` is cleanup that does not happen](cleanup-after-a-question-mark-is-cleanup-that-does-not-happen.md) — a socket's ordinary end is a read error, not EOF.
+- [The scratchpad lives inside this repo](the-scratchpad-lives-inside-this-repo.md) — subagent repo copies break the write guard and ate 8.8 GB.

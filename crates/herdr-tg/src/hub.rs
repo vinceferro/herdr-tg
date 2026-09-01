@@ -57,6 +57,11 @@ use crate::registry::Registry;
 /// How long after `hello` the hub waits for a `pong` before calling a project live.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
 
+/// Telegram's own ceiling on a button's `callback_data`. Not ours to raise.
+///
+/// The `h|` prefix comes out of this budget, which is why the check is `len + 2`.
+pub const CALLBACK_DATA_MAX: usize = 64;
+
 /// What the hub will accept from one connection.
 pub const LIMITS: Limits = Limits {
     max_frame: hub_proto::MAX_FRAME_BYTES,
@@ -107,14 +112,17 @@ pub trait Surface: Send + Sync + 'static {
         buttons: &[AskOption],
     ) -> impl std::future::Future<Output = SendOutcome> + Send;
 
-    /// Strip a stale keyboard and append a note saying what happened to the question.
+    /// Strip a stale keyboard AND say what happened to the question.
     ///
     /// No design that read a rendered screen could ever do this: a screen cannot tell you that a
-    /// question stopped being asked.
+    /// question stopped being asked. The original text comes back in because the message has to
+    /// keep saying what was asked — a body replaced by a bare note reads as the bot having lost the
+    /// question, which is the opposite of the reassurance this is for.
     fn retire_buttons(
         &self,
         topic_id: i32,
         msg_id: &MsgId,
+        original: &str,
         note: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 }
@@ -134,6 +142,10 @@ pub struct AskRecord {
     /// The options exactly as the bridge minted them, labels included, so the hub can say what was
     /// chosen in the words the operator actually read.
     pub options: Vec<AskOption>,
+    /// What the question said. Kept so that retiring the keyboard can leave the question visible
+    /// with its outcome beside it, rather than replacing it with a bare note.
+    #[serde(default)]
+    pub text: String,
     /// Which run of the worker asked. A tap on a menu drawn for a session that has since restarted
     /// is refused with a reason, rather than answered into a process that never asked.
     pub instance: String,
@@ -192,12 +204,33 @@ fn ledger_key(chat_id: i64, msg_id: &MsgId) -> String {
 }
 
 impl AskLedger {
+    /// Read the ledger, or start empty — and say so when starting empty was not the plan.
+    ///
+    /// This used to swallow both the read error and the parse error with `.ok()`. The cost of that
+    /// silence is specific: every keyboard already on the operator's phone becomes a button that
+    /// answers "I have no record of that question", with nothing anywhere explaining why. Starting
+    /// empty is still the right behaviour — refusing to boot would take the whole fleet's channel
+    /// down over one bad byte — but it must not be quiet.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let records = fs::read_to_string(&path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
+        let records = match fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<BTreeMap<String, AskRecord>>(&raw) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e, path = %path.display(),
+                        "the open-questions ledger could not be read. Every keyboard already on \
+                         the operator's phone will refuse; those questions need asking again."
+                    );
+                    BTreeMap::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => {
+                tracing::error!(error = %e, path = %path.display(), "the open-questions ledger is unreadable");
+                BTreeMap::new()
+            }
+        };
         Self { path, records }
     }
 
@@ -468,7 +501,12 @@ impl<S: Surface> Hub<S> {
         };
 
         let (id, enabled) = {
-            let registry = self.registry.lock().await;
+            let mut registry = self.registry.lock().await;
+            // Fresh, every admission. A secret rotated at the terminal has to take effect on the
+            // next connection, not on the next restart — otherwise rotating a LEAKED secret leaves
+            // the leaked one working and locks the honest bridge out, which is the opposite of what
+            // rotation is for.
+            registry.reread();
             match registry.resolve(token) {
                 None => return Admission::Refused(RefusedReason::UnknownProject),
                 Some(p) => (p.id.clone(), p.enabled),
@@ -478,16 +516,7 @@ impl<S: Surface> Hub<S> {
             return Admission::Refused(RefusedReason::NotEnabled);
         }
 
-        let claims = self.claims.lock().await;
-        if let Some(incumbent) = claims.get(&id)
-            && pid_is_alive(incumbent.pid)
-        {
-            tracing::warn!(
-                project = %id, incumbent = incumbent.pid, arriving = pid,
-                "a second bridge tried to take a project that is already connected"
-            );
-            return Admission::Refused(RefusedReason::AlreadyClaimed);
-        }
+        let _ = pid;
         Admission::Admitted(id)
     }
 
@@ -534,30 +563,67 @@ impl<S: Surface> Hub<S> {
     }
 
     /// Hand a frame to a project's live connection.
+    ///
+    /// The sender is CLONED out and the guard dropped before anything is awaited. Holding the
+    /// claims lock across the send was a fleet-wide stall waiting to happen: the outbox is bounded,
+    /// so one bridge that stopped reading would park this `.await` with the lock held, and every
+    /// other project's admit, claim, release and deliver would queue behind it. One wedged bridge,
+    /// every project silent.
+    ///
+    /// `try_send` rather than `send`, for the same reason from the other direction: a full outbox
+    /// means that bridge is not keeping up, and the honest answer is "not delivered" now rather
+    /// than an await that might never finish.
     pub async fn deliver(&self, project: &ProjectId, frame: HubFrame) -> bool {
-        let claims = self.claims.lock().await;
-        let Some(claim) = claims.get(project) else {
-            return false;
+        let tx = {
+            let claims = self.claims.lock().await;
+            match claims.get(project) {
+                None => return false,
+                Some(claim) => claim.tx.clone(),
+            }
         };
         let env = Envelope::new(FrameId::new(format!("h{}", next_frame_seq())), frame);
-        claim.tx.send(env).await.is_ok()
+        match tx.try_send(env) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(project = %project, error = %e, "a bridge is not keeping up; not delivered");
+                false
+            }
+        }
     }
 
-    /// Register a live connection, evicting a corpse if one is holding the project.
+    /// Take the project, or refuse — the check and the reservation in ONE critical section.
+    ///
+    /// This used to be two: `admit` looked for a live incumbent, dropped the lock, and `claim`
+    /// inserted unconditionally some awaits later. Two bridges arriving inside that window were
+    /// both admitted and the second silently replaced the first — measured at roughly one round in
+    /// three when the two `hello`s land within about 100 µs on a multi-thread runtime, which is the
+    /// runtime this binary builds. The consequence is the exact failure gate 4 exists to prevent:
+    /// two bridges live on one project, both posting into one topic, and a tap on the incumbent's
+    /// still-open question refused with "that session has since restarted" while it is sitting
+    /// there waiting for the answer.
+    ///
+    /// A dead incumbent is evicted rather than honoured: a worker that crashed must not lock its
+    /// own project out until someone finds a keyboard.
     pub async fn claim(
         &self,
         project: ProjectId,
         pid: u32,
         instance: String,
         tx: mpsc::Sender<Envelope<HubFrame>>,
-    ) {
+    ) -> Result<(), RefusedReason> {
         let mut claims = self.claims.lock().await;
-        if let Some(old) = claims.get(&project)
-            && !pid_is_alive(old.pid)
-        {
+        if let Some(old) = claims.get(&project) {
+            if pid_is_alive(old.pid) {
+                tracing::warn!(
+                    project = %project, incumbent = old.pid, arriving = pid,
+                    "a second bridge tried to take a project that is already connected"
+                );
+                return Err(RefusedReason::AlreadyClaimed);
+            }
             tracing::info!(project = %project, dead = old.pid, "evicting a bridge that is no longer running");
         }
         claims.insert(project, Claim { pid, instance, tx });
+        Ok(())
     }
 
     /// Drop a connection's claim, but only if it is still the one holding it.
@@ -568,6 +634,19 @@ impl<S: Surface> Hub<S> {
         let mut claims = self.claims.lock().await;
         if claims.get(project).is_some_and(|c| c.pid == pid) {
             claims.remove(project);
+        }
+    }
+
+    /// Give the hub a different outbound budget. Test-only.
+    ///
+    /// The real limits are one message a second and eighteen a minute, so a flow test at those
+    /// values would spend a second per message. The limits themselves are tested at their real
+    /// values — `queue.rs`'s own tests, and `pacing_waits_but_a_real_flood_is_shed` below.
+    #[cfg(test)]
+    pub fn with_budget(self, per_minute: u32, min_gap: Duration) -> Self {
+        Self {
+            budgets: Arc::new(Mutex::new(crate::queue::Budgets::new(per_minute, min_gap))),
+            ..self
         }
     }
 
@@ -596,13 +675,73 @@ impl<S: Surface> Hub<S> {
         }
         let id = self.surface.create_topic(&title, colour).await?;
         self.registry.lock().await.bind_topic(project, id)?;
-        // Greeted immediately, in the same breath as being created. The greeting is what makes the
-        // topic appear in the list at all.
+        // Greeted immediately, in the same breath as being created — the greeting is what makes the
+        // topic appear in the list at all. Through the SAME budgeted, audited path as everything
+        // else: a greeting that skipped the budget was a writer the ceiling could not see, and one
+        // that skipped the audit was a send with no record, which is the one thing the audit
+        // discipline exists to make impossible.
         let _ = self
-            .surface
-            .send(id, &format!("{title} is connected."), &[])
+            .send_into(project, id, &format!("{title} is connected."), &[])
             .await;
         Ok(id)
+    }
+
+    /// The one place a message actually goes out: budget, clip, audit, send, audit.
+    ///
+    /// Every hub-owned write goes through here. Anything that bypassed it would be a writer the
+    /// per-chat ceiling cannot see — and the ceiling is per chat, so an unmetered writer does not
+    /// cost itself, it costs whichever project happens to send next.
+    async fn send_into(
+        &self,
+        project: &ProjectId,
+        topic_id: i32,
+        text: &str,
+        buttons: &[AskOption],
+    ) -> SendOutcome {
+        // PACE, then shed. These are two different things and treating them as one loses messages.
+        //
+        // Telegram's limit has two halves: no more than one message a second, and no more than
+        // about twenty a minute. The first is a rhythm — waiting a beat costs nothing and the
+        // message still arrives. The second is a real ceiling, and past it something has to give.
+        //
+        // Shedding on the one-second gap made a project's FIRST question disappear: the greeting
+        // goes out the instant a bridge connects, and the question that follows lands inside the
+        // gap. The bridge was told `too-fast`, which is true and no use — the agent is blocked on
+        // an answer either way. Found by a test, not by reading.
+        //
+        // The lock is never held across the wait. Holding it would turn one project's pacing into
+        // every project's pause.
+        let mut waited = false;
+        loop {
+            let verdict = {
+                let mut budgets = self.budgets.lock().await;
+                budgets.take(self.forum_chat, std::time::Instant::now())
+            };
+            match verdict {
+                Ok(()) => break,
+                Err(crate::queue::RetryAfter(wait)) if !waited && wait <= crate::queue::MIN_GAP => {
+                    tokio::time::sleep(wait).await;
+                    waited = true;
+                }
+                Err(crate::queue::RetryAfter(wait)) => {
+                    // A real ceiling, not a rhythm. Shed, and say when to come back.
+                    let outcome = SendOutcome::TooFast(wait);
+                    let _ = self.audit.outcome(project, &outcome);
+                    return outcome;
+                }
+            }
+        }
+
+        // Clipped here rather than by the surface, because whether anything was lost is a fact the
+        // BRIDGE has to be told, and only this side is holding the ack.
+        let (text, clamped) = crate::queue::fit(text, crate::queue::MAX_TEXT);
+        let _ = self.audit.sent(project, topic_id, text.len());
+        let mut outcome = self.surface.send(topic_id, &text, buttons).await;
+        if clamped && let SendOutcome::Sent(id) = outcome {
+            outcome = SendOutcome::Clamped(id);
+        }
+        let _ = self.audit.outcome(project, &outcome);
+        outcome
     }
 
     /// Send into a project's topic, with the audit around it and one rebinding if the topic is gone.
@@ -614,27 +753,7 @@ impl<S: Surface> Hub<S> {
                 return SendOutcome::Refused(e.to_string());
             }
         };
-        // The budget is spent BEFORE the audit line, so a send the budget refused never produces a
-        // `sent` record. A dangling `sent` has to keep meaning exactly one thing: the process died
-        // mid-write.
-        if let Err(crate::queue::RetryAfter(wait)) = self
-            .budgets
-            .lock()
-            .await
-            .take(self.forum_chat, std::time::Instant::now())
-        {
-            let outcome = SendOutcome::TooFast(wait);
-            let _ = self.audit.outcome(project, &outcome);
-            return outcome;
-        }
-
-        // Clipped here rather than by the surface, because whether anything was lost is a fact the
-        // BRIDGE has to be told, and only this side is holding the ack.
-        let (text, clamped) = crate::queue::fit(text, crate::queue::MAX_TEXT);
-        let text = text.as_str();
-
-        let _ = self.audit.sent(project, topic_id, text.len());
-        let mut outcome = self.surface.send(topic_id, text, buttons).await;
+        let outcome = self.send_into(project, topic_id, text, buttons).await;
 
         if outcome == SendOutcome::TopicGone {
             // Exactly once, and never as a retry: Telegram gives no service message when a topic is
@@ -643,14 +762,9 @@ impl<S: Surface> Hub<S> {
             tracing::warn!(project = %project, "the topic is gone; making a new one");
             let _ = self.registry.lock().await.unbind_topic(project);
             if let Ok(fresh) = self.topic_for(project).await {
-                let _ = self.audit.sent(project, fresh, text.len());
-                outcome = self.surface.send(fresh, text, buttons).await;
+                return self.send_into(project, fresh, text, buttons).await;
             }
         }
-        if clamped && let SendOutcome::Sent(id) = outcome {
-            outcome = SendOutcome::Clamped(id);
-        }
-        let _ = self.audit.outcome(project, &outcome);
         outcome
     }
 
@@ -660,16 +774,48 @@ impl<S: Surface> Hub<S> {
     /// admit or refuse, admit BEFORE creating anything, prove the far end is really there, and only
     /// then create the topic that makes the project visible.
     pub async fn serve_connection(self: Arc<Self>, stream: UnixStream) -> anyhow::Result<()> {
-        let peer = peer_uid(&stream)?;
+        // The kernel's own answer, both fields. The pid a bridge puts in its `hello` is a number it
+        // chose; this one is a fact about the process on the other end of THIS socket. Gate 4's
+        // liveness check runs on it, so a bridge cannot make itself look dead — or make an
+        // incumbent look dead — by reporting a pid that is not its own.
+        let peer = peer_cred(&stream)?;
         let (rx_half, mut tx_half) = stream.into_split();
         let mut reader = hub_proto::FrameReader::new(rx_half);
 
-        let Some(first) = reader.next::<BridgeFrame>().await? else {
-            // Connected and said nothing. Not an error and not worth a line per occurrence.
-            return Ok(());
+        // A connection that never says hello used to sit here forever, holding a task and a file
+        // descriptor. Nothing had authenticated at that point, so anything that can reach the
+        // socket could park as many as it liked until the process ran out of descriptors — and the
+        // accept loop's first error would then have been fatal.
+        let first = match tokio::time::timeout(self.settle, reader.next::<BridgeFrame>()).await {
+            Err(_) => {
+                tracing::debug!("a connection was opened and never said anything");
+                return Ok(());
+            }
+            Ok(Err(hub_proto::ProtoError::Oversize { max })) => {
+                // Told, not just closed. A bridge that knows its frame was too big can split it;
+                // a bridge handed a closed socket can only guess.
+                let env = Envelope::new(
+                    FrameId::new("h-refused"),
+                    HubFrame::Refused {
+                        reason: RefusedReason::FrameTooLarge,
+                    },
+                );
+                let _ = hub_proto::write_frame(&mut tx_half, &env).await;
+                tracing::warn!(max, "a bridge's first frame was over the ceiling");
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "a connection ended before it said hello");
+                return Ok(());
+            }
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(f))) => f,
         };
 
-        let project = match self.admit(peer, our_uid(), &first.payload, first.v).await {
+        let project = match self
+            .admit(peer.uid, our_uid(), &first.payload, first.v)
+            .await
+        {
             // No reply at all. A refusal would confirm that something is listening here.
             Admission::ClosedSilently => return Ok(()),
             Admission::Refused(reason) => {
@@ -680,9 +826,25 @@ impl<S: Surface> Hub<S> {
             Admission::Admitted(id) => id,
         };
 
-        let BridgeFrame::Hello { instance, pid, .. } = first.payload.clone() else {
+        let BridgeFrame::Hello {
+            instance,
+            pid: claimed_pid,
+            ..
+        } = first.payload.clone()
+        else {
             unreachable!("admit only admits a hello");
         };
+        if claimed_pid != peer.pid {
+            // Not fatal — a bridge behind a wrapper legitimately does not know its own outermost
+            // pid. It IS worth a line, because the audit trail should record which number was
+            // believed and which was merely offered.
+            tracing::debug!(
+                claimed = claimed_pid,
+                actual = peer.pid,
+                "a bridge reported a pid that is not the one on its socket; using the socket's"
+            );
+        }
+        let pid = peer.pid;
 
         let title = {
             let registry = self.registry.lock().await;
@@ -703,8 +865,21 @@ impl<S: Surface> Hub<S> {
             }
         });
 
-        self.claim(project.clone(), pid, instance.clone(), tx.clone())
-            .await;
+        if let Err(reason) = self
+            .claim(project.clone(), pid, instance.clone(), tx.clone())
+            .await
+        {
+            let env = Envelope::new(FrameId::new("h-refused"), HubFrame::Refused { reason });
+            let _ = tx.send(env).await;
+            // Give the writer a moment to put the refusal on the wire before the task is dropped;
+            // a refusal nobody receives is the same as the silent takeover this replaced.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            writer.abort();
+            let _ = self
+                .audit
+                .refused(&project, "another bridge already holds this project");
+            return Ok(());
+        }
 
         // Admitted, with no topic yet. See `HubFrame::Welcome` for why that is not an omission.
         let _ = tx
@@ -725,15 +900,27 @@ impl<S: Surface> Hub<S> {
             .send(Envelope::new(ping_id.clone(), HubFrame::Ping))
             .await;
 
+        // Anything the bridge says before its pong is KEPT, not dropped on the floor.
+        //
+        // A bridge that opens with a question — which is the whole point of the product — used to
+        // have it read, discarded, and never acked. No message, no record, no reply, and the agent
+        // sitting blocked on an answer that could never come. Buffered here and replayed the
+        // moment the project is live.
+        let mut waiting: Vec<Envelope<BridgeFrame>> = Vec::new();
         let live = tokio::time::timeout(self.settle, async {
-            while let Ok(Some(frame)) = reader.next::<BridgeFrame>().await {
-                if let BridgeFrame::Pong { r#ref } = &frame.payload
-                    && r#ref == &ping_id
-                {
-                    return true;
+            loop {
+                match reader.next::<BridgeFrame>().await {
+                    Ok(Some(frame)) => {
+                        if let BridgeFrame::Pong { r#ref } = &frame.payload
+                            && r#ref == &ping_id
+                        {
+                            return true;
+                        }
+                        waiting.push(frame);
+                    }
+                    _ => return false,
                 }
             }
-            false
         })
         .await
         .unwrap_or(false);
@@ -754,6 +941,21 @@ impl<S: Surface> Hub<S> {
             tracing::error!(project = %project, error = %e, "could not make a topic for a live project");
         }
 
+        for frame in waiting {
+            let ack_ref = frame.id.clone();
+            let (delivered, why) = self.handle(&project, &instance, frame.payload).await;
+            let _ = tx
+                .send(Envelope::new(
+                    FrameId::new(format!("h{}", next_frame_seq())),
+                    HubFrame::Ack {
+                        r#ref: ack_ref,
+                        delivered,
+                        why,
+                    },
+                ))
+                .await;
+        }
+
         // The claim is released on EVERY way out of this loop, not only the tidy one.
         //
         // It used to be released after a `?`, which meant a read error skipped it entirely — and a
@@ -766,6 +968,29 @@ impl<S: Surface> Hub<S> {
         loop {
             match reader.next::<BridgeFrame>().await {
                 Ok(None) => break,
+                // A line that will not DECODE is one bad frame, not a dead peer — and this is
+                // exactly what a bridge one version ahead sends. Tearing the connection down for it
+                // makes an additive change on the other side a project that goes silent. The
+                // transport failures do end it, because after those there is nothing to read.
+                Err(hub_proto::ProtoError::Decode { source, len }) => {
+                    tracing::warn!(project = %project, len, error = %source, "a frame this build cannot read; ignoring it");
+                    continue;
+                }
+                Err(hub_proto::ProtoError::Oversize { max }) => {
+                    tracing::warn!(project = %project, max, "a frame over the ceiling; refusing it");
+                    let _ = tx
+                        .send(Envelope::new(
+                            FrameId::new(format!("h{}", next_frame_seq())),
+                            HubFrame::Refused {
+                                reason: RefusedReason::FrameTooLarge,
+                            },
+                        ))
+                        .await;
+                    let _ = self
+                        .audit
+                        .refused(&project, "a frame was over the size ceiling");
+                    break;
+                }
                 Err(e) => {
                     tracing::debug!(project = %project, error = %e, "the bridge's connection ended");
                     break;
@@ -813,6 +1038,40 @@ impl<S: Surface> Hub<S> {
                 options,
             } => {
                 let options = options.unwrap_or_default();
+
+                // Telegram gives a button 64 bytes of `callback_data` and no more. The option id is
+                // minted by the BRIDGE, so it is agent-authored and arbitrary: too long and the API
+                // refuses the whole message, leaving an agent blocked on a question that was never
+                // asked. A `|` is worse than that — it survives the send and then splits wrong on
+                // the way back, so the tap resolves to nothing while looking perfectly fine.
+                //
+                // Refused here, where the bridge can still be told and can ask again differently.
+                if let Some(bad) = options.iter().find(|o| {
+                    let data = o.option_id.as_str();
+                    data.contains('|') || data.len() + 2 > CALLBACK_DATA_MAX
+                }) {
+                    tracing::warn!(
+                        project = %project, option = %bad.option_id,
+                        "a question's answer ids will not fit in a Telegram button; refusing it"
+                    );
+                    let _ = self.audit.refused(
+                        project,
+                        "an answer id was too long or contained a separator",
+                    );
+                    // One plain line where the operator can see it: an agent blocked on a question
+                    // that never arrived is the failure this product exists to prevent, and it must
+                    // not be visible only in a log.
+                    let _ = self
+                        .say(
+                            project,
+                            "This project asked me something I could not put on a button, so it is \
+                             still waiting. Answer it at the terminal.",
+                            &[],
+                        )
+                        .await;
+                    return (Delivered::No, Some(hub_proto::AckWhy::TelegramRefused));
+                }
+
                 let outcome = self.say(project, &text, &options).await;
 
                 // The record is written for the message that actually exists. Recording before the
@@ -833,6 +1092,7 @@ impl<S: Surface> Hub<S> {
                         topic_id,
                         options,
                         instance: instance.to_owned(),
+                        text: text.clone(),
                     };
                     if let Err(e) = self
                         .ledger
@@ -900,6 +1160,28 @@ impl<S: Surface> Hub<S> {
         }
     }
 
+    /// The operator answered from his phone: take the keyboard away and say what he chose.
+    ///
+    /// This used to just delete the ledger record. That left the keyboard live forever — the record
+    /// the retirement needed was gone, so the `ask_resolved` that followed found nothing to retire —
+    /// and a menu that stays tappable after it has been answered is the second live menu this
+    /// design went out of its way not to manufacture.
+    pub async fn answered_from_phone(&self, chat_id: i64, msg_id: &MsgId, label: &str) {
+        let record = { self.ledger.lock().await.get(chat_id, msg_id).cloned() };
+        if let Some(record) = record {
+            let _ = self
+                .surface
+                .retire_buttons(
+                    record.topic_id,
+                    msg_id,
+                    &record.text,
+                    &format!("answered from your phone — {label}"),
+                )
+                .await;
+        }
+        let _ = self.ledger.lock().await.forget(chat_id, msg_id);
+    }
+
     /// Strip a stale keyboard, because a screen could never tell you a question stopped being asked.
     async fn retire(
         &self,
@@ -915,15 +1197,15 @@ impl<S: Surface> Hub<S> {
             (hub_proto::AskEnd::Timeout, _) => "timed out".to_owned(),
         };
         let targets = { self.ledger.lock().await.messages_for(project, ask_id) };
-        let topic = self
-            .registry
-            .lock()
-            .await
-            .get(project)
-            .and_then(|p| p.topic_id);
         for (chat, msg) in targets {
-            if let Some(topic) = topic {
-                let _ = self.surface.retire_buttons(topic, &msg, &note).await;
+            // The record carries both the topic and the question's own words, so the retirement
+            // does not have to go back to the registry for one and cannot leave the other out.
+            let record = { self.ledger.lock().await.get(chat, &msg).cloned() };
+            if let Some(record) = record {
+                let _ = self
+                    .surface
+                    .retire_buttons(record.topic_id, &msg, &record.text, &note)
+                    .await;
             }
             let _ = self.ledger.lock().await.forget(chat, &msg);
         }
@@ -937,10 +1219,23 @@ fn next_frame_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Read the uid of whoever is on the other end of a connection.
-pub fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+/// Who is on the other end of a connection, according to the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+    pub uid: u32,
+    /// The process on the other end of THIS socket. Not the pid the bridge says it is: gate 4's
+    /// liveness check runs on this one, so a wrong number here would let a bridge make an incumbent
+    /// look dead and take its project.
+    pub pid: u32,
+}
+
+/// Read the credentials of whoever is on the other end of a connection.
+pub fn peer_cred(stream: &UnixStream) -> std::io::Result<PeerCred> {
     let cred = rustix::net::sockopt::socket_peercred(stream)?;
-    Ok(cred.uid.as_raw())
+    Ok(PeerCred {
+        uid: cred.uid.as_raw(),
+        pid: cred.pid.as_raw_nonzero().get() as u32,
+    })
 }
 
 /// This process's uid, for comparison against the peer's.

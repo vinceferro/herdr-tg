@@ -61,12 +61,15 @@ impl Surface for FakeTelegram {
         &self,
         topic_id: i32,
         msg_id: &MsgId,
+        original: &str,
         note: &str,
     ) -> anyhow::Result<()> {
+        // Both halves are recorded, because a retirement that drops the question is exactly the
+        // defect this signature grew a parameter to close.
         self.retired
             .lock()
             .await
-            .push((topic_id, msg_id.clone(), note.to_owned()));
+            .push((topic_id, msg_id.clone(), format!("{original} || {note}")));
         Ok(())
     }
 }
@@ -101,7 +104,11 @@ async fn harness() -> Harness {
         )
         // The five-second window is the real one; a test that waited it out would be five seconds
         // slower for nothing. What is under test is that the window EXISTS and gates the topic.
-        .with_settle(Duration::from_millis(500)),
+        .with_settle(Duration::from_millis(500))
+        // Likewise the budget: the real pacing is one message a second, which would make every
+        // flow test below a stopwatch exercise. The limits are tested at their real values in
+        // `queue.rs` and in `pacing_waits_but_a_real_flood_is_shed`.
+        .with_budget(crate::queue::PER_MINUTE, Duration::from_millis(5)),
     );
 
     let sock = dir.path().join("hub.sock");
@@ -568,7 +575,8 @@ async fn a_crashed_bridge_does_not_lock_its_own_project_out() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     h.hub
         .claim(h.project.clone(), dead_pid, "i0".into(), tx)
-        .await;
+        .await
+        .expect("a dead incumbent must not block a claim");
     assert!(h.hub.is_claimed(&h.project).await);
 
     let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
@@ -578,6 +586,200 @@ async fn a_crashed_bridge_does_not_lock_its_own_project_out() {
         "a live bridge was refused because a dead one held the claim: {:?}",
         welcome.payload
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_bridges_arriving_together_do_not_both_get_the_project() {
+    // The race the sequential version of this test cannot see, on the runtime the binary actually
+    // builds (`main.rs` uses `new_multi_thread`).
+    //
+    // Gate 4 used to be a check in `admit` and an unconditional insert in `claim`, with several
+    // awaits in between. Two bridges landing inside that window were BOTH admitted and the second
+    // silently replaced the first — measured at roughly one round in three when the two hellos are
+    // within about 100 µs of each other. The consequence is exactly what gate 4 exists to prevent:
+    // two bridges live on one project, both posting into one topic, and a tap on the incumbent's
+    // still-open question refused with "that session has since restarted" while it sits there
+    // waiting for the answer.
+    //
+    // Both sockets are held open for the whole round on purpose. Dropping one would let the hub see
+    // EOF and release the claim, and the second bridge would then be admitted legitimately — which
+    // looks like the bug and is not.
+    for round in 0..40 {
+        let h = harness().await;
+        let (sock, secret, project) = (h.sock.clone(), h.secret.clone(), h.project.clone());
+
+        let a = tokio::spawn({
+            let (sock, secret, project) = (sock.clone(), secret.clone(), project.clone());
+            async move {
+                let mut b = FakeBridge::connect(&sock, &secret, "iA", project.as_str()).await;
+                let first = b.next().await.map(|e| e.payload);
+                (b, first)
+            }
+        });
+        let b = tokio::spawn({
+            let (sock, secret, project) = (sock.clone(), secret.clone(), project.clone());
+            async move {
+                let mut b = FakeBridge::connect(&sock, &secret, "iB", project.as_str()).await;
+                let first = b.next().await.map(|e| e.payload);
+                (b, first)
+            }
+        });
+
+        let (_ka, ra) = a.await.expect("bridge a");
+        let (_kb, rb) = b.await.expect("bridge b");
+
+        let welcomed = [&ra, &rb]
+            .iter()
+            .filter(|r| matches!(r, Some(HubFrame::Welcome { .. })))
+            .count();
+        assert_eq!(
+            welcomed, 1,
+            "round {round}: {welcomed} bridges were admitted for one project — \
+             a={ra:?} b={rb:?}"
+        );
+        let refused = [&ra, &rb]
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Some(HubFrame::Refused {
+                        reason: RefusedReason::AlreadyClaimed
+                    })
+                )
+            })
+            .count();
+        assert_eq!(refused, 1, "round {round}: the loser was not told why");
+    }
+}
+
+#[tokio::test]
+async fn a_question_asked_before_the_pong_is_kept_rather_than_swallowed() {
+    // A bridge that opens with a question — which is the whole point of the product — used to have
+    // it read during the settling window, discarded, and never acked. No message, no record, no
+    // reply, and an agent blocked on an answer that could never come.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+
+    // Welcome, then the question, and only THEN the pong.
+    let welcome = bridge.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "asked before I was live".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+
+    // Answer the ping explicitly. `wait_for` only auto-pongs frames its predicate REJECTS, so a
+    // predicate that matches the ping returns without ever answering it — and the bridge would
+    // never become live, which is not what this test is about.
+    let ping = bridge.next().await.expect("a ping");
+    assert!(matches!(ping.payload, HubFrame::Ping), "{:?}", ping.payload);
+    bridge.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+
+    until(async || {
+        h.fake
+            .sends
+            .lock()
+            .await
+            .iter()
+            .any(|(_, t, _)| t == "asked before I was live")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_answer_id_that_will_not_fit_on_a_button_is_refused_where_the_bridge_can_hear_it() {
+    // Telegram gives a button 64 bytes of callback_data. The option id is minted by the BRIDGE, so
+    // it is agent-authored and arbitrary. Too long and the API refuses the whole message, leaving
+    // an agent blocked on a question that was never asked; a `|` survives the send and then splits
+    // wrong on the way back, so the tap resolves to nothing while looking perfectly fine.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    for bad in ["x".repeat(70), "yes|no".to_owned()] {
+        let sent = bridge
+            .send(BridgeFrame::Ask {
+                ask_id: AskId::new("a1"),
+                text: "ok?".into(),
+                options: Some(vec![AskOption {
+                    option_id: OptionId::new(bad.clone()),
+                    label: "Yes".into(),
+                }]),
+            })
+            .await;
+
+        let (delivered, why) = bridge
+            .wait_for(|f| match f {
+                HubFrame::Ack {
+                    r#ref,
+                    delivered,
+                    why,
+                } if r#ref == &sent => Some((*delivered, *why)),
+                _ => None,
+            })
+            .await;
+        assert_eq!(
+            delivered,
+            Delivered::No,
+            "an unsendable question was acked as delivered"
+        );
+        assert_eq!(why, Some(hub_proto::AckWhy::TelegramRefused));
+
+        // And the operator is told, because an agent blocked on a question that never arrived must
+        // not be visible only in a log.
+        assert!(
+            h.fake
+                .sends
+                .lock()
+                .await
+                .iter()
+                .any(|(_, t, _)| t.contains("could not put on a button")),
+            "nothing in the topic said the project was stuck"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tap_answered_from_the_phone_takes_the_keyboard_away() {
+    // Deleting the ledger record alone left the menu live forever: the record the later
+    // `ask_resolved` needed was already gone, so nothing ever retired the buttons, and an answered
+    // question stayed tappable.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite it?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    h.hub
+        .answered_from_phone(ALLOWED_CHAT, &MsgId::new("m2"), "Yes")
+        .await;
+
+    let retired = h.fake.retired.lock().await;
+    let (_, msg, body) = retired.first().expect("the keyboard was never retired");
+    assert_eq!(msg, &MsgId::new("m2"));
+    assert!(
+        body.contains("Overwrite it?"),
+        "the question was thrown away instead of kept beside its answer: {body}"
+    );
+    assert!(body.contains("answered from your phone"), "{body}");
 }
 
 #[tokio::test]
@@ -608,15 +810,25 @@ async fn a_deleted_topic_is_rebound_once_rather_than_retried_forever() {
         })
         .await;
 
-    until(async || h.fake.topics.lock().await.len() == 2).await;
+    // Wait for the MESSAGE, not for the topic count. The new topic is created and greeted first,
+    // so a test that waited on the count could look before the message had been re-sent — and would
+    // then report the message lost when it was merely not there yet.
+    until(async || {
+        h.fake
+            .sends
+            .lock()
+            .await
+            .iter()
+            .any(|(_, text, _)| text == "after the topic went")
+    })
+    .await;
     let sends = h.fake.sends.lock().await;
-    let last = sends.last().expect("a send");
+    let (topic, _, _) = sends
+        .iter()
+        .find(|(_, text, _)| text == "after the topic went")
+        .expect("the message was lost in the rebinding");
     assert_eq!(
-        last.1, "after the topic went",
-        "the message was lost in the rebinding"
-    );
-    assert_eq!(
-        last.0, 1002,
+        *topic, 1002,
         "the message went back into the topic that is gone"
     );
 }
@@ -691,7 +903,7 @@ async fn every_frame_a_bridge_sends_gets_exactly_one_ack() {
     }
 
     let mut acked = Vec::new();
-    let mut shed = 0;
+    let mut refused = 0;
     while acked.len() < sent.len() {
         let Some(env) = bridge.next().await else {
             break;
@@ -707,8 +919,12 @@ async fn every_frame_a_bridge_sends_gets_exactly_one_ack() {
             // most of them are shed — and each one says so, with a reason the bridge can act on.
             // The old shape of this failure was a single error log and a drop, which had already
             // lost 5,164 characters of a real agent's longest message.
+            // Whether these are delivered or shed depends on the budget, and that is not what this
+            // test is about. What must hold either way is that a refusal SAYS WHY: the old shape of
+            // this failure was one error log and a drop, which had already lost 5,164 characters of
+            // a real agent's longest message.
             if delivered == Delivered::No {
-                shed += 1;
+                refused += 1;
                 assert_eq!(
                     why,
                     Some(hub_proto::AckWhy::TooFast),
@@ -719,8 +935,83 @@ async fn every_frame_a_bridge_sends_gets_exactly_one_ack() {
         }
     }
     assert_eq!(acked, sent, "acks did not match the frames one for one");
+    // Under the test budget these are paced rather than shed, and either is a correct outcome for
+    // five frames. The invariant this test exists for is the ack, not the verdict.
+    let _ = refused;
+}
+
+#[tokio::test]
+async fn pacing_waits_but_a_real_flood_is_shed() {
+    // At the REAL limits, and the distinction cost a live defect to find.
+    //
+    // Telegram's ceiling has two halves: no more than one message a second, and about twenty a
+    // minute. The gap is a rhythm — waiting a beat costs nothing and the message still arrives —
+    // while the per-minute ceiling is a real limit past which something has to give. Treating both
+    // as "refuse it" made a project's FIRST question vanish: the greeting goes out the instant a
+    // bridge connects, and the question that follows lands inside the one-second gap.
+    let h = harness().await;
+    let hub = Arc::new(Hub::new(
+        Arc::clone(&h.fake),
+        Registry::load(h.dir.path().join("projects.json")),
+        AskLedger::load(h.dir.path().join("asks2.json")),
+        HubAudit::new(h.dir.path().join("hub2.audit.log")),
+        vec![ALLOWED_CHAT],
+        ALLOWED_CHAT,
+    )); // deliberately NOT with_budget: this one runs at the real limits
+
+    let before = h.fake.sends.lock().await.len();
+    let started = std::time::Instant::now();
+    let first = hub.say(&h.project, "one", &[]).await;
+    let second = hub.say(&h.project, "two", &[]).await;
+
+    assert!(matches!(first, SendOutcome::Sent(_)), "{first:?}");
     assert!(
-        shed > 0,
-        "nothing was shed, so this proved nothing about backpressure"
+        matches!(second, SendOutcome::Sent(_)),
+        "a message inside the one-second gap was DROPPED rather than paced: {second:?}"
+    );
+    assert!(
+        started.elapsed() >= crate::queue::MIN_GAP,
+        "the second message did not wait for the gap, so the pacing is not real"
+    );
+    // Checked by content, not by count: this hub has its own registry handle and no bridge has
+    // connected to it, so its first `say` also creates and greets a topic. Counting totals would be
+    // counting that greeting.
+    let sends = h.fake.sends.lock().await;
+    for wanted in ["one", "two"] {
+        assert!(
+            sends[before..].iter().any(|(_, t, _)| t == wanted),
+            "{wanted:?} never reached the operator"
+        );
+    }
+    drop(sends);
+
+    // The other half — a real ceiling still sheds — with a budget of one a minute rather than the
+    // real eighteen. At the real rate the bucket refills faster than a paced sender drains it, so
+    // draining it honestly takes about ninety seconds of wall clock to prove something `queue.rs`
+    // already pins at its real values. What is worth proving HERE is that `send_into` reaches the
+    // shed at all rather than pacing forever, and that the refusal says when to come back.
+    let tight = Arc::new(
+        Hub::new(
+            Arc::clone(&h.fake),
+            Registry::load(h.dir.path().join("projects.json")),
+            AskLedger::load(h.dir.path().join("asks3.json")),
+            HubAudit::new(h.dir.path().join("hub3.audit.log")),
+            vec![ALLOWED_CHAT],
+            ALLOWED_CHAT,
+        )
+        .with_budget(1, Duration::from_millis(5)),
+    );
+    let _ = tight.say(&h.project, "the one allowed", &[]).await;
+    let mut shed = None;
+    for _ in 0..4 {
+        if let SendOutcome::TooFast(wait) = tight.say(&h.project, "over the ceiling", &[]).await {
+            shed = Some(wait);
+            break;
+        }
+    }
+    let wait = shed.expect("a sender past the ceiling was never shed");
+    assert!(
+        wait > Duration::ZERO,
+        "a refusal must say when to come back"
     );
 }
