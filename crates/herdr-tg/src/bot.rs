@@ -103,6 +103,10 @@ struct Ctx {
     /// bridge is Telegram-only — which is a real state on a box where the forum has not been set
     /// up yet, and must not be a crash.
     hub: Option<Arc<crate::hub::Hub<crate::surface::Telegram>>>,
+    /// Whether the older pane path is switched on. `false` by default, and false is what stops a
+    /// keystroke reaching a terminal — including from a button still sitting in Telegram's history
+    /// from a previous run, which is tappable forever and does not know the path is off.
+    panes: bool,
     client: Arc<HerdrClient>,
     gate: Arc<Gate>,
     routing: Arc<Mutex<Routing>>,
@@ -153,6 +157,7 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
 
     let ctx = Ctx {
         hub: None,
+        panes: std::env::var("HERDR_TG_PANES").is_ok_and(|v| v == "1"),
         client: Arc::new(client),
         gate: Arc::new(gate),
         routing: Arc::new(Mutex::new(routing)),
@@ -171,23 +176,41 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
         ),
         None => tracing::debug!("no summarizer configured; asks go out as-is"),
     }
-    match ctx.forum {
-        Some(c) => tracing::info!(forum = c.0, "forum mode: one topic per pane"),
-        None => {
-            tracing::info!("flat mode: no forum group configured; routing uses reply-to + sticky")
-        }
+    // THE PANE HALF IS OFF UNLESS SOMEONE ASKED FOR IT.
+    //
+    // `serve` used to start two things: the hub, and the older path that watches herdr's panes,
+    // mirrors them to Telegram, and can put KEYSTROKES in a real terminal. That second half is
+    // stopped by decision — a review found four ways it could type the wrong thing — and starting
+    // the service to try the hub silently re-armed it, which is exactly what happened the first
+    // time this was run for real.
+    //
+    // So it is opt-in, by an environment variable, and the default is the safe one. A restart, a
+    // reboot, or someone starting the unit to look at the hub cannot arm a keystroke path by
+    // accident; it takes a deliberate line in the environment file.
+    let panes = std::env::var("HERDR_TG_PANES").is_ok_and(|v| v == "1");
+    if panes {
+        tracing::warn!(
+            routing = %routing_path.display(),
+            audit = %audit.path().display(),
+            submit = %config.submit_key,
+            "HERDR_TG_PANES=1: the pane path is ON, and it can type into a real terminal. \
+             Unset it to run the hub alone."
+        );
+    } else {
+        tracing::info!(
+            "the pane path is off: no mirroring, no pushes, and nothing here can type into a \
+             terminal. Set HERDR_TG_PANES=1 to turn it back on."
+        );
     }
-    tracing::info!(
-        routing = %routing_path.display(),
-        audit = %audit.path().display(),
-        submit = %config.submit_key,
-        "reply path armed"
-    );
+    match ctx.forum {
+        Some(c) if panes => tracing::info!(forum = c.0, "forum mode: one topic per pane"),
+        _ => {}
+    }
 
     // The push loop, spawned before dispatch so an ask that is ALREADY blocked reaches the phone at
     // startup — the filtered subscription's replay, which is what recovers asks raised while the
     // laptop slept.
-    {
+    if panes {
         let ctx = ctx.clone();
         let bot = bot.clone();
         let chats: Vec<i64> = config.allowed_chat_ids.iter().copied().collect();
@@ -206,7 +229,7 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
     // session that never got stuck had no conversation to open — which is exactly the session the
     // operator wants to pick up from their phone. Idempotent: a pane that already has a topic keeps
     // it, so restarts do not multiply topics.
-    if ctx.forum.is_some() {
+    if panes && ctx.forum.is_some() {
         let ctx2 = ctx.clone();
         let bot2 = bot.clone();
         tokio::spawn(async move {
@@ -227,7 +250,7 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
     // The mirror. Without it a topic is an alert channel that goes quiet exactly while you are
     // working — you open it on a phone and see the last alarm, not the session. This is what makes
     // walking away a non-event.
-    if ctx.forum.is_some() {
+    if panes && ctx.forum.is_some() {
         let ctx3 = ctx.clone();
         let bot3 = bot.clone();
         tokio::spawn(async move { mirror_loop(&bot3, &ctx3).await });
@@ -853,6 +876,13 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         .and_then(|m| m.thread_id)
         .map(|t| t.0.0);
     let reply = match data.split('|').collect::<Vec<_>>().as_slice() {
+        // A button from the pane path, tapped while that path is off. They stay tappable in
+        // Telegram's history forever and cannot know the path has been switched off, so the refusal
+        // has to live here rather than relying on them not being pressed.
+        ["t", _] | ["c", _, _] if !ctx.panes => escape_html(
+            "That button belongs to the older way of driving panes, which is switched off. \
+             Nothing was sent.",
+        ),
         // This also answers taps on buttons still sitting in the group's history from before the
         // topic became the aim.
         ["t", _] if !sticky_offered(ctx.forum, ChatId(chat_id)) => escape_html(TOPIC_IS_THE_AIM),
@@ -1013,6 +1043,25 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
                 .parse_mode(ParseMode::Html);
             out = out.message_thread_id(ThreadId(MessageId(thread)));
             let _ = out.await;
+            return Ok(());
+        }
+
+        if !ctx.panes {
+            // The same reasoning as the buttons: a topic from a previous run is still there to
+            // type in, and the person typing has no way to know the path behind it is off.
+            tracing::info!(
+                chat_id,
+                "a typed reply while the pane path is off; nothing was sent"
+            );
+            reply(
+                &bot,
+                msg.chat.id,
+                &escape_html(
+                    "Typing here used to reach a terminal. That path is switched off, so nothing \
+                     was sent.",
+                ),
+            )
+            .await;
             return Ok(());
         }
 
