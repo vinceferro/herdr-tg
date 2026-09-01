@@ -17,6 +17,7 @@ futures-core = { workspace = true }
 tracing-subscriber = { workspace = true }
 toml       = { workspace = true }
 reqwest    = { workspace = true }
+rustix     = { workspace = true }
 
 # SLICE 2 — Telegram. `default-features = false` is LOAD-BEARING, not stylistic: teloxide 0.17.0's
 # default is ['native-tls','ctrlc_handler','teloxide-core/default'] and teloxide-core 0.13.0's default
@@ -33,6 +34,7 @@ reqwest    = { workspace = true }
 teloxide = { version = "0.17.0", default-features = false, features = ["rustls", "ctrlc_handler", "macros"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # The summarizer tests stand up a real HTTP server on loopback and read back what was sent to it.
 # What is under test is what this crate does with a REPLY — which responder answered, and whether
 # the operator's pane text was already on the wire by then — and a hand-rolled stand-in for reqwest

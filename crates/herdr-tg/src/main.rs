@@ -39,6 +39,8 @@ mod bot;
 mod cmd;
 mod config;
 mod deliver;
+mod heartbeat;
+mod lock;
 mod mirror;
 mod notify;
 mod permission;
@@ -212,6 +214,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             timeout_ms,
         } => cmd::watch::run(&client, &pane, once, expect_status.as_deref(), timeout_ms).await,
         Cmd::Serve { config } => {
+            // FIRST, before the config is even read, and long before a `Bot` exists.
+            //
+            // Two processes long-polling one bot token do not share the slot; they take turns
+            // losing to each other on HTTP 409, and the operator sees a bot that answers
+            // sometimes. Taking the lock here means the second copy dies in milliseconds with a
+            // sentence naming the first, instead of joining it on the line.
+            //
+            // The ordering is the property, not the lock: `a_second_hub_never_reaches_the_token`
+            // runs this binary with no token at all and asserts the failure is about the lock. If
+            // this moved below `Config::load`, that test would see a complaint about the token.
+            let hub_lock = lock::HubLock::acquire(lock::state_dir())?;
+            tracing::debug!(lock = %hub_lock.path().display(), "this process holds the hub lock");
             let cfg = config::Config::load(config.as_deref())?;
             // `--socket` still wins; the config's socket is the next fallback, so a probe session
             // can be targeted from the file the unit already reads.
@@ -219,7 +233,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 (None, Some(path)) => HerdrClient::new(path.clone()),
                 _ => client,
             };
-            bot::serve(cfg, client).await
+            let outcome = bot::serve(cfg, client).await;
+            // Explicit, and not merely stylistic: the lock lives as long as this binding. Letting
+            // it drop before `serve` returns would release it while the bot was still polling,
+            // which is precisely the two-poller state it exists to prevent.
+            drop(hub_lock);
+            outcome
         }
     }
 }

@@ -40,6 +40,7 @@ use teloxide::utils::command::BotCommands;
 use crate::audit::Audit;
 use crate::config::Config;
 use crate::deliver::{self, Settle};
+use crate::heartbeat::{Heartbeat, HubHealth};
 use crate::mirror::Mirror;
 use crate::notify::{self, Ask, Beat, Timing};
 use crate::permission::Screen;
@@ -230,6 +231,42 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message))
         .branch(Update::filter_callback_query().endpoint(on_callback));
+
+    // The other half of the watchdog contract. `deploy/herdr-tg-watchdog.sh` buzzes the operator's
+    // phone when this file stops being touched, and it arms itself the first time it ever sees it,
+    // so from here on a hub that dies is a hub the operator hears about.
+    //
+    // WHAT THIS STAMP PROVES, exactly: the process is alive, the network is up, the token is still
+    // good, and Telegram answered. It is a real round trip, not a local clock read.
+    //
+    // WHAT IT DOES NOT PROVE: that updates are being DELIVERED. A dispatcher wedged behind a stuck
+    // handler would keep this stamping. That gap is deliberate rather than overlooked — closing it
+    // needs the hub's own loop, which is where the 409 counter lands too, and slice 4's own
+    // deaf-worker alarm is the thing that finally covers it. Claiming more here would be the exact
+    // failure this file exists to prevent: a healthy-looking report from something that is not.
+    let heartbeat = Heartbeat::new(Heartbeat::default_path());
+    let hb_bot = bot.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(45));
+        loop {
+            tick.tick().await;
+            match hb_bot.get_me().await {
+                Ok(_) => {
+                    if let Err(e) = heartbeat.stamp(HubHealth::Serving) {
+                        // Not fatal, and loudly not silent: if this keeps failing the watchdog will
+                        // alarm on a hub that is perfectly healthy, and this line is the only thing
+                        // that will explain why.
+                        tracing::error!(error = %e, path = %heartbeat.path().display(),
+                            "could not stamp the heartbeat — the watchdog may raise a false alarm");
+                    }
+                }
+                // Deliberately NOT stamped. An unreachable Bot API is exactly the state the
+                // operator needs to hear about, and stamping here would hide it from the one thing
+                // watching.
+                Err(e) => tracing::warn!(error = %e, "the Bot API did not answer; not stamping"),
+            }
+        }
+    });
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![ctx])
