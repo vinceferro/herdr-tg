@@ -1,11 +1,18 @@
-//! The four read-only subcommands, and the one helper they share.
+//! The subcommands, and the one helper they share.
 //!
-//! There is no fifth module here and there must not be: `herdr-client`'s
-//! `tests/no_live_write_call_site.rs` greps this whole directory and fails the suite if any file
-//! under it so much as names one of herdr's three write RPCs — the ones that type keystrokes into
-//! the operator's real terminals. Not a call, not an import, not a subcommand, not a TODO.
+//! Four of them — `status`, `read`, `doctor`, `watch` — are read-only against herdr. `enroll` is
+//! not: it writes the hub's own registry and a secret into a project's tree. That is a different
+//! axis from the rule below, and worth separating rather than blurring, because the rule is about
+//! one thing only.
+//!
+//! **No file under this directory may so much as name one of herdr's three write RPCs** — the ones
+//! that type keystrokes into the operator's real terminals. Not a call, not an import, not a
+//! subcommand, not a TODO. `herdr-client`'s `tests/no_live_write_call_site.rs` greps this whole
+//! directory and fails the suite on a mention. `enroll` writing files does not weaken that: it
+//! never reaches a terminal, and it is reachable only from argv at a keyboard.
 
 pub(crate) mod doctor;
+pub(crate) mod enroll;
 pub(crate) mod read;
 pub(crate) mod status;
 pub(crate) mod watch;

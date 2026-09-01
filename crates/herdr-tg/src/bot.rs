@@ -99,6 +99,10 @@ pub enum Command {
 /// Everything the handlers share. One Arc, so adding a handler does not mean threading six clones.
 #[derive(Clone)]
 struct Ctx {
+    /// The hub, when a forum is configured. `None` means the socket half is not running and the
+    /// bridge is Telegram-only — which is a real state on a box where the forum has not been set
+    /// up yet, and must not be a crash.
+    hub: Option<Arc<crate::hub::Hub<crate::surface::Telegram>>>,
     client: Arc<HerdrClient>,
     gate: Arc<Gate>,
     routing: Arc<Mutex<Routing>>,
@@ -148,6 +152,7 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
     }
 
     let ctx = Ctx {
+        hub: None,
         client: Arc::new(client),
         gate: Arc::new(gate),
         routing: Arc::new(Mutex::new(routing)),
@@ -227,6 +232,68 @@ pub async fn serve(config: Config, client: HerdrClient) -> anyhow::Result<()> {
         let bot3 = bot.clone();
         tokio::spawn(async move { mirror_loop(&bot3, &ctx3).await });
     }
+
+    // ── the hub ───────────────────────────────────────────────────────────────────────────────
+    // One socket, one claim per project, and the operator's taps coming back the other way. It
+    // needs a forum: routing is a single rule — a topic, inside the one configured chat — and
+    // without that chat there is nowhere for a project's topic to live.
+    let hub = match config.forum_chat_id {
+        None => {
+            tracing::warn!(
+                "no forum chat is configured, so no project can be given a topic.                  Set HERDR_TG_FORUM_CHAT_ID to switch the hub on."
+            );
+            None
+        }
+        Some(forum) => {
+            let surface = Arc::new(crate::surface::Telegram::new(bot.clone(), ChatId(forum)));
+            let hub = Arc::new(crate::hub::Hub::new(
+                surface,
+                crate::registry::Registry::load(crate::registry::Registry::default_path()),
+                crate::hub::AskLedger::load(crate::hub::AskLedger::default_path()),
+                crate::hub::HubAudit::new(crate::hub::HubAudit::default_path()),
+                config.allowed_chat_ids.iter().copied().collect(),
+                forum,
+            ));
+            let sock = crate::hub::socket_path();
+            match crate::hub::bind(&sock) {
+                Err(e) => {
+                    // Not fatal. The Telegram half still works, and a hub that refused to start the
+                    // whole bridge over its own socket would take the operator's only channel down
+                    // with it.
+                    tracing::error!(error = %e, path = %sock.display(), "could not open the hub's socket");
+                    None
+                }
+                Ok(listener) => {
+                    tracing::info!(
+                        path = %sock.display(),
+                        audit = %hub.audit.path().display(),
+                        "the hub is listening"
+                    );
+                    let accept = Arc::clone(&hub);
+                    tokio::spawn(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((stream, _)) => {
+                                    let hub = Arc::clone(&accept);
+                                    tokio::spawn(async move {
+                                        if let Err(e) = hub.serve_connection(stream).await {
+                                            tracing::warn!(error = %e, "a bridge connection ended badly");
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "the hub's listener failed");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    Some(hub)
+                }
+            }
+        }
+    };
+    let ctx = Ctx { hub, ..ctx };
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(on_message))
@@ -771,6 +838,56 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                 } => answer_dialog(&ctx, chat_id, &pane, &label, &drawn_from, seq).await,
             }
         }
+        // A tap on one of the hub's questions. The option id is opaque; what it MEANS was written
+        // down in the ledger beside the message when the question went out, and that record is what
+        // resolves it — never the button's position.
+        [crate::surface::CALLBACK_PREFIX, option] => match &ctx.hub {
+            None => escape_html("The hub is not running, so I cannot pass that on."),
+            Some(hub) => {
+                let msg_id = q
+                    .message
+                    .as_ref()
+                    .map(|m| hub_proto::MsgId::new(m.id().0.to_string()));
+                let option_id = hub_proto::OptionId::new(*option);
+                match msg_id {
+                    None => escape_html("I cannot tell which question that button belongs to."),
+                    Some(msg_id) => match hub.resolve_tap(chat_id, &msg_id, &option_id).await {
+                        Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
+                        Err(why) => escape_html(why.say()),
+                        Ok((project, ask_id, option_id)) => {
+                            let label = hub
+                                .ledger
+                                .lock()
+                                .await
+                                .get(chat_id, &msg_id)
+                                .and_then(|r| {
+                                    r.options
+                                        .iter()
+                                        .find(|o| o.option_id == option_id)
+                                        .map(|o| o.label.clone())
+                                })
+                                .unwrap_or_default();
+                            let sent = hub
+                                .deliver(
+                                    &project,
+                                    hub_proto::HubFrame::Choice {
+                                        msg_id: msg_id.clone(),
+                                        ask_id,
+                                        option_id,
+                                    },
+                                )
+                                .await;
+                            if sent {
+                                let _ = hub.ledger.lock().await.forget(chat_id, &msg_id);
+                                format!("Sent: {}", escape_html(&label))
+                            } else {
+                                escape_html(crate::hub::TapRefusal::NotConnected.say())
+                            }
+                        }
+                    },
+                }
+            }
+        },
         _ => "I don't recognise that button".to_string(),
     };
 

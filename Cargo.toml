@@ -23,11 +23,23 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 reqwest    = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 toml       = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 tempfile     = "3.27.0"
+# "std" is NOT optional here despite looking like it: without it rustix has no `AsFd` impl for
+# std::fs::File and no `From<Errno> for io::Error`. It compiled anyway for a while because the
+# dev-dependency tempfile turns it on, so `cargo test` was green while `cargo build` would not have
+# been — a feature-unification accident, and exactly the kind of thing that surfaces on the day
+# someone builds a release.
 # Already in the graph via tempfile; a direct dependency adds no new crate to the test build and
 # no C build dependency. It is here for ONE call: an advisory lock on the state directory. The
 # alternative — a pidfile created with O_EXCL — cannot be released by the kernel when a process is
 # killed, so a SIGKILL would leave a lock nobody can clear from a phone.
-rustix       = { version = "1.1.4", default-features = false, features = ["fs"] }
+rustix       = { version = "1.1.4", default-features = false, features = ["std", "fs", "net", "process"] }
+# All three are ALREADY in the graph — ring and subtle via rustls, getrandom under it — so naming
+# them directly adds no crate to the build and no C dependency. They are here for the enrolment
+# secret and nothing else: 32 random bytes, a SHA-256 of them, and a comparison that does not leak
+# how far it got. Hand-rolling any of those three is how a token check becomes a timing oracle.
+ring         = "0.17.14"
+subtle       = "2.6.1"
+getrandom    = "0.4.3"
 
 [profile.release]
 lto           = "thin"

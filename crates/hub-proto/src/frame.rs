@@ -248,10 +248,20 @@ pub enum AckStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum HubFrame {
-    /// The connection is live. Carries the name the REGISTRY holds, not anything the bridge sent.
+    /// The connection is admitted. Carries the name the REGISTRY holds, not anything the bridge sent.
+    ///
+    /// `topic_id` is `None` at this point and usually stays that way for a few seconds: a topic is
+    /// created when the connection becomes LIVE — after a settling window and one answered ping —
+    /// not when it is admitted. A channel plugin that is not allowlisted boots and exits in about a
+    /// tenth of a second, and a topic created for one of those is an empty topic bound forever to a
+    /// project whose bridge was never there.
+    ///
+    /// A bridge does not need it and must not use it to address anything. It is here because the
+    /// number is useful in a log when someone is working out where a message went.
     Welcome {
         project: String,
-        topic_id: i32,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        topic_id: Option<i32>,
         limits: Limits,
     },
     /// Not admitted. The connection closes immediately after.

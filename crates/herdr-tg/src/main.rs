@@ -40,13 +40,17 @@ mod cmd;
 mod config;
 mod deliver;
 mod heartbeat;
+mod hub;
 mod lock;
 mod mirror;
 mod notify;
 mod permission;
+mod queue;
+mod registry;
 mod render;
 mod routing;
 mod summarize;
+mod surface;
 mod voice;
 
 use std::io::{IsTerminal, Write};
@@ -157,6 +161,23 @@ enum Cmd {
     /// dials out to api.telegram.org and to the local herdr socket, so the box needs no ingress
     /// (D7). The token comes from `$HERDR_TG_TOKEN`, never from the config file; the chat-id
     /// allowlist is the identity gate and fails closed, so an empty allowlist answers nobody.
+    /// Enrol a project so its bridge may connect, or rotate the secret of one already enrolled.
+    ///
+    /// **The only door.** Nothing arriving over Telegram or over the hub's socket can add a
+    /// project, mint a secret, or switch one on. Inbound content selects from what this machine
+    /// already knows; it never names something new. That boundary is only real because admission
+    /// lives here, in argv, at a keyboard.
+    ///
+    /// Re-running it on an enrolled project rotates the secret and keeps the topic, so a leaked
+    /// secret costs a command rather than a conversation's history.
+    Enroll {
+        /// The project's own directory.
+        repo: PathBuf,
+    },
+
+    /// Every enrolled project, and whether it has a topic yet.
+    Projects,
+
     Serve {
         /// Structure only — workspace, allowlist, socket. Never the token.
         #[arg(long, value_name = "PATH")]
@@ -213,6 +234,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             expect_status,
             timeout_ms,
         } => cmd::watch::run(&client, &pane, once, expect_status.as_deref(), timeout_ms).await,
+        Cmd::Enroll { repo } => cmd::enroll::enrol(&repo),
+        Cmd::Projects => cmd::enroll::projects(),
         Cmd::Serve { config } => {
             // FIRST, before the config is even read, and long before a `Bot` exists.
             //

@@ -18,6 +18,10 @@ tracing-subscriber = { workspace = true }
 toml       = { workspace = true }
 reqwest    = { workspace = true }
 rustix     = { workspace = true }
+ring       = { workspace = true }
+subtle     = { workspace = true }
+getrandom  = { workspace = true }
+hub-proto  = { path = "../hub-proto" }
 
 # SLICE 2 — Telegram. `default-features = false` is LOAD-BEARING, not stylistic: teloxide 0.17.0's
 # default is ['native-tls','ctrlc_handler','teloxide-core/default'] and teloxide-core 0.13.0's default
