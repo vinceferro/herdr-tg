@@ -1233,7 +1233,123 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
         "the wrong option reached the agent: {got}"
     );
 
+    // And the other direction: the operator types, and it arrives as a MESSAGE in the agent's own
+    // turn. This is the half that used to be keystrokes in a terminal.
+    assert!(
+        h.hub
+            .relay(
+                &project,
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "use --dry-run first"
+            )
+            .await
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut typed = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), stdout.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if line.contains("notifications/claude/channel") && line.contains("--dry-run") {
+                    typed = Some(line);
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let typed = typed.expect("what the operator typed never reached the agent");
+    assert!(
+        typed.contains("use --dry-run first"),
+        "his words changed on the way: {typed}"
+    );
+
     let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn what_the_operator_types_reaches_the_agent_as_a_message_in_its_own_turn() {
+    // The other direction of the round trip, and the whole safety story of the redesign: his words
+    // arrive as a MESSAGE the agent reads in its own turn, never as keystrokes in a terminal. The
+    // two-writer race that made the old path unsafe has no mechanism here.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // The topic is bound, so the hub can tell which project a message typed there belongs to.
+    let topic = h.hub.topic_for(&h.project).await.expect("a topic");
+    assert_eq!(
+        h.hub.project_for_topic(topic).await.as_ref(),
+        Some(&h.project),
+        "the hub could not tell which project owns its own topic"
+    );
+
+    assert!(
+        h.hub
+            .relay(
+                &h.project,
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "try it with --dry-run first"
+            )
+            .await
+    );
+
+    let got = bridge
+        .wait_for(|f| match f {
+            HubFrame::Message { text, from, .. } => Some((text.clone(), from.chat_id)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        got.0, "try it with --dry-run first",
+        "his words changed on the way"
+    );
+    assert_eq!(got.1, ALLOWED_CHAT);
+}
+
+#[tokio::test]
+async fn a_message_from_a_chat_this_bot_does_not_answer_reaches_nobody() {
+    // The allowlist runs first, before anything else looks at the message. It is the ONLY scope
+    // boundary now that one bot serves every project, so it is checked in the relay itself rather
+    // than only in the handler above it — a second caller is a second way around.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    assert!(
+        !h.hub
+            .relay(&h.project, 4242, 7, &MsgId::new("m9"), "let me in")
+            .await,
+        "a stranger's message was relayed to an agent"
+    );
+}
+
+#[tokio::test]
+async fn a_message_for_a_project_that_is_not_connected_is_dropped_rather_than_queued() {
+    // Never queued. A message held for a worker that may never come back is a message the operator
+    // believes was sent, and he finds out it was not at the worst possible moment.
+    let h = harness().await;
+    assert!(
+        !h.hub
+            .relay(
+                &h.project,
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "anyone there?"
+            )
+            .await
+    );
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        audit.contains("not connected"),
+        "a dropped message left no record:\n{audit}"
+    );
 }
 
 #[tokio::test]

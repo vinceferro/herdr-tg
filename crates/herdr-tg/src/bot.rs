@@ -367,12 +367,38 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
     };
 
     let Ok(cmd) = Command::parse(text, "herdr_tg") else {
-        // Not a command. Relaying typed replies to a bridge is a later slice; until then the
-        // refusal has to be TRUE and it has to appear where he typed, not in General.
+        // Not a command: it is something the operator typed at a project. A message belongs to the
+        // topic it was typed in and to no other — that is the whole of routing, and every other
+        // rule this bridge used to have is deleted rather than tested against.
         let thread = msg.thread_id.map(|t| t.0.0);
-        let body = escape_html(
-            "I cannot pass typed replies to a project yet — use the buttons on its questions.",
-        );
+        let body = match (&ctx.hub, thread) {
+            (Some(hub), Some(thread)) => match hub.project_for_topic(thread).await {
+                Some(project) => {
+                    let mid = hub_proto::MsgId::new(msg.id.0.to_string());
+                    let user = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+                    if hub.relay(&project, chat_id, user, &mid, text).await {
+                        tracing::info!(chat_id, %project, bytes = text.len(), "relayed to a project");
+                        // Nothing is said back. A confirmation under every line the operator types
+                        // turns a conversation into a receipt printer; the agent's own answer is
+                        // the acknowledgement, and it is the one he is waiting for.
+                        return Ok(());
+                    }
+                    // Dropped, visibly, where he typed it — never queued. A message held for a
+                    // worker that may never come back is a message he believes was sent.
+                    escape_html(
+                        "That project is not connected right now, so nothing was sent. It will not \
+                         be delivered later.",
+                    )
+                }
+                None => escape_html(
+                    "I do not know which project this topic belongs to, so I have not sent anything.",
+                ),
+            },
+            _ => escape_html(
+                "Type inside a project's topic and I will pass it on. Here in General I do not know \
+                 who you mean.",
+            ),
+        };
         let mut out = bot
             .send_message(msg.chat.id, &body)
             .parse_mode(ParseMode::Html);

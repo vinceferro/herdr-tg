@@ -751,6 +751,62 @@ impl<S: Surface> Hub<S> {
         self.claims.lock().await.contains_key(project)
     }
 
+    /// Which project owns a topic, if any.
+    ///
+    /// A message typed in a topic belongs to that project and to no other. This is the whole of
+    /// routing: rule 0 and nothing else. Every supergroup numbers its reply threads from one
+    /// counter, which is how a swipe-reply on a direct message once reached a forum pane — deleting
+    /// the other rules deletes that failure rather than testing against it.
+    pub async fn project_for_topic(&self, topic_id: i32) -> Option<ProjectId> {
+        self.registry
+            .lock()
+            .await
+            .all()
+            .find(|p| p.topic_id == Some(topic_id))
+            .map(|p| p.id.clone())
+    }
+
+    /// Hand the operator's own words to a project, verbatim and exactly once.
+    ///
+    /// **Opaque.** The hub does not parse it, does not act on it, and does not let it name
+    /// anything. Inbound content selects; it never names. What the agent receives is a MESSAGE in
+    /// its own turn — never a keystroke — which is why the operator's phone and his laptop are no
+    /// longer two writers fighting over one keyboard.
+    ///
+    /// Returns whether it was delivered, so the caller can say so rather than guess. A project that
+    /// is not connected is told to the operator visibly, in the topic, and never queued: a message
+    /// held for a worker that may never return is a message he believes was sent.
+    pub async fn relay(
+        &self,
+        project: &ProjectId,
+        chat_id: i64,
+        user_id: i64,
+        msg_id: &MsgId,
+        text: &str,
+    ) -> bool {
+        if !self.chat_is_allowed(chat_id) {
+            return false;
+        }
+        let delivered = self
+            .deliver(
+                project,
+                HubFrame::Message {
+                    msg_id: msg_id.clone(),
+                    text: text.to_owned(),
+                    from: hub_proto::From { chat_id, user_id },
+                    in_reply_to_ask: None,
+                },
+            )
+            .await;
+        let _ = if delivered {
+            self.audit
+                .outcome(project, &SendOutcome::Sent(msg_id.clone()))
+        } else {
+            self.audit.refused(project, "the project was not connected")
+        };
+        delivered
+    }
+
     /// The topic a project's messages go in, created and greeted on first use.
     ///
     /// Created here rather than at `hello` for one reason: a topic with no messages is invisible in
