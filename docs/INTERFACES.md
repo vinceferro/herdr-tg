@@ -67,10 +67,18 @@ they are allowed to.
 | attachment | MCP channel plugin, in-process | HTTP + `/event` stream, out-of-process |
 | lifetime | dies with the session | outlives sessions |
 | granularity | one session | one server, many sessions |
-| status | BUILT, proven against the real hub | not built |
+| status | BUILT, proven against the real hub | first slice BUILT, `adapters/opencode-bridge/` |
 
 Consequence worth stating plainly: the opencode adapter is **one bridge per project, not per
-lane**, holding one hub connection per lane. The Claude adapter is one per session because that is
+lane**, holding one hub connection per lane.
+
+What the first slice found, 2 September: opencode publishes `question.v2.asked` with real
+`options[{label, description}]` and `permission.v2.asked` with a closed reply set of
+once/always/reject. So the adapter maps a question to an `ask` and a tap to a reply without
+parsing anything — the structure herdr threw away is on the wire here. Its `/session` does report a
+`directory` per session, and the adapter deliberately does **not** use it to serve several projects
+from one server: identity is a secret the hub resolves, and one bridge per project addressed by URL
+is also what survives each agent moving into its own container. The Claude adapter is one per session because that is
 all a channel plugin can be.
 
 ## Seam ③ — the discipline. Undefined, and it belongs to the ADAPTER.
