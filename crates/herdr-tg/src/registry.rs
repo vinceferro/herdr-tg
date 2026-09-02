@@ -86,6 +86,19 @@ pub enum EnrolError {
     /// this one. Refused — and told how to recover, because refusing without a way forward turns a
     /// bad byte into a locked door.
     Unreadable { path: PathBuf, why: String },
+    /// The folder is inside one that is already enrolled.
+    ///
+    /// Refused, not warned. Allowing it made one repository into two projects with two separate
+    /// chats, and which one a question landed in depended on the folder the session happened to
+    /// start in — the hub cannot tell them apart, because it resolves a connection by its secret
+    /// and throws the `repo` it was sent away. It also wrote a second secret one level down, where
+    /// the guard that checks whether git would commit it was looking for a `.git` that is only ever
+    /// at the top.
+    InsideAnotherProject {
+        repo: PathBuf,
+        parent: PathBuf,
+        title: String,
+    },
 }
 
 impl std::fmt::Display for EnrolError {
@@ -100,6 +113,20 @@ impl std::fmt::Display for EnrolError {
             Self::NoRandomness => write!(
                 f,
                 "this machine would not give me random bytes, so I will not invent a secret"
+            ),
+            Self::InsideAnotherProject {
+                repo,
+                parent,
+                title,
+            } => write!(
+                f,
+                "{} is inside {}, which is already enrolled as \"{title}\". Enrolling it as well \
+                 would split one project across two chats, and it would leave a second secret in a \
+                 folder git is watching. Enrol the project by its own top folder instead:\n\
+                 \n    herdr-tg enroll {}",
+                repo.display(),
+                parent.display(),
+                parent.display()
             ),
             Self::Unreadable { path, why } => write!(
                 f,
@@ -269,6 +296,21 @@ impl Registry {
         })?;
         if !repo.is_dir() {
             return Err(EnrolError::NoSuchRepo { repo });
+        }
+
+        // Both paths are canonical, so this is a real containment test and not a string prefix that
+        // would call `/srv/app2` a child of `/srv/app`. Re-enrolling the same folder is a rotation
+        // and stays allowed; only a folder BELOW an enrolled one is refused.
+        if let Some(parent) = self
+            .projects
+            .values()
+            .find(|p| repo != p.repo && repo.starts_with(&p.repo))
+        {
+            return Err(EnrolError::InsideAnotherProject {
+                repo,
+                parent: parent.repo.clone(),
+                title: parent.title.clone(),
+            });
         }
 
         // Minted from the canonical path, never from a counter. A recycled counter silently
@@ -640,6 +682,32 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "mode {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn a_folder_inside_an_enrolled_project_cannot_become_a_second_project() {
+        // A session started in `crates/` used to be told to enrol `crates/`, and it worked: one
+        // repository became two projects with two chats, a question landed in whichever one the
+        // session had started under, and a second secret was written a level down where the guard
+        // that checks whether git would commit it does not look.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let top = repo(&d, "herdr-tg");
+        r.enrol(&top).expect("enrols the project");
+        let inside = repo(&d, "herdr-tg/crates");
+        let said = r.enrol(&inside).expect_err("refused").to_string();
+        assert!(said.contains("herdr-tg"), "{said}");
+        assert!(said.contains("herdr-tg enroll"), "{said}");
+        for jargon in ["Err", "InsideAnotherProject", "parent", "canonical", "None"] {
+            assert!(
+                !said.contains(jargon),
+                "jargon reached the operator: {said}"
+            );
+        }
+        // The top folder still rotates, because that is not the same folder.
+        r.enrol(&top)
+            .expect("re-enrolling the project itself still works");
+        assert_eq!(r.all().count(), 1);
     }
 
     #[test]

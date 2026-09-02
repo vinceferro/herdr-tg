@@ -1128,8 +1128,9 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
         .canonicalize()
         .expect("the plugin is in the repo");
 
-    // The plugin reads its secret from <repo>/.kickoff/hub.token, exactly as a real project does.
-    let repo = h.dir.path().join("plugin-repo");
+    // The plugin reads its secret from <repo>/.kickoff/hub.token, exactly as a real project does —
+    // and `repo` is the directory the harness actually enrolled, not a stand-in beside it.
+    let repo = h.dir.path().join("herdr-tg");
     std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
     std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
 
@@ -1137,7 +1138,12 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
         .arg("server.ts")
         .current_dir(&plugin)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
-        .env("KICKOFF_CHANNEL_REPO", &repo)
+        // Byte for byte how Claude Code starts it: cwd is the plugin, and the project is named only
+        // here. The socket is the one thing a tempdir harness cannot help overriding.
+        .env("CLAUDE_PROJECT_DIR", &repo)
+        // The same hazard as in the test below: a leaked bun holds the inherited stderr pipe open
+        // and `cargo test` waits on it forever, so a failure here would hang instead of failing.
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -1265,6 +1271,154 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
         "his words changed on the way: {typed}"
     );
 
+    let _ = child.kill().await;
+}
+
+/// The bridge has to work out which project it is before it can prove it, and for a while it got
+/// that from `process.cwd()`. For an MCP server started out of a plugin manifest, cwd is the PLUGIN
+/// directory — so it looked for the secret at `<plugin>/.kickoff/hub.token`, found nothing, and
+/// said so only on a stderr stream that reaches neither the agent nor the operator. Every message
+/// the agent believed it had sent went nowhere, silently, for as long as that lasted.
+///
+/// So this starts the bridge the way Claude Code starts it and no other way: cwd is the plugin, and
+/// the only thing naming the project is `CLAUDE_PROJECT_DIR`. There used to be a second variable
+/// that could name it, set by the tests and by nothing in production — which is precisely how a
+/// bridge that could never find its secret passed every test it had.
+///
+/// It shares the `the_real_plugin` prefix with the test above because that string is the filter
+/// `scripts/install-channel-plugin.sh` runs, and a bun test outside that filter is one nothing runs.
+#[tokio::test]
+#[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
+async fn the_real_plugin_finds_its_project_in_the_directory_claude_code_names_and_not_its_own() {
+    let h = harness().await;
+
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+
+    // The directory the harness actually enrolled, with its secret where a real project keeps it.
+    let repo = h.dir.path().join("herdr-tg");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&plugin)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        .env("CLAUDE_PROJECT_DIR", &repo)
+        // Without this, a FAILING assertion below leaks the bun process, which keeps the inherited
+        // stderr pipe open and leaves `cargo test` waiting on it forever. A red test has to be able
+        // to go red out loud.
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+
+    // A topic is only ever created for a connection the hub ADMITTED, and it admits on the secret.
+    // So a topic here is proof the bridge read the right directory: nothing else could have got it
+    // a secret the registry recognises.
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    let topics = h.fake.topics.lock().await;
+    assert_eq!(
+        topics.len(),
+        1,
+        "the bridge never proved who it was: it did not find the secret in the directory it was given"
+    );
+    assert_eq!(
+        topics[0].0, "herdr-tg",
+        "the title did not come from the registry"
+    );
+
+    drop(topics);
+    let _ = child.kill().await;
+}
+
+/// `CLAUDE_PROJECT_DIR` is the folder `claude` was STARTED in, which is routinely a folder deep
+/// inside the repo rather than its top. Joining `.kickoff/hub.token` onto it and stopping there was
+/// the original defect with a new wrong directory substituted in: the bridge looked for a secret
+/// nobody had enrolled, refused honestly, and the operator's phone stayed exactly as silent. The
+/// advice it printed made it worse — it named the subfolder, and enrolling that mints a SECOND
+/// project for one repository.
+///
+/// So the bridge searches upward, bounded by the top of the working tree, and this starts it three
+/// folders down to prove it.
+#[tokio::test]
+#[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
+async fn the_real_plugin_finds_its_project_when_the_session_started_in_a_folder_deep_inside_it() {
+    let h = harness().await;
+
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+
+    // A real working tree, because the search stops at the top of one and git is what names it.
+    let repo = h.dir.path().join("herdr-tg");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["init", "-q"])
+        .status()
+        .expect("run git");
+    assert!(git.success(), "git init failed");
+
+    let deep = repo.join("crates/herdr-tg/src");
+    std::fs::create_dir_all(&deep).expect("a folder deep in the repo");
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&plugin)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The one difference from the test above, and the whole point of this one.
+        .env("CLAUDE_PROJECT_DIR", &deep)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+
+    // Same proof as the test above: only a secret the registry recognises gets a topic created.
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    let topics = h.fake.topics.lock().await;
+    assert_eq!(
+        topics.len(),
+        1,
+        "a session started inside the project could not find the project"
+    );
+    assert_eq!(
+        topics[0].0, "herdr-tg",
+        "it proved itself as something other than the enrolled project"
+    );
+
+    drop(topics);
     let _ = child.kill().await;
 }
 

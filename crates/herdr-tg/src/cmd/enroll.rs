@@ -78,13 +78,40 @@ pub(crate) fn projects() -> anyhow::Result<()> {
 /// and everything gets committed. It also could not see a nested `.gitignore`, `core.excludesFile`,
 /// or `.git/info/exclude`, all of which git honours and all of which a real repo uses.
 ///
+/// It also used to open with `if !repo.join(".git").exists() { return None }`, which is not the
+/// same question. A directory INSIDE a working tree has no `.git` of its own, so enrolling one
+/// wrote a 0600 secret into a tracked tree and this guard — the only thing between that secret and
+/// a public remote — never even asked git.
+///
 /// **Fails closed.** If git cannot answer, the operator is warned rather than reassured: this is
 /// the only thing standing between a bot token and a public remote, and "I could not check" must
 /// never render as silence.
 fn gitignore_gap(repo: &Path) -> Option<String> {
-    if !repo.join(".git").exists() {
-        return None;
+    let unanswered = |what: String| {
+        Some(format!(
+            "I could not ask git whether {TOKEN_FILE} is ignored in {} ({what}). Check it yourself \
+             before you commit: that file is this project's secret.",
+            repo.display()
+        ))
+    };
+
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        // git ran and would not name a working tree. Either there genuinely is not one — no remote,
+        // no leak, and a warning here would fire on every non-git project and teach the operator to
+        // ignore the one that counts — or git refused for its own reasons, which is an unanswered
+        // question about a credential. `.git` somewhere above is what tells the two apart, and it
+        // is decided WITHOUT git, so that a git that will not talk cannot vote on it.
+        Ok(_) if !inside_a_working_tree(repo) => return None,
+        Ok(o) => return unanswered(format!("git exited {}", o.status)),
+        Err(e) => return unanswered(e.to_string()),
     }
+
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -102,16 +129,20 @@ fn gitignore_gap(repo: &Path) -> Option<String> {
         )),
         // Anything else — git missing, a fatal error, a signal — is an unanswered question, and an
         // unanswered question about a credential is a warning.
-        other => Some(format!(
-            "I could not ask git whether {TOKEN_FILE} is ignored in {} ({}). Check it yourself \
-             before you commit: that file is this project's secret.",
-            repo.display(),
-            match &other {
-                Ok(o) => format!("git exited {}", o.status),
-                Err(e) => e.to_string(),
-            }
-        )),
+        other => unanswered(match &other {
+            Ok(o) => format!("git exited {}", o.status),
+            Err(e) => e.to_string(),
+        }),
     }
+}
+
+/// Whether any folder at or above `repo` holds a `.git`.
+///
+/// Decided without running git, on purpose: it is the tiebreak for a `git rev-parse` that failed,
+/// where "there is no repository here" and "git would not answer" mean opposite things and only
+/// one of them is safe to be quiet about.
+fn inside_a_working_tree(repo: &Path) -> bool {
+    repo.ancestors().any(|d| d.join(".git").exists())
 }
 
 #[cfg(test)]
@@ -170,6 +201,17 @@ mod tests {
         std::fs::create_dir_all(d.path().join(".kickoff")).expect("dir");
         std::fs::write(d.path().join(".kickoff/.gitignore"), "hub.token\n").expect("write");
         assert!(gitignore_gap(d.path()).is_none());
+    }
+
+    #[test]
+    fn a_folder_inside_a_working_tree_is_checked_rather_than_waved_through() {
+        // It has no `.git` of its own, which is exactly why the guard used to return before asking
+        // git anything at all — and a secret written there is a secret in a tracked tree.
+        let d = repo_with(Some(".kickoff/hub.token\n"));
+        let inside = d.path().join("crates");
+        std::fs::create_dir_all(&inside).expect("dir");
+        let said = gitignore_gap(&inside).expect("a warning");
+        assert!(said.contains(TOKEN_FILE), "{said}");
     }
 
     #[test]
