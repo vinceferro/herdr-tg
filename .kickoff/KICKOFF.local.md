@@ -23,6 +23,12 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
 
 - **Report in chat, not to the tracker.** `.kickoff/bin/mc` is dead here — the pinned core dropped
   mission-control from the public line.
+- **Answer where the question came from.** A message that arrives as a `<channel …>` block was typed
+  on a phone, and the operator is not reading this transcript. Reply to it through the channel's
+  `reply` or `ask`, not only in the terminal — printing an answer he cannot see is the same failure
+  as not answering. On 2 September he typed "Restarted" from Telegram and the answer went to the
+  terminal alone. A message typed at the keyboard is answered at the keyboard; when both are live,
+  the channel carries the decision and the terminal carries the detail.
 - **Fail closed on your own tools, not just in the code.** CLAUDE.md's "fail closed" and
   write-safety's "a lookup that comes up empty is a FAILURE, not a silent continue" bind you too.
   Three instances in one session, one shape: three tracker writes whose exit codes were never read,
