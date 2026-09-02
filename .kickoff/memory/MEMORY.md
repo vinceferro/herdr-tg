@@ -17,3 +17,4 @@
 - [The scratchpad lives inside this repo](the-scratchpad-lives-inside-this-repo.md) — subagent repo copies break the write guard and ate 8.8 GB.
 - [A sleep per caller is not a queue](a-sleep-per-caller-is-not-a-queue.md) — N sleepers wake together; one wins and the rest fall through to the failure branch.
 - [An edit script that aborts writes nothing](an-edit-script-that-aborts-writes-nothing.md) — the earlier replacements are lost too, and the commit message still claims them.
+- [A max over a pool drifts as the pool grows](a-max-over-a-pool-drifts-as-the-pool-grows.md) — the retrieval cutoff loosens with corpus size and K; scoping fixes it, a big shared core does not.
