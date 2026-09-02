@@ -253,6 +253,50 @@ check('when the hub says he never got it, the agent is told in its own turn',
 check('and told that no answer to that question is coming',
   shed.includes(ask.ask_id) && /stop waiting/.test(shed), shed)
 
+// The wire defines THREE delivery values and this bridge branched on two: anything that was not an
+// explicit `no` counted as success, so `unseen` — the hub saying it put the message out and could
+// not check whether it landed — read as "he got it". The agent's only record then said the operator
+// had been asked and an answer was on its way, and no correction ever arrived.
+const unconfirmed = await call(b, 6, 'ask',
+  { text: 'Restart the database?', options: [{ id: 'y', label: 'Yes' }] })
+check('the second question reaches the hub', /^asked \(/.test(unconfirmed.text), unconfirmed.text)
+await until('the second ask frame', () => fromBridge.filter(f => f.t === 'ask').length >= 2)
+const unsureAsk = fromBridge.filter(f => f.t === 'ask')[1]
+toBridge({ v: 1, id: 'h12', t: 'ack', ref: unsureAsk.id, delivered: 'unseen' })
+await until('the notice that the send could not be confirmed', () => noticesTo(b).length >= 2, 8000).catch(() => {})
+const unsure = String(noticesTo(b)[1]?.params?.content ?? '')
+check('a send the hub could not confirm tells the agent that an answer may never come',
+  unsure !== '' && /could not confirm/i.test(unsure) &&
+    unsure.includes(unsureAsk.ask_id) && /no answer/i.test(unsure), unsure)
+check('and it does not claim he never got it either, because nobody knows that',
+  unsure !== '' && !/never got/.test(unsure), unsure)
+// The notice gives its own reason for not re-sending — two live menus for one question, only one of
+// which can answer — and then told the agent to do exactly that, in the clause an agent skimming
+// reads last. Worse than two menus: the hub writes no ledger record for a send it could not
+// confirm, so if the first one DID land, its buttons are live, unregistered, and every tap on them
+// is answered "I have no record of that question, so I will not answer it for you."
+check('it tells the agent plainly NOT to ask the same question again',
+  unsure !== '' && /do not ask it again/i.test(unsure), unsure)
+check('and never offers asking again as a way forward',
+  unsure !== '' && !/or ask (it )?again/i.test(unsure), unsure)
+check('and it offers the one way back that is safe, which is plain words',
+  unsure !== '' && /plain message|plain words/i.test(unsure), unsure)
+
+// `clamped` is the one ack reason the hub only ever pairs with `delivered: yes`, so returning early
+// on `yes` made it unreachable — the bridge carried a sentence for it that nothing could print. The
+// operator sees the truncation on his phone; the agent believed it had delivered the whole thing.
+const long = await call(b, 7, 'reply', { text: 'x'.repeat(200) })
+check('the long message reaches the hub', !long.isError, long.text)
+await until('the say frame', () => fromBridge.filter(f => f.t === 'say').length >= 1)
+const longFrame = fromBridge.filter(f => f.t === 'say').at(-1)!
+toBridge({ v: 1, id: 'h13', t: 'ack', ref: longFrame.id, delivered: 'yes', why: 'clamped' })
+await until('the notice that it was shortened', () => noticesTo(b).length >= 3, 8000).catch(() => {})
+const clipped = String(noticesTo(b)[2]?.params?.content ?? '')
+check('a message the hub had to shorten says so, rather than reading as delivered in full',
+  clipped !== '' && /clipped|shortened|too long/i.test(clipped), clipped)
+check('and it still says he got something, because he did',
+  clipped !== '' && !/never got|could not confirm/i.test(clipped), clipped)
+
 b.child.kill()
 hub.stop()
 

@@ -36,7 +36,7 @@
 //! process died mid-write and nothing else. It deliberately mirrors `audit.rs` rather than
 //! extending it: that file's subject is a pane and a keystroke, and the hub has neither.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -212,6 +212,22 @@ impl TapRefusal {
     }
 }
 
+/// What happened when a tap that reached nobody was taken back.
+///
+/// Three, because the operator reads a different sentence for each and two of them are opposites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// The keyboard came off and the record went with it.
+    Retired,
+    /// Telegram refused the edit. The menu is still live — and it can be tapped again, because the
+    /// answer was taken back off the question rather than the record being thrown away.
+    StillOnHisPhone,
+    /// There was nothing written down any more. The project's own side finished with the question
+    /// while the tap was in flight, which is not far-fetched: the delivery that failed may well
+    /// have failed because that same bridge's outbox was full.
+    NothingLeftToTakeBack,
+}
+
 /// Every open question, keyed by the message the operator can see.
 ///
 /// Persisted, because a restart must not turn every live keyboard into a button that does nothing.
@@ -295,6 +311,18 @@ impl AskLedger {
         self.save()
     }
 
+    /// Take the answer back off a question, so its keyboard can be tapped again.
+    ///
+    /// For the one case where an answer was written down and then reached nobody. The record has to
+    /// stay — it is the only handle anything has on a keyboard that is still live — so what is
+    /// undone is the authorisation, not the record.
+    pub fn mark_unanswered(&mut self, chat_id: i64, msg_id: &MsgId) -> std::io::Result<()> {
+        if let Some(r) = self.records.get_mut(&ledger_key(chat_id, msg_id)) {
+            r.answered = None;
+        }
+        self.save()
+    }
+
     /// Forget a question that has been answered or withdrawn.
     pub fn forget(&mut self, chat_id: i64, msg_id: &MsgId) -> std::io::Result<()> {
         self.records.remove(&ledger_key(chat_id, msg_id));
@@ -302,10 +330,50 @@ impl AskLedger {
     }
 
     /// Every message still carrying a live keyboard for one ask, so it can be retired.
-    pub fn messages_for(&self, project: &ProjectId, ask_id: &AskId) -> Vec<(i64, MsgId)> {
+    ///
+    /// **Scoped to the session that asked it.** A bridge mints its ask ids from a counter that
+    /// starts over with the process, so the first question of every session carries the same
+    /// string — and a session that dies with its opening question still open leaves that record
+    /// behind, because nothing prunes. Matching on the ask id alone therefore reached across
+    /// sessions: a new session answering its own first question rewrote the dead one's question on
+    /// the operator's phone with an outcome that belonged to a different question, and then deleted
+    /// the record that proved it had ever been asked.
+    pub fn messages_for(
+        &self,
+        project: &ProjectId,
+        instance: &str,
+        ask_id: &AskId,
+    ) -> Vec<(i64, MsgId)> {
+        self.matching(|r| &r.project == project && r.instance == instance && &r.ask_id == ask_id)
+    }
+
+    /// Every question left open by some run of this project OTHER than the one named, so a worker
+    /// that never came back does not leave a keyboard on the operator's phone that nothing will
+    /// ever take away.
+    ///
+    /// "Other than this one" is the whole of it, and it is asked when a bridge arrives rather than
+    /// when one leaves. A claim is exclusive, so at the moment one is granted every other run of
+    /// this project is provably not connected. Asked the other way round — at `release` — the
+    /// answer would be wrong: a bridge keeps its instance across a reconnect, so a session that
+    /// drops and comes straight back is still waiting for exactly those answers, and taking their
+    /// keyboards away would be a live question removed from his phone.
+    ///
+    /// An already-answered record is left alone. Its keyboard is still live only because taking it
+    /// away failed, and the outcome written on it is the true one — replacing that with a note
+    /// about a restart would be the same misinformation from the other direction.
+    pub fn open_for_other_instances(
+        &self,
+        project: &ProjectId,
+        instance: &str,
+    ) -> Vec<(i64, MsgId)> {
+        self.matching(|r| &r.project == project && r.instance != instance && r.answered.is_none())
+    }
+
+    /// The chat and message behind every record the predicate accepts.
+    fn matching(&self, mut want: impl FnMut(&AskRecord) -> bool) -> Vec<(i64, MsgId)> {
         self.records
             .iter()
-            .filter(|(_, r)| &r.project == project && &r.ask_id == ask_id)
+            .filter(|(_, r)| want(r))
             .filter_map(|(k, _)| {
                 let (chat, msg) = k.split_once(':')?;
                 Some((chat.parse().ok()?, MsgId::new(msg)))
@@ -705,19 +773,62 @@ impl<S: Surface> Hub<S> {
         instance: String,
         tx: mpsc::Sender<Envelope<HubFrame>>,
     ) -> Result<(), RefusedReason> {
-        let mut claims = self.claims.lock().await;
-        if let Some(old) = claims.get(&project) {
-            if pid_is_alive(old.pid) {
-                tracing::warn!(
-                    project = %project, incumbent = old.pid, arriving = pid,
-                    "a second bridge tried to take a project that is already connected"
-                );
-                return Err(RefusedReason::AlreadyClaimed);
+        {
+            let mut claims = self.claims.lock().await;
+            if let Some(old) = claims.get(&project) {
+                if pid_is_alive(old.pid) {
+                    tracing::warn!(
+                        project = %project, incumbent = old.pid, arriving = pid,
+                        "a second bridge tried to take a project that is already connected"
+                    );
+                    return Err(RefusedReason::AlreadyClaimed);
+                }
+                tracing::info!(project = %project, dead = old.pid, "evicting a bridge that is no longer running");
             }
-            tracing::info!(project = %project, dead = old.pid, "evicting a bridge that is no longer running");
+            claims.insert(project.clone(), Claim { pid, instance, tx });
         }
-        claims.insert(project, Claim { pid, instance, tx });
         Ok(())
+    }
+
+    /// Take the keyboard off every question a run of this project OTHER than this one left open.
+    ///
+    /// Run when a bridge ARRIVES, because that is the one moment the hub can prove those sessions
+    /// are gone: a claim is exclusive, so nothing else holds this project now. Every other place it
+    /// could have gone is wrong. At `release` a bridge that merely lost its socket would have its
+    /// live questions taken off the phone, because a bridge keeps its instance across a reconnect
+    /// and is still waiting for those answers. At eviction — which is where this started — it fires
+    /// only when a claim was left behind by a pid that is no longer running, and every ordinary way
+    /// a bridge goes away reaches `release` first, so the successor finds an empty claims map and
+    /// nothing is ever swept. Sessions open when the hub itself restarted are missed the same way.
+    ///
+    /// Doing it here also means a retirement Telegram refused is tried again by the next session,
+    /// which matters because a record left behind by a failed edit has nothing else that would ever
+    /// come back to it.
+    ///
+    /// **Spawned, never awaited on the handshake.** It is one Telegram edit per abandoned question
+    /// and nothing bounds how many there are; awaited before `Welcome`, six of them measured 1.8
+    /// seconds, and the bridge cannot do anything at all until `Welcome` arrives — it holds
+    /// everything the agent says until then, and starts dropping it after sixty-four. The session
+    /// paying that would be the one that just came back.
+    async fn retire_what_other_sessions_left(&self, project: &ProjectId, instance: &str) {
+        let targets = {
+            self.ledger
+                .lock()
+                .await
+                .open_for_other_instances(project, instance)
+        };
+        if targets.is_empty() {
+            return;
+        }
+        // What is said is that the session restarted, and nothing more. Never an outcome — no
+        // question retired here was ever answered, and saying otherwise is the exact misinformation
+        // the instance filter exists to stop.
+        self.retire_each(
+            project,
+            targets,
+            "the session that asked this restarted, so it is not waiting for an answer any more",
+        )
+        .await;
     }
 
     /// Drop a connection's claim, but only if it is still the one holding it.
@@ -744,11 +855,25 @@ impl<S: Surface> Hub<S> {
         }
     }
 
-    /// Test-only. Production code asks by trying to deliver, which is the question it actually has;
-    /// a separate "is it connected" read would be a fact that could be stale by the time it is used.
+    /// Test-only, and it stays that way. The DELIVERY path must never ask this: it asks by trying
+    /// to deliver, which is the question it actually has, and a "is it connected" read taken a
+    /// moment earlier is a fact that can already be wrong by the time it is acted on.
+    ///
+    /// [`Self::connected_ids`] answers a different question — what to show a person — and there a
+    /// snapshot is the honest answer rather than a stale one.
     #[cfg(test)]
     pub async fn is_claimed(&self, project: &ProjectId) -> bool {
         self.claims.lock().await.contains_key(project)
+    }
+
+    /// Which projects have a bridge on the socket right now, for a human reading a list.
+    ///
+    /// A snapshot, deliberately, and it is the right shape for this one caller: by the time he has
+    /// read the message anything in it may have changed, and he knows that about a status list. The
+    /// alternative on offer was worse than stale — the list rendered a project's topic binding,
+    /// which is permanent from its first connection onward and says nothing whatever about now.
+    pub async fn connected_ids(&self) -> BTreeSet<ProjectId> {
+        self.claims.lock().await.keys().cloned().collect()
     }
 
     /// Which project owns a topic, if any.
@@ -1149,6 +1274,20 @@ impl<S: Surface> Hub<S> {
             tracing::error!(project = %project, error = %e, "could not make a topic for a live project");
         }
 
+        // Whatever the last run of this project left open comes off the phone now — in a task of
+        // its own, so this session's own first question is never queued behind the cleanup of one
+        // that is already gone. Nothing else reads those records, so it does not matter whether it
+        // finishes before or after anything below.
+        {
+            let hub = Arc::clone(&self);
+            let project = project.clone();
+            let instance = instance.clone();
+            tokio::spawn(async move {
+                hub.retire_what_other_sessions_left(&project, &instance)
+                    .await;
+            });
+        }
+
         for frame in waiting {
             let ack_ref = frame.id.clone();
             let (delivered, why) = self.handle(&project, &instance, frame.payload).await;
@@ -1371,7 +1510,8 @@ impl<S: Surface> Hub<S> {
                 how,
                 outcome,
             } => {
-                self.retire(project, &ask_id, how, outcome.as_deref()).await;
+                self.retire(project, instance, &ask_id, how, outcome.as_deref())
+                    .await;
                 (Delivered::Yes, None)
             }
             // Liveness and bookkeeping. Acked so that "every frame gets exactly one" stays true
@@ -1453,10 +1593,71 @@ impl<S: Surface> Hub<S> {
         }
     }
 
+    /// A tap resolved, and then the project could not be told. Take the question back.
+    ///
+    /// A tap is written down as answered BEFORE the caller delivers, and it has to be: the window
+    /// between the two is a Telegram round trip on a keyboard the operator is still looking at, and
+    /// a second tap inside it would deliver twice. The cost was that a delivery which then failed
+    /// burned the question for good — nothing ever cleared `answered` — so he was told first that
+    /// the project was not connected (false when it was merely behind, which is the outbox-full
+    /// case this code documents as expected) and then, on the same button, that it had already been
+    /// answered and nothing had been sent. Only the second half of that was true.
+    ///
+    /// **Nothing went out on this path.** `deliver` reports false only when there is no connection
+    /// or the frame never entered the outbox, never after a frame has gone, so withdrawing cannot
+    /// contradict something an agent has already been told.
+    ///
+    /// **Returns which of the three actually happened**, because the caller has to say so and the
+    /// sentences are not interchangeable. Two would not do: `deliver` reports false when the
+    /// bridge's outbox is full, and that bridge is LIVE — it can be sending `ask_resolved` for this
+    /// very question in the same instant, which retires the keyboard and forgets the record. So
+    /// "there was nothing left to take back" is a real outcome on this path and not a defensive
+    /// branch, and reporting it as "the buttons are still there" would be a plain untruth. The record follows the same order as every
+    /// other retirement here: it goes only once the buttons have. Forgetting it either way looked
+    /// safe — nothing was sent, so nothing can be contradicted — but the record is also the only
+    /// handle any LATER retirement has on that message, so throwing it away while the menu is
+    /// still live means nothing can ever take the menu off: not the session's own withdrawal, not
+    /// a timeout, not the next session. What is undone instead is the authorisation, so the
+    /// still-live keyboard can be tapped again rather than answering "that was already answered".
+    pub async fn withdraw_undelivered(&self, chat_id: i64, msg_id: &MsgId) -> Withdrawal {
+        let record = { self.ledger.lock().await.get(chat_id, msg_id).cloned() };
+        let Some(record) = record else {
+            return Withdrawal::NothingLeftToTakeBack;
+        };
+        match self
+            .surface
+            .retire_buttons(
+                record.topic_id,
+                msg_id,
+                &record.text,
+                "not sent — the project could not be reached",
+            )
+            .await
+        {
+            Ok(()) => {
+                let _ = self.ledger.lock().await.forget(chat_id, msg_id);
+                Withdrawal::Retired
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e, project = %record.project,
+                    "a tap reached nobody and its keyboard is still on his phone"
+                );
+                let _ = self.ledger.lock().await.mark_unanswered(chat_id, msg_id);
+                Withdrawal::StillOnHisPhone
+            }
+        }
+    }
+
     /// Strip a stale keyboard, because a screen could never tell you a question stopped being asked.
+    ///
+    /// `instance` is which run of the worker is saying so, and it is half the address: ask ids
+    /// repeat across sessions, so an outcome matched on the ask id alone landed on a question
+    /// another session was still waiting on.
     async fn retire(
         &self,
         project: &ProjectId,
+        instance: &str,
         ask_id: &AskId,
         how: hub_proto::AskEnd,
         outcome: Option<&str>,
@@ -1467,7 +1668,17 @@ impl<S: Surface> Hub<S> {
             (hub_proto::AskEnd::Withdrawn, _) => "no longer being asked".to_owned(),
             (hub_proto::AskEnd::Timeout, _) => "timed out".to_owned(),
         };
-        let targets = { self.ledger.lock().await.messages_for(project, ask_id) };
+        let targets = {
+            self.ledger
+                .lock()
+                .await
+                .messages_for(project, instance, ask_id)
+        };
+        self.retire_each(project, targets, &note).await;
+    }
+
+    /// Take the keyboard off each of these messages and leave the note in its place.
+    async fn retire_each(&self, project: &ProjectId, targets: Vec<(i64, MsgId)>, note: &str) {
         for (chat, msg) in targets {
             // The record carries both the topic and the question's own words, so the retirement
             // does not have to go back to the registry for one and cannot leave the other out.
@@ -1475,7 +1686,7 @@ impl<S: Surface> Hub<S> {
             let retired = match &record {
                 Some(record) => {
                     self.surface
-                        .retire_buttons(record.topic_id, &msg, &record.text, &note)
+                        .retire_buttons(record.topic_id, &msg, &record.text, note)
                         .await
                 }
                 None => Ok(()),

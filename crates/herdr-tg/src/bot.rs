@@ -323,7 +323,14 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                                     hub.answered_from_phone(chat_id, &msg_id, &label).await;
                                     format!("Sent: {}", escape_html(&label))
                                 } else {
-                                    escape_html(crate::hub::TapRefusal::NotConnected.say())
+                                    // Withdrawn, not merely reported. The tap was already written
+                                    // down as answered — it has to be, or a second tap in the round
+                                    // trip would deliver twice — so leaving it there burned the
+                                    // question: the keyboard stayed live and could only ever answer
+                                    // "that has already been answered, I have not sent anything",
+                                    // which is false in the half he cares about.
+                                    let what = hub.withdraw_undelivered(chat_id, &msg_id).await;
+                                    escape_html(a_tap_that_reached_nobody(what))
                                 }
                             }
                         }
@@ -413,28 +420,65 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
         Command::Help => escape_html(&Command::descriptions().to_string()),
         Command::Projects => projects_digest(&ctx).await,
     };
-    reply(&bot, msg.chat.id, &body).await;
+    // Answered where it was asked. An unthreaded reply lands in the forum's General, so a `/projects`
+    // typed inside a project's topic was answered somewhere the operator was not looking — and once
+    // you live inside topics, which is what more than one project means, that is most of the time.
+    reply(&bot, msg.chat.id, msg.thread_id.map(|t| t.0.0), &body).await;
     Ok(())
 }
 
 /// Which projects are enrolled, and which have a bridge on the socket right now.
 async fn projects_digest(ctx: &Ctx) -> String {
-    let Some(hub) = &ctx.hub else {
-        return escape_html("The hub is not running, so I do not know about any projects.");
-    };
-    let registry = hub.registry.lock().await;
-    let mut lines: Vec<String> = Vec::new();
-    for p in registry.all() {
-        let where_it_is = match p.topic_id {
-            Some(_) => "has a topic",
-            None => "not connected yet",
-        };
-        lines.push(format!(
-            "<b>{}</b> — {}",
-            escape_html(&p.title),
-            escape_html(where_it_is)
-        ));
+    match &ctx.hub {
+        None => escape_html("The hub is not running, so I do not know about any projects."),
+        Some(hub) => digest_of(hub.as_ref()).await,
     }
+}
+
+/// The digest itself, over any surface — so it can be tested without a bot token, which is the only
+/// way a test of this can exist at all: the operator's phone is not a fixture.
+async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) -> String {
+    // Read who is connected FIRST, and be finished with that lock before the registry is taken.
+    // The other order would hold the registry while waiting on the claims map — and every path that
+    // sends a message takes the registry, so one contended lock would stall the whole fleet's
+    // outgoing messages behind a status list somebody typed.
+    let connected = hub.connected_ids().await;
+    let lines: Vec<String> = {
+        let mut registry = hub.registry.lock().await;
+        // Fresh, because `herdr-tg enroll` runs at a terminal while the hub is running. Rendered
+        // from the boot-time snapshot, a project enrolled since was absent from the only fleet view
+        // there is — not shown as disconnected, simply not there.
+        if let Err(e) = registry.reread() {
+            // The last good copy is still better than nothing, and refusing to answer a status
+            // question over a transient read error tells him less than a slightly old list does.
+            tracing::error!(error = %e, "could not re-read the project list; showing the last good copy");
+        }
+        registry
+            .all()
+            .map(|p| {
+                // One set lookup per project rather than a walk per project: this list is read on a
+                // phone and it is meant to grow to fourteen rows.
+                // Three states out of what the row already holds. Liveness alone loses the one
+                // permanent fact the old row had: a topic exists only once a bridge has been live
+                // at least once, so a project whose plugin was never installed is not the same as
+                // one that ran this morning and is idle now. At fourteen rows those two printed
+                // the same line, and "did it ever dial in at all" is the first question a second
+                // enrolment raises.
+                let where_it_is = if connected.contains(&p.id) {
+                    "connected"
+                } else if p.topic_id.is_some() {
+                    "not connected"
+                } else {
+                    "has never connected"
+                };
+                format!(
+                    "<b>{}</b> — {}",
+                    escape_html(&p.title),
+                    escape_html(where_it_is)
+                )
+            })
+            .collect()
+    };
     if lines.is_empty() {
         return escape_html(
             "Nothing is enrolled yet. Enrol a project at the terminal with: herdr-tg enroll <repo>",
@@ -443,12 +487,37 @@ async fn projects_digest(ctx: &Ctx) -> String {
     lines.join("\n")
 }
 
-async fn reply(bot: &Bot, chat: ChatId, html: &str) {
-    if let Err(e) = bot
+/// What the operator reads when his tap reached nobody.
+fn a_tap_that_reached_nobody(what: crate::hub::Withdrawal) -> &'static str {
+    // One sentence each. Taking the question back is the keyboard AND the record, and the edit that
+    // removes the keyboard fails on any Telegram 5xx, any flood wait, and any message past the
+    // 48-hour edit window — so "I have taken the buttons away", said unconditionally, was read by
+    // someone looking straight at them. Every one of these says the half he cares about most first:
+    // nothing was sent.
+    match what {
+        crate::hub::Withdrawal::Retired => {
+            "That did not reach the project, so nothing was sent. I have taken the buttons away — \
+             a menu that cannot answer is worse than none."
+        }
+        crate::hub::Withdrawal::StillOnHisPhone => {
+            "That did not reach the project, so nothing was sent. I could not take the buttons off \
+             this one either, so they are still there — tap again and I will try it once more."
+        }
+        crate::hub::Withdrawal::NothingLeftToTakeBack => {
+            "That did not reach the project, so nothing was sent. The project has since finished \
+             with that question at its own end, so there is nothing left to answer."
+        }
+    }
+}
+
+async fn reply(bot: &Bot, chat: ChatId, thread: Option<i32>, html: &str) {
+    let mut out = bot
         .send_message(chat, fit(html.to_owned()))
-        .parse_mode(ParseMode::Html)
-        .await
-    {
+        .parse_mode(ParseMode::Html);
+    if let Some(t) = thread {
+        out = out.message_thread_id(ThreadId(MessageId(t)));
+    }
+    if let Err(e) = out.await {
         // Never silent. A rejected send used to be one error log and a drop, and that had already
         // lost 5,164 characters of a real agent's longest message.
         tracing::error!(error = %e, chat = chat.0, "the operator was NOT told");
@@ -508,6 +577,149 @@ mod tests {
         let out = fit("🙂".repeat(BODY_BUDGET));
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
         assert!(out.chars().count() <= BODY_BUDGET);
+    }
+
+    /// A hub needs a surface to exist. Nothing below sends, creates or retires anything, and every
+    /// method here says so out loud rather than returning a plausible value — his phone is not a
+    /// test fixture, and a fake that quietly succeeded would hide a test that had started using it.
+    struct NoSurface;
+
+    impl crate::hub::Surface for NoSurface {
+        async fn create_topic(&self, _title: &str, _icon_color: u8) -> anyhow::Result<i32> {
+            unreachable!("the project list creates no topics")
+        }
+        async fn send(
+            &self,
+            _topic_id: i32,
+            _text: &str,
+            _buttons: &[hub_proto::AskOption],
+        ) -> crate::hub::SendOutcome {
+            unreachable!("the project list sends nothing")
+        }
+        async fn retire_buttons(
+            &self,
+            _topic_id: i32,
+            _msg_id: &hub_proto::MsgId,
+            _original: &str,
+            _note: &str,
+        ) -> anyhow::Result<()> {
+            unreachable!("the project list retires nothing")
+        }
+    }
+
+    #[tokio::test]
+    async fn the_project_list_calls_a_project_connected_only_while_its_bridge_is_on_the_socket() {
+        // The only fleet view there is, and with one project the operator could tell what it meant
+        // by knowing. It rendered `topic_id` — which records that a topic was ever created, is
+        // permanent from the first connection on, and says nothing whatever about now — and it read
+        // a snapshot of the registry taken when the process booted, so a project enrolled since was
+        // missing from the list altogether. With two projects, typing at each topic in turn is the
+        // only way to learn the truth.
+        let dir = tempfile::tempdir().expect("tmp");
+        let file = dir.path().join("projects.json");
+        let mut registry = crate::registry::Registry::load(&file);
+
+        let idle = dir.path().join("llm-gateway");
+        let busy = dir.path().join("herdr-tg");
+        std::fs::create_dir_all(&idle).expect("dir");
+        std::fs::create_dir_all(&busy).expect("dir");
+        let (idle, _) = registry.enrol(&idle).expect("enrols");
+        let (busy, _) = registry.enrol(&busy).expect("enrols");
+        // The idle one has run before, so it is bound to a topic and keeps it forever. That binding
+        // is exactly the fact the list used to print as "connected".
+        registry.bind_topic(&idle.id, 1001).expect("binds");
+
+        let hub = crate::hub::Hub::new(
+            Arc::new(NoSurface),
+            registry,
+            crate::hub::AskLedger::load(dir.path().join("asks.json")),
+            crate::hub::HubAudit::new(dir.path().join("hub.audit.log")),
+            vec![-1001],
+            -1001,
+        );
+
+        // Only the busy one has a bridge on the socket — and it has never been given a topic.
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        hub.claim(busy.id.clone(), std::process::id(), "i1".into(), tx)
+            .await
+            .expect("claims");
+
+        // Enrolled at a terminal while the hub is running, which is how a second project arrives.
+        let late = dir.path().join("obsidian-link-map");
+        std::fs::create_dir_all(&late).expect("dir");
+        let (late, _) = crate::registry::Registry::load(&file)
+            .enrol(&late)
+            .expect("enrols");
+
+        let said = digest_of(&hub).await;
+        let line = |title: &str| {
+            said.lines()
+                .find(|l| l.contains(title))
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        assert!(
+            line(&busy.title).contains("connected") && !line(&busy.title).contains("not connected"),
+            "a project whose bridge is on the socket is not shown as connected:\n{said}"
+        );
+        assert!(
+            line(&idle.title).contains("not connected"),
+            "a project that merely has a topic from a previous run is shown as connected:\n{said}"
+        );
+        assert!(
+            !line(&late.title).is_empty(),
+            "a project enrolled while the hub was running is missing from the list:\n{said}"
+        );
+
+        // Three states, not two. The row it replaced carried a permanent-history fact next to the
+        // wrong liveness one — "has a topic" is true only of a project whose bridge has been live at
+        // least once — and rendering liveness alone threw that away. At fourteen rows, a project
+        // whose plugin was never installed then reads exactly like one that ran this morning and is
+        // idle now, and "has it ever dialled in at all" is the very first question a second
+        // enrolment raises. It costs one `else if` over data the row already holds.
+        assert_ne!(
+            line(&idle.title).replace(&idle.title, ""),
+            line(&late.title).replace(&late.title, ""),
+            "a project that has never once connected reads exactly like one that is merely idle, \
+             so the only fleet view there is cannot answer whether it ever dialled in:\n{said}"
+        );
+        assert!(
+            line(&late.title).contains("never"),
+            "a project that has never connected does not say so:\n{said}"
+        );
+    }
+
+    #[test]
+    fn a_tap_that_reached_nobody_never_says_the_buttons_are_gone_when_they_are_not() {
+        // Taking a question back is two things — the keyboard off the phone, and the record — and
+        // the edit that removes the keyboard fails on any Telegram 5xx, any flood wait, and every
+        // message past the 48-hour edit window. Said unconditionally, "I have taken the buttons
+        // away" is read by an operator who is looking straight at them.
+        use crate::hub::Withdrawal;
+        let gone = a_tap_that_reached_nobody(Withdrawal::Retired);
+        let still_there = a_tap_that_reached_nobody(Withdrawal::StillOnHisPhone);
+        let nothing_left = a_tap_that_reached_nobody(Withdrawal::NothingLeftToTakeBack);
+        assert!(
+            gone.contains("taken the buttons away"),
+            "the ordinary case stopped saying what happened: {gone}"
+        );
+        for said in [still_there, nothing_left] {
+            assert!(
+                !said.contains("taken the buttons away"),
+                "he is told the buttons are gone when nothing here knows that: {said}"
+            );
+        }
+        // And the promise of a retry is made only where a retry would actually do something. With
+        // no record left, tapping again answers "I have no record of that question".
+        assert!(still_there.contains("tap again"));
+        assert!(!nothing_left.contains("tap again"));
+        for said in [gone, still_there, nothing_left] {
+            assert!(
+                said.contains("nothing was sent"),
+                "the half he cares about most is missing: {said}"
+            );
+        }
     }
 
     #[test]

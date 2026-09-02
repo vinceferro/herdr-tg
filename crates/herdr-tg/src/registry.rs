@@ -99,6 +99,12 @@ pub enum EnrolError {
         parent: PathBuf,
         title: String,
     },
+    /// The new secret reached the repo and the list of projects did not, so that project's bridge
+    /// will be refused until this is run again.
+    ///
+    /// Its own variant because silence here is the worst outcome there is: nothing else on the box
+    /// would ever explain why a project that worked yesterday is turned away.
+    HalfWritten { repo: PathBuf, why: String },
 }
 
 impl std::fmt::Display for EnrolError {
@@ -127,6 +133,15 @@ impl std::fmt::Display for EnrolError {
                 repo.display(),
                 parent.display(),
                 parent.display()
+            ),
+            Self::HalfWritten { repo, why } => write!(
+                f,
+                "the new secret was written into {}, but the list of projects could not be saved — \
+                 so that project's own copy no longer matches and its bridge will be turned away \
+                 until you run this again:\n\
+                 \n    herdr-tg enroll {}\n\nWhat went wrong saving the list: {why}",
+                repo.display(),
+                repo.display()
             ),
             Self::Unreadable { path, why } => write!(
                 f,
@@ -341,9 +356,25 @@ impl Registry {
             topic_id,
             icon_color,
         };
-        self.projects.insert(id, project.clone());
-        self.save()?;
+        // The SECRET GOES DOWN FIRST, and the list of projects second. The other order took a
+        // project off the air whenever the second step failed: the registry already held the hash
+        // of a secret that had never been written, the repo still held the old one, and the old one
+        // no longer resolved — so the bridge was refused on every reconnect and nothing on the box
+        // said why. What the operator had been told was "could not write the project's token file",
+        // which reads as a command that did nothing. A full disk, a read-only mount, or a
+        // `.kickoff` left root-owned by one sudo run is all it takes.
+        //
+        // This way round the same failure changes nothing at all: no hash is saved, and the secret
+        // already in the repo goes on working.
         write_token_file(&repo, &secret)?;
+        self.projects.insert(id, project.clone());
+        // Reached only when the secret IS on disk, so this failure is the one direction that can
+        // still leave a project unable to connect. It says so rather than reporting a write error,
+        // because the operator has to know to run the command again.
+        self.save().map_err(|e| EnrolError::HalfWritten {
+            repo: repo.clone(),
+            why: e.to_string(),
+        })?;
         Ok((project, secret))
     }
 
@@ -518,6 +549,45 @@ mod tests {
         let p = d.path().join(name);
         fs::create_dir_all(&p).expect("make a repo");
         p
+    }
+
+    #[test]
+    fn a_rotation_that_could_not_write_the_new_secret_leaves_the_old_one_still_working() {
+        // The registry was saved with the NEW hash first, and the secret written second. When that
+        // write failed the repo still held the OLD secret — which no longer resolved — and the new
+        // one existed nowhere at all, so the project could never connect again. All the operator
+        // was told was "could not write the project's token file", which reads like a command that
+        // did nothing, and nothing anywhere else would ever explain why its bridge was refused.
+        let d = tempfile::tempdir().expect("tmp");
+        let repo = repo(&d, "herdr-tg");
+        let mut r = reg(&d);
+        let (_, old) = r.enrol(&repo).expect("enrols");
+
+        // A token file this process cannot replace. This is one of the shapes the operator can
+        // actually reach — alongside a full disk, a read-only mount, and a `.kickoff` left
+        // root-owned by a sudo run — and it needs no exotic setup to arrange.
+        let token = repo.join(TOKEN_FILE);
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o400)).expect("chmod");
+
+        let failed = r.enrol(&repo).expect_err(
+            "this test needs a rotation whose write fails, and the write went through — if this \
+             is running as root, file permissions do not apply and this test cannot arrange it",
+        );
+
+        // Read back from disk, because rereading it is exactly what the hub does before it admits
+        // a bridge.
+        let after = Registry::load(d.path().join("projects.json"));
+        let on_disk = fs::read_to_string(&token).expect("the old secret is still readable");
+        assert_eq!(
+            on_disk, old,
+            "the failed rotation still replaced the secret in the repo"
+        );
+        assert!(
+            after.resolve(&old).is_some(),
+            "the failed rotation took the project down with it: the secret in its repo no longer \
+             resolves, the new one was never written anywhere, and what the operator was told was \
+             only: {failed}"
+        );
     }
 
     #[test]

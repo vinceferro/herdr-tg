@@ -35,6 +35,9 @@ struct FakeTelegram {
     /// Set to make retiring a keyboard fail, which is what an edit past Telegram's limit, or on a
     /// message older than 48 hours, actually does.
     retire_fails: AsyncMutex<bool>,
+    /// How long one keyboard edit takes. Zero everywhere except the one test that is about a real
+    /// network round trip being on, or off, the path a bridge waits on.
+    retire_takes: AsyncMutex<Duration>,
 }
 
 impl Surface for FakeTelegram {
@@ -69,6 +72,10 @@ impl Surface for FakeTelegram {
     ) -> anyhow::Result<()> {
         if *self.retire_fails.lock().await {
             anyhow::bail!("the edit was refused");
+        }
+        let takes = *self.retire_takes.lock().await;
+        if !takes.is_zero() {
+            tokio::time::sleep(takes).await;
         }
         // Both halves are recorded, because a retirement that drops the question is exactly the
         // defect this signature grew a parameter to close.
@@ -496,6 +503,13 @@ async fn a_tap_on_a_menu_from_a_session_that_has_restarted_is_refused_with_a_rea
     drop(bridge);
     until(async || !h.hub.is_claimed(&h.project).await).await;
 
+    // Telegram refuses the edit, so the successor's arrival cannot take this keyboard off the
+    // phone. That is the shape this refusal is FOR: when the sweep works, the buttons are gone and
+    // a tap on a stale view is answered "I have no record of that question" instead — which is
+    // pinned by `a_question_a_session_never_came_back_to_is_taken_off_the_phone_by_the_next_one`.
+    // A menu still sitting there, tappable, is what needs a reason of its own.
+    *h.fake.retire_fails.lock().await = true;
+
     let mut fresh = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
     fresh.become_live().await;
     until(async || h.hub.is_claimed(&h.project).await).await;
@@ -511,6 +525,350 @@ async fn a_tap_on_a_menu_from_a_session_that_has_restarted_is_refused_with_a_rea
         "the operator is owed a reason: {}",
         refused.say()
     );
+}
+
+#[tokio::test]
+async fn an_answer_from_one_session_never_rewrites_the_question_another_session_left_open() {
+    // The bridge mints ask ids from a counter that starts over with the process, so the FIRST
+    // question of every session carries the same string. A session that dies with its opening
+    // question still open leaves that record behind — nothing prunes it — and the successor's
+    // answer to its own first question used to retire BOTH: a question nobody ever answered was
+    // rewritten on the operator's phone with an outcome that belonged to a different one, and the
+    // record proving it had been asked was then deleted.
+    let h = harness().await;
+
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    first.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    first
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a3"),
+            text: "Shall I delete the staging database?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    // It goes away with that question still open, and the record outlives it.
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+
+    // The next run of the same worker. Its counter starts over, so its first question is `a3` too.
+    let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    second.become_live().await;
+    until(async || h.hub.is_claimed(&h.project).await).await;
+
+    second
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a3"),
+            text: "Shall I run the migration?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 3).await;
+
+    // The SECOND session's question is answered at its own terminal.
+    second
+        .send(BridgeFrame::AskResolved {
+            ask_id: AskId::new("a3"),
+            how: AskEnd::Answered,
+            outcome: Some("No".into()),
+        })
+        .await;
+
+    until(async || h.fake.retired.lock().await.len() == 2).await;
+    // The wrong retirement would be a THIRD edit, so give it every chance to happen before looking.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let retired = h.fake.retired.lock().await.clone();
+    let note_on = |msg: &str| {
+        let hits: Vec<String> = retired
+            .iter()
+            .filter(|(_, id, _)| id == &MsgId::new(msg))
+            .map(|(_, _, note)| note.clone())
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "{msg} was rewritten {} times: {retired:?}",
+            hits.len()
+        );
+        hits[0].clone()
+    };
+
+    // The second session's own question carries the second session's own answer.
+    assert!(
+        note_on("m3").contains("answered at the terminal — No"),
+        "the question that WAS answered does not say so: {retired:?}"
+    );
+    // The first session's question is taken off the phone, because nothing will ever answer it —
+    // but what is written on it is that its session restarted, and never somebody else's outcome.
+    let m2 = note_on("m2");
+    assert!(
+        m2.contains("restarted"),
+        "the abandoned question was left without a reason: {m2}"
+    );
+    assert!(
+        !m2.contains("answered"),
+        "one session's answer was stamped on a question it never asked: {m2}"
+    );
+
+    // And a tap on the dead session's question never becomes an answer. It cannot be `Restarted`
+    // here, because the retirement above succeeded and took the record with the keyboard; what it
+    // must never be is the second session's own answer going out a second time.
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &MsgId::new("m2"), &OptionId::new("y"))
+        .await
+        .expect_err("a dead session's question must not answer");
+    assert_eq!(refused, TapRefusal::NoRecord);
+}
+
+#[tokio::test]
+async fn a_session_that_is_evicted_has_its_open_questions_taken_off_the_phone() {
+    // The other half of the same defect. Once a retirement can no longer reach across sessions, a
+    // question its own session never came back to answer has nothing left that would ever take its
+    // keyboard away — it would sit on his phone offering choices forever, and every tap on it be
+    // refused. The eviction is the moment the hub learns that session is not coming back.
+    let h = harness().await;
+
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    first.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    first
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a3"),
+            text: "Deploy to production?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    // A worker that crashed leaves its claim behind, held by a pid that is no longer a process.
+    // Spawned and reaped, because a made-up number could belong to something real.
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+    assert!(
+        !super::pid_is_alive(dead_pid),
+        "the probe pid is somehow still alive"
+    );
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    h.hub
+        .claim(h.project.clone(), dead_pid, "i1".into(), tx)
+        .await
+        .expect("a dead incumbent must not block a claim");
+
+    // Its successor arrives and evicts it.
+    let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    second.become_live().await;
+
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0].1, MsgId::new("m2"), "{retired:?}");
+    assert!(
+        retired[0].2.contains("restarted"),
+        "the operator is owed a reason the question went quiet: {}",
+        retired[0].2
+    );
+    // Never another session's outcome — that is the misinformation this whole change exists to
+    // stop, and it would be worse coming from here.
+    assert!(
+        !retired[0].2.contains("at the terminal") && !retired[0].2.contains("from your phone"),
+        "an evicted session's question was stamped with an answer: {}",
+        retired[0].2
+    );
+
+    // The record goes with the keyboard, so nothing is left that could still resolve.
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &MsgId::new("m2"), &OptionId::new("y"))
+        .await
+        .expect_err("a retired question must not still answer");
+    assert_eq!(refused, TapRefusal::NoRecord);
+}
+
+/// Bring a session up, have it ask one question with buttons, and let it go away the ordinary way.
+///
+/// The ordinary way is what matters: EOF on a dropped socket, which is what a `bye`, a crash and a
+/// closed laptop all look like from here. It reaches `release`, so the claims map is EMPTY when the
+/// next session arrives and nothing is ever evicted.
+async fn a_session_that_asks_and_leaves(h: &Harness, instance: &str, text: &str) {
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, instance, h.project.as_str()).await;
+    bridge.become_live().await;
+    let before = h.fake.sends.lock().await.len();
+    until(async || h.fake.sends.lock().await.len() > before).await;
+
+    let before = h.fake.sends.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a3"),
+            text: text.to_owned(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() > before).await;
+
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+}
+
+#[tokio::test]
+async fn a_question_a_session_never_came_back_to_is_taken_off_the_phone_by_the_next_one() {
+    // Scoping a retirement to its own session closed the misinformation and took away the only
+    // thing that had ever pruned the ledger — because before it, a later session answering its own
+    // first question swept the dead one's identically-numbered record as a side effect. That sweep
+    // was the defect; it was also, in practice, the garbage collector.
+    //
+    // Eviction does not replace it. Eviction fires only when a claim is still held by a pid that is
+    // no longer running, and every ORDINARY way a bridge goes away — bye, EOF, RST, SIGKILL —
+    // reaches `release` first, so the successor finds an empty claims map and evicts nothing. So
+    // does every session that was open when the hub itself restarted. Left alone, each one leaves a
+    // keyboard on his phone that nothing will ever take away and that refuses every tap, and the
+    // ledger grows by one record per abandoned session, for ever, under a mutex every ask and every
+    // tap has to take.
+    let h = harness().await;
+
+    a_session_that_asks_and_leaves(&h, "i1", "question from the first session").await;
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "a question was retired while its own session might still have come back to it"
+    );
+
+    // The next run of the same worker. Nothing was evicted to get here.
+    let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    second.become_live().await;
+
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0].1, MsgId::new("m2"), "{retired:?}");
+    assert!(
+        retired[0].2.contains("restarted"),
+        "the operator is owed a reason the question went quiet: {}",
+        retired[0].2
+    );
+    // Never an outcome. Nothing here was answered, and saying so would be the same misinformation
+    // this whole change exists to stop, arriving from the other direction.
+    assert!(
+        !retired[0].2.contains("at the terminal") && !retired[0].2.contains("from your phone"),
+        "an abandoned question was stamped with an answer: {}",
+        retired[0].2
+    );
+
+    // And the record goes with the keyboard, so the ledger does not grow by one per dead session.
+    assert_eq!(
+        h.hub
+            .resolve_tap(ALLOWED_CHAT, &MsgId::new("m2"), &OptionId::new("y"))
+            .await
+            .expect_err("a retired question must not still answer"),
+        TapRefusal::NoRecord
+    );
+}
+
+#[tokio::test]
+async fn the_arriving_session_is_not_kept_waiting_while_the_last_one_s_keyboards_come_off() {
+    // The retirement is one Telegram edit per question the gone session left open, and nothing
+    // bounds how many that is. Done on the handshake — before `welcome` — the returning agent waits
+    // out every one of them, and it cannot do anything else while it waits: the bridge holds
+    // everything the agent says until the hub says welcome, and drops what the agent says after
+    // sixty-four of them. The session paying that cost is the one that just came back.
+    let h = harness().await;
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    first.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    for n in 0..6 {
+        first
+            .send(BridgeFrame::Ask {
+                ask_id: AskId::new(format!("a{n}")),
+                text: format!("question {n}"),
+                options: Some(vec![AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                }]),
+            })
+            .await;
+    }
+    until(async || h.fake.sends.lock().await.len() == 7).await;
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+
+    // One edit, one network round trip. This is the whole point of the measurement.
+    *h.fake.retire_takes.lock().await = Duration::from_millis(300);
+
+    let began = std::time::Instant::now();
+    let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    let first_frame = second.next().await.expect("a welcome");
+    let waited = began.elapsed();
+    assert!(
+        matches!(first_frame.payload, HubFrame::Welcome { .. }),
+        "expected a welcome, got {:?}",
+        first_frame.payload
+    );
+    assert!(
+        waited < Duration::from_millis(900),
+        "the new session waited {waited:?} to be admitted while six of the last session's \
+         keyboards came off — that is a Telegram round trip per abandoned question, in front of \
+         the one frame the bridge cannot start work without"
+    );
+
+    // Still done, just not in the way. Six edits at 300 ms each.
+    second.become_live().await;
+    until(async || h.fake.retired.lock().await.len() == 6).await;
+}
+
+#[tokio::test]
+async fn a_retirement_telegram_refused_is_tried_again_when_the_next_session_arrives() {
+    // A retirement that fails keeps its record, which is right: the record is what lets a later
+    // retirement finish the job. Done only on eviction, though, there IS no later retirement — that
+    // instance can never be evicted twice, the session that asked cannot come back to resolve it,
+    // and no other session can reach it now that the filter is scoped. One transient Telegram error
+    // at that exact moment made the leak permanent.
+    let h = harness().await;
+    a_session_that_asks_and_leaves(&h, "i1", "Deploy to production?").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    second.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "this test needs a retirement that Telegram refused"
+    );
+    drop(second);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+
+    // Telegram is well again, and a third session arrives.
+    *h.fake.retire_fails.lock().await = false;
+    let mut third = FakeBridge::connect(&h.sock, &h.secret, "i3", h.project.as_str()).await;
+    third.become_live().await;
+
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(
+        retired.len(),
+        1,
+        "one refused edit left a keyboard on his phone that nothing tried again: {retired:?}"
+    );
+    assert_eq!(retired[0].1, MsgId::new("m2"), "{retired:?}");
 }
 
 #[tokio::test]
@@ -1737,5 +2095,187 @@ async fn pacing_waits_but_a_real_flood_is_shed() {
     assert!(
         wait > Duration::ZERO,
         "a refusal must say when to come back"
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawal_whose_edit_failed_says_so_and_leaves_the_question_answerable() {
+    // Taking a question back forgot its record whether or not the keyboard actually came off, which
+    // inverts the order every other retirement in this file uses — and the reason that order exists
+    // is that the record is also what a LATER retirement finds its target through. Forget it while
+    // the buttons are still live and nothing can ever take them off: not the session's own
+    // withdrawal, not a timeout, not another session. Meanwhile the operator was told, flatly, "I
+    // have taken the buttons away" — while looking at them — and every tap after that answered "I
+    // have no record of that question".
+    //
+    // Both halves need two failures at once, and this file documents both as expected: a delivery
+    // that does not land is the outbox-full case, and an edit is refused by any Telegram 5xx, any
+    // flood wait, and every message past the 48-hour edit window.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite deploy/prod.yaml?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    let msg = MsgId::new("m2");
+    let (project, _, _) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+
+    // It reaches nobody, and the edit that would take the buttons off is refused as well.
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+    assert!(
+        !h.hub
+            .deliver(
+                &project,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id: AskId::new("a1"),
+                    option_id: OptionId::new("y"),
+                }
+            )
+            .await,
+        "this test needs a delivery that fails"
+    );
+    *h.fake.retire_fails.lock().await = true;
+
+    assert_eq!(
+        h.hub.withdraw_undelivered(ALLOWED_CHAT, &msg).await,
+        Withdrawal::StillOnHisPhone,
+        "it reported the buttons gone when the edit that would have removed them was refused — \
+         and that sentence is what the operator reads while looking at the buttons"
+    );
+
+    // The record survives, because it is the only handle anything has on that live keyboard.
+    {
+        let ledger = h.hub.ledger.lock().await;
+        let record = ledger
+            .get(ALLOWED_CHAT, &msg)
+            .expect("the record of a keyboard that is still live must not be thrown away");
+        assert!(
+            record.answered.is_none(),
+            "the question is still burnt, so the live keyboard can only ever say it was answered"
+        );
+    }
+
+    // The same session comes back — same instance, which is what a bridge really does across a
+    // reconnect — and withdraws the question. THIS is what the forgotten record used to make
+    // impossible.
+    *h.fake.retire_fails.lock().await = false;
+    let mut again = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    again.become_live().await;
+    again
+        .send(BridgeFrame::AskResolved {
+            ask_id: AskId::new("a1"),
+            how: AskEnd::Withdrawn,
+            outcome: None,
+        })
+        .await;
+
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(
+        retired.len(),
+        1,
+        "nothing was ever able to take that keyboard off again: {retired:?}"
+    );
+    assert_eq!(retired[0].1, msg, "{retired:?}");
+}
+
+#[tokio::test]
+async fn a_tap_the_project_never_received_takes_the_question_back_rather_than_burning_it() {
+    // A tap is written down as answered BEFORE the caller delivers, and it has to be: the window
+    // between the two is a Telegram round trip on a keyboard the operator is still looking at, and
+    // a second tap inside it would deliver twice.
+    //
+    // The cost was that a delivery which then failed burned the question for good. Nothing ever
+    // cleared `answered`, so the operator was told first that the project was not connected — false
+    // when it was merely behind, which is the documented outbox-full case — and then, when he
+    // tried the same button again, that it had already been answered and nothing had been sent.
+    // The second half of that sentence is true and the first is not, and the keyboard stayed live
+    // forever, able only to repeat it.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite deploy/prod.yaml?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    // He taps, and it resolves — which writes the answer down.
+    let msg = MsgId::new("m2");
+    let (project, _, _) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+
+    // And then it reaches nobody. A full outbox does this without anything having to go wrong;
+    // dropping the connection is the same thing from the hub's side and needs no timing to arrange.
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.project).await).await;
+    assert!(
+        !h.hub
+            .deliver(
+                &project,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id: AskId::new("a1"),
+                    option_id: OptionId::new("y"),
+                }
+            )
+            .await,
+        "this test needs a delivery that fails"
+    );
+
+    assert_eq!(
+        h.hub.withdraw_undelivered(ALLOWED_CHAT, &msg).await,
+        Withdrawal::Retired
+    );
+
+    // The keyboard comes off, and what it says is what happened — not an answer, and not silence.
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "the menu was left live: {retired:?}");
+    assert_eq!(retired[0].1, msg);
+    assert!(
+        retired[0].2.contains("not sent"),
+        "the note does not say it was not sent: {}",
+        retired[0].2
+    );
+
+    // And the question is no longer burnt. "I have no record of that question" is true; "that has
+    // already been answered, I have not sent anything" was not.
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect_err("a withdrawn question must not answer");
+    assert_eq!(
+        refused,
+        TapRefusal::NoRecord,
+        "the question is still burnt: he is told {:?}",
+        refused.say()
     );
 }

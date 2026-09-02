@@ -768,7 +768,47 @@ function handle(s: import('bun').Socket, line: string): void {
       // has to reach the agent, and the agent's own turn is the only place it can.
       const was = inFlight.get(String(frame.ref))
       inFlight.delete(String(frame.ref))
-      if (frame.delivered !== 'no') break
+      // The wire carries THREE delivery values and this branched on two. `!== 'no'` folded `unseen`
+      // into success, so a send the hub could not confirm read as one that landed: the agent's only
+      // record said the operator had been asked and an answer was on its way, and no correction
+      // ever arrived. Only `yes` is success now, and anything a newer hub sends that is neither
+      // `yes` nor `no` is treated as unconfirmed rather than guessed either way.
+      if (frame.delivered === 'yes') {
+        // `yes` still hides one thing. `clamped` is the only ack reason the hub ever pairs with a
+        // successful delivery — it clips on its own side and says so BECAUSE, in its own words,
+        // whether anything was lost is a fact the bridge has to be told — and returning here
+        // unconditionally meant nothing could ever read it. The operator sees "… (clipped)" on his
+        // phone; the agent believed it had delivered the whole thing and went on referring to a
+        // part he never read.
+        if (frame.why === 'clamped' && was) {
+          deliver(
+            `He got ${was.what}, but it was too long for one message: what is on his phone ends ` +
+              'in "… (clipped)" and he has not read a word after that. Say the rest in a second, ' +
+              'shorter message if it mattered.',
+            { about: 'he got a shortened version', user: 'the channel itself' },
+          )
+        }
+        break
+      }
+      if (frame.delivered !== 'no') {
+        // `unseen` is the hub refusing to guess. Telegram has no idempotency key, so a send that
+        // times out may or may not have landed and there is no way to ask — and re-sending a
+        // question with buttons would put two live menus for it on his phone, both tappable
+        // forever. So this is the end of it, and the agent has to be told that in words it cannot
+        // read as "I asked him".
+        note(`the hub could not confirm a frame reached him (${frame.why ?? 'no reason given'})`)
+        if (!was) break
+        deliver(
+          `The hub could not confirm he got ${was.what}. It may have arrived and it may not have, ` +
+            'and there is no way to find out — so it will not be sent again, because sending it ' +
+            'twice would leave two of it on his phone. Do not tell him you reached him.' +
+            (was.askId
+              ? ` If the question ${was.askId} never arrived, no answer to it is ever coming, so do not wait for one — carry on without it. Do NOT ask it again: if it DID arrive, its buttons are already dead, and a second copy would leave him two menus with only one of them able to answer. If you must have an answer, say what you need in a plain message and let him type it back.`
+              : ''),
+          { about: 'he may never have got this', user: 'the channel itself' },
+        )
+        break
+      }
       const why = ackReasons.get(String(frame.why)) ?? 'his phone did not take it'
       note(`the hub did not deliver a frame (${frame.why ?? 'no reason given'})`)
       if (!was) break

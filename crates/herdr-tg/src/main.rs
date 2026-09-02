@@ -166,6 +166,20 @@ enum Cmd {
     Enroll {
         /// The project's own directory.
         repo: PathBuf,
+
+        /// Write the secret even though git says that repo would commit it.
+        ///
+        /// Without this, a repo whose git would commit the secret is refused and nothing is
+        /// written — a secret in a public history cannot be untracked afterwards, so the refusal
+        /// is the safe answer. But this command is also how a leaked secret is rotated, and a door
+        /// with no handle is a door nobody can use. The name is long and unmistakable on purpose:
+        /// it is not a flag anyone reaches for by habit.
+        ///
+        /// It is honoured only when this is run AT A TERMINAL. The reader of that refusal is most
+        /// often a coding agent that was just told to run this command, and an override a
+        /// non-interactive process can pass on its own is not a decision anybody made.
+        #[arg(long)]
+        even_if_git_would_commit_it: bool,
     },
 
     /// Every enrolled project, and whether it has a topic yet.
@@ -228,7 +242,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             expect_status,
             timeout_ms,
         } => cmd::watch::run(&client, &pane, once, expect_status.as_deref(), timeout_ms).await,
-        Cmd::Enroll { repo } => cmd::enroll::enrol(&repo),
+        Cmd::Enroll {
+            repo,
+            even_if_git_would_commit_it,
+        } => cmd::enroll::enrol(&repo, even_if_git_would_commit_it),
         Cmd::Projects => cmd::enroll::projects(),
         Cmd::Serve { config } => {
             // FIRST, before the config is even read, and long before a `Bot` exists.
