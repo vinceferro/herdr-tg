@@ -69,9 +69,13 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   resolution, retirement, alarm. `an_ask_becomes_a_tap_becomes_a_choice` passes, and so does
   `the_real_plugin_and_the_real_hub_agree_on_the_wire` — the real bun bridge against the real hub
   over a real socket, both directions, with only Telegram faked.
-- **The round trip with a live Telegram has never run.** That needs the operator to start a session
-  with `claude --channels plugin:kickoff-channel@herdr-tg-local`. Everything up to the Bot API is
-  proven; the last hop is not.
+- **The round trip with a live Telegram has run**, on 2 September 2026: a question left an agent's
+  turn, reached the operator's phone, and his tap came back as a message in that same turn. It needs
+  a session started with `claude --channels plugin:kickoff-channel@herdr-tg-local`; a `claude -p` run
+  cannot do it, because print mode ends the turn and the bridge dies before the tap arrives.
+- **Two projects are enrolled.** `herdr-tg` and a throwaway, `~/scratch/hub-dogfood`, which proved a
+  project other than this one can hold a topic of its own. `docs/MULTIPLEXER-READINESS.md` is the
+  audit of what still breaks between two projects and fourteen.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
