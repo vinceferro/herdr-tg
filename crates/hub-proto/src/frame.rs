@@ -112,6 +112,13 @@ pub enum RefusedReason {
     NotEnabled,
     /// The frame was larger than the ceiling. Never truncated — a half message is worse than none.
     FrameTooLarge,
+    /// The `lane` on the `hello` is not a name the hub will address a conversation by.
+    ///
+    /// Safe to add to a closed set the bridge branches on, because only a bridge that SENT a lane
+    /// can ever receive it — and a bridge old enough not to know the word cannot send one. It is
+    /// permanent, not temporary: the same lane name will be refused every time, so a bridge that
+    /// treats an unknown reason as worth retrying must be taught this one or it spins for ever.
+    BadLane,
 }
 
 /// One answer button, as the bridge minted it.
@@ -172,6 +179,20 @@ pub enum BridgeFrame {
         /// The repo path, for the audit record and for a human reading it. Never for routing.
         repo: String,
         pid: u32,
+        /// Absent means the project's own voice — which is every bridge shipped before this field
+        /// existed, and is why it is optional rather than required.
+        ///
+        /// Present means one worktree of that project, speaking for itself. The hub reads nothing
+        /// OUT of the string; it is an address, exactly as an [`crate::ids::AskId`] is. It cannot
+        /// widen a bridge's reach, because the token beside it still resolves to the PROJECT and
+        /// the hub builds the address from that resolved project plus this name — so a lane named
+        /// here is always a lane of the project the secret already proved.
+        ///
+        /// `skip_serializing_if`, so a bridge that names no lane puts BYTE FOR BYTE what it always
+        /// put on the wire. A `"lane":null` would be a field an older hub has to tolerate for no
+        /// reason at all, on the one frame whose failure is a project that can never connect.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        lane: Option<crate::ids::LaneId>,
     },
     /// Something the agent said. Does not buzz.
     Say {
@@ -260,6 +281,20 @@ pub enum HubFrame {
     /// number is useful in a log when someone is working out where a message went.
     Welcome {
         project: String,
+        /// The lane the hub actually admitted, echoed back.
+        ///
+        /// It exists so a bridge that NAMED a lane can tell it was heard. An unknown field inside a
+        /// known kind is ignored on purpose, which is what lets a new bridge talk to an old hub —
+        /// but it also means an old hub admits a lane silently as the project itself, giving the
+        /// worktree the project's one claim and its topic while the project's own session is turned
+        /// away. Nothing else in this frame can distinguish that from being given a place of one's
+        /// own: `project` is a registry-owned title the bridge cannot predict.
+        ///
+        /// Absent means "no lane", which is both what an ordinary session is and what every hub
+        /// built before lanes says about everything. A bridge that named one and gets no echo has
+        /// learned the hub is older than it is, and must refuse rather than impersonate.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        lane: Option<crate::ids::LaneId>,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         topic_id: Option<i32>,
         limits: Limits,
@@ -368,12 +403,15 @@ mod tests {
     fn a_hello_carries_no_display_name_for_the_topic() {
         // Pinned as a property of the TYPE, not of a code path: a bridge that could name itself
         // could claim another project's topic, and no amount of escaping downstream would help.
+        // A lane is not an exception to this. It names WHICH CONVERSATION a connection is, and the
+        // hub still takes every title it prints from its own registry.
         let json = serde_json::to_string(&env(BridgeFrame::Hello {
             project_id: ProjectId::new("p-herdr-tg"),
             token: "s3cret".into(),
             instance: "i1".into(),
             repo: "/home/u/Projects/herdr-tg".into(),
             pid: 42,
+            lane: Some(crate::ids::LaneId::new("lane-0902-201212-2783563")),
         }))
         .expect("serialises");
         for forbidden in ["\"name\"", "\"project\":", "\"title\"", "\"topic\""] {
@@ -382,6 +420,74 @@ mod tests {
                 "hello must not carry {forbidden}: {json}"
             );
         }
+    }
+
+    #[test]
+    fn a_hello_without_a_lane_is_byte_for_byte_the_hello_this_protocol_has_always_sent() {
+        // The upgrade that matters most is the one nobody performs: a bridge already installed in a
+        // running session keeps sending exactly this, and it must go on being the project's own
+        // voice. Pinned as BYTES rather than as a round trip, because a round trip is green even
+        // when a `"lane":null` has appeared on the wire — and a null here is a field an older hub
+        // would have to be tolerant of for no reason at all.
+        let json = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("unknown-until-the-hub-says"),
+            token: "s3cret".into(),
+            instance: "i1".into(),
+            repo: "/home/u/Projects/herdr-tg".into(),
+            pid: 42,
+            lane: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"s3cret","instance":"i1","repo":"/home/u/Projects/herdr-tg","pid":42}"#
+        );
+    }
+
+    #[test]
+    fn a_hello_from_a_bridge_that_has_never_heard_of_lanes_is_still_a_hello() {
+        // The upgrade day that actually happens: the hub is replaced and the bridge is not, because
+        // a channel plugin restarts only when its session does. The hello already on the wire has no
+        // `lane` in it at all, and if this build required one, every project on the box would be
+        // refused at the first gate with nothing to say why.
+        let f: Envelope<BridgeFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f2","t":"hello","project_id":"p","token":"s","instance":"i","repo":"/r","pid":1}"#,
+        )
+        .expect("a hello with no lane must not be a parse error");
+        assert_eq!(
+            f.payload,
+            BridgeFrame::Hello {
+                project_id: ProjectId::new("p"),
+                token: "s".into(),
+                instance: "i".into(),
+                repo: "/r".into(),
+                pid: 1,
+                lane: None,
+            },
+            "a bridge that named no lane stopped being the project's own voice"
+        );
+    }
+
+    #[test]
+    fn a_hello_that_names_a_lane_still_parses_on_a_build_that_has_never_heard_of_lanes() {
+        // The other direction of the same skew, and the only one that cannot be run end to end,
+        // because the hub that would have to be old is the one being replaced. `hello` is where a
+        // wrong answer costs most: it is refused before anything else can happen and the bridge is
+        // left with a closed socket and no reason.
+        //
+        // What makes it safe is structural rather than a policy anyone could flip. The escape hatch
+        // — `deny_unknown_fields` on this variant — DOES NOT COMPILE here: serde refuses it on an
+        // internally tagged enum reached through the envelope's `flatten`, with 49 errors. So the
+        // tolerance is a property of the shape of this type, and the assertion below is what a
+        // reader gets to see rather than the whole of the guarantee.
+        let f: Envelope<BridgeFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f2","t":"hello","project_id":"p","token":"s","instance":"i","repo":"/r","pid":1,"lane":"lane-0902-201212-2783563"}"#,
+        )
+        .expect("a hello naming a lane must not be a parse error");
+        let BridgeFrame::Hello { instance, .. } = f.payload else {
+            panic!("a hello that names a lane stopped being a hello");
+        };
+        assert_eq!(instance, "i");
     }
 
     #[test]

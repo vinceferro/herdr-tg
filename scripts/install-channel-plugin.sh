@@ -72,3 +72,12 @@ say
 say "Then, per project:"
 say "    herdr-tg enroll <repo>"
 say "    echo 'CHANNEL_SPEC=plugin:kickoff-channel@herdr-tg-local' >> <repo>/.kickoff/instance.env"
+
+# The two halves ship from one repo and are installed by two different commands, and this one only
+# ever touches the bridge. A bridge that knows about worktrees against a hub that does not is the
+# ordinary intermediate state of an upgrade — the bridge now refuses rather than quietly taking the
+# whole project's place, but a refusal is still a session that cannot reach him.
+say
+say "And restart the hub, or a session in a worktree will refuse to connect:"
+say "    systemctl --user restart herdr-tg"
+

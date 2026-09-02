@@ -16,10 +16,32 @@
 //! 2. **Which project.** The secret resolves to one, in constant time, over the whole registry.
 //!    The `project_id` on the wire is not consulted.
 //! 3. **Switched on.** Enrolled and disabled is a real state.
-//! 4. **Exactly one live connection per project.** A second is refused, never a takeover. A
+//! 4. **A lane, if the bridge named one, must be a name the hub can address.** Empty, over-long, or
+//!    carrying a control character is refused here — before a claim, before a topic, before a line
+//!    of audit — because the audit is one tab-separated record per line and a lane with a newline in
+//!    it would write records of its own choosing into the one file an incident is read from.
+//! 5. **Exactly one live connection per CONVERSATION.** A second is refused, never a takeover. A
 //!    takeover is what bridge-murder felt like from the inside: the incumbent kept running and
 //!    quietly stopped being heard. If the incumbent's pid is gone from `/proc` it is evicted
 //!    instead — a crashed worker must not lock its own project out until someone finds a keyboard.
+//!
+//! # A conversation is a project, or one worktree of it
+//!
+//! kickoff runs several worktrees of one repo at once, each its own agent process, and gate 5 keyed
+//! on the project admitted exactly one of them. So `hello` carries an optional `lane` and the claim
+//! key is [`Addr`] — the project plus that lane.
+//!
+//! **The secret still proves only the PROJECT.** The address is built from the project the secret
+//! resolved to plus the lane the bridge named, never from anything else on the wire, so a bridge
+//! naming a lane can only ever reach a lane of the project it has already proved it is. A lane and
+//! its project are one repository and one trust domain; a lane is an address, not a credential.
+//!
+//! Every key that used to say "this project" now has to be asked which it means, and getting one
+//! wrong is silent: an answer delivered into an agent that never asked, or a question retired on the
+//! phone while the agent behind it waits for ever. The two filters in [`AskLedger`], the claims map,
+//! the topic lookup and the tap's route all say **conversation**. The per-chat delivery budget, the
+//! registry, the secret and enrolment all still say **project**, because a lane is not enrolled and
+//! Telegram's ceiling is per chat rather than per topic.
 //!
 //! # Live is not the same as connected
 //!
@@ -45,8 +67,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hub_proto::{
-    AskId, AskOption, BridgeFrame, Delivered, Envelope, FrameId, HubFrame, Limits, MsgId, OptionId,
-    ProjectId, RefusedReason, VERSION,
+    AskId, AskOption, BridgeFrame, Delivered, Envelope, FrameId, HubFrame, LaneId, Limits, MsgId,
+    OptionId, ProjectId, RefusedReason, VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
@@ -65,6 +87,19 @@ pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
 /// nine more than the one-second rhythm needs and far less than the per-minute ceiling implies, so
 /// a burst that fits under the ceiling drains and a genuine flood still sheds.
 pub const MAX_PACE_WAIT: Duration = Duration::from_secs(10);
+
+/// How long Telegram lets a bot edit one of its own messages. Not ours to raise either.
+///
+/// It is the shelf life of an ask record: past it, the edit that takes a keyboard off is refused,
+/// so the record can no longer do the only thing it is kept for.
+pub const EDIT_WINDOW_SECS: u64 = 48 * 60 * 60;
+
+/// How long a refused topic creation is remembered before Telegram is asked again.
+///
+/// Long enough that an agent talking steadily costs one call rather than one per message, short
+/// enough that a flood wait or a 5xx mends itself inside a turn or two. Telegram's own flood waits
+/// on this call are seconds to half a minute.
+pub const TOPIC_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// Telegram's own ceiling on a button's `callback_data`. Not ours to raise.
 ///
@@ -146,6 +181,19 @@ pub trait Surface: Send + Sync + 'static {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AskRecord {
     pub project: ProjectId,
+    /// Which worktree of that project asked, when it was not the project itself.
+    ///
+    /// Half the address, and it has to be written down rather than re-derived: two lanes of one
+    /// repo are two agents that both mint their first ask id from a counter starting at the same
+    /// number, and the opencode adapter gives both of them ONE instance because it is one process.
+    /// So neither the ask id nor the instance can tell them apart, and an outcome matched without
+    /// this field lands on a question a different lane is still waiting on.
+    ///
+    /// `#[serde(default)]` because the ledger on the operator's box holds records written before
+    /// lanes existed, and a ledger that will not parse turns every keyboard on his phone into a
+    /// button that answers "I have no record of that question".
+    #[serde(default)]
+    pub lane: Option<LaneId>,
     pub ask_id: AskId,
     pub topic_id: i32,
     /// The options exactly as the bridge minted them, labels included, so the hub can say what was
@@ -158,6 +206,31 @@ pub struct AskRecord {
     /// Which run of the worker asked. A tap on a menu drawn for a session that has since restarted
     /// is refused with a reason, rather than answered into a process that never asked.
     pub instance: String,
+    /// The process that asked, so "that agent is gone" can be a fact rather than a guess.
+    ///
+    /// A lane is never dispatched twice under the same name, so nothing of its own ever comes back
+    /// to clear what it left open — and clearing it from a sibling's arrival needs proof, because
+    /// the two states it has to tell apart look identical in the ledger: a worktree that ENDED, and
+    /// one whose socket dropped for a second and is coming straight back. A bridge keeps its pid
+    /// across a reconnect, so the pid separates them and nothing else here does.
+    ///
+    /// `None` means "written by a build that did not record it", and it is read as unknown rather
+    /// than as gone: a sweep that guesses takes a live agent's question off the phone, which is the
+    /// failure this whole field exists to avoid.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// When it was written, in seconds since the epoch.
+    ///
+    /// Not for display. Telegram refuses an edit on a message older than about 48 hours, so past
+    /// that age a record can no longer do the one job it has — being the handle that takes a
+    /// keyboard off — and keeping it only grows a file that is rewritten whole on every ask.
+    ///
+    /// `0` means a build that did not record it wrote this, and it is read as an UNKNOWN age that
+    /// is never dropped — never as "older than anything". Nothing is lost by that: lanes have never
+    /// shipped, so every record already on the operator's box belongs to a project's own voice, and
+    /// those are collected the ordinary way when that project's next session arrives.
+    #[serde(default)]
+    pub at: u64,
     /// What was already answered, if anything.
     ///
     /// The record's presence used to BE the authorisation, which was fine only while the record was
@@ -170,6 +243,46 @@ pub struct AskRecord {
     /// So authorisation is this field, and the record's presence is only retirement bookkeeping.
     #[serde(default)]
     pub answered: Option<OptionId>,
+}
+
+impl AskRecord {
+    /// Who asked this: the project speaking for itself, or one lane of it.
+    pub fn addr(&self) -> Addr {
+        Addr {
+            project: self.project.clone(),
+            lane: self.lane.clone(),
+        }
+    }
+
+    /// Was it this exact conversation? Both halves, always — a project and a lane of it are two
+    /// different agents, and matching on the project alone is the whole of the defect above.
+    fn addr_is(&self, addr: &Addr) -> bool {
+        self.project == addr.project && self.lane == addr.lane
+    }
+}
+
+/// Why a conversation has no topic to send into.
+///
+/// Two values and not one, because the ack the agent gets is different and the two sentences it
+/// renders are not interchangeable: "the chat is over its limit for this minute" is a thing that
+/// mends itself, and "Telegram would not make the topic" is not. Collapsed into one, a budget shed
+/// reached the agent as a Telegram refusal, which is a small untruth in the one place this system
+/// exists to keep honest.
+#[derive(Debug)]
+pub enum NoTopic {
+    /// The chat's budget could not pay for the topic. Try again in the duration named.
+    TooFast(Duration),
+    /// Telegram, or the registry, would not give this conversation a topic.
+    Failed(String),
+}
+
+impl std::fmt::Display for NoTopic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFast(d) => write!(f, "the chat is at its limit for now; {}s", d.as_secs()),
+            Self::Failed(why) => write!(f, "{why}"),
+        }
+    }
 }
 
 /// Why a tap did not become an answer. Every one of these is said out loud in the topic.
@@ -198,8 +311,13 @@ impl TapRefusal {
             Self::NotAnOption => {
                 "That button is not one of the answers I wrote down for this question."
             }
+            // "That project" was true while a topic could only ever belong to a project. A lane has
+            // its own topic now, and the project it belongs to may be connected and busy while the
+            // worktree he is looking at is not — so that sentence became one he could read as false
+            // with the project's own topic open beside it. The topic is what he is looking at, so
+            // the topic is what this talks about.
             Self::NotConnected => {
-                "That project is not connected right now, so there is nobody to tell."
+                "Nothing is connected in this topic right now, so there is nobody to tell."
             }
             Self::Restarted => {
                 "That question belonged to a session that has since restarted. Ask again and it will come back."
@@ -338,35 +456,91 @@ impl AskLedger {
     /// sessions: a new session answering its own first question rewrote the dead one's question on
     /// the operator's phone with an outcome that belonged to a different question, and then deleted
     /// the record that proved it had ever been asked.
-    pub fn messages_for(
-        &self,
-        project: &ProjectId,
-        instance: &str,
-        ask_id: &AskId,
-    ) -> Vec<(i64, MsgId)> {
-        self.matching(|r| &r.project == project && r.instance == instance && &r.ask_id == ask_id)
+    pub fn messages_for(&self, addr: &Addr, instance: &str, ask_id: &AskId) -> Vec<(i64, MsgId)> {
+        self.matching(|r| r.addr_is(addr) && r.instance == instance && &r.ask_id == ask_id)
     }
 
-    /// Every question left open by some run of this project OTHER than the one named, so a worker
-    /// that never came back does not leave a keyboard on the operator's phone that nothing will
-    /// ever take away.
+    /// Every question left open by some run of THIS CONVERSATION other than the one named, so a
+    /// worker that never came back does not leave a keyboard on the operator's phone that nothing
+    /// will ever take away.
     ///
     /// "Other than this one" is the whole of it, and it is asked when a bridge arrives rather than
     /// when one leaves. A claim is exclusive, so at the moment one is granted every other run of
-    /// this project is provably not connected. Asked the other way round — at `release` — the
+    /// this conversation is provably not connected. Asked the other way round — at `release` — the
     /// answer would be wrong: a bridge keeps its instance across a reconnect, so a session that
     /// drops and comes straight back is still waiting for exactly those answers, and taking their
     /// keyboards away would be a live question removed from his phone.
     ///
+    /// **Scoped to the lane, and that is not a refinement — it is what keeps the argument above
+    /// true.** A claim used to be exclusive per PROJECT, so "nothing else of this project is
+    /// connected" and "nothing else of this conversation is connected" were the same sentence. Two
+    /// lanes may now hold claims at once, and only the second sentence survives. Matched on the
+    /// project, an arriving lane swept every open question of every other LIVE lane off his phone
+    /// with "the session that asked this restarted" — false, while each of those agents sat there
+    /// still waiting for the answer it had taken away.
+    ///
     /// An already-answered record is left alone. Its keyboard is still live only because taking it
     /// away failed, and the outcome written on it is the true one — replacing that with a note
     /// about a restart would be the same misinformation from the other direction.
-    pub fn open_for_other_instances(
+    pub fn open_for_other_instances(&self, addr: &Addr, instance: &str) -> Vec<(i64, MsgId)> {
+        self.matching(|r| r.addr_is(addr) && r.instance != instance && r.answered.is_none())
+    }
+
+    /// Every question left open by a worktree of this project whose process is GONE.
+    ///
+    /// The sweep above only ever reaches the conversation that is arriving, and for a project's own
+    /// voice that was enough: the next session of a project always arrives eventually. A lane is
+    /// never dispatched twice under the same name, so its address never arrives again and nothing
+    /// above will ever look at what it left behind — a keyboard on his phone that no restart, no
+    /// sibling and no timeout can take off, and a record in a file that is rewritten whole on every
+    /// ask of every project on the box.
+    ///
+    /// Widening the sweep to the project needed PROOF, not a heuristic, because the widening that
+    /// was tried first — "nothing is connected at that address right now" — is the exact failure
+    /// `release` was rejected for: a bridge that merely lost its socket is disconnected for a second
+    /// and is still waiting for those answers. Two facts together are the proof, and neither alone
+    /// is: nothing holds that address now, AND the process that asked is no longer running. A
+    /// reconnecting bridge is the same process, so it fails the second.
+    ///
+    /// A record whose pid was never written down is left alone. Unknown is not gone.
+    pub fn open_where_the_asker_is_gone(
         &self,
         project: &ProjectId,
-        instance: &str,
+        live: &BTreeSet<Addr>,
     ) -> Vec<(i64, MsgId)> {
-        self.matching(|r| &r.project == project && r.instance != instance && r.answered.is_none())
+        self.matching(|r| {
+            &r.project == project
+                && r.answered.is_none()
+                && !live.contains(&r.addr())
+                && r.pid.is_some_and(|pid| !pid_is_alive(pid))
+        })
+    }
+
+    /// Drop every record too old for Telegram to edit, and say how many went.
+    ///
+    /// A record's one job is to be the handle that takes a keyboard off a message. Telegram refuses
+    /// an edit on a message older than about 48 hours, so past that age it cannot do that job for
+    /// anybody — and what is left is a row in a file that is serialised whole and rewritten on every
+    /// ask and every tap of every project. Keeping it costs and buys nothing.
+    ///
+    /// A tap on one of those keyboards is then refused with "I have no record of that question",
+    /// which is the fail-closed answer and the true one: the session that asked it two days ago is
+    /// not there to hear an answer.
+    pub fn drop_what_can_no_longer_be_retired(&mut self, now: u64) -> usize {
+        let before = self.records.len();
+        self.records
+            .retain(|_, r| r.at == 0 || now.saturating_sub(r.at) <= EDIT_WINDOW_SECS);
+        let dropped = before - self.records.len();
+        if dropped > 0 {
+            // Not silent: the ledger shrinking is a thing someone reading an incident afterwards
+            // has to be able to account for.
+            tracing::info!(
+                dropped,
+                "dropped questions too old for their keyboards ever to come off again"
+            );
+            let _ = self.save();
+        }
+        dropped
     }
 
     /// The chat and message behind every record the predicate accepts.
@@ -381,6 +555,21 @@ impl AskLedger {
             .collect()
     }
 
+    /// Write the whole ledger, every time.
+    ///
+    /// **This is the state file that compounds, and it is the expensive one.** It is serialised
+    /// whole and renamed into place on every `record`, `mark_answered`, `mark_unanswered` and
+    /// `forget` — so every ask and every tap of every project on the box pays for whatever is in
+    /// it, on a blocking write with the ledger mutex held. Measured: a record holding a
+    /// worst-case-length question costs about 3.9 KB, and one further ask on top of a 360-record
+    /// backlog costs about 37 ms under that lock.
+    ///
+    /// Two things bound it, and both are here because a topic per lane made "the next session of
+    /// this project will collect it" stop being true: [`Self::open_where_the_asker_is_gone`] takes
+    /// what a worktree left when its process is provably gone, and
+    /// [`Self::drop_what_can_no_longer_be_retired`] takes what has aged past the point of being
+    /// useful to anybody. `projects.json` grows too, and is the one people notice — but a lane row
+    /// there costs 40 bytes and is only read on admission. This is the one to watch.
     fn save(&self) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
@@ -425,13 +614,14 @@ impl HubAudit {
 
     /// Recorded BEFORE the send. A `sent` with no outcome after it means the process died in the
     /// middle of writing, and means nothing else — which is the only reason the pair is useful.
-    pub fn sent(&self, project: &ProjectId, topic_id: i32, bytes: usize) -> std::io::Result<()> {
+    pub fn sent(&self, addr: &Addr, topic_id: i32, bytes: usize) -> std::io::Result<()> {
         self.line(&format!(
-            "sent\tproject={project}\ttopic={topic_id}\tbytes={bytes}"
+            "sent\t{}\ttopic={topic_id}\tbytes={bytes}",
+            subject(addr)
         ))
     }
 
-    pub fn outcome(&self, project: &ProjectId, outcome: &SendOutcome) -> std::io::Result<()> {
+    pub fn outcome(&self, addr: &Addr, outcome: &SendOutcome) -> std::io::Result<()> {
         let word = match outcome {
             SendOutcome::Sent(id) => format!("delivered\tmessage={id}"),
             SendOutcome::Clamped(id) => format!("delivered\tmessage={id}\tclipped=yes"),
@@ -440,13 +630,13 @@ impl HubAudit {
             SendOutcome::Refused(why) => format!("refused\twhy={why}"),
             SendOutcome::Unseen => "unseen".to_owned(),
         };
-        self.line(&format!("{word}\tproject={project}"))
+        self.line(&format!("{word}\t{}", subject(addr)))
     }
 
     /// A branch that sends nothing still writes a line, so silence in this file always means the
     /// process stopped rather than that the hub decided something quietly.
-    pub fn refused(&self, project: &ProjectId, why: &str) -> std::io::Result<()> {
-        self.line(&format!("refused\tproject={project}\twhy={why}"))
+    pub fn refused(&self, addr: &Addr, why: &str) -> std::io::Result<()> {
+        self.line(&format!("refused\t{}\twhy={why}", subject(addr)))
     }
 
     fn line(&self, body: &str) -> std::io::Result<()> {
@@ -465,14 +655,38 @@ impl HubAudit {
     }
 }
 
+/// Who a line is about, as the fields an incident is grepped by.
+///
+/// `project=` stays exactly what it was, so a search for a project still finds every line its lanes
+/// wrote. The lane is a SECOND field rather than a decoration on the first, because a compound
+/// subject would match neither of the two queries anyone actually types.
+///
+/// Nothing here escapes anything, and nothing here needs to: a lane that could carry a tab or a
+/// newline would write lines of its own choosing into this file, so the shape of a lane is checked
+/// once, where a lane first becomes an address, and a bad one never reaches a claim or a topic —
+/// let alone this.
+fn subject(addr: &Addr) -> String {
+    match &addr.lane {
+        None => format!("project={}", addr.project),
+        Some(lane) => format!("project={}\tlane={lane}", addr.project),
+    }
+}
+
 fn now_iso() -> String {
     // Seconds since the epoch. Not pretty, and deliberately dependency-free: a log line's job here
     // is ordering and correlation, and a date crate is a supply-chain decision for a timestamp.
-    let secs = std::time::SystemTime::now()
+    format!("t={}", now_secs())
+}
+
+/// Seconds since the epoch, or zero when the clock will not say.
+///
+/// Zero is the same value a record written before ages existed carries, and both mean the same
+/// thing to the only reader there is: an age this code will not act on.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("t={secs}")
+        .unwrap_or(0)
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -484,6 +698,87 @@ struct Claim {
     pid: u32,
     instance: String,
     tx: mpsc::Sender<Envelope<HubFrame>>,
+}
+
+/// The longest lane name the hub will address a conversation by.
+///
+/// Well past anything kickoff mints — `lane-0902-201212-2783563` is twenty-four characters — and
+/// short enough that a lane cannot crowd its project's own name out of a topic title.
+pub const MAX_LANE: usize = 64;
+
+/// Which conversation a connection is: a project speaking for itself, or one worktree of it.
+///
+/// Built ONLY from the project a SECRET resolved to plus the lane the bridge named. That
+/// construction is the entire security argument: the project half never comes from the wire, so a
+/// bridge naming a lane can only ever reach a lane of the project it has already proved it is. A
+/// lane is an address, never a credential.
+///
+/// `Ord` puts `None` before `Some(_)`, so a project sorts immediately above its own lanes and the
+/// list the operator reads comes out grouped without anything sorting it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Addr {
+    pub project: ProjectId,
+    pub lane: Option<LaneId>,
+}
+
+impl Addr {
+    /// The project speaking for itself — which is every bridge shipped before lanes existed.
+    pub fn project_itself(project: ProjectId) -> Self {
+        Self {
+            project,
+            lane: None,
+        }
+    }
+
+    /// One worktree of a project, speaking for itself.
+    pub fn lane_of(project: ProjectId, lane: LaneId) -> Self {
+        Self {
+            project,
+            lane: Some(lane),
+        }
+    }
+
+    /// The lane as a log field, and a dash where there is none.
+    ///
+    /// Always present, so finding one lane's lines is a search rather than a guess about which
+    /// lines left the field out on purpose.
+    fn lane_field(&self) -> &str {
+        self.lane.as_ref().map_or("-", |l| l.as_str())
+    }
+}
+
+impl std::fmt::Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.lane {
+            None => write!(f, "{}", self.project),
+            Some(lane) => write!(f, "{}/{lane}", self.project),
+        }
+    }
+}
+
+/// Is this a name the hub can safely address a conversation by?
+///
+/// Refused rather than sanitised, and refused before a claim is taken, before a topic exists and
+/// before a byte is audited. Four things it stops, and only the first is obvious:
+///
+/// * A tab or a newline FORGES A LINE IN THE AUDIT. That file is one tab-separated record per line
+///   and it interpolates its subject exactly as given, so a lane carrying either writes records of
+///   its own choosing into the one place an incident is read from.
+/// * Any other control character reaches a topic title and the journal, where it is invisible and
+///   can reorder what a person reads.
+/// * A separator or a `..` is refused because nothing here joins a lane onto a path today, and the
+///   cheapest moment to close that door is before anyone is tempted to.
+/// * An empty name is not "no lane" — sending none is. A conversation with no name is not one the
+///   hub can address, and guessing what was meant is how the wrong agent gets an answer.
+fn lane_is_addressable(lane: &LaneId) -> bool {
+    let s = lane.as_str();
+    !s.is_empty()
+        && s.len() <= MAX_LANE
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.chars().any(char::is_control)
 }
 
 /// Is a pid still a process on this machine?
@@ -528,25 +823,34 @@ pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
 /// Why a connection was turned away before it became a project.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admission {
-    Admitted(ProjectId),
+    Admitted(Addr),
     /// Closed without a reply. A refusal is information, and this one is not owed.
     ClosedSilently,
     Refused(RefusedReason),
 }
 
-/// The hub: one socket, one registry, one claim per project.
+/// The hub: one socket, one registry, one claim per conversation.
 pub struct Hub<S: Surface> {
     pub surface: Arc<S>,
     pub registry: Arc<Mutex<Registry>>,
     pub ledger: Arc<Mutex<AskLedger>>,
     pub audit: Arc<HubAudit>,
-    claims: Arc<Mutex<BTreeMap<ProjectId, Claim>>>,
+    /// One live connection per ADDRESS, not per project. Two worktrees of one repo are two agents
+    /// that can each block on a question of their own, and the second used to be turned away.
+    claims: Arc<Mutex<BTreeMap<Addr, Claim>>>,
     /// One outbound budget per chat, because Telegram's ceiling is per chat and forum topics do
     /// not get one of their own. Six busy projects share it.
     budgets: Arc<Mutex<crate::queue::Budgets>>,
     /// Whose turn it is to send. Held for the whole of one send's pacing wait, so that projects
     /// queue for the rhythm instead of racing for it — see `send_into` for what racing cost.
     send_permit: Arc<Mutex<()>>,
+    /// When Telegram last refused to make a topic for an address.
+    ///
+    /// `topic_for` runs on EVERY message, so without a memory a conversation whose topic cannot be
+    /// made asked Telegram for one per message, with no backoff, outside the budget. An entry is
+    /// dropped the moment a topic is made, so this only ever holds addresses that are currently
+    /// failing.
+    topic_refused: Arc<Mutex<BTreeMap<Addr, std::time::Instant>>>,
     /// The one-line gist put above a question, when one is configured.
     ///
     /// `None` unless the operator has set it up, and that default matters: a gist is the only thing
@@ -581,6 +885,7 @@ impl<S: Surface> Hub<S> {
             claims: Arc::new(Mutex::new(BTreeMap::new())),
             budgets: Arc::new(Mutex::new(crate::queue::Budgets::default())),
             send_permit: Arc::new(Mutex::new(())),
+            topic_refused: Arc::new(Mutex::new(BTreeMap::new())),
             gist: crate::summarize::Summarizer::from_env().map(Arc::new),
             allowed_chats: Arc::new(allowed_chats),
             forum_chat,
@@ -618,7 +923,10 @@ impl<S: Surface> Hub<S> {
         if version != VERSION {
             return Admission::Refused(RefusedReason::VersionSkew);
         }
-        let BridgeFrame::Hello { token, pid, .. } = hello else {
+        let BridgeFrame::Hello {
+            token, pid, lane, ..
+        } = hello
+        else {
             // The first frame must be `hello`. Anything else is a bridge that does not speak this
             // protocol, and letting it continue would mean guessing which project it is.
             return Admission::Refused(RefusedReason::UnknownProject);
@@ -650,8 +958,26 @@ impl<S: Surface> Hub<S> {
             return Admission::Refused(RefusedReason::NotEnabled);
         }
 
+        // The lane is checked HERE, after the secret has resolved, and the order is deliberate: a
+        // caller holding no valid secret learns only "unknown project" and never the difference
+        // between a bad lane and a bad token.
+        if let Some(lane) = lane
+            && !lane_is_addressable(lane)
+        {
+            tracing::warn!(
+                project = %id, bytes = lane.as_str().len(),
+                "a bridge named a lane the hub will not address a conversation by; refusing it"
+            );
+            return Admission::Refused(RefusedReason::BadLane);
+        }
+
         let _ = pid;
-        Admission::Admitted(id)
+        // The address, minted from the RESOLVED project and the wire's lane. Never from the wire's
+        // `project_id`, which is exactly why a bridge naming a lane cannot reach another project's.
+        Admission::Admitted(Addr {
+            project: id,
+            lane: lane.clone(),
+        })
     }
 
     /// Is this chat one the bot answers?
@@ -668,7 +994,7 @@ impl<S: Surface> Hub<S> {
         chat_id: i64,
         msg_id: &MsgId,
         option_id: &OptionId,
-    ) -> Result<(ProjectId, AskId, OptionId), TapRefusal> {
+    ) -> Result<(Addr, AskId, OptionId), TapRefusal> {
         // The allowlist first. A tap from a chat this bot does not answer must not even reach the
         // ledger — and it gets silence, not a refusal, because a refusal is a reply.
         if !self.chat_is_allowed(chat_id) {
@@ -692,11 +1018,21 @@ impl<S: Surface> Hub<S> {
         // The connection is checked BEFORE the record is marked, so a tap that could not be
         // delivered leaves the question answerable — refusing it and then closing it would burn the
         // operator's only way to answer.
+        //
+        // Looked up by the ADDRESS the record carries, so the lane travels in the record rather
+        // than being re-derived here. Keyed on the project alone this read either handed back some
+        // arbitrary lane's connection — a `Choice` delivered into a turn that never asked anything,
+        // with no error anywhere — or missed and called a lane not connected while it sat waiting.
+        let addr = record.addr();
         {
             let claims = self.claims.lock().await;
-            let Some(claim) = claims.get(&record.project) else {
+            let Some(claim) = claims.get(&addr) else {
                 return Err(TapRefusal::NotConnected);
             };
+            // Within one lane this still means what it always meant. Across lanes it means nothing
+            // at all — the opencode adapter is one process holding every lane, so its lanes share
+            // an instance and this check passes between them. The address above is what separates
+            // them; this separates two runs of the same one.
             if claim.instance != record.instance {
                 return Err(TapRefusal::Restarted);
             }
@@ -721,7 +1057,7 @@ impl<S: Surface> Hub<S> {
                 return Err(TapRefusal::NoRecord);
             }
         }
-        Ok((record.project, record.ask_id, option_id.clone()))
+        Ok((addr, record.ask_id, option_id.clone()))
     }
 
     /// Hand a frame to a project's live connection.
@@ -735,10 +1071,10 @@ impl<S: Surface> Hub<S> {
     /// `try_send` rather than `send`, for the same reason from the other direction: a full outbox
     /// means that bridge is not keeping up, and the honest answer is "not delivered" now rather
     /// than an await that might never finish.
-    pub async fn deliver(&self, project: &ProjectId, frame: HubFrame) -> bool {
+    pub async fn deliver(&self, addr: &Addr, frame: HubFrame) -> bool {
         let tx = {
             let claims = self.claims.lock().await;
-            match claims.get(project) {
+            match claims.get(addr) {
                 None => return false,
                 Some(claim) => claim.tx.clone(),
             }
@@ -747,7 +1083,10 @@ impl<S: Surface> Hub<S> {
         match tx.try_send(env) {
             Ok(()) => true,
             Err(e) => {
-                tracing::warn!(project = %project, error = %e, "a bridge is not keeping up; not delivered");
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(), error = %e,
+                    "a bridge is not keeping up; not delivered"
+                );
                 false
             }
         }
@@ -768,32 +1107,42 @@ impl<S: Surface> Hub<S> {
     /// own project out until someone finds a keyboard.
     pub async fn claim(
         &self,
-        project: ProjectId,
+        addr: Addr,
         pid: u32,
         instance: String,
         tx: mpsc::Sender<Envelope<HubFrame>>,
     ) -> Result<(), RefusedReason> {
         {
             let mut claims = self.claims.lock().await;
-            if let Some(old) = claims.get(&project) {
+            // Exclusive per ADDRESS. Widening it to the project was the refusal that made a second
+            // worktree of one repo unreachable; widening it to nothing would be the takeover this
+            // whole gate exists to refuse, so within one lane the rule is untouched.
+            if let Some(old) = claims.get(&addr) {
                 if pid_is_alive(old.pid) {
                     tracing::warn!(
-                        project = %project, incumbent = old.pid, arriving = pid,
-                        "a second bridge tried to take a project that is already connected"
+                        project = %addr.project, lane = addr.lane_field(),
+                        incumbent = old.pid, arriving = pid,
+                        "a second bridge tried to take a conversation that is already connected"
                     );
                     return Err(RefusedReason::AlreadyClaimed);
                 }
-                tracing::info!(project = %project, dead = old.pid, "evicting a bridge that is no longer running");
+                tracing::info!(
+                    project = %addr.project, lane = addr.lane_field(), dead = old.pid,
+                    "evicting a bridge that is no longer running"
+                );
             }
-            claims.insert(project.clone(), Claim { pid, instance, tx });
+            claims.insert(addr, Claim { pid, instance, tx });
         }
         Ok(())
     }
 
-    /// Take the keyboard off every question a run of this project OTHER than this one left open.
+    /// Take the keyboard off every question a run of this CONVERSATION other than this one left
+    /// open.
     ///
     /// Run when a bridge ARRIVES, because that is the one moment the hub can prove those sessions
-    /// are gone: a claim is exclusive, so nothing else holds this project now. Every other place it
+    /// are gone: a claim is exclusive, so nothing else holds this conversation now. "Conversation"
+    /// and not "project" is load-bearing — see [`AskLedger::open_for_other_instances`], where the
+    /// same widening turned this sweep into a thing that took live lanes' questions off the phone. Every other place it
     /// could have gone is wrong. At `release` a bridge that merely lost its socket would have its
     /// live questions taken off the phone, because a bridge keeps its instance across a reconnect
     /// and is still waiting for those answers. At eviction — which is where this started — it fires
@@ -810,35 +1159,61 @@ impl<S: Surface> Hub<S> {
     /// seconds, and the bridge cannot do anything at all until `Welcome` arrives — it holds
     /// everything the agent says until then, and starts dropping it after sixty-four. The session
     /// paying that would be the one that just came back.
-    async fn retire_what_other_sessions_left(&self, project: &ProjectId, instance: &str) {
-        let targets = {
+    async fn retire_what_other_sessions_left(&self, addr: &Addr, instance: &str) {
+        // First, the ledger's own shelf life. A question whose message Telegram will no longer let
+        // anyone edit cannot have its keyboard taken off by this sweep or any later one, so it is
+        // dropped rather than carried in a file every ask of every project rewrites whole.
+        {
             self.ledger
                 .lock()
                 .await
-                .open_for_other_instances(project, instance)
-        };
-        if targets.is_empty() {
-            return;
+                .drop_what_can_no_longer_be_retired(now_secs());
         }
+
+        let (mine, orphaned) = {
+            // The claims map is read while the ledger lock is NOT held, and it is authoritative:
+            // this connection's own claim is in it, which is what keeps a live sibling — and this
+            // conversation itself — out of the second list.
+            let live: BTreeSet<Addr> = self.claims.lock().await.keys().cloned().collect();
+            let ledger = self.ledger.lock().await;
+            (
+                ledger.open_for_other_instances(addr, instance),
+                ledger.open_where_the_asker_is_gone(&addr.project, &live),
+            )
+        };
+
         // What is said is that the session restarted, and nothing more. Never an outcome — no
         // question retired here was ever answered, and saying otherwise is the exact misinformation
         // the instance filter exists to stop.
-        self.retire_each(
-            project,
-            targets,
-            "the session that asked this restarted, so it is not waiting for an answer any more",
-        )
-        .await;
+        if !mine.is_empty() {
+            self.retire_each(
+                addr,
+                mine,
+                "the session that asked this restarted, so it is not waiting for an answer any more",
+            )
+            .await;
+        }
+        // A different sentence, because it is a different thing that happened. A worktree is not
+        // dispatched twice under one name, so what is being cleared here did not restart and is not
+        // coming back — saying it restarted would tell him to expect the question again.
+        if !orphaned.is_empty() {
+            self.retire_each(
+                addr,
+                orphaned,
+                "the session that asked this has ended, so it is not waiting for an answer any more",
+            )
+            .await;
+        }
     }
 
     /// Drop a connection's claim, but only if it is still the one holding it.
     ///
     /// The guard matters: a bridge that was evicted and then finished shutting down would otherwise
     /// remove its successor's claim on the way out, leaving a live worker unreachable.
-    pub async fn release(&self, project: &ProjectId, pid: u32) {
+    pub async fn release(&self, addr: &Addr, pid: u32) {
         let mut claims = self.claims.lock().await;
-        if claims.get(project).is_some_and(|c| c.pid == pid) {
-            claims.remove(project);
+        if claims.get(addr).is_some_and(|c| c.pid == pid) {
+            claims.remove(addr);
         }
     }
 
@@ -862,8 +1237,8 @@ impl<S: Surface> Hub<S> {
     /// [`Self::connected_ids`] answers a different question — what to show a person — and there a
     /// snapshot is the honest answer rather than a stale one.
     #[cfg(test)]
-    pub async fn is_claimed(&self, project: &ProjectId) -> bool {
-        self.claims.lock().await.contains_key(project)
+    pub async fn is_claimed(&self, addr: &Addr) -> bool {
+        self.claims.lock().await.contains_key(addr)
     }
 
     /// Which projects have a bridge on the socket right now, for a human reading a list.
@@ -872,23 +1247,33 @@ impl<S: Surface> Hub<S> {
     /// read the message anything in it may have changed, and he knows that about a status list. The
     /// alternative on offer was worse than stale — the list rendered a project's topic binding,
     /// which is permanent from its first connection onward and says nothing whatever about now.
-    pub async fn connected_ids(&self) -> BTreeSet<ProjectId> {
+    pub async fn connected_ids(&self) -> BTreeSet<Addr> {
         self.claims.lock().await.keys().cloned().collect()
     }
 
-    /// Which project owns a topic, if any.
+    /// Which conversation owns a topic, if any.
     ///
-    /// A message typed in a topic belongs to that project and to no other. This is the whole of
-    /// routing: rule 0 and nothing else. Every supergroup numbers its reply threads from one
+    /// A message typed in a topic belongs to that conversation and to no other. This is the whole
+    /// of routing: rule 0 and nothing else. Every supergroup numbers its reply threads from one
     /// counter, which is how a swipe-reply on a direct message once reached a forum pane — deleting
     /// the other rules deletes that failure rather than testing against it.
-    pub async fn project_for_topic(&self, topic_id: i32) -> Option<ProjectId> {
-        self.registry
-            .lock()
-            .await
-            .all()
-            .find(|p| p.topic_id == Some(topic_id))
-            .map(|p| p.id.clone())
+    ///
+    /// A lane's topic answers with the LANE. There is deliberately no falling back to the project
+    /// when a lane's topic is not found: that would put what the operator typed at a worktree into
+    /// the project's own turn, which is an agent reading an instruction meant for someone else.
+    pub async fn addr_for_topic(&self, topic_id: i32) -> Option<Addr> {
+        let registry = self.registry.lock().await;
+        for p in registry.all() {
+            if p.topic_id == Some(topic_id) {
+                return Some(Addr::project_itself(p.id.clone()));
+            }
+            // In the same pass, because the answer has to be ONE address and a second store would
+            // need a rule about which of the two wins.
+            if let Some((lane, _)) = p.lane_topics.iter().find(|(_, t)| **t == topic_id) {
+                return Some(Addr::lane_of(p.id.clone(), lane.clone()));
+            }
+        }
+        None
     }
 
     /// Hand the operator's own words to a project, verbatim and exactly once.
@@ -903,7 +1288,7 @@ impl<S: Surface> Hub<S> {
     /// held for a worker that may never return is a message he believes was sent.
     pub async fn relay(
         &self,
-        project: &ProjectId,
+        addr: &Addr,
         chat_id: i64,
         user_id: i64,
         msg_id: &MsgId,
@@ -914,7 +1299,7 @@ impl<S: Surface> Hub<S> {
         }
         let delivered = self
             .deliver(
-                project,
+                addr,
                 HubFrame::Message {
                     msg_id: msg_id.clone(),
                     text: text.to_owned(),
@@ -924,65 +1309,184 @@ impl<S: Surface> Hub<S> {
             )
             .await;
         let _ = if delivered {
-            self.audit
-                .outcome(project, &SendOutcome::Sent(msg_id.clone()))
+            self.audit.outcome(addr, &SendOutcome::Sent(msg_id.clone()))
         } else {
-            self.audit.refused(project, "the project was not connected")
+            self.audit.refused(addr, "the project was not connected")
         };
         delivered
     }
 
-    /// The topic a project's messages go in, created and greeted on first use.
+    /// The topic a conversation's messages go in, created and greeted on first use.
     ///
     /// Created here rather than at `hello` for one reason: a topic with no messages is invisible in
     /// Telegram's topic list, so a topic created for a bridge that then vanished is the same as no
     /// topic at all to the person looking for it — except that it is now bound.
-    pub async fn topic_for(&self, project: &ProjectId) -> anyhow::Result<i32> {
-        let (existing, title, colour) = {
+    ///
+    /// A LANE GETS ITS OWN, so a worktree's rolling context is in one place. The cost was weighed
+    /// and accepted: roughly twelve permanent topics a day, and nothing here ever deletes one.
+    ///
+    /// **Three things here exist because a lane needs a new topic twelve times a day where a
+    /// project needed one once in its life**, which turned each of them from a once-per-project
+    /// hazard into a daily one:
+    ///
+    /// * The creation is METERED, so a burst of arriving worktrees cannot spend the chat's real
+    ///   ceiling behind the back of the budget that is supposed to be guarding it.
+    /// * A creation Telegram refused is REMEMBERED for a short while, because this runs on every
+    ///   message: without it, a worktree whose topic could not be made asked Telegram for one per
+    ///   message it sent, with no backoff, for as long as its agent kept talking.
+    /// * A creation that FAILED is logged with the title, because a `createForumTopic` whose reply
+    ///   was lost may have made the topic anyway — and that topic is in his forum with nothing
+    ///   pointing at it. Greppable is the least this can be.
+    pub async fn topic_for(&self, addr: &Addr) -> Result<i32, NoTopic> {
+        let (existing, title, colour, project_title) = {
             let registry = self.registry.lock().await;
             let p = registry
-                .get(project)
-                .ok_or_else(|| anyhow::anyhow!("that project is not enrolled"))?;
-            (p.topic_id, p.title.clone(), p.icon_color)
+                .get(&addr.project)
+                .ok_or_else(|| NoTopic::Failed("that project is not enrolled".to_owned()))?;
+            let title = match &addr.lane {
+                None => p.title.clone(),
+                Some(lane) => crate::registry::lane_title(&p.title, lane),
+            };
+            // The COLOUR stays the project's. Telegram gives six, and a project with its lanes
+            // beneath it reads as one block in the list only if they share one.
+            (
+                registry.topic_of(addr),
+                title,
+                p.icon_color,
+                p.title.clone(),
+            )
         };
         if let Some(id) = existing {
             return Ok(id);
         }
-        let id = self.surface.create_topic(&title, colour).await?;
+
+        // Refused a moment ago, so do not ask again yet. Nothing about this conversation has
+        // changed since, and the cost of asking is a Telegram call per message the agent sends.
+        if let Some(when) = self.topic_refused.lock().await.get(addr) {
+            if when.elapsed() < TOPIC_RETRY_AFTER {
+                return Err(NoTopic::Failed(
+                    "Telegram would not make a topic for this a moment ago".to_owned(),
+                ));
+            }
+        }
+
+        // One token before the call, not after. Refused, nothing is created at all — which is the
+        // right answer: a topic made in a minute whose budget cannot pay to greet it is bound,
+        // permanent, and invisible, because Telegram does not show an empty topic in the list.
+        // Any refusal at all stops this, not only the one shape it returns today. Matching a single
+        // variant here would mean a future one fell through and made the topic anyway, which is the
+        // fail-open half of exactly the thing being closed.
+        if let Err(refused) = self.take_a_turn(addr).await {
+            return Err(match refused {
+                SendOutcome::TooFast(wait) => NoTopic::TooFast(wait),
+                other => NoTopic::Failed(format!("{other:?}")),
+            });
+        }
+
+        let id = match self.surface.create_topic(&title, colour).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.topic_refused
+                    .lock()
+                    .await
+                    .insert(addr.clone(), std::time::Instant::now());
+                let _ = self.audit.refused(addr, &e.to_string());
+                tracing::error!(
+                    project = %addr.project, lane = addr.lane_field(), title = %title, error = %e,
+                    "asked Telegram for a topic and did not get one; if it was made anyway it is \
+                     in the forum with nothing pointing at it"
+                );
+                return Err(NoTopic::Failed(e.to_string()));
+            }
+        };
+        self.topic_refused.lock().await.remove(addr);
         // A bind that fails must not be reported as a topic. Returning Ok here meant the next
         // message created ANOTHER topic, and the one before it was orphaned — one new empty topic
         // per message, for as long as the registry stayed unreadable, with every message dropped.
-        if let Err(e) = self.registry.lock().await.bind_topic(project, id) {
+        if let Err(e) = self.registry.lock().await.bind_topic(addr, id) {
             tracing::error!(
-                project = %project, topic = id, error = %e,
+                project = %addr.project, lane = addr.lane_field(), topic = id, error = %e,
                 "made a topic and could not write it down; it is orphaned and no message will be \
                  sent until the registry is readable again"
             );
-            return Err(e.into());
+            return Err(NoTopic::Failed(e.to_string()));
         }
         // Greeted immediately, in the same breath as being created — the greeting is what makes the
         // topic appear in the list at all. Through the SAME budgeted, audited path as everything
         // else: a greeting that skipped the budget was a writer the ceiling could not see, and one
         // that skipped the audit was a send with no record, which is the one thing the audit
         // discipline exists to make impossible.
-        let _ = self
-            .send_into(project, id, &format!("{title} is connected."), &[])
-            .await;
+        //
+        // A lane's greeting NAMES the worktree, because it is the first thing in a brand-new topic
+        // and twelve of them arrive on a dispatch day. Identical, they are twelve notifications he
+        // cannot tell apart, and the only thing left carrying which one is a topic title that a
+        // phone row truncates. The name is the same string `/projects` and the title show him.
+        let greeting = match &addr.lane {
+            None => format!("{project_title} is connected."),
+            Some(lane) => format!(
+                "{lane} is connected — a separate worktree of {project_title}. It talks here, not \
+                 in the project's own topic."
+            ),
+        };
+        // The greeting's outcome is READ, not discarded. A topic that was made, written down, and
+        // never greeted is a conversation he cannot find at all: Telegram does not list an empty
+        // one. Without this the hub could not tell that state from a healthy topic.
+        match self.send_into(addr, id, &greeting, &[]).await {
+            SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {}
+            outcome => tracing::error!(
+                project = %addr.project, lane = addr.lane_field(), topic = id, title = %title,
+                ?outcome,
+                "made a topic and could not greet it, so it is bound but does not appear in his \
+                 forum list; the next message into it is what will make it visible"
+            ),
+        }
         Ok(id)
     }
 
     /// The one place a message actually goes out: budget, clip, audit, send, audit.
     ///
-    /// Every hub-owned write goes through here. Anything that bypassed it would be a writer the
-    /// per-chat ceiling cannot see — and the ceiling is per chat, so an unmetered writer does not
-    /// cost itself, it costs whichever project happens to send next.
+    /// Every hub-owned MESSAGE goes through here, and the ceiling is per chat — so a writer this
+    /// cannot see does not cost itself, it costs whichever project happens to send next. That
+    /// sentence used to claim every hub-owned WRITE, which was untrue and is what let unmetered
+    /// writers accumulate; they are listed in `docs/MULTIPLEXER-READINESS.md` §3. Topic creation is
+    /// no longer one of them: it does not come through here, because it is not a message and has no
+    /// text to clip, but it takes a token through [`Self::take_a_turn`] before it calls Telegram.
     async fn send_into(
         &self,
-        project: &ProjectId,
+        addr: &Addr,
         topic_id: i32,
         text: &str,
         buttons: &[AskOption],
     ) -> SendOutcome {
+        if let Err(too_fast) = self.take_a_turn(addr).await {
+            return too_fast;
+        }
+
+        // Clipped here rather than by the surface, because whether anything was lost is a fact the
+        // BRIDGE has to be told, and only this side is holding the ack.
+        let (text, clamped) = crate::queue::fit(text, crate::queue::MAX_TEXT);
+        let _ = self.audit.sent(addr, topic_id, text.len());
+        let mut outcome = self.surface.send(topic_id, &text, buttons).await;
+        if clamped && let SendOutcome::Sent(id) = outcome {
+            outcome = SendOutcome::Clamped(id);
+        }
+        let _ = self.audit.outcome(addr, &outcome);
+        outcome
+    }
+
+    /// Wait for this sender's turn in the queue and spend one of the chat's tokens, or shed.
+    ///
+    /// Lifted out of `send_into` so that MAKING A TOPIC can pay for one too. `create_forum_topic`
+    /// is a write to the same chat and Telegram counts it whether this code does or not; unmetered,
+    /// twelve worktrees arriving on a dispatch day spent twelve calls the ceiling could not see, and
+    /// the ceiling is per chat — so what an unmetered writer costs is not itself, it is whichever
+    /// project sends next. A brand-new conversation now pays two tokens before its first word, and
+    /// that is the honest price of a topic per lane rather than a hidden one.
+    ///
+    /// Worst case it makes a new conversation's first message wait two queue slots instead of one.
+    /// That is bounded at twice `MAX_PACE_WAIT` and only reachable behind a queue ten deep, which is
+    /// far short of the "unread for minutes" this deadline exists to prevent.
+    async fn take_a_turn(&self, addr: &Addr) -> Result<(), SendOutcome> {
         // PACE, then shed — and pace in a QUEUE, not as a crowd.
         //
         // Telegram's limit has two halves: no more than one message a second, and about twenty a
@@ -1009,8 +1513,8 @@ impl<S: Surface> Hub<S> {
             Ok(t) => t,
             Err(_) => {
                 let outcome = SendOutcome::TooFast(MAX_PACE_WAIT);
-                let _ = self.audit.outcome(project, &outcome);
-                return outcome;
+                let _ = self.audit.outcome(addr, &outcome);
+                return Err(outcome);
             }
         };
         loop {
@@ -1029,8 +1533,8 @@ impl<S: Surface> Hub<S> {
                     // Either the per-minute ceiling — a real limit — or a queue so long that
                     // waiting longer would cost the connection more than the message is worth.
                     let outcome = SendOutcome::TooFast(refusal.wait());
-                    let _ = self.audit.outcome(project, &outcome);
-                    return outcome;
+                    let _ = self.audit.outcome(addr, &outcome);
+                    return Err(outcome);
                 }
             }
         }
@@ -1039,38 +1543,39 @@ impl<S: Surface> Hub<S> {
         // to serialise Telegram: holding it across `surface.send` made one slow round trip a pause
         // for every other project's read loop.
         drop(turn);
-
-        // Clipped here rather than by the surface, because whether anything was lost is a fact the
-        // BRIDGE has to be told, and only this side is holding the ack.
-        let (text, clamped) = crate::queue::fit(text, crate::queue::MAX_TEXT);
-        let _ = self.audit.sent(project, topic_id, text.len());
-        let mut outcome = self.surface.send(topic_id, &text, buttons).await;
-        if clamped && let SendOutcome::Sent(id) = outcome {
-            outcome = SendOutcome::Clamped(id);
-        }
-        let _ = self.audit.outcome(project, &outcome);
-        outcome
+        Ok(())
     }
 
-    /// Send into a project's topic, with the audit around it and one rebinding if the topic is gone.
-    pub async fn say(&self, project: &ProjectId, text: &str, buttons: &[AskOption]) -> SendOutcome {
-        let topic_id = match self.topic_for(project).await {
+    /// Send into a conversation's topic, with the audit around it and one rebinding if the topic is
+    /// gone.
+    pub async fn say(&self, addr: &Addr, text: &str, buttons: &[AskOption]) -> SendOutcome {
+        let topic_id = match self.topic_for(addr).await {
             Ok(id) => id,
+            // The two are not one: a budget shed mends itself in a minute and is acked
+            // `too_fast`, a Telegram refusal does not and is acked as one.
+            Err(NoTopic::TooFast(wait)) => {
+                let outcome = SendOutcome::TooFast(wait);
+                let _ = self.audit.outcome(addr, &outcome);
+                return outcome;
+            }
             Err(e) => {
-                let _ = self.audit.refused(project, &e.to_string());
+                let _ = self.audit.refused(addr, &e.to_string());
                 return SendOutcome::Refused(e.to_string());
             }
         };
-        let outcome = self.send_into(project, topic_id, text, buttons).await;
+        let outcome = self.send_into(addr, topic_id, text, buttons).await;
 
         if outcome == SendOutcome::TopicGone {
             // Exactly once, and never as a retry: Telegram gives no service message when a topic is
             // deleted and no way to list them, so this is first-class rebinding. Treating it as a
             // transient would make the project's messages disappear quietly and forever.
-            tracing::warn!(project = %project, "the topic is gone; making a new one");
-            let _ = self.registry.lock().await.unbind_topic(project);
-            if let Ok(fresh) = self.topic_for(project).await {
-                return self.send_into(project, fresh, text, buttons).await;
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(),
+                "the topic is gone; making a new one"
+            );
+            let _ = self.registry.lock().await.unbind_topic(addr);
+            if let Ok(fresh) = self.topic_for(addr).await {
+                return self.send_into(addr, fresh, text, buttons).await;
             }
         }
         outcome
@@ -1120,7 +1625,7 @@ impl<S: Surface> Hub<S> {
             Ok(Ok(Some(f))) => f,
         };
 
-        let project = match self
+        let addr = match self
             .admit(peer.uid, our_uid(), &first.payload, first.v)
             .await
         {
@@ -1131,7 +1636,7 @@ impl<S: Surface> Hub<S> {
                 let _ = hub_proto::write_frame(&mut tx_half, &env).await;
                 return Ok(());
             }
-            Admission::Admitted(id) => id,
+            Admission::Admitted(addr) => addr,
         };
 
         let BridgeFrame::Hello {
@@ -1154,11 +1659,16 @@ impl<S: Surface> Hub<S> {
         }
         let pid = peer.pid;
 
+        // The name the REGISTRY holds, composed for the conversation this is — so a lane's own log
+        // says the same thing as the topic the operator is looking at.
         let title = {
             let registry = self.registry.lock().await;
             registry
-                .get(&project)
-                .map(|p| p.title.clone())
+                .get(&addr.project)
+                .map(|p| match &addr.lane {
+                    None => p.title.clone(),
+                    Some(lane) => crate::registry::lane_title(&p.title, lane),
+                })
                 .unwrap_or_default()
         };
 
@@ -1174,7 +1684,7 @@ impl<S: Surface> Hub<S> {
         });
 
         if let Err(reason) = self
-            .claim(project.clone(), pid, instance.clone(), tx.clone())
+            .claim(addr.clone(), pid, instance.clone(), tx.clone())
             .await
         {
             let env = Envelope::new(FrameId::new("h-refused"), HubFrame::Refused { reason });
@@ -1185,7 +1695,7 @@ impl<S: Surface> Hub<S> {
             writer.abort();
             let _ = self
                 .audit
-                .refused(&project, "another bridge already holds this project");
+                .refused(&addr, "another bridge already holds this conversation");
             return Ok(());
         }
 
@@ -1195,6 +1705,10 @@ impl<S: Surface> Hub<S> {
                 FrameId::new(format!("h{}", next_frame_seq())),
                 HubFrame::Welcome {
                     project: title,
+                    // Echoed from the ADMITTED address, never from the wire. It is the only thing
+                    // that tells a bridge which named a lane that this hub understood it, rather
+                    // than ignoring the word and handing the worktree the project's own place.
+                    lane: addr.lane.clone(),
                     topic_id: None,
                     limits: LIMITS,
                 },
@@ -1262,16 +1776,30 @@ impl<S: Surface> Hub<S> {
             } else {
                 "connected but never answered; it is probably not allowed to talk to me"
             };
-            tracing::warn!(project = %project, why, "a bridge did not become live");
-            let _ = self.audit.refused(&project, why);
-            self.release(&project, pid).await;
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(), why,
+                "a bridge did not become live"
+            );
+            let _ = self.audit.refused(&addr, why);
+            self.release(&addr, pid).await;
             writer.abort();
             return Ok(());
         }
 
         // Live. NOW the topic exists, and the greeting is what makes it visible in the list.
-        if let Err(e) = self.topic_for(&project).await {
-            tracing::error!(project = %project, error = %e, "could not make a topic for a live project");
+        // Two levels, because they are two different things. A busy minute is not a fault and the
+        // next message this bridge sends will open the topic; anything else is a conversation that
+        // cannot be seen and is not going to mend itself.
+        match self.topic_for(&addr).await {
+            Ok(_) => {}
+            Err(NoTopic::TooFast(wait)) => tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(), wait = ?wait,
+                "the chat's budget could not open a topic for a live project yet"
+            ),
+            Err(e) => tracing::error!(
+                project = %addr.project, lane = addr.lane_field(), error = %e,
+                "could not make a topic for a live project"
+            ),
         }
 
         // Whatever the last run of this project left open comes off the phone now — in a task of
@@ -1280,17 +1808,16 @@ impl<S: Surface> Hub<S> {
         // finishes before or after anything below.
         {
             let hub = Arc::clone(&self);
-            let project = project.clone();
+            let addr = addr.clone();
             let instance = instance.clone();
             tokio::spawn(async move {
-                hub.retire_what_other_sessions_left(&project, &instance)
-                    .await;
+                hub.retire_what_other_sessions_left(&addr, &instance).await;
             });
         }
 
         for frame in waiting {
             let ack_ref = frame.id.clone();
-            let (delivered, why) = self.handle(&project, &instance, frame.payload).await;
+            let (delivered, why) = self.handle(&addr, &instance, frame.payload).await;
             let _ = tx
                 .send(Envelope::new(
                     FrameId::new(format!("h{}", next_frame_seq())),
@@ -1320,11 +1847,17 @@ impl<S: Surface> Hub<S> {
                 // makes an additive change on the other side a project that goes silent. The
                 // transport failures do end it, because after those there is nothing to read.
                 Err(hub_proto::ProtoError::Decode { source, len }) => {
-                    tracing::warn!(project = %project, len, error = %source, "a frame this build cannot read; ignoring it");
+                    tracing::warn!(
+                        project = %addr.project, lane = addr.lane_field(), len, error = %source,
+                        "a frame this build cannot read; ignoring it"
+                    );
                     continue;
                 }
                 Err(hub_proto::ProtoError::Oversize { max }) => {
-                    tracing::warn!(project = %project, max, "a frame over the ceiling; refusing it");
+                    tracing::warn!(
+                        project = %addr.project, lane = addr.lane_field(), max,
+                        "a frame over the ceiling; refusing it"
+                    );
                     let _ = tx
                         .send(Envelope::new(
                             FrameId::new(format!("h{}", next_frame_seq())),
@@ -1335,7 +1868,7 @@ impl<S: Surface> Hub<S> {
                         .await;
                     let _ = self
                         .audit
-                        .refused(&project, "a frame was over the size ceiling");
+                        .refused(&addr, "a frame was over the size ceiling");
                     // Queued is not sent. `break` used to fall straight into `writer.abort()`,
                     // which destroyed this refusal before the writer task could put it on the wire
                     // — so the bridge got the closed socket the refusal existed to replace. A
@@ -1347,18 +1880,21 @@ impl<S: Surface> Hub<S> {
                     // `already_claimed` for two seconds by the connection it had just been told to
                     // abandon. And releasing drops the claim's own `Sender`, so the writer's channel
                     // really closes and it ends at once rather than at the timeout.
-                    self.release(&project, pid).await;
+                    self.release(&addr, pid).await;
                     drop(tx);
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::debug!(project = %project, error = %e, "the bridge's connection ended");
+                    tracing::debug!(
+                        project = %addr.project, lane = addr.lane_field(), error = %e,
+                        "the bridge's connection ended"
+                    );
                     break;
                 }
                 Ok(Some(frame)) => {
                     let ack_ref = frame.id.clone();
-                    let (delivered, why) = self.handle(&project, &instance, frame.payload).await;
+                    let (delivered, why) = self.handle(&addr, &instance, frame.payload).await;
                     let _ = tx
                         .send(Envelope::new(
                             FrameId::new(format!("h{}", next_frame_seq())),
@@ -1373,7 +1909,7 @@ impl<S: Surface> Hub<S> {
             }
         }
 
-        self.release(&project, pid).await;
+        self.release(&addr, pid).await;
         writer.abort();
         Ok(())
     }
@@ -1385,13 +1921,13 @@ impl<S: Surface> Hub<S> {
     /// now reaches the only party that can do anything about it.
     async fn handle(
         &self,
-        project: &ProjectId,
+        addr: &Addr,
         instance: &str,
         frame: BridgeFrame,
     ) -> (Delivered, Option<hub_proto::AckWhy>) {
         match frame {
             BridgeFrame::Say { text, .. } | BridgeFrame::Done { text } => {
-                self.say_and_ack(project, &text, &[]).await
+                self.say_and_ack(addr, &text, &[]).await
             }
             BridgeFrame::Ask {
                 ask_id,
@@ -1418,7 +1954,7 @@ impl<S: Surface> Hub<S> {
                         // simply stopped, with nothing saying why or that they were not coming back.
                         if g.newly_off() {
                             let _ = self
-                                .say(project, "I have stopped summarising. Questions still reach you in full.", &[])
+                                .say(addr, "I have stopped summarising. Questions still reach you in full.", &[])
                                 .await;
                         }
                         match summarised {
@@ -1440,67 +1976,90 @@ impl<S: Surface> Hub<S> {
                     data.contains('|') || data.len() + 2 > CALLBACK_DATA_MAX
                 }) {
                     tracing::warn!(
-                        project = %project, option = %bad.option_id,
+                        project = %addr.project, lane = addr.lane_field(), option = %bad.option_id,
                         "a question's answer ids will not fit in a Telegram button; refusing it"
                     );
-                    let _ = self.audit.refused(
-                        project,
-                        "an answer id was too long or contained a separator",
-                    );
+                    let _ = self
+                        .audit
+                        .refused(addr, "an answer id was too long or contained a separator");
                     // One plain line where the operator can see it: an agent blocked on a question
                     // that never arrived is the failure this product exists to prevent, and it must
                     // not be visible only in a log.
+                    //
+                    // Subject the TOPIC, not the project — the same rule as `TapRefusal::say`. This
+                    // lands in a worktree's own topic as often as a project's, where "this project"
+                    // is a thing he can read as false with the project's topic busy beside it, and
+                    // "the terminal" is one of twelve he could go to and find nothing waiting.
                     let _ = self
                         .say(
-                            project,
-                            "This project asked me something I could not put on a button, so it is \
-                             still waiting. Answer it at the terminal.",
+                            addr,
+                            "Something here asked me a question I could not put on a button, so it \
+                             is still waiting. Answer it where it is running.",
                             &[],
                         )
                         .await;
                     return (Delivered::No, Some(hub_proto::AckWhy::TelegramRefused));
                 }
 
-                let outcome = self.say(project, &text, &options).await;
+                let outcome = self.say(addr, &text, &options).await;
 
                 // The record is written for the message that actually exists. Recording before the
                 // send would leave a ledger entry for a message nobody can see; recording against a
                 // guessed id would let a tap resolve against the wrong question, which is the exact
                 // shape of the defect where a button reading "Reject" confirmed "Allow always".
                 if let SendOutcome::Sent(msg_id) | SendOutcome::Clamped(msg_id) = &outcome {
-                    let topic_id = self
-                        .registry
-                        .lock()
-                        .await
-                        .get(project)
-                        .and_then(|p| p.topic_id)
-                        .unwrap_or_default();
-                    let record = AskRecord {
-                        project: project.clone(),
-                        ask_id,
-                        topic_id,
-                        options,
-                        instance: instance.to_owned(),
-                        // The CLIPPED text, because that is what the operator is actually looking
-                        // at. Storing the original meant the retirement rebuilt the message from
-                        // text longer than the one that was sent — and a retirement body over
-                        // Telegram's 4096 is an edit that fails, which leaves the answered keyboard
-                        // live and still offering choices that have already been made.
-                        text: crate::queue::fit(&text, crate::queue::MAX_TEXT).0,
-                        answered: None,
-                    };
-                    if let Err(e) = self
-                        .ledger
-                        .lock()
-                        .await
-                        .record(self.forum_chat, msg_id, record)
-                    {
-                        // A keyboard whose meaning was not written down must not stay tappable, so
-                        // this is loud. `resolve_tap` will refuse it, which is the fail-closed half.
-                        tracing::error!(
-                            project = %project, error = %e,
-                            "sent a question but could not write down what its buttons mean"
-                        );
+                    // Read back for THIS conversation, and refused rather than defaulted. This
+                    // ended in `.unwrap_or_default()`, which wrote a zero on a miss: a record
+                    // naming no topic at all, whose later retirement edits into the forum's General
+                    // or fails outright. A record that cannot be written correctly must not be
+                    // written, and `resolve_tap` then answers the tap with "I have no record of
+                    // that question" — which is the fail-closed half, and true.
+                    let topic_id = { self.registry.lock().await.topic_of(addr) };
+                    match topic_id {
+                        None => tracing::error!(
+                            project = %addr.project, lane = addr.lane_field(),
+                            "sent a question and then could not find which topic it went to, so \
+                             what its buttons mean was not written down; a tap will be refused"
+                        ),
+                        Some(topic_id) => {
+                            // The pid of the connection that is asking, read from the claim it is
+                            // holding right now. Not passed down from `hello`, because the claim is
+                            // the thing the eviction rule already trusts and a second copy of the
+                            // same number is a second thing that can disagree with it.
+                            let pid = { self.claims.lock().await.get(addr).map(|c| c.pid) };
+                            let record = AskRecord {
+                                project: addr.project.clone(),
+                                lane: addr.lane.clone(),
+                                ask_id,
+                                topic_id,
+                                options,
+                                instance: instance.to_owned(),
+                                pid,
+                                at: now_secs(),
+                                // The CLIPPED text, because that is what the operator is actually
+                                // looking at. Storing the original meant the retirement rebuilt the
+                                // message from text longer than the one that was sent — and a
+                                // retirement body over Telegram's 4096 is an edit that fails, which
+                                // leaves the answered keyboard live and still offering choices that
+                                // have already been made.
+                                text: crate::queue::fit(&text, crate::queue::MAX_TEXT).0,
+                                answered: None,
+                            };
+                            if let Err(e) =
+                                self.ledger
+                                    .lock()
+                                    .await
+                                    .record(self.forum_chat, msg_id, record)
+                            {
+                                // A keyboard whose meaning was not written down must not stay
+                                // tappable, so this is loud. `resolve_tap` refuses it, which is the
+                                // fail-closed half.
+                                tracing::error!(
+                                    project = %addr.project, lane = addr.lane_field(), error = %e,
+                                    "sent a question but could not write down what its buttons mean"
+                                );
+                            }
+                        }
                     }
                 }
                 self.ack_for(&outcome)
@@ -1510,7 +2069,7 @@ impl<S: Surface> Hub<S> {
                 how,
                 outcome,
             } => {
-                self.retire(project, instance, &ask_id, how, outcome.as_deref())
+                self.retire(addr, instance, &ask_id, how, outcome.as_deref())
                     .await;
                 (Delivered::Yes, None)
             }
@@ -1531,11 +2090,11 @@ impl<S: Surface> Hub<S> {
 
     async fn say_and_ack(
         &self,
-        project: &ProjectId,
+        addr: &Addr,
         text: &str,
         options: &[AskOption],
     ) -> (Delivered, Option<hub_proto::AckWhy>) {
-        let outcome = self.say(project, text, options).await;
+        let outcome = self.say(addr, text, options).await;
         self.ack_for(&outcome)
     }
 
@@ -1586,7 +2145,7 @@ impl<S: Surface> Hub<S> {
                 let _ = self.ledger.lock().await.forget(chat_id, msg_id);
             }
             Err(e) => tracing::error!(
-                error = %e, project = %record.project,
+                error = %e, project = %record.project, lane = record.addr().lane_field(),
                 "answered from the phone but the keyboard is still there; leaving the record so it \
                  can be retired later"
             ),
@@ -1630,7 +2189,10 @@ impl<S: Surface> Hub<S> {
                 record.topic_id,
                 msg_id,
                 &record.text,
-                "not sent — the project could not be reached",
+                // Written into the message he is looking at, in whichever topic that is. A
+                // worktree's topic and its project's sit side by side, and the project may be
+                // perfectly reachable while the thing that asked this is not.
+                "not sent — nothing here could be reached",
             )
             .await
         {
@@ -1640,7 +2202,7 @@ impl<S: Surface> Hub<S> {
             }
             Err(e) => {
                 tracing::error!(
-                    error = %e, project = %record.project,
+                    error = %e, project = %record.project, lane = record.addr().lane_field(),
                     "a tap reached nobody and its keyboard is still on his phone"
                 );
                 let _ = self.ledger.lock().await.mark_unanswered(chat_id, msg_id);
@@ -1651,12 +2213,13 @@ impl<S: Surface> Hub<S> {
 
     /// Strip a stale keyboard, because a screen could never tell you a question stopped being asked.
     ///
-    /// `instance` is which run of the worker is saying so, and it is half the address: ask ids
-    /// repeat across sessions, so an outcome matched on the ask id alone landed on a question
-    /// another session was still waiting on.
+    /// `addr` and `instance` are the two halves of who is saying so, and neither can be dropped.
+    /// Ask ids repeat across sessions, so an outcome matched on the ask id alone landed on a
+    /// question another session was still waiting on — and they repeat across LANES too, where the
+    /// instance cannot separate them because one opencode process holds every lane it serves.
     async fn retire(
         &self,
-        project: &ProjectId,
+        addr: &Addr,
         instance: &str,
         ask_id: &AskId,
         how: hub_proto::AskEnd,
@@ -1672,13 +2235,13 @@ impl<S: Surface> Hub<S> {
             self.ledger
                 .lock()
                 .await
-                .messages_for(project, instance, ask_id)
+                .messages_for(addr, instance, ask_id)
         };
-        self.retire_each(project, targets, &note).await;
+        self.retire_each(addr, targets, &note).await;
     }
 
     /// Take the keyboard off each of these messages and leave the note in its place.
-    async fn retire_each(&self, project: &ProjectId, targets: Vec<(i64, MsgId)>, note: &str) {
+    async fn retire_each(&self, addr: &Addr, targets: Vec<(i64, MsgId)>, note: &str) {
         for (chat, msg) in targets {
             // The record carries both the topic and the question's own words, so the retirement
             // does not have to go back to the registry for one and cannot leave the other out.
@@ -1697,10 +2260,18 @@ impl<S: Surface> Hub<S> {
                 Ok(()) => {
                     let _ = self.ledger.lock().await.forget(chat, &msg);
                 }
-                Err(e) => tracing::error!(
-                    error = %e, project = %project,
-                    "a question stopped being asked but its keyboard is still there"
-                ),
+                // Named for the conversation the RECORD belongs to, not the one that triggered the
+                // sweep: a bridge arriving now clears what other worktrees of its project left, and
+                // a log line naming the sweeper sends whoever reads it to the wrong topic.
+                Err(e) => {
+                    let whose = record
+                        .as_ref()
+                        .map_or_else(|| addr.clone(), AskRecord::addr);
+                    tracing::error!(
+                        error = %e, project = %whose.project, lane = whose.lane_field(),
+                        "a question stopped being asked but its keyboard is still there"
+                    );
+                }
             }
         }
     }

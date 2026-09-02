@@ -31,7 +31,7 @@ pub use frame::{
     AckStatus, AckWhy, AskEnd, AskOption, BeatState, BridgeFrame, Delivered, Envelope, From,
     HubFrame, Limits, RefusedReason, SayHint, VERSION,
 };
-pub use ids::{AskId, FrameId, MsgId, OptionId, ProjectId};
+pub use ids::{AskId, FrameId, LaneId, MsgId, OptionId, ProjectId};
 
 /// Hard ceiling on one frame, terminator included.
 ///

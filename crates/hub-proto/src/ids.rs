@@ -74,6 +74,18 @@ Resolved against the record written down beside the message, never against a but
 Position is how a button reading \"Reject\" once confirmed \"Allow always\"."
 );
 opaque_id!(MsgId, "One Telegram message, as the hub knows it.");
+opaque_id!(
+    LaneId,
+    "One worktree of a project, speaking for itself rather than as the project.
+
+Minted by whatever dispatched the lane and read off the machine by an adapter — never parsed here,
+and never resolved to anything. It is an ADDRESS, not a credential: the secret still proves only the
+project, so a lane named on the wire can only ever be a lane of the project that secret resolved to.
+
+Its SHAPE is checked in the hub, in the same place the 64-byte button check lives and for the same
+reason: a lane carrying a newline or a tab would forge a line in the audit, and the audit is the one
+record that has to stay unforgeable."
+);
 
 #[cfg(test)]
 mod tests {

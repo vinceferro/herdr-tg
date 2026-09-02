@@ -53,9 +53,29 @@ The contract, in one line each:
 * **Skew is normal**: unknown frame kind is ignored, unknown field is ignored, major version
   mismatch is refused.
 
-**The one widening this seam needs:** `hello` gains an optional `lane`, and the claim key becomes
-`(project, lane)`. The secret still proves only the PROJECT — a lane and its project are one repo
-and one trust domain, so a bridge naming a lane can only ever affect its own.
+**The one widening this seam needed. BUILT, 2 September.** `hello` gained an optional `lane`, and
+the claim key is now `(project, lane)`. The secret still proves only the PROJECT — a lane and its
+project are one repo and one trust domain, so a bridge naming a lane can only ever affect its own.
+
+Additive in both directions, and both directions matter because a channel plugin restarts only when
+its session does: a `hello` with no lane is byte for byte what it always was and is still the
+project's own voice, and a `hello` that names one parses on a build that has never heard of the word.
+A lane the hub will not address — empty, over-long, or carrying a control character that would forge
+a line in the audit — is refused with `bad_lane`, permanently rather than as something to retry.
+
+The Claude adapter learns its lane from **git's own name for the worktree** — the last segment of
+`--git-dir`, which git guarantees unique across a repository — crossing to the main worktree via
+`--git-common-dir` to find the secret: a lane worktree has no `.kickoff/hub.token` in it, because
+the secret is gitignored and never checked out into one. Not the checkout's folder name, which git
+does not dedupe: `~/a/wip` and `~/b/wip` are two trees that would have presented one address.
+
+The echo closes the other direction. `welcome` carries the lane the hub admitted, and a bridge that
+named one and does not get it back refuses rather than connecting — because an old hub ignores the
+unknown field and would admit the worktree AS THE PROJECT, taking its claim and its topic while the
+project's own session is turned away. A channel plugin restarts only when its session does, so
+new-bridge/old-hub is the ordinary middle of an upgrade rather than an exotic state.
+
+The opencode adapter sends no lane yet; its per-lane fan-in is the later slice named in seam ②.
 
 ## Seam ② — adapter ↔ engine. Engine-specific by definition.
 
@@ -128,7 +148,8 @@ The hub does exactly these things, and adding a seventh is a decision, not a ref
 1. **Identity** — resolve a secret to a project; one live claim per addressable thing; a dead pid is
    evicted, a live one is refused.
 2. **Presence** — a topic per addressable thing, created on first LIVE connection and greeted, so it
-   is visible in the list at all.
+   is visible in the list at all. A lane gets its own, titled `<project> · <lane>` and clipped from
+   the left so that lanes of one project are told apart by their tails rather than their heads.
 3. **Delivery** — say / ask / done reach the phone, budgeted per chat, clipped on a character
    boundary, audited before and after, acked exactly once.
 4. **Resolution** — a tap becomes the option the bridge minted, resolved against a written record,
@@ -151,8 +172,31 @@ Each of these is a line, not an omission:
 
 ## What to decide before building
 
-1. **Is a lane its own topic?** Lanes are ephemeral, topics are permanent, and there were twelve
-   lane worktrees in one day. Suggested: lanes speak in the project's topic, tagged, and get their
-   own only when the operator asks for one.
+1. ~~**Is a lane its own topic?**~~ **DECIDED, 2 September: yes, its own.** The document suggested a
+   tagged voice inside the project's topic; the operator chose a topic per lane because he wants a
+   worktree's rolling context in one place. He was told the cost — roughly twelve permanent topics a
+   day, and this design deliberately deletes none — and took it: *"if we need topic cleanup we'll do
+   it."* So topic retirement is out of scope, and two consequences are written down rather than
+   solved:
+
+   * **`projects.json` grows without bound**, and it turns out not to matter: measured, a lane row
+     costs 40 bytes, a year of twelve a day is about 175 KB, and a full parse of a 360-lane file
+     takes half a millisecond on an admission that happens a dozen times a day. The file that
+     actually compounds is `asks.json`, which is rewritten whole on every ask and every tap — and
+     that one is now bounded twice over, by the sweep below and by a shelf life.
+   * **A lane that never comes back was leaving its open questions' keyboards on the phone.**
+     ~~Nothing of its own ever arrives to sweep it.~~ **Closed, 3 September.** The sweep stays scoped
+     to the conversation — scoped to the project it took live lanes' questions away — and a second,
+     narrower one runs beside it: when any bridge of a project arrives, every open question of that
+     project whose address nothing holds AND whose asking process is no longer running comes off the
+     phone. Both facts together are what make it safe; the claims map alone is not, because a bridge
+     that merely lost its socket is unclaimed for a second and still waiting. Beyond that, a record
+     older than Telegram's 48-hour edit window is dropped rather than kept: past it no keyboard can
+     be taken off by anybody, so the record can no longer do the one job it is for.
+   * **The delivery budget is what a dispatch day actually hits.** A brand-new conversation costs two
+     of the chat's eighteen minute-tokens before its agent speaks — the topic and the greeting that
+     makes it visible — so about six new conversations a minute can open, across the whole forum.
+     The agent is told when its own cannot; the operator is not told anything. Named and left, in
+     `docs/MULTIPLEXER-READINESS.md` §3.
 2. **Does the launcher exist at all?** Everything except seam ④ works without it, and refusing it is
    coherent: enrolment is terminal-only, so starting could be too.

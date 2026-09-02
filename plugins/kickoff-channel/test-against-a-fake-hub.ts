@@ -14,7 +14,7 @@
  * could never find its secret passed every test it had.
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -403,6 +403,144 @@ check('whole, and in the order they were said',
   arrived.map(f => f.text.slice(0, 3)).join(''))
 backlog.child.kill()
 backlogHub.stop()
+
+// ── Part 4: lanes ──────────────────────────────────────────────────────────────────────────────
+//
+// kickoff runs several worktrees of one repo at once. A lane worktree holds NO `.kickoff/hub.token`
+// — the secret is gitignored and never checked out into one — so the bridge stopped at the top of
+// the working tree, found nothing, and every lane failed closed with "this project is not
+// enrolled". Its project is the MAIN working tree of the same repository, which git names.
+
+check('an ordinary session names no lane at all', !('lane' in hello),
+  JSON.stringify(hello.lane))
+
+// A real repository with a real linked worktree, because `--git-common-dir` is the fact this rests
+// on and a fake of it would prove nothing.
+const laneRepo = join(dir, 'lanerepo')
+mkdirSync(join(laneRepo, '.kickoff'), { recursive: true })
+writeFileSync(join(laneRepo, '.kickoff', 'hub.token'), 'b'.repeat(64))
+const git = (...args: string[]) => {
+  const r = Bun.spawnSync(['git', '-C', laneRepo, ...args], { stdout: 'ignore', stderr: 'ignore' })
+  if (r.exitCode !== 0) { console.log(`git ${args.join(' ')} failed`); process.exit(1) }
+}
+git('init', '-q')
+git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x')
+const laneDir = join(dir, 'lane-0902-201212-2783563')
+git('worktree', 'add', '-q', laneDir, '-b', 'lane/x')
+check('a lane worktree really has no secret of its own',
+  !existsSync(join(laneDir, '.kickoff', 'hub.token')))
+
+const laneSock = join(dir, 'lane.sock')
+// A hub that echoes the lane it admitted, which is what the new one does. The echo is what tells
+// the bridge its worktree got a conversation of its own rather than the project's.
+const laneHub = fakeHub(laneSock, (h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-w', t: 'welcome', project: 'repo', lane: h.lane,
+    limits: { max_frame_bytes: 262144, max_text_chars: 3500, max_options: 8 } }) + '\n'))
+const laneBridge = startBridge({ CLAUDE_PROJECT_DIR: laneDir, KICKOFF_HUB_SOCKET: laneSock })
+await handshake(laneBridge)
+await until('a lane to say hello', () => laneHub.got.some(f => f.t === 'hello'))
+const laneHello = laneHub.got.find(f => f.t === 'hello')!
+check('a session in a lane worktree finds the secret in the main working tree',
+  laneHello.token === 'b'.repeat(64), laneHello.token?.slice(0, 8))
+check("and it names itself by git's own name for the worktree",
+  laneHello.lane === 'lane-0902-201212-2783563', JSON.stringify(laneHello.lane))
+check('the repo it reports is the main tree, not the worktree',
+  laneHello.repo === laneRepo, laneHello.repo)
+laneBridge.child.kill()
+laneHub.stop()
+
+// A lane name the hub will not address is PERMANENT — the folder does not rename itself between
+// attempts — so the agent has to be told to stop waiting. An unknown reason is treated as temporary
+// on purpose, and a bad lane inheriting that would spin for ever saying nothing useful.
+const badSock = join(dir, 'badlane.sock')
+const badHub = fakeHub(badSock, (_h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-r', t: 'refused', reason: 'bad_lane' }) + '\n'))
+const badBridge = startBridge({ CLAUDE_PROJECT_DIR: laneDir, KICKOFF_HUB_SOCKET: badSock })
+await handshake(badBridge)
+await until('the hub to see the lane', () => badHub.got.some(f => f.t === 'hello'))
+// Polled rather than slept on: the refusal is in flight, and what is under test is that once it
+// lands the agent is told to STOP — never that it is queued behind a link that is coming back.
+let badSaid = { text: '', isError: false }
+for (let i = 0; i < 60 && !badSaid.isError; i++) {
+  badSaid = await call(badBridge, 200 + i, 'reply', { text: 'anything' })
+  if (!badSaid.isError) await Bun.sleep(50)
+}
+check('a lane the hub will not address is told for good rather than retried',
+  badSaid.isError && /worktree/.test(badSaid.text) && !/waiting/i.test(badSaid.text), badSaid.text)
+badBridge.child.kill()
+badHub.stop()
+
+// Two worktrees of one repo may have the SAME folder name — git dedupes only its own internal name,
+// never the checkout path — and two worktrees that present one lane are one conversation: the
+// second one's arrival evicts the first's claim and sweeps its still-open questions off his phone
+// as "the session that asked this restarted". Neither tree restarted; they are different trees.
+const twinRepo = join(dir, 'twinrepo')
+mkdirSync(join(twinRepo, '.kickoff'), { recursive: true })
+writeFileSync(join(twinRepo, '.kickoff', 'hub.token'), 'c'.repeat(64))
+const twin = (...args: string[]) => {
+  const r = Bun.spawnSync(['git', '-C', twinRepo, ...args], { stdout: 'ignore', stderr: 'ignore' })
+  if (r.exitCode !== 0) { console.log(`git ${args.join(' ')} failed`); process.exit(1) }
+}
+twin('init', '-q')
+twin('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x')
+const twinA = join(dir, 'twin-a', 'wip')
+const twinB = join(dir, 'twin-b', 'wip')
+twin('worktree', 'add', '-q', twinA, '-b', 'wip-a')
+twin('worktree', 'add', '-q', twinB, '-b', 'wip-b')
+
+const twinSock = join(dir, 'twin.sock')
+const twinHub = fakeHub(twinSock, (h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-w', t: 'welcome', project: 'repo', lane: h.lane,
+    limits: { max_frame_bytes: 262144, max_text_chars: 3500, max_options: 8 } }) + '\n'))
+const twinNames: string[] = []
+for (const [i, tree] of [twinA, twinB].entries()) {
+  const b = startBridge({ CLAUDE_PROJECT_DIR: tree, KICKOFF_HUB_SOCKET: twinSock })
+  await handshake(b)
+  await until(`worktree ${i} to say hello`, () => twinHub.got.filter(f => f.t === 'hello').length > i)
+  twinNames.push(twinHub.got.filter(f => f.t === 'hello')[i].lane)
+  b.child.kill()
+}
+check('two worktrees checked out under one folder name are still two conversations',
+  twinNames[0] !== twinNames[1], JSON.stringify(twinNames))
+twinHub.stop()
+
+// A channel plugin restarts only when its session does, so plugin-new against hub-old is the
+// ORDINARY intermediate state of a rollout — and an old hub ignores an unknown field, so it admits
+// a lane AS THE PROJECT ITSELF. Silently: the worktree takes the project's one claim, talks in the
+// project's topic, and the project's own session is then refused. The echo is the only thing that
+// can tell those two apart, so its absence has to be a refusal and not a shrug.
+const oldSock = join(dir, 'oldhub.sock')
+const oldHub = fakeHub(oldSock, (_h, s) => welcome(s))
+const oldBridge = startBridge({ CLAUDE_PROJECT_DIR: laneDir, KICKOFF_HUB_SOCKET: oldSock })
+await handshake(oldBridge)
+await until('the old hub to admit the lane', () => oldHub.got.some(f => f.t === 'hello'))
+let oldSaid = { text: '', isError: false }
+for (let i = 0; i < 60 && !oldSaid.isError; i++) {
+  oldSaid = await call(oldBridge, 400 + i, 'reply', { text: 'anything' })
+  if (!oldSaid.isError) await Bun.sleep(50)
+}
+check('a worktree whose hub cannot give it a place of its own refuses rather than impersonating the project',
+  oldSaid.isError && /restart/i.test(oldSaid.text), oldSaid.text)
+oldBridge.child.kill()
+oldHub.stop()
+
+// The claim is per worktree now, so "another session for this project" names the wrong thing and
+// its instruction — close that session — sends him to a session that is not the holder.
+const heldSock = join(dir, 'held.sock')
+const heldHub = fakeHub(heldSock, (_h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-r', t: 'refused', reason: 'already_claimed' }) + '\n'))
+const heldBridge = startBridge({ CLAUDE_PROJECT_DIR: laneDir, KICKOFF_HUB_SOCKET: heldSock })
+await handshake(heldBridge)
+await until('the hub to refuse the worktree', () => heldHub.got.some(f => f.t === 'hello'))
+let heldSaid = { text: '', isError: false }
+for (let i = 0; i < 60 && !/worktree/.test(heldSaid.text); i++) {
+  heldSaid = await call(heldBridge, 600 + i, 'reply', { text: 'anything' })
+  await Bun.sleep(50)
+}
+check('a worktree told its link is already held is told WHICH thing is holding it',
+  /worktree/.test(heldSaid.text) && heldSaid.text.includes('lane-0902-201212-2783563'), heldSaid.text)
+heldBridge.child.kill()
+heldHub.stop()
 
 rmSync(dir, { recursive: true, force: true })
 console.log(`\n${failures === 0 ? 'all checks passed' : `${failures} FAILED`}`)

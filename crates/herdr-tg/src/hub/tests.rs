@@ -38,10 +38,19 @@ struct FakeTelegram {
     /// How long one keyboard edit takes. Zero everywhere except the one test that is about a real
     /// network round trip being on, or off, the path a bridge waits on.
     retire_takes: AsyncMutex<Duration>,
+    /// Set to make every topic creation fail, which is what a flood wait or a 5xx does. The
+    /// ATTEMPT is still counted, because the number of attempts is the property under test.
+    create_fails: AsyncMutex<bool>,
+    /// Every topic creation that was asked for, whether or not it succeeded.
+    create_attempts: AsyncMutex<Vec<String>>,
 }
 
 impl Surface for FakeTelegram {
     async fn create_topic(&self, title: &str, icon_color: u8) -> anyhow::Result<i32> {
+        self.create_attempts.lock().await.push(title.to_owned());
+        if *self.create_fails.lock().await {
+            anyhow::bail!("Too Many Requests: retry after 30");
+        }
         let mut t = self.topics.lock().await;
         t.push((title.to_owned(), icon_color));
         Ok(1000 + t.len() as i32)
@@ -148,6 +157,50 @@ async fn harness() -> Harness {
     }
 }
 
+impl Harness {
+    /// The project speaking for itself, which is what a bridge that names no lane is.
+    fn own(&self) -> Addr {
+        Addr::project_itself(self.project.clone())
+    }
+
+    /// One worktree of it.
+    fn lane(&self, lane: &str) -> Addr {
+        Addr::lane_of(self.project.clone(), hub_proto::LaneId::new(lane))
+    }
+}
+
+/// A second hub over the SAME state, which is what a restart really is: the registry file and the
+/// ledger the first one wrote, a socket of its own, and a Telegram that has never seen any of it.
+async fn restarted(h: &Harness) -> (Arc<Hub<FakeTelegram>>, Arc<FakeTelegram>, PathBuf) {
+    let fake = Arc::new(FakeTelegram::default());
+    let hub = Arc::new(
+        Hub::new(
+            Arc::clone(&fake),
+            Registry::load(h.dir.path().join("projects.json")),
+            AskLedger::load(h.dir.path().join("asks.json")),
+            HubAudit::new(h.dir.path().join("hub.audit.log")),
+            vec![ALLOWED_CHAT],
+            ALLOWED_CHAT,
+        )
+        .with_settle(Duration::from_millis(500))
+        .with_budget(crate::queue::PER_MINUTE, Duration::from_millis(5)),
+    );
+    let sock = h.dir.path().join("hub-again.sock");
+    let listener = UnixListener::bind(&sock).expect("bind");
+    {
+        let hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let hub = Arc::clone(&hub);
+                tokio::spawn(async move {
+                    let _ = hub.serve_connection(stream).await;
+                });
+            }
+        });
+    }
+    (hub, fake, sock)
+}
+
 /// A bridge, as a bridge really behaves: connect, say hello, answer the ping.
 struct FakeBridge {
     reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
@@ -156,7 +209,36 @@ struct FakeBridge {
 }
 
 impl FakeBridge {
+    /// A bridge that names no lane — which is every bridge shipped before lanes existed, and is
+    /// still what an ordinary session sends. Left lane-less on purpose: every test above uses it,
+    /// so the whole suite goes on proving that the old shape is the project's own voice.
     async fn connect(sock: &Path, secret: &str, instance: &str, claimed_id: &str) -> Self {
+        Self::connect_as(sock, secret, instance, claimed_id, None).await
+    }
+
+    async fn connect_as(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+        lane: Option<&str>,
+    ) -> Self {
+        Self::connect_full(sock, secret, instance, claimed_id, lane, std::process::id()).await
+    }
+
+    /// The same, with the pid the bridge reports chosen by the test.
+    ///
+    /// Separate because the pid is the hub's only proof that the agent behind a record is gone: a
+    /// worktree that ended and one that dropped its socket for a second look identical in the
+    /// ledger and are not the same thing.
+    async fn connect_full(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+        lane: Option<&str>,
+        pid: u32,
+    ) -> Self {
         let stream = UnixStream::connect(sock).await.expect("connect");
         let (r, w) = stream.into_split();
         let mut me = Self {
@@ -169,10 +251,33 @@ impl FakeBridge {
             token: secret.to_owned(),
             instance: instance.to_owned(),
             repo: "/wherever".into(),
-            pid: std::process::id(),
+            pid,
+            lane: lane.map(hub_proto::LaneId::new),
         })
         .await;
         me
+    }
+
+    /// Everything the hub has sent within a short window.
+    ///
+    /// For the tests whose property is that something must NOT arrive — which can only ever be
+    /// observed for as long as you are willing to wait, so the window is named at the call site
+    /// rather than hidden here.
+    async fn drain_for(&mut self, how_long: Duration) -> Vec<HubFrame> {
+        let deadline = tokio::time::Instant::now() + how_long;
+        let mut seen = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), self.reader.next::<HubFrame>())
+                .await
+            {
+                Ok(Ok(Some(env))) => seen.push(env.payload),
+                // The peer ended or the frame would not read: nothing more is coming, and waiting
+                // out the rest of the window would only make the test slower.
+                Ok(_) => break,
+                Err(_) => {}
+            }
+        }
+        seen
     }
 
     async fn send(&mut self, f: BridgeFrame) -> FrameId {
@@ -338,7 +443,7 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
         .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
         .await
         .expect("the tap resolves");
-    assert_eq!(project, h.project);
+    assert_eq!(project, h.own());
     assert_eq!(ask_id, AskId::new("a1"));
 
     assert!(
@@ -402,9 +507,14 @@ async fn a_bridge_cannot_claim_another_projects_identity() {
     );
 
     bridge.become_live().await;
-    until(async || h.hub.is_claimed(&other_project.id).await).await;
+    until(async || {
+        h.hub
+            .is_claimed(&Addr::project_itself(other_project.id.clone()))
+            .await
+    })
+    .await;
     assert!(
-        !h.hub.is_claimed(&h.project).await,
+        !h.hub.is_claimed(&h.own()).await,
         "a bridge took a claim on a project it has no secret for"
     );
 }
@@ -416,7 +526,7 @@ async fn a_second_bridge_for_a_live_project_is_refused_rather_than_swapped_in() 
     let h = harness().await;
     let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
     first.become_live().await;
-    until(async || h.hub.is_claimed(&h.project).await).await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
 
     let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
     let frame = second.next().await.expect("an answer");
@@ -467,7 +577,7 @@ async fn a_bridge_that_connects_and_never_answers_gets_no_topic() {
         "a topic was created for a bridge that never answered"
     );
     assert!(
-        !h.hub.is_claimed(&h.project).await,
+        !h.hub.is_claimed(&h.own()).await,
         "a silent bridge kept its claim"
     );
 }
@@ -501,7 +611,7 @@ async fn a_tap_on_a_menu_from_a_session_that_has_restarted_is_refused_with_a_rea
     // test process. In production the two are different processes and the pid check settles it; in
     // a test that shares one pid, the disconnect is what has to be observed.
     drop(bridge);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
 
     // Telegram refuses the edit, so the successor's arrival cannot take this keyboard off the
     // phone. That is the shape this refusal is FOR: when the sweep works, the buttons are gone and
@@ -512,7 +622,7 @@ async fn a_tap_on_a_menu_from_a_session_that_has_restarted_is_refused_with_a_rea
 
     let mut fresh = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
     fresh.become_live().await;
-    until(async || h.hub.is_claimed(&h.project).await).await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
 
     let refused = h
         .hub
@@ -555,12 +665,12 @@ async fn an_answer_from_one_session_never_rewrites_the_question_another_session_
 
     // It goes away with that question still open, and the record outlives it.
     drop(first);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
 
     // The next run of the same worker. Its counter starts over, so its first question is `a3` too.
     let mut second = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
     second.become_live().await;
-    until(async || h.hub.is_claimed(&h.project).await).await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
 
     second
         .send(BridgeFrame::Ask {
@@ -657,7 +767,7 @@ async fn a_session_that_is_evicted_has_its_open_questions_taken_off_the_phone() 
     // A worker that crashed leaves its claim behind, held by a pid that is no longer a process.
     // Spawned and reaped, because a made-up number could belong to something real.
     drop(first);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
     let mut child = std::process::Command::new("/bin/true")
         .spawn()
         .expect("spawn");
@@ -669,7 +779,7 @@ async fn a_session_that_is_evicted_has_its_open_questions_taken_off_the_phone() 
     );
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     h.hub
-        .claim(h.project.clone(), dead_pid, "i1".into(), tx)
+        .claim(h.own(), dead_pid, "i1".into(), tx)
         .await
         .expect("a dead incumbent must not block a claim");
 
@@ -728,7 +838,7 @@ async fn a_session_that_asks_and_leaves(h: &Harness, instance: &str, text: &str)
     until(async || h.fake.sends.lock().await.len() > before).await;
 
     drop(bridge);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
 }
 
 #[tokio::test]
@@ -809,7 +919,7 @@ async fn the_arriving_session_is_not_kept_waiting_while_the_last_one_s_keyboards
     }
     until(async || h.fake.sends.lock().await.len() == 7).await;
     drop(first);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
 
     // One edit, one network round trip. This is the whole point of the measurement.
     *h.fake.retire_takes.lock().await = Duration::from_millis(300);
@@ -854,7 +964,7 @@ async fn a_retirement_telegram_refused_is_tried_again_when_the_next_session_arri
         "this test needs a retirement that Telegram refused"
     );
     drop(second);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
 
     // Telegram is well again, and a third session arrives.
     *h.fake.retire_fails.lock().await = false;
@@ -884,7 +994,7 @@ async fn a_bridge_that_dies_without_reading_its_acks_still_releases_its_project(
     let h = harness().await;
     let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
     bridge.become_live().await;
-    until(async || h.hub.is_claimed(&h.project).await).await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
 
     // Send enough that the hub's acks are certainly sitting unread on this side. Most of these
     // are shed by the chat budget, which is fine and is not what this test is about — what matters
@@ -911,9 +1021,9 @@ async fn a_bridge_that_dies_without_reading_its_acks_still_releases_its_project(
 
     drop(bridge);
 
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
     assert!(
-        !h.hub.is_claimed(&h.project).await,
+        !h.hub.is_claimed(&h.own()).await,
         "the project is still claimed by a bridge that is gone"
     );
 }
@@ -938,10 +1048,10 @@ async fn a_crashed_bridge_does_not_lock_its_own_project_out() {
 
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     h.hub
-        .claim(h.project.clone(), dead_pid, "i0".into(), tx)
+        .claim(h.own(), dead_pid, "i0".into(), tx)
         .await
         .expect("a dead incumbent must not block a claim");
-    assert!(h.hub.is_claimed(&h.project).await);
+    assert!(h.hub.is_claimed(&h.own()).await);
 
     let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
     let welcome = bridge.next().await.expect("an answer");
@@ -1171,7 +1281,7 @@ async fn several_projects_sending_at_once_all_get_through() {
     hub.registry
         .lock()
         .await
-        .bind_topic(&h.project, 1001)
+        .bind_topic(&h.own(), 1001)
         .expect("bind");
 
     const SENDERS: usize = 6;
@@ -1180,8 +1290,12 @@ async fn several_projects_sending_at_once_all_get_through() {
         let hub = Arc::clone(&hub);
         let project = h.project.clone();
         tasks.push(tokio::spawn(async move {
-            hub.say(&project, &format!("project {n} says something"), &[])
-                .await
+            hub.say(
+                &Addr::project_itself(project.clone()),
+                &format!("project {n} says something"),
+                &[],
+            )
+            .await
         }));
     }
 
@@ -1221,7 +1335,9 @@ async fn a_registry_that_cannot_be_read_is_never_written_over() {
     std::fs::write(&path, "{ not json at all").expect("corrupt it");
 
     assert!(
-        registry.bind_topic(&project.id, 99).is_err(),
+        registry
+            .bind_topic(&Addr::project_itself(project.id.clone()), 99)
+            .is_err(),
         "the hub wrote to a registry it could not read"
     );
     assert_eq!(
@@ -1237,7 +1353,7 @@ async fn a_registry_that_cannot_be_read_is_never_written_over() {
     // And once the file is good again, everything works and nothing was lost.
     std::fs::write(&path, good).expect("restore");
     registry
-        .bind_topic(&project.id, 99)
+        .bind_topic(&Addr::project_itself(project.id.clone()), 99)
         .expect("binds once readable");
     assert_eq!(
         Registry::load(&path)
@@ -1388,6 +1504,7 @@ async fn a_frame_the_hub_cannot_read_before_the_pong_does_not_kill_the_connectio
                 instance: "i1".into(),
                 repo: "/wherever".into(),
                 pid: std::process::id(),
+                lane: None,
             },
         ),
     )
@@ -1425,7 +1542,7 @@ async fn a_frame_the_hub_cannot_read_before_the_pong_does_not_kill_the_connectio
     // The connection survived the bad frame and became live.
     until(async || !h.fake.topics.lock().await.is_empty()).await;
     assert!(
-        h.hub.is_claimed(&h.project).await,
+        h.hub.is_claimed(&h.own()).await,
         "one undecodable frame killed a connection that went on to answer"
     );
 }
@@ -1450,7 +1567,7 @@ async fn a_bridge_that_talks_before_answering_is_stopped_rather_than_buffered_wi
             .await;
     }
 
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
     assert!(
         h.fake.topics.lock().await.is_empty(),
         "a bridge that never answered was given a topic"
@@ -1780,6 +1897,115 @@ async fn the_real_plugin_finds_its_project_when_the_session_started_in_a_folder_
     let _ = child.kill().await;
 }
 
+/// kickoff runs its lanes in `git worktree` checkouts, and a lane worktree has NO
+/// `.kickoff/hub.token` in it: the secret is gitignored, so it is never checked out into one. The
+/// upward search stopped at the top of the working tree — which in a lane IS the worktree — found
+/// nothing, and every lane failed closed with "this project is not enrolled". A topic per lane was
+/// unreachable from a real lane until the search could cross to the main working tree.
+///
+/// The crossing is machine-derived and stays inside one repository: `--git-common-dir` answers with
+/// the MAIN repo's `.git` from a linked worktree, and its parent is the main tree. The alternative
+/// on offer was enrolling the worktree, which the containment guard cannot even see — a lane lives
+/// outside the project's folder — and which would make one repository two projects with two secrets
+/// and two topics.
+///
+/// It shares the `the_real_plugin` prefix because that string is the filter
+/// `scripts/install-channel-plugin.sh` runs, and a test outside it is one nothing runs.
+#[tokio::test]
+#[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
+async fn the_real_plugin_finds_its_project_from_inside_a_lane_worktree_of_it() {
+    let h = harness().await;
+
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+
+    // The enrolled project, with its secret where a real project keeps it, in a real working tree.
+    let repo = h.dir.path().join("herdr-tg");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(ok.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+
+    // The lane, exactly as `lane-dispatch.sh` makes one — and deliberately WITHOUT a token in it,
+    // because that is the whole of the problem.
+    let lane_name = "lane-0902-201212-2783563";
+    let lane = h.dir.path().join(lane_name);
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        lane.to_str().expect("a path"),
+        "-b",
+        "lane/x",
+    ]);
+    assert!(
+        !lane.join(".kickoff/hub.token").exists(),
+        "this test needs a lane with no secret in it, and this one has one"
+    );
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&plugin)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The one difference from the tests above: the session started in the LANE.
+        .env("CLAUDE_PROJECT_DIR", &lane)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+
+    // A topic exists only for a connection the hub ADMITTED, and it admits on the secret — so a
+    // topic here is proof the bridge crossed to the main working tree and read the right one.
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(
+        topics.len(),
+        1,
+        "a session in a lane worktree could not find the project it is a worktree of"
+    );
+    // And it spoke as the LANE, not as the project: its own topic, named for both.
+    assert!(
+        topics[0].0.starts_with("herdr-tg") && topics[0].0.contains("2783563"),
+        "the lane spoke as the project itself rather than as a worktree of it: {topics:?}"
+    );
+
+    let _ = child.kill().await;
+}
+
 #[tokio::test]
 async fn what_the_operator_types_reaches_the_agent_as_a_message_in_its_own_turn() {
     // The other direction of the round trip, and the whole safety story of the redesign: his words
@@ -1791,17 +2017,17 @@ async fn what_the_operator_types_reaches_the_agent_as_a_message_in_its_own_turn(
     until(async || !h.fake.sends.lock().await.is_empty()).await;
 
     // The topic is bound, so the hub can tell which project a message typed there belongs to.
-    let topic = h.hub.topic_for(&h.project).await.expect("a topic");
+    let topic = h.hub.topic_for(&h.own()).await.expect("a topic");
     assert_eq!(
-        h.hub.project_for_topic(topic).await.as_ref(),
-        Some(&h.project),
+        h.hub.addr_for_topic(topic).await,
+        Some(h.own()),
         "the hub could not tell which project owns its own topic"
     );
 
     assert!(
         h.hub
             .relay(
-                &h.project,
+                &h.own(),
                 ALLOWED_CHAT,
                 7,
                 &MsgId::new("m9"),
@@ -1835,7 +2061,7 @@ async fn a_message_from_a_chat_this_bot_does_not_answer_reaches_nobody() {
 
     assert!(
         !h.hub
-            .relay(&h.project, 4242, 7, &MsgId::new("m9"), "let me in")
+            .relay(&h.own(), 4242, 7, &MsgId::new("m9"), "let me in")
             .await,
         "a stranger's message was relayed to an agent"
     );
@@ -1849,7 +2075,7 @@ async fn a_message_for_a_project_that_is_not_connected_is_dropped_rather_than_qu
     assert!(
         !h.hub
             .relay(
-                &h.project,
+                &h.own(),
                 ALLOWED_CHAT,
                 7,
                 &MsgId::new("m9"),
@@ -2043,8 +2269,8 @@ async fn pacing_waits_but_a_real_flood_is_shed() {
 
     let before = h.fake.sends.lock().await.len();
     let started = std::time::Instant::now();
-    let first = hub.say(&h.project, "one", &[]).await;
-    let second = hub.say(&h.project, "two", &[]).await;
+    let first = hub.say(&h.own(), "one", &[]).await;
+    let second = hub.say(&h.own(), "two", &[]).await;
 
     assert!(matches!(first, SendOutcome::Sent(_)), "{first:?}");
     assert!(
@@ -2083,10 +2309,10 @@ async fn pacing_waits_but_a_real_flood_is_shed() {
         )
         .with_budget(1, Duration::from_millis(5)),
     );
-    let _ = tight.say(&h.project, "the one allowed", &[]).await;
+    let _ = tight.say(&h.own(), "the one allowed", &[]).await;
     let mut shed = None;
     for _ in 0..4 {
-        if let SendOutcome::TooFast(wait) = tight.say(&h.project, "over the ceiling", &[]).await {
+        if let SendOutcome::TooFast(wait) = tight.say(&h.own(), "over the ceiling", &[]).await {
             shed = Some(wait);
             break;
         }
@@ -2136,7 +2362,7 @@ async fn a_withdrawal_whose_edit_failed_says_so_and_leaves_the_question_answerab
 
     // It reaches nobody, and the edit that would take the buttons off is refused as well.
     drop(bridge);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
     assert!(
         !h.hub
             .deliver(
@@ -2235,7 +2461,7 @@ async fn a_tap_the_project_never_received_takes_the_question_back_rather_than_bu
     // And then it reaches nobody. A full outbox does this without anything having to go wrong;
     // dropping the connection is the same thing from the hub's side and needs no timing to arrange.
     drop(bridge);
-    until(async || !h.hub.is_claimed(&h.project).await).await;
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
     assert!(
         !h.hub
             .deliver(
@@ -2277,5 +2503,1212 @@ async fn a_tap_the_project_never_received_takes_the_question_back_rather_than_bu
         TapRefusal::NoRecord,
         "the question is still burnt: he is told {:?}",
         refused.say()
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Lanes.
+//
+// kickoff runs several worktrees of one repo at once — twelve in a single day — and each one is its
+// own agent process. Until this section existed the hub admitted exactly one of them and turned the
+// rest away with "another session is holding the link to his phone", which was true of the hub and
+// false of the world.
+//
+// The security argument is unchanged and is the reason a lane is safe to accept from the wire: THE
+// SECRET STILL PROVES ONLY THE PROJECT. The hub builds the address it uses from the project that
+// secret resolved to plus the lane the bridge named, so a lane can only ever be a lane of the
+// project the bridge already proved it is.
+
+/// Lane names shaped like the ones kickoff really mints, so what these tests assert about titles is
+/// what the operator will actually be looking at.
+const LANE_A: &str = "lane-0902-201212-2783563";
+const LANE_B: &str = "lane-0902-204418-2791104";
+
+/// Ask one question with one button, and wait for it to reach Telegram.
+async fn ask_once(bridge: &mut FakeBridge, h: &Harness, ask_id: &str, text: &str) {
+    let before = h.fake.sends.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new(ask_id),
+            text: text.to_owned(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() > before).await;
+}
+
+#[tokio::test]
+async fn two_lanes_of_one_project_are_both_admitted_and_speak_in_their_own_topics() {
+    // The whole point. Two worktrees of one repo are two agents, both able to block on a question,
+    // and the second used to be refused outright.
+    let h = harness().await;
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || h.fake.topics.lock().await.len() == 1).await;
+
+    let mut b =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ib", h.project.as_str(), Some(LANE_B)).await;
+    let first = b.next().await.expect("an answer");
+    assert!(
+        matches!(first.payload, HubFrame::Welcome { .. }),
+        "the second lane of one project was turned away: {:?}",
+        first.payload
+    );
+    b.become_live().await;
+    until(async || h.fake.topics.lock().await.len() == 2).await;
+
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(
+        topics.len(),
+        2,
+        "two lanes did not get two topics: {topics:?}"
+    );
+    assert!(
+        topics.iter().any(|(t, _)| t.contains("2783563")),
+        "one lane's topic does not name it: {topics:?}"
+    );
+    assert!(
+        topics.iter().any(|(t, _)| t.contains("2791104")),
+        "the other lane's topic does not name it: {topics:?}"
+    );
+    // One colour block. Telegram offers six topic colours and the operator will have a project and
+    // several of its lanes in one list; a lane in a different colour from its project reads as an
+    // unrelated thing.
+    assert_eq!(
+        topics[0].1, topics[1].1,
+        "two lanes of one project are different colours: {topics:?}"
+    );
+
+    // Both lanes hold a claim, and NEITHER of them holds the project's own. A lane that took the
+    // project's claim would leave the project itself unable to connect while any worktree of it
+    // was running.
+    assert!(
+        h.hub.is_claimed(&h.lane(LANE_A)).await && h.hub.is_claimed(&h.lane(LANE_B)).await,
+        "two lanes are live and the hub is holding a claim for only one of them"
+    );
+    assert!(
+        !h.hub.is_claimed(&h.own()).await,
+        "a lane took the claim belonging to the project's own voice"
+    );
+
+    // A lane is an ADDRESS and never a path. Nothing anywhere joins it onto a directory, and the
+    // cheapest proof is that no lane ever became one.
+    for entry in std::fs::read_dir(h.dir.path()).expect("the state directory") {
+        let name = entry.expect("an entry").file_name();
+        let name = name.to_string_lossy();
+        assert!(
+            !name.contains("lane-"),
+            "a lane named on the wire became a file: {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_bridge_for_the_same_lane_is_refused_rather_than_swapped_in() {
+    // Widening the key must not widen it to nothing. WITHIN one lane the old rule still holds, and
+    // for the old reason: a takeover is what bridge-murder felt like from the inside, with the
+    // incumbent still running and quietly no longer heard.
+    let h = harness().await;
+    let mut first =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    first.become_live().await;
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+
+    let mut second =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ib", h.project.as_str(), Some(LANE_A)).await;
+    let frame = second.next().await.expect("an answer");
+    assert!(
+        matches!(
+            frame.payload,
+            HubFrame::Refused {
+                reason: RefusedReason::AlreadyClaimed
+            }
+        ),
+        "a second bridge for one lane was let in beside the first: {:?}",
+        frame.payload
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_names_no_lane_is_the_project_itself_exactly_as_before() {
+    // The upgrade that actually happens: the hub is replaced and the bridge is not, because a
+    // channel plugin restarts only when its session does. A hello with no lane has to go on being
+    // exactly what it has always been — the project's own voice, in the project's own topic, with
+    // its taps reaching it.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(topics.len(), 1, "{topics:?}");
+    assert_eq!(
+        topics[0].0, "herdr-tg",
+        "a bridge that named no lane was given a lane's topic: {topics:?}"
+    );
+
+    ask_once(&mut bridge, &h, "a1", "Overwrite deploy/prod.yaml?").await;
+    let msg = MsgId::new("m2");
+    let (who, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &who,
+                HubFrame::Choice {
+                    msg_id: msg,
+                    ask_id: ask_id.clone(),
+                    option_id
+                }
+            )
+            .await
+    );
+    let got = bridge
+        .wait_for(|f| match f {
+            HubFrame::Choice { ask_id, .. } => Some(ask_id.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        got, ask_id,
+        "the project's own voice stopped hearing its taps"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_can_never_name_a_lane_of_a_project_it_does_not_hold_the_secret_for() {
+    // The security argument, as a test. The address the hub uses takes its PROJECT half from the
+    // registry — resolved from the secret — and only its LANE half from the wire. A bridge that
+    // could supply both halves could write into another project's forum by choosing a string.
+    let h = harness().await;
+    let other = h.dir.path().join("llm-gateway");
+    std::fs::create_dir_all(&other).expect("repo");
+    let (_other, other_secret) = {
+        let mut r = h.hub.registry.lock().await;
+        r.enrol(&other).expect("enrols")
+    };
+
+    // Its own secret, another project's name, and a lane.
+    let mut bridge = FakeBridge::connect_as(
+        &h.sock,
+        &other_secret,
+        "i1",
+        h.project.as_str(),
+        Some(LANE_A),
+    )
+    .await;
+    bridge.become_live().await;
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(topics.len(), 1, "{topics:?}");
+    assert!(
+        topics[0].0.starts_with("llm-gateway"),
+        "a bridge reached a lane of the project it NAMED rather than of the one its secret \
+         proves: {topics:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_in_one_lane_never_retires_a_question_another_lane_left_open() {
+    // The morning's defect, one field further out — and this shape needs no restart at all, only
+    // two lanes that are alive at the same time.
+    //
+    // Both lanes here carry ONE instance, which is not contrived: the opencode adapter is one
+    // process per project holding a connection per lane, so its lanes share a single instance
+    // string. The instance filter that closed the cross-SESSION version of this therefore cannot
+    // close the cross-LANE one, and every bridge mints its ask ids from a counter that starts over
+    // with the process, so both lanes ask `a3` first.
+    //
+    // Left unclosed: lane B's answer rewrites lane A's question on the operator's phone as answered,
+    // strips its keyboard, and deletes the record proving it was ever asked — while lane A sits
+    // blocked for ever on a question the phone now says is closed.
+    let h = harness().await;
+
+    let mut a = FakeBridge::connect_as(
+        &h.sock,
+        &h.secret,
+        "one-process",
+        h.project.as_str(),
+        Some(LANE_A),
+    )
+    .await;
+    a.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+
+    let mut b = FakeBridge::connect_as(
+        &h.sock,
+        &h.secret,
+        "one-process",
+        h.project.as_str(),
+        Some(LANE_B),
+    )
+    .await;
+    b.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    ask_once(&mut a, &h, "a3", "Shall I force-push?").await;
+    ask_once(&mut b, &h, "a3", "Shall I run the migration?").await;
+
+    // Lane B's own question is answered at lane B's own terminal.
+    b.send(BridgeFrame::AskResolved {
+        ask_id: AskId::new("a3"),
+        how: AskEnd::Answered,
+        outcome: Some("No".into()),
+    })
+    .await;
+
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    // The wrong retirement would be a SECOND edit, so give it every chance before looking.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(
+        retired.len(),
+        1,
+        "one lane's answer reached another lane's question: {retired:?}"
+    );
+    assert_eq!(
+        retired[0].1,
+        MsgId::new("m4"),
+        "the wrong lane's question was retired: {retired:?}"
+    );
+
+    // And lane A's question is still there, still answerable, still being waited on.
+    let msg = MsgId::new("m3");
+    let (who, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the question the other lane never touched must still answer");
+    assert!(
+        h.hub
+            .deliver(
+                &who,
+                HubFrame::Choice {
+                    msg_id: msg,
+                    ask_id,
+                    option_id
+                }
+            )
+            .await
+    );
+    let got = a
+        .wait_for(|f| match f {
+            HubFrame::Choice { ask_id, .. } => Some(ask_id.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(got, AskId::new("a3"), "the answer went to the wrong lane");
+}
+
+#[tokio::test]
+async fn a_lane_arriving_never_takes_another_live_lanes_questions_off_the_phone() {
+    // The other half, and this one needs no id collision at all. A Claude lane is its own process
+    // with its own instance, so an arriving lane looked to the sweep exactly like "some other run of
+    // this project" — and the sweep took every open question of every other LIVE lane off his phone
+    // with "the session that asked this restarted". Both halves of that were false, and every one of
+    // those agents was still waiting.
+    //
+    // What changed underneath the sweep is its premise. It was safe because a claim was exclusive
+    // per project, so at the instant one was granted nothing else of that project was connected.
+    // Once two lanes hold claims at once that is true only of a LANE.
+    let h = harness().await;
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+    ask_once(&mut a, &h, "a3", "Shall I force-push?").await;
+
+    // A second lane arrives while the first is still blocked on its question.
+    let mut b =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ib", h.project.as_str(), Some(LANE_B)).await;
+    b.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let retired = h.fake.retired.lock().await.clone();
+    assert!(
+        retired.is_empty(),
+        "a lane arriving took a live lane's question off the phone: {retired:?}"
+    );
+
+    // Still answerable, which is the half the operator can see.
+    let msg = MsgId::new("m2");
+    let (who, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("a live lane's question must still answer");
+    assert!(
+        h.hub
+            .deliver(
+                &who,
+                HubFrame::Choice {
+                    msg_id: msg,
+                    ask_id,
+                    option_id
+                }
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn a_tap_in_a_lane_s_topic_reaches_that_lane_and_no_other() {
+    // With one claim per project the delivery map had no lane to look up. It either handed the
+    // `Choice` to whichever lane the map happened to be holding — an answer arriving in a turn that
+    // never asked anything, with no error anywhere — or missed and reported the lane as not
+    // connected while it sat there waiting. The second is visible. The first is the one that reaches
+    // an agent.
+    let h = harness().await;
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+    let mut b =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ib", h.project.as_str(), Some(LANE_B)).await;
+    b.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    ask_once(&mut a, &h, "a7", "Shall I force-push?").await;
+    ask_once(&mut b, &h, "a9", "Shall I run the migration?").await;
+
+    // The tap is on the message in LANE A's topic.
+    let msg = MsgId::new("m3");
+    let (who, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert_eq!(
+        ask_id,
+        AskId::new("a7"),
+        "the tap resolved against the wrong lane's question"
+    );
+    assert!(
+        h.hub
+            .deliver(
+                &who,
+                HubFrame::Choice {
+                    msg_id: msg,
+                    ask_id: ask_id.clone(),
+                    option_id
+                }
+            )
+            .await
+    );
+
+    let got = a
+        .wait_for(|f| match f {
+            HubFrame::Choice { ask_id, .. } => Some(ask_id.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(got, ask_id, "the lane that asked did not get its answer");
+
+    let heard = b.drain_for(Duration::from_millis(400)).await;
+    assert!(
+        !heard.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "an answer to a question this lane never asked arrived in its turn: {heard:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_lane_name_that_would_forge_a_line_in_the_audit_is_refused_before_anything_is_written() {
+    // The audit writes one tab-separated record per line and interpolates its subject exactly as it
+    // was given. A lane carrying a tab or a newline therefore writes lines of its own choosing into
+    // the one file an incident is read from — which is the single thing the audit discipline exists
+    // to make impossible.
+    //
+    // Refused where a lane first becomes an address: before a claim is taken, before a topic is
+    // created, before a byte is audited. Empty is refused too, because "no lane" is already said by
+    // sending none, and a conversation with no name is not one the hub can address.
+    let h = harness().await;
+    for bad in [
+        "forged\tproject=p-somebody-else",
+        "two\nlines",
+        "",
+        &"x".repeat(200),
+        "..",
+        "lanes/../../etc",
+    ] {
+        let mut bridge =
+            FakeBridge::connect_as(&h.sock, &h.secret, "i1", h.project.as_str(), Some(bad)).await;
+        let frame = bridge.next().await.expect("an answer");
+        assert!(
+            matches!(
+                frame.payload,
+                HubFrame::Refused {
+                    reason: RefusedReason::BadLane
+                }
+            ),
+            "a lane named {bad:?} was admitted: {:?}",
+            frame.payload
+        );
+    }
+    assert!(
+        h.fake.topics.lock().await.is_empty(),
+        "a refused lane was given a topic"
+    );
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        !audit.contains("forged\tproject=p-somebody-else"),
+        "a lane name reached the audit before it was checked:\n{audit}"
+    );
+}
+
+#[tokio::test]
+async fn a_lanes_topic_names_the_project_and_the_lane_and_fits_a_phone() {
+    // He will have the project's own topic and several of its lanes side by side in one list on a
+    // phone. The project comes FIRST, so a lane sorts and reads under the project it belongs to.
+    // The lane comes second, and when it will not fit it is clipped from the LEFT: real lane names
+    // share a `lane-<date>-` head and differ only in the tail, so clipping the other way makes every
+    // lane of a project read identically.
+    let h = harness().await;
+    let long = "lane-0902-201212-2783563-rewrite-the-registry-lock-discipline";
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(long)).await;
+    a.become_live().await;
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+
+    let title = h.fake.topics.lock().await[0].0.clone();
+    assert!(
+        title.starts_with("herdr-tg"),
+        "a lane's topic does not open with the project it belongs to: {title:?}"
+    );
+    // Clipped from the LEFT: what survives is a tail of the lane's own name, never its head.
+    assert!(
+        title.ends_with("discipline") && long.ends_with(title.rsplit('…').next().expect("a tail")),
+        "the lane was clipped from the wrong end, so every lane of this project would read the \
+         same: {title:?}"
+    );
+    // Telegram's own ceiling on a topic title, and the point past which a phone shows an ellipsis
+    // of its own rather than the part that tells them apart.
+    assert!(
+        title.chars().count() <= 48,
+        "a topic title of {} characters: {title:?}",
+        title.chars().count()
+    );
+    for jargon in ["None", "Some", "ProjectId", "LaneId", "p-"] {
+        assert!(
+            !title.contains(jargon),
+            "jargon reached a topic title: {title:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_lanes_topic_is_still_its_own_after_the_hub_restarts() {
+    // Twelve lanes a day and nothing that deletes a topic means the registry is the only thing that
+    // remembers which topic a lane already has. Forgotten across a restart, a lane that came back
+    // would be given a SECOND topic and its history would split in half — with the first one left
+    // sitting in the forum for ever, because this design deliberately deletes none.
+    let h = harness().await;
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+    let lane_topic = h.fake.sends.lock().await[0].0;
+
+    // The project's own voice arrives after it. A lane's topic is ITS OWN: sharing one would put a
+    // worktree's rolling context in the project's topic, which is the thing topic-per-lane exists
+    // to stop.
+    drop(a);
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "ib", h.project.as_str()).await;
+    own.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+    let project_topic = h.fake.sends.lock().await[1].0;
+    assert_ne!(
+        lane_topic, project_topic,
+        "a lane and its project share one topic, so the lane's rolling context lands in the \
+         project's own"
+    );
+    drop(own);
+
+    // A restart: the same registry file and the same ledger, a Telegram that has never seen any of
+    // it, and a socket of its own.
+    let (hub, fake, sock) = restarted(&h).await;
+    let mut again =
+        FakeBridge::connect_as(&sock, &h.secret, "ic", h.project.as_str(), Some(LANE_A)).await;
+    again.become_live().await;
+    // It has to SAY something to be observed: a topic that already exists is not greeted again,
+    // which is right — the greeting is what makes a NEW topic appear in Telegram's list.
+    again
+        .send(BridgeFrame::Say {
+            text: "back after a restart".into(),
+            hint: None,
+        })
+        .await;
+    until(async || !fake.sends.lock().await.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        fake.topics.lock().await.is_empty(),
+        "the lane was given a second topic after a restart: {:?}",
+        fake.topics.lock().await
+    );
+    assert_eq!(
+        fake.sends.lock().await[0].0,
+        lane_topic,
+        "the lane came back somewhere else"
+    );
+    let _ = hub;
+}
+
+#[tokio::test]
+async fn the_audit_says_which_lane_a_message_was_written_for() {
+    // An incident is read afterwards by grepping this file. With one line per send carrying only the
+    // project, twelve lanes of one repo produce a single indistinguishable stream and "which of them
+    // wrote that" has no answer at all.
+    let h = harness().await;
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    let audit = std::fs::read_to_string(h.hub.audit.path()).expect("an audit log");
+    let line = audit
+        .lines()
+        .find(|l| l.contains("\tsent\t"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        line.contains(&format!("lane={LANE_A}")),
+        "the audit does not say which lane wrote this:\n{audit}"
+    );
+    // And the project is still its own field, so grepping a project still finds everything its
+    // lanes wrote.
+    assert!(
+        line.contains(&format!("project={}", h.project)),
+        "a lane's line stopped naming its project:\n{audit}"
+    );
+}
+
+#[tokio::test]
+async fn the_project_list_shows_a_lane_under_its_project_and_never_as_a_project_of_its_own() {
+    // The only fleet view there is, and lanes multiply its rows. He has to be able to tell a project
+    // from a worktree of it at a glance — a lane rendered as a peer of its project reads as a
+    // thirteenth enrolled repo that he never enrolled.
+    let h = harness().await;
+
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    own.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    let said = crate::bot::digest_of(h.hub.as_ref()).await;
+    let lines: Vec<&str> = said.lines().collect();
+    let project_row = lines
+        .iter()
+        .position(|l| l.contains("herdr-tg") && !l.contains(LANE_A))
+        .unwrap_or_else(|| panic!("the project is not in its own list:\n{said}"));
+    let lane_row = lines
+        .iter()
+        .position(|l| l.contains(LANE_A))
+        .unwrap_or_else(|| panic!("a connected lane is missing from the list:\n{said}"));
+    assert!(
+        lane_row > project_row,
+        "a lane is listed away from the project it belongs to:\n{said}"
+    );
+    assert!(
+        lines[lane_row].starts_with(' '),
+        "a lane reads as a project of its own rather than as a worktree of one:\n{said}"
+    );
+    assert!(
+        lines[project_row].contains("connected") && !lines[project_row].contains("not connected"),
+        "the project's own voice is not shown as connected:\n{said}"
+    );
+    for jargon in ["None", "Some(", "lane_topics", "Addr", "p-"] {
+        assert!(
+            !said.contains(jargon),
+            "jargon reached the fleet view: {said}"
+        );
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// What the second review round found: a topic per lane multiplies things that used to happen once
+// in a project's life, and each of them was written for the once.
+
+#[tokio::test]
+async fn a_lanes_greeting_says_which_worktree_opened_the_topic() {
+    // The greeting is the first thing in a brand-new topic and the thing that makes the topic
+    // appear in his list at all. Twelve of these arrive on a dispatch day; identical, they are
+    // twelve notifications he cannot tell apart, and the only thing carrying which worktree is a
+    // topic title that a phone row truncates.
+    let h = harness().await;
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    let mut b =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ib", h.project.as_str(), Some(LANE_B)).await;
+    b.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    let sends = h.fake.sends.lock().await.clone();
+    let greetings: Vec<String> = sends.iter().map(|(_, text, _)| text.clone()).collect();
+    assert!(
+        greetings[0] != greetings[1],
+        "two worktrees opened two topics with the same sentence, so neither says which: {greetings:?}"
+    );
+    assert!(
+        greetings.iter().any(|g| g.contains(LANE_A))
+            && greetings.iter().any(|g| g.contains(LANE_B)),
+        "a worktree's first message does not name the worktree: {greetings:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_worktrees_of_one_project_are_told_apart_in_the_width_a_phone_row_shows() {
+    // The title is clipped from the left so that lanes differ in their tails — but the clip only
+    // fires when the lane is longer than the room left, and for a real `lane-<date>-<time>-<pid>`
+    // it never fires. The head then survives whole and the differing bytes sit at the right-hand
+    // end, which is exactly what a list row truncates away.
+    const ROW: usize = 24;
+    // Two real names minted by `lane-dispatch.sh` two minutes apart on one afternoon, which is the
+    // ordinary case and not a contrived one: a dispatch day makes twelve of these.
+    let a = crate::registry::lane_title(
+        "herdr-tg",
+        &hub_proto::LaneId::new("lane-0902-160607-2051465"),
+    );
+    let b = crate::registry::lane_title(
+        "herdr-tg",
+        &hub_proto::LaneId::new("lane-0902-160812-2051988"),
+    );
+    let cut = |s: &str| s.chars().take(ROW).collect::<String>();
+    assert_ne!(
+        cut(&a),
+        cut(&b),
+        "two worktrees of one project read identically in the {ROW} characters a phone row shows: \
+         {a:?} and {b:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_question_a_gone_worktree_left_open_is_taken_off_the_phone_when_its_project_reconnects() {
+    // A worktree is never dispatched twice under the same name, so nothing of its own ever arrives
+    // to sweep what it left behind. Scoped to the conversation and nothing else, its keyboard stays
+    // on his phone for ever and its record stays in a file that is rewritten whole on every ask of
+    // every project on the box.
+    let h = harness().await;
+    let lane = h.lane(LANE_A);
+
+    // A worktree whose process is provably gone. The hub takes a bridge's pid from the SOCKET, not
+    // from what the bridge claims, so a fake bridge inside this process can never present a dead
+    // one — the claim is taken directly, exactly as the eviction tests do.
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("/bin/true");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+    assert!(
+        !super::pid_is_alive(dead_pid),
+        "the probe pid is still alive"
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    h.hub
+        .claim(lane.clone(), dead_pid, "ia".into(), tx)
+        .await
+        .expect("claims");
+    h.hub
+        .handle(
+            &lane,
+            "ia",
+            BridgeFrame::Ask {
+                ask_id: hub_proto::AskId::new("a1"),
+                text: "Shall I force-push?".into(),
+                options: Some(vec![AskOption {
+                    option_id: OptionId::new("yes"),
+                    label: "Yes".into(),
+                }]),
+            },
+        )
+        .await;
+    assert_eq!(
+        h.hub.ledger.lock().await.records.len(),
+        1,
+        "the worktree's question was never written down, so this test proves nothing"
+    );
+    h.hub.release(&lane, dead_pid).await;
+
+    // The project's own voice comes back. It is a different conversation, so scoped to the
+    // conversation it sweeps nothing of the worktree's.
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    own.become_live().await;
+    until(async || h.hub.ledger.lock().await.records.is_empty()).await;
+
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(
+        retired.len(),
+        1,
+        "the keyboard a gone worktree left behind is still on his phone: {retired:?}"
+    );
+    assert!(
+        !retired[0].2.contains("restarted"),
+        "a worktree that ended was described as one that restarted, which is not true of a lane \
+         and never will be: {retired:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_worktree_that_only_lost_its_socket_keeps_its_open_question() {
+    // The reason the sweep is not done at `release`: a bridge keeps its instance AND its pid across
+    // a reconnect, so a session that drops and comes straight back is still waiting for exactly
+    // those answers. Widening the sweep to the project must not smuggle that failure back in.
+    let h = harness().await;
+
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    lane.become_live().await;
+    lane.send(BridgeFrame::Ask {
+        ask_id: hub_proto::AskId::new("a1"),
+        text: "Still waiting on this".into(),
+        options: Some(vec![AskOption {
+            option_id: OptionId::new("yes"),
+            label: "Yes".into(),
+        }]),
+    })
+    .await;
+    until(async || h.hub.ledger.lock().await.records.len() == 1).await;
+    // The socket goes; the process behind it does not.
+    drop(lane);
+    until(async || !h.hub.is_claimed(&h.lane(LANE_A)).await).await;
+
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    own.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "a question a still-running worktree is waiting on was taken off his phone: {:?}",
+        h.fake.retired.lock().await
+    );
+    assert_eq!(
+        h.hub.ledger.lock().await.records.len(),
+        1,
+        "the record proving a live worktree asked something was thrown away"
+    );
+}
+
+#[tokio::test]
+async fn a_topic_telegram_would_not_make_is_not_asked_for_again_on_every_message() {
+    // `topic_for` runs on every message, so a conversation whose topic cannot be made asked
+    // Telegram for one per message, with no backoff and outside the budget that exists to stop
+    // exactly this. A project's topic was made once in its life; a lane needs a new one twelve
+    // times a day, which is what puts the fleet in this state routinely.
+    let h = harness().await;
+    *h.fake.create_fails.lock().await = true;
+
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    lane.become_live().await;
+    for i in 0..5 {
+        lane.send(BridgeFrame::Say {
+            text: format!("line {i}"),
+            hint: None,
+        })
+        .await;
+    }
+    // Every one of them is acked, so nothing hangs — the question is only how many times Telegram
+    // was asked for the same topic.
+    for _ in 0..5 {
+        lane.wait_for(|f| match f {
+            HubFrame::Ack { .. } => Some(()),
+            _ => None,
+        })
+        .await;
+    }
+
+    let attempts = h.fake.create_attempts.lock().await.clone();
+    assert!(
+        attempts.len() <= 2,
+        "one worktree asked Telegram for the same topic {} times, once per message: {attempts:?}",
+        attempts.len()
+    );
+}
+
+#[tokio::test]
+async fn no_topic_is_made_in_a_minute_whose_budget_is_already_spent() {
+    // Topic creation did not go through the budget, so twelve lanes arriving cost twelve calls the
+    // ceiling could not see — and Telegram's real ceiling counts them whether ours does or not. The
+    // topic was created and bound anyway, then greeted with a token that was not there, leaving a
+    // permanent registry row for a topic Telegram does not show in the list at all.
+    let h = harness().await;
+    // Exactly enough for one conversation to open: a topic and the greeting that makes it visible.
+    {
+        let mut b = h.hub.budgets.lock().await;
+        *b = crate::queue::Budgets::new(2, Duration::from_millis(5));
+    }
+
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    own.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+    let spent = h.fake.create_attempts.lock().await.len();
+
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    lane.become_live().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Taken ONCE, into a local. Locking the same mutex twice inside one `assert_eq!` — the
+    // scrutinee and again in the message — deadlocks on the failing path instead of failing: the
+    // scrutinee's guard is still alive when the panic arm reaches for the second lock. This test
+    // then hangs the suite forever rather than reporting, which is the one thing a regression test
+    // must never do. Measured before the fix: passing took 0.31s, failing ran past 400s in silence.
+    let attempts = h.fake.create_attempts.lock().await.clone();
+    assert_eq!(
+        attempts.len(),
+        spent,
+        "a topic was made in a minute whose budget could not pay to greet it, so it is bound, \
+         permanent and invisible: {attempts:?}"
+    );
+    assert!(
+        h.hub
+            .registry
+            .lock()
+            .await
+            .get(&h.project)
+            .expect("enrolled")
+            .lane_topics
+            .is_empty(),
+        "a registry row was written for a topic that was never greeted"
+    );
+
+    // And the worktree's agent is told the truth about WHICH limit stopped it. A busy minute mends
+    // itself and a Telegram refusal does not, and the bridge renders the two as different sentences
+    // — so acking a budget shed as a refusal is a small untruth in the one place this system exists
+    // to keep honest.
+    let sent = lane
+        .send(BridgeFrame::Say {
+            text: "anything".into(),
+            hint: None,
+        })
+        .await;
+    let why = lane
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, why, .. } if r#ref == &sent => Some(*why),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        why,
+        Some(hub_proto::AckWhy::TooFast),
+        "a worktree shed by the chat's budget was told Telegram had refused it"
+    );
+}
+
+#[tokio::test]
+async fn a_project_reached_only_through_its_worktrees_is_never_called_never_connected() {
+    // `where_it_is` is computed from the project's OWN claim, and a project whose sessions are all
+    // dispatched into worktrees never has one. The row then said "has never connected" directly
+    // above a row saying a worktree of it is connected — a self-contradicting pair on the only
+    // fleet view there is.
+    let h = harness().await;
+
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    let said = crate::bot::digest_of(h.hub.as_ref()).await;
+    assert!(
+        !said.contains("has never connected"),
+        "a project with a live worktree is listed as one that has never connected:\n{said}"
+    );
+}
+
+#[tokio::test]
+async fn the_fleet_list_reads_in_the_order_of_the_names_he_gave_them() {
+    // The rows came out in project-id order — a hashed `p-…` string, neither alphabetical nor the
+    // order he enrolled them in. Survivable at three rows; with a worktree row per live lane the
+    // list is eleven rows at three projects and he has no way to predict where anything sits.
+    let h = harness().await;
+    for name in ["zulu-service", "alpha-service", "mike-service"] {
+        let repo = h.dir.path().join(name);
+        std::fs::create_dir_all(&repo).expect("repo");
+        h.hub.registry.lock().await.enrol(&repo).expect("enrols");
+    }
+
+    let said = crate::bot::digest_of(h.hub.as_ref()).await;
+    let titles: Vec<&str> = said
+        .lines()
+        .filter(|l| l.starts_with("<b>"))
+        .map(|l| {
+            l.trim_start_matches("<b>")
+                .split("</b>")
+                .next()
+                .unwrap_or("")
+        })
+        .collect();
+    let mut sorted = titles.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        titles, sorted,
+        "the fleet list is not in the order of the names he gave them:\n{said}"
+    );
+}
+
+#[tokio::test]
+async fn what_is_said_in_a_worktrees_topic_never_calls_it_the_project() {
+    // Two of these sentences were rewritten when lane topics were built, with the argument written
+    // down beside them: the topic is what he is looking at, so the topic is what the sentence is
+    // about. The same argument reaches every other sentence the hub posts into a topic, and these
+    // were missed. "This project asked me something" is wrong in a worktree's topic — the project's
+    // own topic can be connected and busy right beside it — and "answer it at the terminal" sends
+    // him to one of twelve, where he will find nothing waiting.
+    let h = harness().await;
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    lane.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    lane.send(BridgeFrame::Ask {
+        ask_id: hub_proto::AskId::new("a1"),
+        text: "ok?".into(),
+        options: Some(vec![AskOption {
+            option_id: OptionId::new("x".repeat(70)),
+            label: "Yes".into(),
+        }]),
+    })
+    .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    let said = h.fake.sends.lock().await[1].1.clone();
+    assert!(
+        !said.contains("This project") && !said.contains("this project"),
+        "a worktree's own topic was told the PROJECT is stuck, which he can read as false with \
+         the project's topic open beside it: {said:?}"
+    );
+    assert!(
+        !said.contains("at the terminal"),
+        "he is sent to the project's terminal for a question a worktree is holding: {said:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_taken_back_in_a_worktrees_topic_never_blames_the_project() {
+    // The note replaces the keyboard he is looking at, in the LANE's own message. "the project
+    // could not be reached" is a sentence about a thing that may be perfectly reachable.
+    let h = harness().await;
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    lane.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    lane.send(BridgeFrame::Ask {
+        ask_id: hub_proto::AskId::new("a1"),
+        text: "And the migration?".into(),
+        options: Some(vec![AskOption {
+            option_id: OptionId::new("yes"),
+            label: "Yes".into(),
+        }]),
+    })
+    .await;
+    until(async || h.hub.ledger.lock().await.records.len() == 1).await;
+    let msg = MsgId::new("m2");
+
+    let what = h.hub.withdraw_undelivered(ALLOWED_CHAT, &msg).await;
+    assert_eq!(what, Withdrawal::Retired, "the test's own setup is wrong");
+    let note = h.fake.retired.lock().await[0].2.clone();
+    assert!(
+        !note.contains("the project"),
+        "the note written into a worktree's own message blames the project: {note:?}"
+    );
+}
+
+/// Two worktrees of one repository checked out under the SAME folder name, against the real hub.
+///
+/// git dedupes only its own internal name for a worktree, never the checkout path, so `~/a/wip` and
+/// `~/b/wip` are both legal and are what an operator's own hand-made trees look like — `wip`,
+/// `review`, `hotfix`. Presenting one name, they are one conversation: the second one's arrival
+/// evicts the first's claim and sweeps its still-open questions off his phone as a restart.
+#[tokio::test]
+#[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
+async fn the_real_plugin_gives_two_worktrees_of_one_folder_name_two_conversations() {
+    let h = harness().await;
+
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+
+    let repo = h.dir.path().join("herdr-tg");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(ok.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+
+    let mut children = Vec::new();
+    for (i, side) in ["a", "b"].iter().enumerate() {
+        let tree = h.dir.path().join(side).join("wip");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            tree.to_str().expect("a path"),
+            "-b",
+            &format!("wip-{side}"),
+        ]);
+        let mut child = tokio::process::Command::new("bun")
+            .arg("server.ts")
+            .current_dir(&plugin)
+            .env("KICKOFF_HUB_SOCKET", &h.sock)
+            .env("CLAUDE_PROJECT_DIR", &tree)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("bun is on PATH");
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+            .await
+            .expect("initialize");
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .expect("initialized");
+        children.push((child, stdin));
+        until(async || h.fake.topics.lock().await.len() > i).await;
+    }
+
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(
+        topics.len(),
+        2,
+        "two worktrees checked out under one folder name got one conversation between them, so \
+         the second evicted the first: {topics:?}"
+    );
+    assert_ne!(
+        topics[0].0, topics[1].0,
+        "two worktrees got two topics with the same name: {topics:?}"
+    );
+
+    for (mut child, _) in children {
+        let _ = child.kill().await;
+    }
+}
+
+#[tokio::test]
+async fn a_question_too_old_for_its_keyboard_ever_to_come_off_is_not_kept_for_ever() {
+    // A record's one job is to be the handle that takes a keyboard off a message, and Telegram
+    // refuses that edit past about 48 hours. Past it the record cannot serve anybody — and what is
+    // left is a row in the one state file that is serialised whole and rewritten on every ask and
+    // every tap of every project on the box.
+    let h = harness().await;
+    let stale = super::now_secs() - (super::EDIT_WINDOW_SECS + 60);
+    {
+        let mut ledger = h.hub.ledger.lock().await;
+        for (n, at) in [("m9", stale), ("m8", super::now_secs())] {
+            ledger
+                .record(
+                    ALLOWED_CHAT,
+                    &MsgId::new(n),
+                    AskRecord {
+                        project: h.project.clone(),
+                        lane: Some(hub_proto::LaneId::new(LANE_A)),
+                        ask_id: hub_proto::AskId::new("a1"),
+                        topic_id: 1001,
+                        options: vec![],
+                        text: "old".into(),
+                        instance: "gone".into(),
+                        pid: None,
+                        at,
+                        answered: None,
+                    },
+                )
+                .expect("writes");
+        }
+    }
+
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    own.become_live().await;
+    until(async || h.hub.ledger.lock().await.records.len() == 1).await;
+
+    let left = h.hub.ledger.lock().await.records.clone();
+    assert!(
+        left.keys().all(|k| k.ends_with("m8")),
+        "the record that was dropped is not the one past the edit window: {left:?}"
+    );
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "an edit was attempted on a message Telegram will not let anybody edit"
+    );
+}
+
+#[tokio::test]
+async fn a_ledger_written_before_worktrees_existed_still_answers_every_keyboard_on_his_phone() {
+    // The running binary's `asks.json` was written by a build that had never heard of a worktree, a
+    // pid or an age. A ledger that will not parse turns every live keyboard on his phone into a
+    // button that answers "I have no record of that question", so every field added here is
+    // defaulted — and defaulted the FAIL-CLOSED way: an unknown pid is not a gone one, and an
+    // unknown age is not an expired one.
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("asks.json");
+    std::fs::write(
+        &path,
+        r#"{"-1001:m1":{"project":"p-old","ask_id":"a1","topic_id":7,
+            "options":[{"option_id":"y","label":"Yes"}],"text":"ok?","instance":"i1"}}"#,
+    )
+    .expect("writes");
+
+    let mut ledger = AskLedger::load(&path);
+    let record = ledger
+        .get(-1001, &MsgId::new("m1"))
+        .expect("a question written by the build that is running now");
+    assert_eq!(record.lane, None, "an old record grew a worktree");
+    assert_eq!(record.pid, None);
+    assert_eq!(record.at, 0);
+
+    assert_eq!(
+        ledger.drop_what_can_no_longer_be_retired(super::now_secs()),
+        0,
+        "a record whose age nobody wrote down was thrown away as if it were expired"
+    );
+    let live = std::collections::BTreeSet::new();
+    assert!(
+        ledger
+            .open_where_the_asker_is_gone(&ProjectId::new("p-old"), &live)
+            .is_empty(),
+        "a record whose pid nobody wrote down was swept as if the agent were provably gone"
     );
 }

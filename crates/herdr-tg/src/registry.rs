@@ -27,9 +27,11 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use hub_proto::ProjectId;
+use hub_proto::{LaneId, ProjectId};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
+
+use crate::hub::Addr;
 
 /// Where a project's bridge finds its own secret, relative to the repo root.
 pub const TOKEN_FILE: &str = ".kickoff/hub.token";
@@ -60,6 +62,69 @@ pub struct Project {
     pub topic_id: Option<i32>,
     /// `0..6`. Derived, so it is stable across restarts and across machines.
     pub icon_color: u8,
+    /// One topic per lane of this project, bound the first time that lane goes live.
+    ///
+    /// It lives HERE, inside the project the secret already resolved to, rather than in a file of
+    /// its own. Three reasons, and the first is the one that matters: `bind_topic` already carries
+    /// the whole read-modify-write discipline this needs — the flock, the re-read, the atomic
+    /// rename, the per-process temp name — and that discipline exists because two processes write
+    /// this file. A second state file would have to reproduce every part of it. Second, the reverse
+    /// lookup from a topic stays one scan over one store instead of two lookups with a rule about
+    /// which wins. Third, a lane row landing inside an already-resolved project is a write a bridge
+    /// cannot use to add a project or flip `enabled`, so the trust boundary is exactly where it was.
+    ///
+    /// `#[serde(default)]` because the file on the operator's box was written by a build that had
+    /// never heard of a lane, and a registry that would not parse refuses every project on the box.
+    ///
+    /// **Nothing prunes this**, and that is the accepted price of a topic per lane with retirement
+    /// out of scope — not an oversight. Measured rather than feared: a lane row costs 40 bytes, so
+    /// twelve a day is 15 KB a month and about 175 KB a year, and a full parse of a 360-lane file
+    /// takes half a millisecond on an admission that happens a dozen times a day. He will never
+    /// notice this file. What he WILL notice, in this order, is the forum topic list on his phone,
+    /// then the per-chat delivery budget on a dispatch day — and `asks.json`, which is rewritten
+    /// whole on every ask and every tap and is where the real growth is guarded. See
+    /// `AskLedger::save`.
+    #[serde(default)]
+    pub lane_topics: BTreeMap<LaneId, i32>,
+}
+
+/// What a lane's topic is called, so the operator can pick it out of a list on a phone.
+///
+/// The PROJECT comes first, so a lane sorts and reads under the project it belongs to; he will have
+/// the project's own topic and several of its lanes side by side. The lane comes second, and when it
+/// will not fit it is clipped from the LEFT, because real lane names share a `lane-<date>-` head and
+/// differ only in the tail — clipped the other way, every lane of one project reads identically and
+/// the list stops telling him anything.
+pub fn lane_title(project_title: &str, lane: &LaneId) -> String {
+    const SEP: &str = " · ";
+    /// Enough tail left to tell two lanes of one project apart, even when the project's own title
+    /// has taken nearly all the room.
+    const LANE_TAIL_MIN: usize = 10;
+
+    /// How much of a lane name is worth showing before a phone's own truncation takes over.
+    ///
+    /// Without a cap the clip below never fires for a real name — `lane-<MMDD>-<HHMMSS>-<pid>` is
+    /// 24 characters and the room left by a short project title is 37 — so the shared `lane-<date>-`
+    /// head survived whole and every distinguishing byte sat at the right-hand end, which is exactly
+    /// what a list row removes. Capped, the clip always fires and the tail leads.
+    const LANE_SHOWN_MAX: usize = 14;
+
+    let sep = SEP.chars().count();
+    // The project's title is kept WHOLE where it fits, because it is the half that groups the row.
+    // It is clipped only to leave the lane a readable tail.
+    let head_room = MAX_TITLE.saturating_sub(sep + LANE_TAIL_MIN);
+    let head: String = project_title.chars().take(head_room).collect();
+
+    let room = MAX_TITLE
+        .saturating_sub(head.chars().count() + sep)
+        .min(LANE_SHOWN_MAX);
+    let lane_chars: Vec<char> = lane.as_str().chars().collect();
+    if lane_chars.len() <= room {
+        return format!("{head}{SEP}{lane}");
+    }
+    let keep = room.saturating_sub(1);
+    let tail: String = lane_chars[lane_chars.len() - keep..].iter().collect();
+    format!("{head}{SEP}…{tail}")
 }
 
 /// Every enrolled project, and the file they live in.
@@ -263,16 +328,34 @@ impl Registry {
         self.projects.values()
     }
 
-    /// Remember which topic a project's messages go to.
-    pub fn bind_topic(&mut self, id: &ProjectId, topic_id: i32) -> Result<(), EnrolError> {
+    /// Which topic a conversation's messages already go to, if it has one.
+    ///
+    /// A conversation, not a project: a lane's topic is its own, and answering with the project's
+    /// would put a worktree's rolling context in the project's own topic — the thing a topic per
+    /// lane exists to stop.
+    pub fn topic_of(&self, addr: &Addr) -> Option<i32> {
+        let p = self.projects.get(&addr.project)?;
+        match &addr.lane {
+            None => p.topic_id,
+            Some(lane) => p.lane_topics.get(lane).copied(),
+        }
+    }
+
+    /// Remember which topic a conversation's messages go to.
+    pub fn bind_topic(&mut self, addr: &Addr, topic_id: i32) -> Result<(), EnrolError> {
         // Read-modify-write under the lock, never write-what-I-remember. Writing the in-memory map
         // would put this process's snapshot back over anything enrolled at the terminal since it
         // started — and a read that FAILED must abandon the write rather than write what it could
         // not read.
         let _held = self.hold()?;
         self.reread()?;
-        if let Some(p) = self.projects.get_mut(id) {
-            p.topic_id = Some(topic_id);
+        if let Some(p) = self.projects.get_mut(&addr.project) {
+            match &addr.lane {
+                None => p.topic_id = Some(topic_id),
+                Some(lane) => {
+                    p.lane_topics.insert(lane.clone(), topic_id);
+                }
+            }
         }
         self.save()
     }
@@ -283,11 +366,16 @@ impl Registry {
     /// hub learns about it from `message thread not found` on a send. That is a rebinding, handled
     /// once and deliberately — never retried as if it were a transient network error, which would
     /// swallow the project's messages forever.
-    pub fn unbind_topic(&mut self, id: &ProjectId) -> Result<(), EnrolError> {
+    pub fn unbind_topic(&mut self, addr: &Addr) -> Result<(), EnrolError> {
         let _held = self.hold()?;
         self.reread()?;
-        if let Some(p) = self.projects.get_mut(id) {
-            p.topic_id = None;
+        if let Some(p) = self.projects.get_mut(&addr.project) {
+            match &addr.lane {
+                None => p.topic_id = None,
+                Some(lane) => {
+                    p.lane_topics.remove(lane);
+                }
+            }
         }
         self.save()
     }
@@ -347,6 +435,14 @@ impl Registry {
         // A re-enrolment keeps the topic. The whole point of a stable id is that history survives.
         let topic_id = self.projects.get(&id).and_then(|p| p.topic_id);
 
+        // A re-enrolment keeps its lanes' topics for the same reason it keeps its own: rotating a
+        // secret must not scatter a day's worktrees into a second set of topics beside the first.
+        let lane_topics = self
+            .projects
+            .get(&id)
+            .map(|p| p.lane_topics.clone())
+            .unwrap_or_default();
+
         let project = Project {
             id: id.clone(),
             title,
@@ -355,6 +451,7 @@ impl Registry {
             enabled: true,
             topic_id,
             icon_color,
+            lane_topics,
         };
         // The SECRET GOES DOWN FIRST, and the list of projects second. The other order took a
         // project off the air whenever the second step failed: the registry already held the hash
@@ -641,7 +738,8 @@ mod tests {
         let mut r = reg(&d);
         let repo = repo(&d, "herdr-tg");
         let (p1, s1) = r.enrol(&repo).expect("enrols");
-        r.bind_topic(&p1.id, 77).expect("binds");
+        r.bind_topic(&Addr::project_itself(p1.id.clone()), 77)
+            .expect("binds");
         let (p2, s2) = r.enrol(&repo).expect("re-enrols");
 
         assert_eq!(p1.id, p2.id, "a stable id is the whole point");
@@ -708,6 +806,45 @@ mod tests {
                 p.icon_color
             );
         }
+    }
+
+    #[test]
+    fn a_registry_written_before_lanes_existed_still_loads_every_project() {
+        // The file on the operator's box was written by a build that had never heard of a lane, and
+        // an upgrade must not look like a corrupt file. The property below — a bad byte refuses
+        // everyone rather than refusing to boot — is the RIGHT answer to a bad byte and the WRONG
+        // one to an ordinary upgrade: every project on the box would be turned away, with the only
+        // explanation on a log line nobody is reading.
+        let d = tempfile::tempdir().expect("tmp");
+        let path = d.path().join("projects.json");
+        let secret = {
+            let mut r = Registry::load(&path);
+            let (_, s) = r.enrol(&repo(&d, "herdr-tg")).expect("enrols");
+            s
+        };
+        // Exactly what yesterday's file looks like: every key this build writes except the one it
+        // learned today. Removed as JSON rather than by deleting a line, because deleting the last
+        // line of an object leaves a trailing comma — a CORRUPT file, which is the other property
+        // entirely and would let this pass for the wrong reason.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("readable")).expect("json");
+        for (_, project) in doc.as_object_mut().expect("an object").iter_mut() {
+            project
+                .as_object_mut()
+                .expect("a project")
+                .remove("lane_topics")
+                .expect("this build wrote the key this test is here to remove");
+        }
+        let older = serde_json::to_string_pretty(&doc).expect("json");
+        assert!(!older.contains("lane_topics"), "{older}");
+        fs::write(&path, &older).expect("write");
+
+        let r = Registry::load(&path);
+        assert_eq!(r.all().count(), 1, "an upgrade un-enrolled every project");
+        assert!(
+            r.resolve(&secret).is_some(),
+            "a registry written before lanes existed refuses the project it holds"
+        );
     }
 
     #[test]

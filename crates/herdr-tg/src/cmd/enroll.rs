@@ -98,15 +98,13 @@ pub(crate) fn projects() -> anyhow::Result<()> {
     let mut any = false;
     for p in registry.all() {
         any = true;
-        let topic = match p.topic_id {
-            Some(id) => format!("topic {id}"),
-            None => "not connected yet".to_owned(),
-        };
         let state = if p.enabled { "" } else { "  (switched off)" };
+        // The middle column is 34 wide because "no topic of its own yet, 12 worktrees" is 37 at its
+        // longest realistic value and a column that overruns takes the repo paths out of line.
         println!(
-            "{:<24} {:<18} {}{}",
+            "{:<24} {:<34} {}{}",
             p.title,
-            topic,
+            where_it_talks(p),
             p.repo.display(),
             state
         );
@@ -115,6 +113,28 @@ pub(crate) fn projects() -> anyhow::Result<()> {
         println!("Nothing is enrolled yet. Add a project with:  herdr-tg enroll <repo>");
     }
     Ok(())
+}
+
+/// Which topics a project has, for the terminal listing.
+///
+/// The worktree count is here because this is the only VISIBLE sign a lane ever ran: a worktree's
+/// topic outlives the worktree by design, and nothing else on the box names how many a project has
+/// collected. Not a size warning — the file itself is cheap, and the measured numbers are on
+/// `Project::lane_topics`.
+fn where_it_talks(p: &crate::registry::Project) -> String {
+    let topic = match p.topic_id {
+        Some(id) => format!("topic {id}"),
+        // Three states, not two. A repo whose sessions are all dispatched into worktrees never
+        // binds a topic of its own, so "not connected yet" beside a worktree count is a row that
+        // contradicts itself — and it is that repo's ORDINARY row, not an edge case.
+        None if p.lane_topics.is_empty() => "not connected yet".to_owned(),
+        None => "no topic of its own yet".to_owned(),
+    };
+    match p.lane_topics.len() {
+        0 => topic,
+        1 => format!("{topic}, 1 worktree"),
+        n => format!("{topic}, {n} worktrees"),
+    }
 }
 
 /// What git says about whether this project's own secret would be committed.
@@ -281,6 +301,70 @@ fn inside_a_working_tree(repo: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_terminal_listing_says_how_many_worktrees_a_project_has_collected() {
+        // Every lane that ever went live keeps its topic for good, and the count lives in the file
+        // the hub re-reads on every admission. This is the only view where that is visible at all,
+        // and "twelve a day, never deleted" is a number the operator agreed to without ever being
+        // shown it.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = crate::registry::Registry::load(d.path().join("projects.json"));
+        let dir = d.path().join("herdr-tg");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (p, _) = r.enrol(&dir).expect("enrols");
+        let addr = crate::hub::Addr::project_itself(p.id.clone());
+        r.bind_topic(&addr, 1001).expect("binds");
+
+        let said =
+            |r: &crate::registry::Registry| where_it_talks(r.get(&p.id).expect("the project"));
+        assert_eq!(said(&r), "topic 1001", "{}", said(&r));
+
+        r.bind_topic(
+            &crate::hub::Addr::lane_of(p.id.clone(), hub_proto::LaneId::new("lane-0902-201212-1")),
+            1002,
+        )
+        .expect("binds");
+        assert_eq!(said(&r), "topic 1001, 1 worktree", "{}", said(&r));
+
+        r.bind_topic(
+            &crate::hub::Addr::lane_of(p.id.clone(), hub_proto::LaneId::new("lane-0902-204418-2")),
+            1003,
+        )
+        .expect("binds");
+        assert_eq!(said(&r), "topic 1001, 2 worktrees", "{}", said(&r));
+
+        for jargon in ["lane_topics", "Some", "None", "BTreeMap"] {
+            assert!(
+                !said(&r).contains(jargon),
+                "jargon in the listing: {}",
+                said(&r)
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_reached_only_through_its_worktrees_is_not_listed_as_never_connected() {
+        // A repo whose sessions are all dispatched into worktrees never binds a topic of its own,
+        // so `topic_id` stays empty for ever. "not connected yet" beside a worktree count is a row
+        // that contradicts itself, and it is the ORDINARY row for such a repo, not an edge case.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = crate::registry::Registry::load(d.path().join("projects.json"));
+        let dir = d.path().join("oc-dogfood");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let (p, _) = r.enrol(&dir).expect("enrols");
+        r.bind_topic(
+            &crate::hub::Addr::lane_of(p.id.clone(), hub_proto::LaneId::new("lane-0902-231907-1")),
+            1002,
+        )
+        .expect("binds");
+
+        let said = where_it_talks(r.get(&p.id).expect("the project"));
+        assert!(
+            !said.contains("not connected yet"),
+            "a project with a worktree topic is listed as one that has never connected: {said}"
+        );
+    }
 
     /// A real git repo, because the check now asks git and a fake `.git` directory is not one.
     fn repo_with(gitignore: Option<&str>) -> tempfile::TempDir {

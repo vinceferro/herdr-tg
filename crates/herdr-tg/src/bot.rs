@@ -292,7 +292,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                             // A chat this bot does not answer gets silence, not a refusal.
                             Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
                             Err(why) => escape_html(why.say()),
-                            Ok((project, ask_id, option_id)) => {
+                            Ok((who, ask_id, option_id)) => {
                                 let label = hub
                                     .ledger
                                     .lock()
@@ -307,7 +307,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                                     .unwrap_or_default();
                                 let sent = hub
                                     .deliver(
-                                        &project,
+                                        &who,
                                         hub_proto::HubFrame::Choice {
                                             msg_id: msg_id.clone(),
                                             ask_id,
@@ -379,12 +379,12 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
         // rule this bridge used to have is deleted rather than tested against.
         let thread = msg.thread_id.map(|t| t.0.0);
         let body = match (&ctx.hub, thread) {
-            (Some(hub), Some(thread)) => match hub.project_for_topic(thread).await {
-                Some(project) => {
+            (Some(hub), Some(thread)) => match hub.addr_for_topic(thread).await {
+                Some(who) => {
                     let mid = hub_proto::MsgId::new(msg.id.0.to_string());
                     let user = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-                    if hub.relay(&project, chat_id, user, &mid, text).await {
-                        tracing::info!(chat_id, %project, bytes = text.len(), "relayed to a project");
+                    if hub.relay(&who, chat_id, user, &mid, text).await {
+                        tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
                         // Nothing is said back. A confirmation under every line the operator types
                         // turns a conversation into a receipt printer; the agent's own answer is
                         // the acknowledgement, and it is the one he is waiting for.
@@ -392,11 +392,15 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
                     }
                     // Dropped, visibly, where he typed it — never queued. A message held for a
                     // worker that may never come back is a message he believes was sent.
+                    // The topic and not "that project": a lane has its own topic, and the project
+                    // it belongs to can be connected and busy while this worktree is not.
                     escape_html(
-                        "That project is not connected right now, so nothing was sent. It will not \
-                         be delivered later.",
+                        "Nothing is connected in this topic right now, so nothing was sent. It \
+                         will not be delivered later.",
                     )
                 }
+                // Never a fall back to the project when a lane's topic is unknown: that would put
+                // what he typed at one worktree into the turn of an agent working on another.
                 None => escape_html(
                     "I do not know which project this topic belongs to, so I have not sent anything.",
                 ),
@@ -437,13 +441,31 @@ async fn projects_digest(ctx: &Ctx) -> String {
 
 /// The digest itself, over any surface — so it can be tested without a bot token, which is the only
 /// way a test of this can exist at all: the operator's phone is not a fixture.
-async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) -> String {
+///
+/// `pub(crate)` for one reason: what this list must SHOW is a property of how the hub addresses a
+/// conversation, and proving it needs claims taken by real bridges over a real socket. That harness
+/// lives beside the hub, and duplicating it here would be a second imagination of a bridge.
+pub(crate) async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) -> String {
     // Read who is connected FIRST, and be finished with that lock before the registry is taken.
     // The other order would hold the registry while waiting on the claims map — and every path that
     // sends a message takes the registry, so one contended lock would stall the whole fleet's
     // outgoing messages behind a status list somebody typed.
     let connected = hub.connected_ids().await;
-    let lines: Vec<String> = {
+    // Split ONCE, into a project's own voice and the worktrees of it that are live, so each row
+    // below costs a lookup rather than a walk. This list is read on a phone and lanes multiply its
+    // rows: twelve worktrees in a day, on top of fourteen projects.
+    let mut project_is_connected: BTreeSet<&hub_proto::ProjectId> = BTreeSet::new();
+    let mut lanes: std::collections::BTreeMap<&hub_proto::ProjectId, Vec<&hub_proto::LaneId>> =
+        Default::default();
+    for who in &connected {
+        match &who.lane {
+            None => {
+                project_is_connected.insert(&who.project);
+            }
+            Some(lane) => lanes.entry(&who.project).or_default().push(lane),
+        }
+    }
+    let mut lines: Vec<String> = {
         let mut registry = hub.registry.lock().await;
         // Fresh, because `herdr-tg enroll` runs at a terminal while the hub is running. Rendered
         // from the boot-time snapshot, a project enrolled since was absent from the only fleet view
@@ -464,21 +486,52 @@ async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) -> String {
                 // one that ran this morning and is idle now. At fourteen rows those two printed
                 // the same line, and "did it ever dial in at all" is the first question a second
                 // enrolment raises.
-                let where_it_is = if connected.contains(&p.id) {
+                // The project's OWN voice, and only that. A project whose worktrees are busy while
+                // it is idle is exactly that, and saying "connected" because something of its
+                // family is would hide which of them he can actually type at.
+                //
+                // A repo whose sessions are ALL dispatched into worktrees never binds a topic of
+                // its own, so it would say "has never connected" directly above a row saying a
+                // worktree of it is connected — a pair that contradicts itself, and the ordinary
+                // row for such a repo rather than an edge case.
+                let where_it_is = if project_is_connected.contains(&p.id) {
                     "connected"
+                } else if lanes.contains_key(&p.id) {
+                    "not connected itself — only its worktrees are"
                 } else if p.topic_id.is_some() {
                     "not connected"
                 } else {
                     "has never connected"
                 };
-                format!(
+                let mut row = format!(
                     "<b>{}</b> — {}",
                     escape_html(&p.title),
                     escape_html(where_it_is)
-                )
+                );
+                // Its live worktrees, indented under it, so he can tell a project from a worktree of
+                // one at a glance — a lane rendered as a peer reads as a repo he never enrolled.
+                //
+                // Only the LIVE ones. A lane's topic outlives the lane by design, and listing every
+                // worktree that ever ran would put a whole day's history in a status message.
+                //
+                // No ", connected" on the end: only live worktrees are ever listed, so the word
+                // carries nothing and costs width on the narrowest screen this is read on.
+                for lane in lanes.get(&p.id).into_iter().flatten() {
+                    row.push_str(&format!(
+                        "\n   ↳ {} — a worktree of it",
+                        escape_html(lane.as_str())
+                    ));
+                }
+                row
             })
             .collect()
     };
+    // Sorted by the name he gave each project, because the registry hands them over in project-id
+    // order — a hashed `p-…` string, neither alphabetical nor the order he enrolled them in. That
+    // was survivable at three rows; with a row per live worktree beneath each project he has no way
+    // to predict where anything sits. `<b>` is a constant prefix, so sorting the rendered rows
+    // sorts by title, and a project's worktrees ride inside its own row string.
+    lines.sort();
     if lines.is_empty() {
         return escape_html(
             "Nothing is enrolled yet. Enrol a project at the terminal with: herdr-tg enroll <repo>",
@@ -494,18 +547,24 @@ fn a_tap_that_reached_nobody(what: crate::hub::Withdrawal) -> &'static str {
     // 48-hour edit window — so "I have taken the buttons away", said unconditionally, was read by
     // someone looking straight at them. Every one of these says the half he cares about most first:
     // nothing was sent.
+    //
+    // The subject is the TOPIC, not the project — these are replied into the thread the tap came
+    // from, and that is a worktree's own topic as often as a project's. Its project can be
+    // connected and busy in the topic right beside it, which makes "that did not reach the
+    // project" a sentence he can read as plainly false about the thing he is looking at.
     match what {
         crate::hub::Withdrawal::Retired => {
-            "That did not reach the project, so nothing was sent. I have taken the buttons away — \
-             a menu that cannot answer is worse than none."
+            "That did not reach whatever is running here, so nothing was sent. I have taken the \
+             buttons away — a menu that cannot answer is worse than none."
         }
         crate::hub::Withdrawal::StillOnHisPhone => {
-            "That did not reach the project, so nothing was sent. I could not take the buttons off \
-             this one either, so they are still there — tap again and I will try it once more."
+            "That did not reach whatever is running here, so nothing was sent. I could not take \
+             the buttons off this one either, so they are still there — tap again and I will try \
+             it once more."
         }
         crate::hub::Withdrawal::NothingLeftToTakeBack => {
-            "That did not reach the project, so nothing was sent. The project has since finished \
-             with that question at its own end, so there is nothing left to answer."
+            "That did not reach whatever is running here, so nothing was sent. It has since \
+             finished with that question at its own end, so there is nothing left to answer."
         }
     }
 }
@@ -627,7 +686,9 @@ mod tests {
         let (busy, _) = registry.enrol(&busy).expect("enrols");
         // The idle one has run before, so it is bound to a topic and keeps it forever. That binding
         // is exactly the fact the list used to print as "connected".
-        registry.bind_topic(&idle.id, 1001).expect("binds");
+        registry
+            .bind_topic(&crate::hub::Addr::project_itself(idle.id.clone()), 1001)
+            .expect("binds");
 
         let hub = crate::hub::Hub::new(
             Arc::new(NoSurface),
@@ -640,9 +701,14 @@ mod tests {
 
         // Only the busy one has a bridge on the socket — and it has never been given a topic.
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        hub.claim(busy.id.clone(), std::process::id(), "i1".into(), tx)
-            .await
-            .expect("claims");
+        hub.claim(
+            crate::hub::Addr::project_itself(busy.id.clone()),
+            std::process::id(),
+            "i1".into(),
+            tx,
+        )
+        .await
+        .expect("claims");
 
         // Enrolled at a terminal while the hub is running, which is how a second project arrives.
         let late = dir.path().join("obsidian-link-map");
@@ -718,6 +784,26 @@ mod tests {
             assert!(
                 said.contains("nothing was sent"),
                 "the half he cares about most is missing: {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tap_that_reached_nobody_talks_about_the_topic_and_not_the_project() {
+        // These three are replied into the topic the tap came from, which is now a worktree's own
+        // as often as it is a project's. "That did not reach the project" is a sentence he can read
+        // as false with the project's topic connected and busy right beside the one he is looking
+        // at — the same argument that rewrote `TapRefusal::NotConnected` and the relay-drop reply.
+        use crate::hub::Withdrawal;
+        for what in [
+            Withdrawal::Retired,
+            Withdrawal::StillOnHisPhone,
+            Withdrawal::NothingLeftToTakeBack,
+        ] {
+            let said = a_tap_that_reached_nobody(what);
+            assert!(
+                !said.contains("the project"),
+                "a reply into a worktree's topic blames the project: {said}"
             );
         }
     }

@@ -66,18 +66,73 @@ const LAUNCHED_IN = process.env.CLAUDE_PROJECT_DIR ?? null
  */
 const PROJECT_TOP = ((): string | null => {
   if (!LAUNCHED_IN) return null
+  return gitDir(LAUNCHED_IN, '--show-toplevel')
+})()
+
+/** Ask git one question about a directory, or null when it will not answer. */
+function gitDir(from: string, flag: string): string | null {
   try {
-    const git = Bun.spawnSync(['git', '-C', LAUNCHED_IN, 'rev-parse', '--show-toplevel'], {
+    const git = Bun.spawnSync(['git', '-C', from, 'rev-parse', flag], {
       stdout: 'pipe',
       stderr: 'ignore',
+      // `--git-common-dir` answers RELATIVELY in the main worktree ('.git') and absolutely in a
+      // linked one, so it is resolved against the directory it was asked about and not against
+      // this process's cwd — which is the plugin folder, nowhere near either.
+      cwd: from,
     })
-    const top = new TextDecoder().decode(git.stdout).trim()
-    return git.exitCode === 0 && top.length ? resolve(top) : null
+    const out = new TextDecoder().decode(git.stdout).trim()
+    return git.exitCode === 0 && out.length ? resolve(from, out) : null
   } catch {
     // git missing, or a tree it will not talk about. The boundary is unknown, and an unknown
     // boundary means the search stays where it started rather than inventing one.
     return null
   }
+}
+
+/**
+ * The MAIN working tree of this repository, when it is not the one the session started in.
+ *
+ * kickoff runs its lanes in `git worktree` checkouts, and a lane worktree has NO
+ * `.kickoff/hub.token`: the secret is gitignored, so it is never checked out into one. The search
+ * below therefore stopped at the worktree, found nothing, and every lane failed closed with "this
+ * project is not enrolled" — which made a topic per lane unreachable from a real lane.
+ *
+ * `--git-common-dir` is the machine-derived fact that joins them. In a linked worktree it is an
+ * absolute path to the MAIN repo's `.git`; in the main worktree it is `.git` itself. Its parent is
+ * the main working tree either way. Crossing to it is not the directory-guessing the original
+ * defect was made of — it is one repository, named by git, and the alternative is enrolling the
+ * worktree, which would make one repo into two projects with two secrets and two topics.
+ */
+const MAIN_TOP = ((): string | null => {
+  if (!LAUNCHED_IN) return null
+  const common = gitDir(LAUNCHED_IN, '--git-common-dir')
+  return common ? dirname(common) : null
+})()
+
+/**
+ * Which worktree this session is in, when it is not the main one — the lane's own name.
+ *
+ * **git's own name for the worktree, not the folder it is checked out in.** In a linked worktree
+ * `--git-dir` is `<main>/.git/worktrees/<name>`, and git guarantees that `<name>` is unique across
+ * the repository: adding a second worktree whose folder is also called `wip` gives it `wip1`.
+ *
+ * The folder's basename is what this read first, and it is not unique. git dedupes only its own
+ * internal name, never the checkout path, so `~/a/wip` and `~/b/wip` are both legal — two different
+ * trees with two different agents, presenting one name and therefore resolving to ONE conversation
+ * at the hub. The second one's arrival then evicts the first's claim and sweeps its still-open
+ * questions off the operator's phone as "the session that asked this restarted". Neither tree
+ * restarted. `lane-<MMDD>-<HHMMSS>-<pid>` never collides, so this never bit the dispatcher — it bit
+ * the operator's own hand-made trees, which are the ones called `wip`, `review` and `hotfix`.
+ *
+ * It is an ADDRESS, not a credential. The token beside it still resolves to the project, and the
+ * hub builds the conversation's address from that resolved project plus this name — so naming a
+ * lane can never reach a project this session does not already hold the secret for.
+ */
+const LANE = ((): string | null => {
+  if (!PROJECT_TOP || !MAIN_TOP || PROJECT_TOP === MAIN_TOP) return null
+  const own = gitDir(PROJECT_TOP, '--git-dir')
+  const name = (own ?? PROJECT_TOP).split('/').pop()
+  return name && name.length ? name : null
 })()
 
 /** The project this session belongs to, or null when it is not in one that is enrolled. */
@@ -97,12 +152,22 @@ type Project = { repo: string; tokenFile: string; token: string }
  */
 function findProject(): Project | null {
   if (!LAUNCHED_IN) return null
-  let dir = resolve(LAUNCHED_IN)
+  const found = searchUpward(resolve(LAUNCHED_IN), PROJECT_TOP)
+  if (found) return found
+  // A lane worktree holds no secret of its own, because the secret is gitignored and never checked
+  // out into one. Its project is the MAIN working tree of the same repository — one repo, named by
+  // git — and this is the only boundary the search may cross.
+  if (MAIN_TOP && MAIN_TOP !== PROJECT_TOP) return searchUpward(MAIN_TOP, MAIN_TOP)
+  return null
+}
+
+function searchUpward(from: string, top: string | null): Project | null {
+  let dir = from
   for (;;) {
     const tokenFile = join(dir, '.kickoff', 'hub.token')
     const token = readSecret(tokenFile)
     if (token) return { repo: dir, tokenFile, token }
-    if (!PROJECT_TOP || dir === PROJECT_TOP) return null
+    if (!top || dir === top) return null
     const up = dirname(dir)
     if (up === dir) return null
     dir = up
@@ -621,6 +686,9 @@ function connect(): void {
           instance: INSTANCE,
           repo: here.repo,
           pid: process.pid,
+          // Omitted entirely when this is not a lane, so an ordinary session puts byte for byte on
+          // the wire what this bridge has always put there.
+          ...(LANE ? { lane: LANE } : {}),
         })
       },
       data(s, chunk) {
@@ -700,6 +768,25 @@ function handle(s: import('bun').Socket, line: string): void {
   }
   switch (frame.t) {
     case 'welcome': {
+      // A worktree that named a lane and was not given one is talking to a hub older than itself,
+      // and it must NOT go up.
+      //
+      // An unknown field inside a known kind is ignored on purpose, which is what lets a new bridge
+      // talk to an old hub at all — but here it means the old hub admitted this worktree AS THE
+      // PROJECT ITSELF. It takes the project's one claim, its words land in the project's own topic,
+      // and the project's own session is then refused. Nothing else in `welcome` can tell that apart
+      // from being given a place of one's own: `project` is a registry-owned title this side cannot
+      // predict. A channel plugin restarts only when its session does, so new-bridge/old-hub is the
+      // ordinary intermediate state of a rollout rather than an exotic one.
+      if (LANE && frame.lane !== LANE) {
+        down(
+          true,
+          `The hub on this machine is older than this bridge and cannot give a worktree a place of its own, so nothing from this worktree (${LANE}) can reach him without pretending to be the whole project. Restart herdr-tg and this session will connect.`,
+        )
+        note('the hub did not confirm this worktree; it is older than this bridge')
+        s.end()
+        break
+      }
       // The hub has taken us, so the queue drains HERE and not at `open`. The backoff resets here
       // too: it used to reset on every connect, which meant a hub that accepted and then refused
       // was dialled again a second later, forever, instead of being left alone.
@@ -720,9 +807,18 @@ function handle(s: import('bun').Socket, line: string): void {
         bad_token: `The secret at ${project?.tokenFile ?? '.kickoff/hub.token'} is not one the hub knows. Re-run:  ${enrolHint().replace('Run:  ', '')}`,
         not_enabled: 'This project is enrolled with the hub but switched off, so nothing is delivered for it.',
         version_skew: 'The hub speaks a different version of this protocol than the bridge. Run:  kickoff pull',
+        // Permanent, not temporary. The name is git's own name for this worktree and will be the
+        // same on every attempt, so treating it as retryable — which is what an unknown reason
+        // gets, deliberately — would spin for ever saying nothing useful.
+        bad_lane: `The hub will not address a conversation by this worktree's name (${LANE ?? 'unnamed'}). Nothing from this session reaches him until the worktree is remade under a plainer one.`,
       }
+      // The claim is per WORKTREE now, so a refusal reaching a lane means that worktree is held —
+      // the project's own topic and every other worktree may be perfectly free. Naming the project
+      // here would point him at up to thirteen candidate holders with nothing saying which.
       const forNow: Record<string, string> = {
-        already_claimed: 'Another session for this project is holding the link to his phone.',
+        already_claimed: LANE
+          ? `Another session in this worktree (${LANE}) is holding the link to his phone.`
+          : 'Another session for this project is holding the link to his phone.',
         frame_too_large: 'The last frame was over the size ceiling and was refused, not truncated.',
       }
       const reason = frame.reason as string
@@ -732,8 +828,12 @@ function handle(s: import('bun').Socket, line: string): void {
       // to keep waiting for that is how every message in the new session ends up queued forever.
       heldByAnother = reason === 'already_claimed' ? heldByAnother + 1 : 0
       const stuck = heldByAnother >= 3
+      // This one is an INSTRUCTION, so naming the wrong thing sends him to close a session that is
+      // not the holder — and the box has already had a stray bridge squat a claim once.
       const why = stuck
-        ? 'Another session for this project has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.'
+        ? LANE
+          ? `Another session in this worktree (${LANE}) has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.`
+          : 'Another session for this project has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.'
         : (forGood[reason] ?? forNow[reason])
       // An unknown reason is treated as temporary on purpose: a hub shipped after this build may
       // refuse for something recoverable, and telling the agent to give up on a guess is worse than
