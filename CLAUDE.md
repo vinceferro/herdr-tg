@@ -4,25 +4,33 @@
 
 # herdr-tg
 
-A Telegram front door for a herd of coding agents. It watches panes through the herdr daemon,
-pushes what an agent says — and what it is asking — to the operator's phone, and can send a reply
-back into the pane the operator meant.
+One Telegram bot, one forum, one topic per project. A project's agent connects to a Unix socket and
+says what it is doing and what it is asking; the operator reads it on his phone and taps an answer,
+which arrives back in the agent's own turn.
 
-**The write half is the dangerous half, and it is currently under review.** See "The state of the
-repo" below before touching anything in it.
+**This binary cannot type into a terminal.** Not "does not by default" — cannot. The path that read
+rendered panes and sent keystrokes was deleted, and the guard that used to permit one audited call
+site now forbids naming a write RPC anywhere.
 
 ## Layout
 
-Two crates in one Cargo workspace.
+Three crates in one Cargo workspace.
 
-- `crates/herdr-client` — the typed client for herdr protocol 20. NDJSON over a unix socket, one-shot
-  RPC plus one event stream. Fixture-pinned against a real herd.
-- `crates/herdr-tg` — the bridge itself. A `clap` binary: four read-only subcommands plus `serve`,
-  which is the Telegram bot. **It binds nothing** — no listening port, deliberately.
+- `crates/hub-proto` — the wire contract between the hub and an adapter. NDJSON over `AF_UNIX`, nine
+  frames up, six down. Knows nothing about herdr, kickoff, claude or panes, and must not learn.
+- `crates/herdr-tg` — the bot. A `clap` binary: `enroll`, `projects`, `serve`, plus four read-only
+  herdr subcommands (`status`, `read`, `doctor`, `watch`). **It binds nothing** — no listening port,
+  and the Unix socket is not one.
+- `crates/herdr-client` — the typed client for herdr protocol 20. Used ONLY by the read-only
+  subcommands now; the bot does not talk to herdr at all.
 
-Docs worth reading before you touch the code: `docs/SLICE-3-REVIEW.md` (the adversarial review that
-stopped the service), `docs/SLICE-3-FIXES.md` (what closing it cost and what is still open), and
-`docs/HUB-DESIGN.md` (a proposed redesign — a proposal, not a decision).
+`plugins/kickoff-channel/` is the Claude Code adapter: an MCP channel plugin that dials the socket.
+It holds no token, no allowlist and no model.
+
+Docs, in the order they are worth reading: `docs/INTERFACES.md` (the four seams and the closed list
+of what this project does), `docs/HUB-AND-KICKOFF.md` (how it wires to kickoff, and two questions
+still open), `docs/HUB-DESIGN.md` (the original redesign — historical, and it predates the
+deletion), `docs/SLICE-3-REVIEW.md` and `docs/SLICE-3-FIXES.md` (why the scraper died).
 
 ## Build and test — all three parts are required
 
@@ -34,42 +42,43 @@ env -u RUSTUP_TOOLCHAIN TMPDIR=<a real absolute dir> PATH="$HOME/.cargo/bin:$PAT
 overrides `rust-toolchain.toml`. `TMPDIR` because an agent session inherits it as the literal string
 `%h/.cache/tmp`, which fails seven `herdr-client` transport tests for a reason you did not cause.
 
-The same applies to `git commit`: the pre-commit hook runs five gates in your environment, so prefix
+The same applies to `git commit`: the pre-commit hook runs six gates in your environment, so prefix
 the commit too, or it is refused with seven red tests you did not break.
 
-The five gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps`, and
-`.kickoff/bin/scan-secrets --staged`.
+Two tests are `#[ignore]`d because they need bun. `scripts/install-channel-plugin.sh` runs them, and
+refuses to install a bridge that disagrees with the hub:
+
+```
+cargo test -p herdr-tg the_real_plugin -- --ignored
+```
 
 ## The domains, and who owns them
 
 | Domain | Owner | Lives in |
 | --- | --- | --- |
-| the herdr wire protocol | `wire-protocol` | `crates/herdr-client/` |
-| the audited keystroke path and its guard | `write-safety` | `deliver.rs`, `audit.rs`, `no_live_write_call_site.rs` |
+| the wire contract | `wire-protocol` | `crates/hub-proto/` |
+| the socket, identity, claims, the tap ledger | `write-safety` | `hub.rs`, `registry.rs`, `no_live_write_call_site.rs` |
 | what leaves this machine | `egress` | `summarize.rs`, the de-identification guard |
-| the operator's channel | `operator-channel` | `bot.rs`, `routing.rs`, `render.rs`, `voice.rs`, `notify.rs` |
+| the operator's channel | `operator-channel` | `bot.rs`, `surface.rs`, `queue.rs` |
 
-**Deliberately unowned: screen interpretation** (`permission.rs`, `mirror.rs`). Five adversarial
-rounds established that reading a rendered pane to decide what it means is ill-posed against herdr's
-protocol, which carries agent status and raw bytes but nothing structured about what an agent is
-asking. If the operator does reopen it, the standing lesson is
-`.kickoff/memory/build-a-two-sided-corpus-before-tuning-a-classifier.md`: build the corpus from both
-sides, and from real captures, before touching a rule — four rounds each traded a false negative for
-a false positive because one real screen was pitted against seventeen imagined ones.
-`docs/HUB-DESIGN.md` proposes deleting both files. Do not staff it; do not iterate on it
-without asking the operator.
+`herdr-client` is in maintenance: it serves four read-only commands and nothing else.
 
 ## The state of the repo
 
-- **The service is STOPPED and stays stopped** until the operator restarts it. Nothing here assumes
-  otherwise. Do not start it to test something.
-- `main` carries all seven original blockers closed and verified — 352 tests, up from 232.
-- `fix/r5-parser` is **unmerged on purpose**: it improves the parser and a sceptic still broke it.
-  Merging it is a decision that depends on whether the write path survives at all.
-- The tracker shim `.kickoff/bin/mc` is **dead** in this repo. The pinned core dropped
-  mission-control from the public line, and the shim's "engine not present" message misdiagnoses it.
-  Report status in chat; do not chase it as a broken install.
+- **The hub is the product.** Slice 1 is functionally complete: identity, presence, delivery,
+  resolution, retirement, alarm. `an_ask_becomes_a_tap_becomes_a_choice` passes, and so does
+  `the_real_plugin_and_the_real_hub_agree_on_the_wire` — the real bun bridge against the real hub
+  over a real socket, both directions, with only Telegram faked.
+- **The round trip with a live Telegram has never run.** That needs the operator to start a session
+  with `claude --channels plugin:kickoff-channel@herdr-tg-local`. Everything up to the Bot API is
+  proven; the last hop is not.
+- **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
+  `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
+  flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
+- **The watchdog is live** and shares no code or process with the hub. It arms the first time
+  something stamps `~/.local/state/herdr-tg/hub.heartbeat`.
+- `fix/r5-parser` is **dead**: it improved the screen parser, and there is no screen parser.
+- The tracker shim `.kickoff/bin/mc` is **dead** in this repo. Report status in chat.
 
 ## The quality bar
 
@@ -77,12 +86,14 @@ The conventions this repo actually holds to. Every specialist charter's CANON bl
 
 - **Comments explain WHY**, in plain words, usually naming the failure the code prevents. They do not
   narrate what the line does. Read three neighbouring files before writing one.
-- **Test names are full sentences** describing a property: `a_two_option_dialog_is_never_recognised`,
-  not `test_parse_2`.
-- **Operator-facing strings carry no jargon** — no pane ids, no enum names, no "parse", no "None".
+- **Test names are full sentences** describing a property:
+  `a_question_answered_once_can_never_be_answered_twice`, not `test_tap_2`.
+- **Operator-facing strings carry no jargon** — no project ids, no enum names, no "None", no "parse".
 - **Fail closed.** When the code cannot prove what it is about to do is right, it refuses and says so.
-  A refused reply is a small annoyance; a wrong keystroke in someone's terminal is not.
-- **RED before GREEN.** A regression test that never failed proves nothing. Check it out against the
-  parent commit and watch it fail for the right reason first.
-- **A fix nobody attacked is a draft.** Every one of five review rounds was green on all five gates
-  before a sceptic broke it. Gates are necessary, not sufficient.
+- **RED before GREEN.** A regression test that never failed proves nothing. Watch it fail for the
+  right reason first.
+- **A fix nobody attacked is a draft.** Three review rounds on the hub found 19, 7 and 9 distinct
+  defects; rounds two and three each found defects introduced by the previous round's fixes. Gates
+  are necessary, not sufficient.
+- **Write and read back after every edit.** A patch script that aborts halfway writes nothing, and
+  the commit message still claims it. That has happened here.
