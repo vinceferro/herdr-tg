@@ -152,8 +152,12 @@ try {
   console.log('\na question opencode asks becomes a question on the phone')
   await until('the stream', () => pushEvent !== null)
   pushEvent!({
+    id: 'evt_1',
     type: 'question.v2.asked',
-    data: {
+    // `properties`, not `data` — this is the shape captured from a real opencode /event stream on
+    // 2 September. The first draft of this test invented `data`, the bridge read `data`, and both
+    // agreed with each other and not with opencode.
+    properties: {
       id: 'que_1',
       sessionID: 'ses_1',
       questions: [
@@ -190,7 +194,10 @@ try {
     JSON.stringify(posted[0]?.body) === JSON.stringify({ answers: [['Delete it']] }),
     JSON.stringify(posted[0]?.body),
   )
-  check('and only then do the buttons come off', await until('the retirement', () => !!frame('ask_resolved')))
+  // The hub takes the buttons off when it resolves the tap, and its note says the phone. A second
+  // retirement from this side overwrites that with "answered at the terminal", which is false.
+  await new Promise(r => setTimeout(r, 400))
+  check('and the bridge does not retire it a second time', !frame('ask_resolved'), JSON.stringify(frame('ask_resolved')))
 
   console.log('\na tap on a question that is already answered answers nothing twice')
   const before = posted.length
@@ -200,8 +207,9 @@ try {
 
   console.log('\na permission request offers only the three answers opencode accepts')
   pushEvent!({
+    id: 'evt_2',
     type: 'permission.v2.asked',
-    data: { id: 'per_1', sessionID: 'ses_1', action: 'run a command', resources: ['rm -rf /'] },
+    properties: { id: 'per_1', sessionID: 'ses_1', action: 'run a command', resources: ['rm -rf /'] },
   })
   check('it arrives as an ask', await until('the permission ask', () => frames('ask').length > 1))
   const perm = frames('ask')[1]
@@ -221,12 +229,17 @@ try {
   tap(perm.ask_id, 'reject')
   check('a tap replies at the permission endpoint', await until('the permission reply', () => posted.length > before + 0 && posted.some(p => p.path.includes('permission'))))
   const pr = posted.find(p => p.path.includes('permission'))
+  check(
+    'at the endpoint the spec names, carrying the ids opencode published',
+    pr?.path === '/api/session/ses_1/permission/per_1/reply',
+    pr?.path,
+  )
   check('with the enum opencode accepts', JSON.stringify(pr?.body) === JSON.stringify({ reply: 'reject' }), JSON.stringify(pr?.body))
 
   console.log('\na question answered at the keyboard has its buttons taken off the phone')
   pushEvent!({
     type: 'question.v2.asked',
-    data: {
+    properties: {
       id: 'que_2',
       sessionID: 'ses_1',
       questions: [{ question: 'Ship it?', header: 'Ship', options: [{ label: 'Yes', description: 'go' }] }],
@@ -234,6 +247,7 @@ try {
   })
   await until('the second question', () => frames('ask').length > 2)
   const retiredBefore = frames('ask_resolved').length
+  // Deliberately the `data` shape: the durable stream uses it, and the bridge must read both.
   pushEvent!({ type: 'question.v2.replied', data: { sessionID: 'ses_1', requestID: 'que_2', answers: [['Yes']] } })
   check(
     'the keyboard is retired without anyone tapping it',

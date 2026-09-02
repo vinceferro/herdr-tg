@@ -366,9 +366,12 @@ async function answer(askId: string, optionId: string): Promise<void> {
       note(`opencode refused the answer to ${askId} (${r.status})`)
       return
     }
-    // The buttons come off only once opencode has taken the answer. Stripping them first would
-    // leave a question that looks settled on his phone and is still open in the session.
-    send({ t: 'ask_resolved', ask_id: askId, how: 'answered', outcome: label }, `retiring ${askId}`)
+    // No `ask_resolved` here. The hub already took the buttons off when it resolved the tap, and
+    // said so in his own words — "answered from your phone — Always". A second retirement from
+    // this side overwrote that note with "answered at the terminal", which is not where he
+    // answered it. A retirement is for a question that stopped being asked somewhere the hub
+    // cannot see; a tap is not that.
+    note(`opencode took the answer to ${askId}`)
   } catch (e) {
     note(`could not reach opencode to answer ${askId}: ${(e as Error)?.message ?? e}`)
   }
@@ -377,7 +380,12 @@ async function answer(askId: string, optionId: string): Promise<void> {
 /** One opencode event, mapped onto the hub's vocabulary. */
 export function onOpencodeEvent(ev: Record<string, any>): void {
   const type = String(ev?.type ?? '')
-  const data = ev?.data ?? {}
+  // opencode carries the same payload under two names. `/event` nests it in `properties`; the
+  // durable per-session stream nests it in `data`, and the OpenAPI schemas describe both. Reading
+  // only one of them is not a parse error — every field simply comes back undefined, and the first
+  // real permission request reached the operator's phone fine and then answered nothing at all,
+  // because the ask id it was recorded under was the string "pundefined".
+  const data = ev?.properties ?? ev?.data ?? {}
   switch (type) {
     case 'question.v2.asked':
     case 'question.asked': {
