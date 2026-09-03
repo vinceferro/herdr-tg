@@ -73,9 +73,18 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   turn, reached the operator's phone, and his tap came back as a message in that same turn. It needs
   a session started with `claude --channels plugin:kickoff-channel@herdr-tg-local`; a `claude -p` run
   cannot do it, because print mode ends the turn and the bridge dies before the tap arrives.
-- **Two projects are enrolled.** `herdr-tg` and a throwaway, `~/scratch/hub-dogfood`, which proved a
-  project other than this one can hold a topic of its own. `docs/MULTIPLEXER-READINESS.md` is the
-  audit of what still breaks between two projects and fourteen.
+- **Three projects are enrolled**, two of them throwaways: `herdr-tg`, `~/scratch/hub-dogfood`, and
+  `~/scratch/oc-dogfood`. `docs/MULTIPLEXER-READINESS.md` is the audit of what still breaks between
+  two projects and fourteen.
+- **A lane is its own addressable thing, and it is proven live.** On 3 September two git worktrees
+  of one throwaway ran at the same moment and each got its own forum topic beside the project's,
+  both delivering. Before that, the second was refused. The bridge takes the lane from git's own
+  worktree name, which git guarantees unique — never the folder basename, which is not.
+- **The opencode adapter is `adapters/opencode-bridge/`.** It maps `question.v2.asked` and
+  `permission.v2.asked` onto `ask`, and a tap back onto opencode's own reply endpoints. Proven
+  against a real opencode server and a real phone. It does not yet carry what an agent *chooses* to
+  say — opencode takes a local stdio MCP server, so the same `reply`/`ask`/`done` tools can be given
+  to it, and that is the next slice.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
