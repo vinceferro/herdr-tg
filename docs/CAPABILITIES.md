@@ -1,0 +1,114 @@
+<!-- SURFACE, v1, 3 September 2026. What another org may rely on, what it must bring, and what will
+     never be built here. Written to be mirrored: kickoff publishes the same three sections in its
+     own repo, and a change to either is a diff rather than a letter. A capability listed under
+     OFFERS is a promise; one under REFUSES will not be reconsidered by mail. -->
+
+# What this hub offers, requires, and refuses
+
+One Telegram bot, one forum, one topic per conversation. An agent says what it is doing and what it
+is asking; the operator reads it on his phone and answers; the answer arrives in that agent's own
+turn.
+
+This file exists because two orgs kept proposing each other's non-capabilities. Half of one day's
+mail was kickoff proposing things this project will not build, and this project correcting things
+kickoff had already decided. A menu ends both.
+
+## How a conversation gets its address — the hub allocates nothing
+
+This is the part most likely to be assumed wrongly, so it is first.
+
+**The hub does not name anything.** A connection presents a secret and, optionally, an opaque
+address string. The secret resolves to a project; the string is carried, never interpreted. The hub
+has no opinion about what it means — worktree, room, function, anything — and holds no rule about
+its shape beyond what a Telegram button and an audit line can carry.
+
+| who | does what |
+| --- | --- |
+| whoever dispatches | mints the address, and owns its uniqueness within the project |
+| the hub | guarantees ONE live connection per `(project, address)`, and one topic per address |
+| the hub, on collision | refuses the second arrival, names the reason, and changes nothing |
+
+So a room is addressed by whatever kickoff calls it. Two rooms colliding is kickoff's bug, and the
+hub's job is to say so rather than to prevent it.
+
+**Git is not part of this contract.** The Claude adapter derives an address from the git worktree
+name as a *default*, because a developer who opens a session by hand still needs one and git
+guarantees the name is unique. That derivation lives in the adapter (`plugins/kickoff-channel/`),
+never in the hub, and a dispatcher that supplies its own address overrides it entirely.
+
+## OFFERS — what you may rely on
+
+| # | offer | how you get it |
+| --- | --- | --- |
+| 1 | **A conversation of its own.** A forum topic per address, created on first LIVE connection and greeted so it appears in the list. | Connect with a secret and an address. |
+| 2 | **Exclusivity.** One live connection per address. A second is refused with a reason it can branch on; a dead one is evicted, a live one is never displaced. | `refused{reason}` on the wire. |
+| 3 | **Delivery you can trust.** Every frame acked exactly once, with three values — `yes`, `no`, `unseen`. `unseen` means it went out and could not be confirmed, and it is never retried. | `ack{ref, delivered, why}`. |
+| 4 | **A question with buttons.** Options you mint; a tap resolves against a written record, and a question answered once can never be answered twice. | `ask` up, `choice` down. |
+| 5 | **Retirement.** Buttons come off a question that has stopped being open, whoever closed it — which no screen-reading design can do. | `ask_resolved{how}`. |
+| 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. | `message{text, from}` down. |
+| 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
+| 8 | **Read-only inventory.** *Proposed, not built* — `herdr-tg projects --json` emitting `{project_id, title, repo, topic_id, connected, lanes:{name:topic_id}}`, honest about `null` before a bridge has ever connected. Say the word and it is a small slice. | Ask for it. |
+
+## REQUIRES — what you must bring
+
+1. **Enrolment, at a terminal, per repo.** Admission is the one thing no message can do. `herdr-tg
+   enroll <repo>` writes a 0600 secret to `<repo>/.kickoff/hub.token`. It refuses outright if git
+   would commit that file, because a secret in a public history cannot be untracked.
+2. **An address that is unique within its project.** See above. We will not de-duplicate for you.
+3. **A bridge that speaks hub-proto** — NDJSON over `AF_UNIX`, nine frames up, six down — and that
+   answers a ping. A topic is minted only after `hello`, a settling window and one answered ping,
+   because a process that boots and exits in a tenth of a second would otherwise leave an empty
+   topic bound forever.
+4. **One connection per address.** If two producers must speak for one conversation, join them on
+   your side. `adapters/fanin/` is our implementation and the local socket speaks hub-proto
+   unchanged, so a producer needs no second wire contract.
+
+## REFUSES — settled, and not reconsidered by mail
+
+Each is a line, not an omission. Several were paid for.
+
+1. **Naming another project's conversation.** The secret proves only the project. An address can
+   only ever reach the repo whose secret the bridge already holds.
+2. **Writing into an org repo.** The hub writes to its own state directory and nowhere else. Hub
+   state in a git working tree is state an adopter's coordinator commits and pushes.
+3. **Treating inbound content as instruction.** What arrives from Telegram SELECTS from what the
+   machine already knows; it never NAMES something new. No message can enrol a project, edit an
+   allowlist, or touch a credential.
+4. **Typing into a terminal.** The path that read panes and sent keystrokes was deleted, not
+   gated, and a guard now forbids naming a write RPC anywhere in the tree.
+5. **Choosing a model, an engine, or a repository.** Those belong to whoever dispatches.
+6. **Knowing what a lane, a room, a proof or a re-ground is.** All of them reach the phone through
+   the conversation primitives. The moment the hub learns one of those words it stops being a
+   multiplexer and becomes a second implementation of someone else's discipline.
+
+## OPEN — joint design, neither side should harden yet
+
+1. **Who starts a container.** The hub has no `Command` in the binary today, and seam ④ of
+   `docs/INTERFACES.md` proposes a launcher that is simply another adapter: it holds a hub
+   connection, offers what it can start as an `ask`, and acts on the `choice` itself. Whether the
+   actor should instead be the hub binary is the operator's call and is being brainstormed across
+   both orgs. Listed here rather than under REFUSES because it is genuinely open.
+2. **What a room needs that a lane does not.** Three answers decide whether one address space is
+   enough: does a room outlive the session that made it; can two rooms of one org be live at once;
+   must a room's topic survive with nothing connected to it.
+3. **The room-map handshake.** Our counter-proposal: the repo file is entirely yours (room name,
+   memory scope, charter, engine); topic ids stay in our registry and are exposed read-only; the
+   join key is the repo path, which both sides already know. This avoids the hub writing into a repo
+   and avoids the fact that a topic id does not exist at enrol time.
+
+## Two measurements that bind both of us
+
+From `docs/RATE-PROBE.md`, taken against the real Bot API on 3 September:
+
+* **The 20/min group ceiling is per CHAT, and topics buy nothing.** Forty sends across four topics:
+  twenty accepted, the twenty-first refused with `retry_after: 41`. More rooms and more lanes share
+  one budget. A new conversation also costs two of it before its agent speaks — the topic, then the
+  greeting — so the practical figure is about six new conversations a minute across the whole forum.
+* **`editMessageText` is free.** Thirty edits after five sends, none refused, and a send still went
+  through. A surface that updates one message costs one token; one that posts each update costs one
+  per update.
+
+## Changing this file
+
+Bump the version in the header comment and say what moved. An offer may be added at any time. An
+offer may not be removed without telling the other org first, because they will have built on it.
