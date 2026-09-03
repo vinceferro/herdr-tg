@@ -22,9 +22,17 @@ subsequent attempt in that minute was refused too — in whichever topic it was 
 are threads inside one chat, and the budget belongs to the chat.
 
 **It is a window, not a rate.** Twenty were accepted in the first 19 seconds with no pacing at all,
-and `retry_after` then counted down the remainder of the minute (41, 40, 39 …). A token bucket
-refilling at 18/60 per second is the *conservative* shape for that, not the exact one: it will never
-exceed the ceiling, and it will also refuse a burst the API would have taken.
+and `retry_after` then counted down the remainder of the minute (41, 40, 39 …).
+
+> This paragraph used to call a token bucket "the conservative shape for that … it will never exceed
+> the ceiling". That was wrong, and it is the sentence that stopped anyone looking. A bucket of
+> capacity `C` refilling at `r` allows `C + 60r` in any sixty seconds, which at the shipped constants
+> was `18 + 18 = 36` — measured on the code itself at **34**, against a ceiling of twenty. A bucket
+> bounds the sustained rate; Telegram enforces a window. `queue.rs` counts the sends inside the
+> trailing minute now, which is what was measured rather than a model of it.
+
+Note also what `retry_after` *is*: the moment the oldest send in Telegram's own window ages out of
+it. So a chat coming back from a flood wait has room for one send, not for a whole fresh burst.
 
 The Bot FAQ agrees, and phrases both limits as properties of a bot rather than of a chat:
 

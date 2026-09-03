@@ -43,13 +43,37 @@ struct FakeTelegram {
     create_fails: AsyncMutex<bool>,
     /// Every topic creation that was asked for, whether or not it succeeded.
     create_attempts: AsyncMutex<Vec<String>>,
+    /// Set to make the next send come back the way Telegram answers a bot that has flooded the
+    /// chat: refused, with a number of seconds attached. `surface.rs` is what turns the real API's
+    /// two 429 shapes into this one, and its own tests pin that; from here down the hub sees only
+    /// the outcome, which is the whole point of the seam.
+    flood_wait_once: AsyncMutex<Option<Duration>>,
+    /// Everything said in the forum itself rather than in a topic.
+    general: AsyncMutex<Vec<String>>,
+    /// Every in-place rewrite, in order: which message, and what it now says.
+    rewrites: AsyncMutex<Vec<(MsgId, String)>>,
+    /// Set to make the next topic creation come back the way Telegram answers a bot that has
+    /// flooded the chat: refused, with a number of seconds attached.
+    create_floods_once: AsyncMutex<Option<Duration>>,
 }
 
 impl Surface for FakeTelegram {
-    async fn create_topic(&self, title: &str, icon_color: u8) -> anyhow::Result<i32> {
+    async fn create_topic(&self, title: &str, icon_color: u8) -> Result<i32, Refused> {
         self.create_attempts.lock().await.push(title.to_owned());
+        if let Some(wait) = self.create_floods_once.lock().await.take() {
+            return Err(Refused {
+                why: format!("Too Many Requests: retry after {}", wait.as_secs()),
+                flood_wait: Some(wait),
+            });
+        }
         if *self.create_fails.lock().await {
-            anyhow::bail!("Too Many Requests: retry after 30");
+            // A refusal with no flood wait on it, which is what a 5xx or a malformed title is. The
+            // 429 shape is `surface.rs`'s to recognise and its own tests pin it; what this flag is
+            // for is the memo-and-backoff behaviour, which is the same either way.
+            return Err(Refused {
+                why: "Telegram would not make a topic".to_owned(),
+                flood_wait: None,
+            });
         }
         let mut t = self.topics.lock().await;
         t.push((title.to_owned(), icon_color));
@@ -64,12 +88,32 @@ impl Surface for FakeTelegram {
                 return SendOutcome::TopicGone;
             }
         }
+        {
+            let mut flood = self.flood_wait_once.lock().await;
+            if let Some(wait) = flood.take() {
+                return SendOutcome::TooFast(wait);
+            }
+        }
         self.sends
             .lock()
             .await
             .push((topic_id, text.to_owned(), buttons.to_vec()));
         let n = self.next_msg.fetch_add(1, Ordering::Relaxed) + 1;
         SendOutcome::Sent(MsgId::new(format!("m{n}")))
+    }
+
+    async fn say_in_general(&self, text: &str) -> SendOutcome {
+        self.general.lock().await.push(text.to_owned());
+        let n = self.next_msg.fetch_add(1, Ordering::Relaxed) + 1;
+        SendOutcome::Sent(MsgId::new(format!("m{n}")))
+    }
+
+    async fn rewrite(&self, msg_id: &MsgId, text: &str) -> anyhow::Result<()> {
+        self.rewrites
+            .lock()
+            .await
+            .push((msg_id.clone(), text.to_owned()));
+        Ok(())
     }
 
     async fn retire_buttons(
@@ -2017,7 +2061,11 @@ async fn what_the_operator_types_reaches_the_agent_as_a_message_in_its_own_turn(
     until(async || !h.fake.sends.lock().await.is_empty()).await;
 
     // The topic is bound, so the hub can tell which project a message typed there belongs to.
-    let topic = h.hub.topic_for(&h.own()).await.expect("a topic");
+    let topic = h
+        .hub
+        .topic_for(&h.own(), std::time::Instant::now() + PROSE_SHELF_LIFE)
+        .await
+        .expect("a topic");
     assert_eq!(
         h.hub.addr_for_topic(topic).await,
         Some(h.own()),
@@ -2293,11 +2341,17 @@ async fn pacing_waits_but_a_real_flood_is_shed() {
     }
     drop(sends);
 
-    // The other half — a real ceiling still sheds — with a budget of one a minute rather than the
-    // real eighteen. At the real rate the bucket refills faster than a paced sender drains it, so
-    // draining it honestly takes about ninety seconds of wall clock to prove something `queue.rs`
-    // already pins at its real values. What is worth proving HERE is that `send_into` reaches the
-    // shed at all rather than pacing forever, and that the refusal says when to come back.
+    // The other half — a real ceiling still gives up on something — with a budget of a couple a
+    // minute rather than the real eighteen. At the real rate the bucket refills faster than a paced
+    // sender drains it, so draining it honestly takes about ninety seconds of wall clock to prove
+    // something `queue.rs` already pins at its real values. What is worth proving HERE is that
+    // `send_into` reaches the give-up at all rather than pacing forever, and that the refusal says
+    // when to come back.
+    //
+    // Asked with BUTTONS, and that is the half of this test that changed: prose is now held through
+    // a ceiling rather than thrown away at one, so a `say` here would wait the ceiling out and
+    // arrive — correctly, and after half a minute of test. A question is the frame with a shelf
+    // life short enough to be given up on, which is the behaviour this half is about.
     let tight = Arc::new(
         Hub::new(
             Arc::clone(&h.fake),
@@ -2307,12 +2361,13 @@ async fn pacing_waits_but_a_real_flood_is_shed() {
             vec![ALLOWED_CHAT],
             ALLOWED_CHAT,
         )
-        .with_budget(1, Duration::from_millis(5)),
+        .with_budget(2, Duration::from_millis(5)),
     );
-    let _ = tight.say(&h.own(), "the one allowed", &[]).await;
     let mut shed = None;
-    for _ in 0..4 {
-        if let SendOutcome::TooFast(wait) = tight.say(&h.own(), "over the ceiling", &[]).await {
+    for _ in 0..5 {
+        if let SendOutcome::TooFast(wait) =
+            tight.say(&h.own(), "over the ceiling", &a_question()).await
+        {
             shed = Some(wait);
             break;
         }
@@ -3353,16 +3408,19 @@ async fn no_topic_is_made_in_a_minute_whose_budget_is_already_spent() {
     // topic was created and bound anyway, then greeted with a token that was not there, leaving a
     // permanent registry row for a topic Telegram does not show in the list at all.
     let h = harness().await;
-    // Exactly enough for one conversation to open: a topic and the greeting that makes it visible.
-    {
-        let mut b = h.hub.budgets.lock().await;
-        *b = crate::queue::Budgets::new(2, Duration::from_millis(5));
-    }
-
     let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
     own.become_live().await;
     until(async || h.fake.sends.lock().await.len() == 1).await;
     let spent = h.fake.create_attempts.lock().await.len();
+
+    // One conversation is open; now the chat has nothing left. Swapped in AFTER the first bridge
+    // rather than sized to allow exactly one, because the size that allows exactly one moves with
+    // the token held back from the agents — and a test that has to be re-derived from the reserve
+    // every time it changes is a test about the reserve rather than about topics.
+    {
+        let mut b = h.hub.budgets.lock().await;
+        *b = crate::queue::Budgets::new(1, Duration::from_millis(5));
+    }
 
     let mut lane =
         FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
@@ -3397,10 +3455,15 @@ async fn no_topic_is_made_in_a_minute_whose_budget_is_already_spent() {
     // itself and a Telegram refusal does not, and the bridge renders the two as different sentences
     // — so acking a budget shed as a refusal is a small untruth in the one place this system exists
     // to keep honest.
+    //
+    // A QUESTION, and that is the half of this test the shelf life changed: prose is held through a
+    // ceiling now rather than thrown away at one, so a `say` here would wait the chat out and be
+    // delivered — correctly, and a minute later. A question is what is given up on.
     let sent = lane
-        .send(BridgeFrame::Say {
+        .send(BridgeFrame::Ask {
+            ask_id: hub_proto::AskId::new("a1"),
             text: "anything".into(),
-            hint: None,
+            options: None,
         })
         .await;
     let why = lane
@@ -3710,5 +3773,872 @@ async fn a_ledger_written_before_worktrees_existed_still_answers_every_keyboard_
             .open_where_the_asker_is_gone(&ProjectId::new("p-old"), &live)
             .is_empty(),
         "a record whose pid nobody wrote down was swept as if the agent were provably gone"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The queue, the shelf life, the flood wait, and the one line that says the chat is full.
+
+/// A hub sharing this harness's registry and Telegram, with a ledger and an audit of its own.
+///
+/// Every pacing test below wants a fresh budget — a bucket one test drained is a bucket the next
+/// one starts empty — and they must not fight over one ledger file either.
+fn its_own_hub(h: &Harness, name: &str) -> Hub<FakeTelegram> {
+    Hub::new(
+        Arc::clone(&h.fake),
+        Registry::load(h.dir.path().join("projects.json")),
+        AskLedger::load(h.dir.path().join(format!("{name}.asks.json"))),
+        HubAudit::new(h.dir.path().join(format!("{name}.audit.log"))),
+        vec![ALLOWED_CHAT],
+        ALLOWED_CHAT,
+    )
+}
+
+/// One button, for probing.
+fn a_question() -> Vec<AskOption> {
+    vec![AskOption {
+        option_id: OptionId::new("y"),
+        label: "Yes".to_owned(),
+    }]
+}
+
+/// Spend the chat down to where the next message cannot go out, and say how many got through.
+///
+/// It probes with QUESTIONS rather than prose, and that is the whole reason it terminates: a
+/// question is given up on the moment the wait is longer than one is worth, so finding the ceiling
+/// does not mean waiting the ceiling out. The count is not asserted on anywhere, because it moves
+/// with the size of the reserve — what every caller wants is the state afterwards.
+async fn spend_the_chat_down(hub: &Hub<FakeTelegram>, who: &Addr) -> usize {
+    for spent in 0..20 {
+        match hub.say(who, "spending what is there", &a_question()).await {
+            SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {}
+            SendOutcome::TooFast(_) => return spent,
+            other => panic!("spending the chat down ran into {other:?}"),
+        }
+    }
+    panic!("twenty messages went out under a budget that cannot afford twenty");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_message_behind_a_full_minute_waits_its_turn_instead_of_being_thrown_away() {
+    // The eleventh connection. The permit hands out turns in order and each turn costs the
+    // one-second rhythm, so ten waiters ahead of you is ten seconds — and the deadline that bounded
+    // the whole wait was ten seconds flat. Below eleven live connections it could never fire; at
+    // eleven it started, and since a worktree became a connection of its own that is an ordinary
+    // dispatch morning for ONE repo. The message was not late, it was gone, and the only thing
+    // wrong with it was its position in the queue.
+    //
+    // At the real rhythm on purpose: what is under test is the real deadline against the real gap,
+    // so this test costs about the wall clock it describes and there is no honest way to make it
+    // cheaper. Every other pacing test below uses a short gap.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "queue"));
+    // Bound first, so the topic and its greeting are not part of what is being queued.
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    // Twelve, which is two past where the old deadline began to bite and well under the per-minute
+    // ceiling — so anything shed here was shed for its position and for nothing else.
+    const SENDERS: usize = 12;
+    let mut tasks = Vec::new();
+    for n in 0..SENDERS {
+        let hub = Arc::clone(&hub);
+        let who = h.own();
+        tasks.push(tokio::spawn(async move {
+            hub.say(&who, &format!("line {n}"), &[]).await
+        }));
+    }
+
+    let mut thrown_away = Vec::new();
+    for t in tasks {
+        match t.await.expect("a sender") {
+            SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {}
+            other => thrown_away.push(other),
+        }
+    }
+    assert!(
+        thrown_away.is_empty(),
+        "{} of {SENDERS} messages were thrown away for being late in the queue, with the \
+         per-minute ceiling nowhere near: {thrown_away:?}",
+        thrown_away.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_question_that_waited_too_long_is_never_asked_and_its_agent_is_told_so() {
+    // A queue that only ever holds is its own lie. A line of prose arriving late is still worth
+    // reading; a QUESTION arriving a minute late is a keyboard for a decision that has moved on,
+    // and the wire already refuses to retry an unseen ask for exactly that reason — two live menus
+    // for one question is worse than none.
+    //
+    // So the shelf life is per kind, and this is the contrast: with the chat shut for longer than a
+    // question is worth waiting for, the question is given up on AT ONCE and its agent told, while
+    // the prose beside it stays in the queue.
+    let h = harness().await;
+    // Two a minute: one token in hand and the next one half a minute away, which is far past what a
+    // question is worth holding and far short of what prose is.
+    let hub = Arc::new(its_own_hub(&h, "shelf").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    spend_the_chat_down(&hub, &h.own()).await;
+    let already_sent = h.fake.sends.lock().await.len();
+
+    // The QUESTION first, and the prose behind it — which is the order this test needs rather than
+    // the order it started with. Prose sits a ceiling out while HOLDING the send permit, so with it
+    // spawned first the two raced for that permit: whichever won decided whether the question gave
+    // up in a millisecond or waited its whole shelf life behind a sleeping sender. Both are correct
+    // behaviour and only one of them passed, so the test was a coin toss. Asked first, what is
+    // measured is what the assertion says: how long a question is worth waiting for when the chat
+    // will not take it.
+    let asked_at = std::time::Instant::now();
+    let outcome = hub.say(&h.own(), "Overwrite it?", &a_question()).await;
+    assert!(
+        matches!(outcome, SendOutcome::TooFast(_)),
+        "a question that could not be asked for a whole window was held anyway: {outcome:?}"
+    );
+    // Five seconds against a shelf life of twenty. The margin is there because giving up on a
+    // question also tells the operator, and that write waits out the rhythm between two edits — a
+    // second at most, on one frame at a time.
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(5),
+        "the question sat in the queue for {:?} before anyone gave up on it",
+        asked_at.elapsed()
+    );
+
+    let waiting = {
+        let hub = Arc::clone(&hub);
+        let who = h.own();
+        tokio::spawn(async move { hub.say(&who, "prose behind the ceiling", &[]).await })
+    };
+    assert_eq!(
+        hub.ack_for(&outcome),
+        (Delivered::No, Some(hub_proto::AckWhy::TooFast)),
+        "the agent was not told, in words it can act on, that its question was never asked"
+    );
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        already_sent,
+        "a keyboard reached his phone for a question the agent had already been told was never asked"
+    );
+
+    // And the other half: the prose is still in the queue rather than having been thrown away with
+    // it. Nothing here waits for it to land — that would be waiting out the ceiling — only that
+    // being late has not by itself killed it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !waiting.is_finished(),
+        "prose was thrown away on the same deadline as a question, which is the whole distinction"
+    );
+    waiting.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_wait_from_telegram_drains_the_budget_instead_of_being_sent_into() {
+    // Telegram refusing for flooding is the one authority on this chat that outranks our own
+    // accounting. It used to be classified as a permanent refusal, its seconds destroyed except as
+    // characters in an audit line nothing reads, and the very next message walked into the same
+    // wall — for as long as the herd kept talking.
+    let h = harness().await;
+    let hub = Arc::new(
+        its_own_hub(&h, "flood").with_budget(crate::queue::PER_MINUTE, Duration::from_millis(5)),
+    );
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    // Probed with questions on both sides of the wall, because a question is the frame that is
+    // given up on rather than held — prose is meant to sit out a flood wait and go out on the far
+    // side of it, which is a minute of wall clock and a different property.
+    *h.fake.flood_wait_once.lock().await = Some(Duration::from_secs(41));
+    let refused = hub
+        .say(&h.own(), "the one that hit the wall", &a_question())
+        .await;
+    assert!(
+        matches!(refused, SendOutcome::TooFast(_)),
+        "a flood wait was reported as something other than being too fast: {refused:?}"
+    );
+
+    // The wall is now known, so nothing may be thrown at it. The budget's own tokens are nowhere
+    // near spent — sixteen of eighteen are still there — so anything that stops the next send is
+    // Telegram's word rather than ours, which is exactly the thing that did not exist.
+    let before = h.fake.sends.lock().await.len();
+    let after_the_wall = hub
+        .say(&h.own(), "straight back into it", &a_question())
+        .await;
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        before,
+        "the hub sent into a chat Telegram had just shut, which is how one flood wait becomes the \
+         next"
+    );
+    match after_the_wall {
+        SendOutcome::TooFast(wait) => assert!(
+            wait > Duration::from_secs(30),
+            "the chat is shut for the rest of the minute and the caller was told to come back in \
+             {wait:?}"
+        ),
+        other => panic!("a send into a chat Telegram had shut came back as {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_operator_learns_the_herd_is_over_the_ceiling_without_spending_a_send_to_say_it() {
+    // `HUB-DESIGN.md` promises "one throttled line… never a silent loss". The half that tells the
+    // AGENT was built; the half that tells him never was, so the one person who can do anything
+    // about a herd over the ceiling was the only one not told.
+    //
+    // The recursion is the reason it was hard: a line saying the chat is full is itself a message,
+    // and it wants a token from a budget that is by construction empty at that exact moment. One
+    // line per shed would spend eleven of eighteen tokens apologising. What pays for itself is one
+    // SEND when the window opens and free EDITS after it — measured 3 September: thirty edits, none
+    // refused, and a send still went through afterwards.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "throttle").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    spend_the_chat_down(&hub, &h.own()).await;
+    // Questions past the ceiling. Each is given up on at once, because a whole window is past what
+    // a question is worth holding — so these are losses inside one cooling-off window.
+    //
+    // No sleep between them, and that is deliberate. This test used to wait out the gap between two
+    // updates of the count before its last loss, "so the last update lands on the final number" —
+    // which was the test agreeing with a defect rather than pinning a property: without the pause
+    // the count stuck at whatever it was a fraction of a second in. The rhythm defers a write now
+    // instead of dropping it, so the number arrives on its own.
+    for n in 0..5 {
+        let outcome = hub
+            .say(&h.own(), &format!("question {n}"), &a_question())
+            .await;
+        assert!(matches!(outcome, SendOutcome::TooFast(_)), "{outcome:?}");
+    }
+
+    // Six, not five: the probe that found the ceiling was itself a message that never went out.
+    let lost = 6;
+
+    let general = h.fake.general.lock().await.clone();
+    assert_eq!(
+        general.len(),
+        1,
+        "{lost} losses in one window cost {} messages to report; one window is one line: \
+         {general:?}",
+        general.len()
+    );
+    let line = &general[0];
+    for jargon in [
+        "too_fast", "TooFast", "None", "shed", "budget", "429", "-100",
+    ] {
+        assert!(
+            !line.contains(jargon),
+            "the operator is being shown {jargon:?}: {line:?}"
+        );
+    }
+
+    // Everything after the first is an edit of that same message, which costs nothing.
+    until(async || {
+        h.fake
+            .rewrites
+            .lock()
+            .await
+            .last()
+            .is_some_and(|(_, text)| text.contains(&lost.to_string()))
+    })
+    .await;
+    let rewrites = h.fake.rewrites.lock().await.clone();
+    let first = &rewrites[0].0;
+    assert!(
+        rewrites.iter().all(|(id, _)| id == first),
+        "the running count was spread over more than one message instead of being kept in one: \
+         {rewrites:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retirement_still_goes_out_when_every_send_token_is_spent() {
+    // The audit graded the retirement edit as the write that scales — fourteen agents timing out a
+    // backlog of asks, none of them metered — and proposed routing it through the budget. The
+    // measurement says otherwise: an edit is not charged against the per-minute ceiling at all, so
+    // metering it would buy nothing and cost the one thing that must never fail. A keyboard that
+    // cannot be taken off is a menu answering a question nobody is waiting for any more, and it
+    // stays on his phone until someone finds a terminal.
+    //
+    // So this pins the re-grade rather than a fix: with the chat shut and every token gone, taking
+    // a keyboard off still works.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "retire").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    let asked = hub.say(&h.own(), "Overwrite it?", &a_question()).await;
+    let SendOutcome::Sent(msg_id) = asked else {
+        panic!("the question never went out: {asked:?}");
+    };
+    hub.ledger
+        .lock()
+        .await
+        .record(
+            ALLOWED_CHAT,
+            &msg_id,
+            AskRecord {
+                project: h.project.clone(),
+                lane: None,
+                ask_id: hub_proto::AskId::new("a1"),
+                topic_id: 1001,
+                options: a_question(),
+                text: "Overwrite it?".to_owned(),
+                instance: "i1".to_owned(),
+                pid: None,
+                at: now_secs(),
+                answered: None,
+            },
+        )
+        .expect("records");
+
+    // Spend the chat down to where nothing else can go out.
+    spend_the_chat_down(&hub, &h.own()).await;
+    assert!(
+        matches!(
+            hub.say(&h.own(), "nothing left", &a_question()).await,
+            SendOutcome::TooFast(_)
+        ),
+        "this test needs a chat that has nothing left to spend"
+    );
+
+    let before = h.fake.retired.lock().await.len();
+    hub.answered_from_phone(ALLOWED_CHAT, &msg_id, "Yes").await;
+    let retired = h.fake.retired.lock().await;
+    assert_eq!(
+        retired.len(),
+        before + 1,
+        "a keyboard could not be taken off because the chat was out of sends, so a menu he has \
+         already answered is still live on his phone"
+    );
+    assert!(
+        retired.last().expect("a retirement").2.contains("Yes"),
+        "{:?}",
+        retired.last()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn messages_leave_in_the_order_they_joined_the_queue_so_no_backlog_can_starve_a_latecomer() {
+    // The fairness the queue has to have, and the only ordering claim this code makes: the permit
+    // is a `tokio::sync::Mutex`, which is documented as strictly FIFO, so a turn belongs to whoever
+    // asked for it first. Nothing here sorts, prioritises or rations by project — it does not have
+    // to, because arrival order is already the property that stops one project's backlog from
+    // pushing another project's single line behind it.
+    //
+    // Holding frames for longer is what makes this worth pinning: a ten-second cap kept the queue
+    // shallow enough that unfairness never showed. Now it can be deep, and a queue that starves is
+    // the defect it was built to fix.
+    let h = harness().await;
+    let hub = Arc::new(
+        its_own_hub(&h, "fair").with_budget(crate::queue::PER_MINUTE, Duration::from_millis(120)),
+    );
+    {
+        // Both bound up front: a conversation with no topic yet pays two extra turns for making
+        // and greeting one, and this test is about the order of turns.
+        let mut registry = hub.registry.lock().await;
+        registry.bind_topic(&h.own(), 1001).expect("bind");
+        registry
+            .bind_topic(&h.lane("a-worktree"), 1002)
+            .expect("bind the worktree");
+    }
+
+    // One busy project and one that says a single thing in the middle of it. They join in a known
+    // order, so what comes out can be checked against it rather than against a guess.
+    let joined = [
+        "busy 1", "busy 2", "quiet 1", "busy 3", "busy 4", "quiet 2", "busy 5",
+    ];
+    let mut tasks = Vec::new();
+    for what in joined {
+        let hub = Arc::clone(&hub);
+        let who = if what.starts_with("quiet") {
+            h.lane("a-worktree")
+        } else {
+            h.own()
+        };
+        tasks.push(tokio::spawn(async move { hub.say(&who, what, &[]).await }));
+        // Long enough that each has reached the queue before the next asks for a turn, and short
+        // enough that they are all waiting on the same permit.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for t in tasks {
+        t.await.expect("a sender");
+    }
+
+    let sends = h.fake.sends.lock().await;
+    let order: Vec<&str> = sends
+        .iter()
+        .map(|(_, text, _)| text.as_str())
+        .filter(|t| joined.contains(t))
+        .collect();
+    assert_eq!(
+        order, joined,
+        "the queue did not hand out turns in the order they were asked for, so a backlog can push \
+         a latecomer behind it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_throttle_line_the_chat_was_too_full_to_carry_goes_out_when_it_reopens() {
+    // The honest hole in telling him anything, and what closes it. The moment he most needs the
+    // line is the moment the chat will least carry it: the reserve buys nothing while Telegram has
+    // the chat shut, because then nothing at all goes out. So the line is OWED rather than lost,
+    // and the next thing that proves the chat is taking messages again is what sends it.
+    //
+    // The subtler half is the one-second rhythm. The likeliest moment to discover a line is owed is
+    // immediately after a send — a message got through, which is how the hub notices — and at that
+    // instant the gap refuses everybody by construction. Read as a refusal rather than waited out,
+    // the line stays owed for as long as the chat is busy, which is precisely when it is needed.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "owed").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    // Spend the chat past its own floor, the way the operator's own replies do: they cannot be
+    // refused, so they are the one thing that can eat into what is held back for this line.
+    for _ in 0..2 {
+        hub.account_for_a_send_that_could_not_be_refused(ALLOWED_CHAT)
+            .await;
+    }
+
+    let lost = hub.say(&h.own(), "the first one lost", &a_question()).await;
+    assert!(matches!(lost, SendOutcome::TooFast(_)), "{lost:?}");
+    assert!(
+        h.fake.general.lock().await.is_empty(),
+        "a line went out into a chat that had nothing left to send it with"
+    );
+
+    // The chat is taking messages again.
+    {
+        let mut b = hub.budgets.lock().await;
+        *b = crate::queue::Budgets::new(2, Duration::from_millis(5));
+    }
+    let got_through = hub.say(&h.own(), "and now one gets through", &[]).await;
+    assert!(
+        matches!(got_through, SendOutcome::Sent(_)),
+        "this test needs the chat to be taking messages again: {got_through:?}"
+    );
+
+    let general = h.fake.general.lock().await.clone();
+    assert_eq!(
+        general.len(),
+        1,
+        "the message he never got was never explained, because the one moment it could have been \
+         said was the one moment nothing could be sent: {general:?}"
+    );
+    assert!(
+        general[0].contains('1'),
+        "the line does not say how much he missed: {:?}",
+        general[0]
+    );
+}
+
+/// An instant a whole cooling-off window in the past, for the tests about a herd going quiet.
+///
+/// Set rather than slept: what these are about is what happens on the far side of a quiet minute,
+/// and a suite that waits out a real one is a suite nobody runs.
+fn a_while_ago(d: Duration) -> std::time::Instant {
+    std::time::Instant::now()
+        .checked_sub(d)
+        .expect("this machine has been up longer than a cooling-off window")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_he_was_never_told_about_is_still_explained_after_the_herd_goes_quiet() {
+    // The recovery in `a_throttle_line_the_chat_was_too_full_to_carry_goes_out_when_it_reopens`
+    // only ever covered a chat that reopened promptly. Being acked too_fast is precisely what makes
+    // an agent stop talking, so a herd that has just been silenced going quiet for a cooling-off
+    // window is the ORDINARY aftermath of a flood, not an exotic one — and the first message that
+    // then got through closed the window before paying the debt. The reset cleared `owed` and the
+    // count together, so the one minute he was told nothing about at the time was the one minute he
+    // then never heard about at all.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "quiet").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+    for _ in 0..2 {
+        hub.account_for_a_send_that_could_not_be_refused(ALLOWED_CHAT)
+            .await;
+    }
+
+    let lost = hub.say(&h.own(), "the first one lost", &a_question()).await;
+    assert!(matches!(lost, SendOutcome::TooFast(_)), "{lost:?}");
+    assert!(
+        hub.throttle.lock().await.owed,
+        "this test needs a line the chat was too full to carry"
+    );
+
+    // The herd goes quiet for a whole window, and only then does the chat reopen.
+    hub.throttle.lock().await.last_loss =
+        Some(a_while_ago(THROTTLE_WINDOW + Duration::from_secs(1)));
+    {
+        let mut b = hub.budgets.lock().await;
+        *b = crate::queue::Budgets::new(2, Duration::from_millis(5));
+    }
+    let got_through = hub.say(&h.own(), "and now one gets through", &[]).await;
+    assert!(
+        matches!(got_through, SendOutcome::Sent(_)),
+        "this test needs the chat to be taking messages again: {got_through:?}"
+    );
+
+    let general = h.fake.general.lock().await.clone();
+    assert_eq!(
+        general.len(),
+        1,
+        "the message he never got was never explained, because the window it belonged to went \
+         quiet before the chat reopened: {general:?}"
+    );
+    // And what he is left looking at says it is over, rather than sounding like a chat that is
+    // still in trouble — the debt is paid with a send and closed with the free edit behind it.
+    let rewrites = h.fake.rewrites.lock().await.clone();
+    assert!(
+        rewrites
+            .last()
+            .is_some_and(|(_, text)| text.contains("keeping up again")),
+        "the window was paid for and never closed off: {rewrites:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_message_that_did_not_get_through_is_counted_once_however_many_turns_it_took() {
+    // The count was taken inside `take_a_turn`, which is one layer too low: it is the turn-taking
+    // primitive for every hub-owned write, not for an agent's frame. A conversation with no topic
+    // yet queues three times for one message — the topic, the greeting, then the message — so one
+    // question nobody saw was reported to him as two messages he had missed. Twelve worktrees
+    // arriving on a dispatch morning read as twenty-four.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "once").with_budget(2, Duration::from_millis(5)));
+    let outcome = hub
+        .say(&h.lane("a-worktree"), "Overwrite it?", &a_question())
+        .await;
+    assert!(matches!(outcome, SendOutcome::TooFast(_)), "{outcome:?}");
+    assert_eq!(
+        hub.throttle.lock().await.lost,
+        1,
+        "one agent message that did not go out was counted more than once, so the number he reads \
+         is not the number of messages he missed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worktree_that_only_connected_is_never_counted_as_a_message_he_missed() {
+    // The other half of the same root cause, and the one that made the line untrue rather than
+    // merely inflated. The topic taken at connection time is not a message: nothing said it, and
+    // nothing is told when it is refused — the fallback is that the bridge's first real message
+    // opens the topic anyway. Counting it made the line's own promise, that nothing is waiting on
+    // him, a claim about writes no agent had authored.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "arrive").with_budget(3, Duration::from_millis(5)));
+    // Spent through the path that cannot be refused, because that is the one way to empty the chat
+    // without producing a loss of its own.
+    for _ in 0..3 {
+        hub.account_for_a_send_that_could_not_be_refused(ALLOWED_CHAT)
+            .await;
+    }
+    let opened = hub
+        .topic_for(
+            &h.lane("a-worktree"),
+            std::time::Instant::now() + GREETING_SHELF_LIFE,
+        )
+        .await;
+    assert!(
+        opened.is_err(),
+        "this test needs a chat with nothing left to spend"
+    );
+    assert_eq!(
+        hub.throttle.lock().await.lost,
+        0,
+        "a worktree that connected and said nothing was counted as a message he missed, from \
+         something that had been told"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_count_in_front_of_him_survives_a_burst_that_ends_in_silence() {
+    // The rhythm between two edits used to DROP the updates it turned away rather than defer them,
+    // and nothing ever came back for them. That is not a rare interleaving — it is the shape of the
+    // event this whole line exists for: frames that arrive together carry the same deadline and
+    // expire in the same instant, so fifteen losses inside one second wrote the number once, at
+    // one. Then the agents, all told too_fast, stopped talking — so no later loss and no later send
+    // ever corrected it, and the last thing standing on his phone said one message when fifteen
+    // were gone.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "burst").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+    spend_the_chat_down(&hub, &h.own()).await;
+
+    // All at once, which is what a herd over the ceiling actually does. No sleeps anywhere: a test
+    // that spaces its losses out is a test of the path that always worked.
+    let mut tasks = Vec::new();
+    for n in 0..5 {
+        let hub = Arc::clone(&hub);
+        let who = h.own();
+        tasks.push(tokio::spawn(async move {
+            hub.say(&who, &format!("question {n}"), &a_question()).await
+        }));
+    }
+    for t in tasks {
+        let outcome = t.await.expect("a sender");
+        assert!(matches!(outcome, SendOutcome::TooFast(_)), "{outcome:?}");
+    }
+
+    // Six, not five: the probe that found the ceiling was itself a message that never went out.
+    let lost = 6;
+    assert_eq!(hub.throttle.lock().await.lost, lost, "this test needs six");
+    until(async || {
+        h.fake
+            .rewrites
+            .lock()
+            .await
+            .last()
+            .is_some_and(|(_, text)| text.contains(&lost.to_string()))
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_line_says_which_conversations_lost_something_and_not_only_that_something_did() {
+    // A bare integer is a number he cannot act on. At fourteen connections "6 messages did not get
+    // through" leaves him opening topics one at a time to find which of them is missing a turn,
+    // which is the work this line exists to save him. The names are the ones his topic titles
+    // carry, so what he reads matches what he taps.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "whose").with_budget(2, Duration::from_millis(5)));
+    // Short names on purpose: a lane title is clipped to the width a phone row shows, and this
+    // test is about which conversations are named rather than about that clip.
+    {
+        let mut registry = hub.registry.lock().await;
+        registry.bind_topic(&h.lane("alpha"), 1001).expect("bind");
+        registry.bind_topic(&h.lane("beta"), 1002).expect("bind");
+    }
+    spend_the_chat_down(&hub, &h.lane("alpha")).await;
+    let outcome = hub
+        .say(&h.lane("beta"), "and mine too", &a_question())
+        .await;
+    assert!(matches!(outcome, SendOutcome::TooFast(_)), "{outcome:?}");
+
+    // Read off what he can actually SEE, which is the opening send once it has been edited to carry
+    // the second worktree — the window is one message kept up to date, not one message per loss.
+    until(async || {
+        h.fake
+            .rewrites
+            .lock()
+            .await
+            .last()
+            .is_some_and(|(_, text)| text.contains("beta"))
+    })
+    .await;
+    let line = h
+        .fake
+        .rewrites
+        .lock()
+        .await
+        .last()
+        .expect("an edit")
+        .1
+        .clone();
+    for worktree in ["alpha", "beta"] {
+        assert!(
+            line.contains(worktree),
+            "he is told something was lost and never which conversation lost it: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn one_lost_message_is_described_in_the_singular_in_both_the_lines_he_reads() {
+    // A plural-only test is vacuously green, which is how "1 message did not get through. Whatever
+    // was saying them was told." reached the operator. The closing line is the one that got it
+    // wrong, and it is the version he is most likely to be reading — the last edit, and the one
+    // that stands in his forum afterwards — with one the commonest count it will ever hold.
+    for line in [
+        throttle_line(1, " from a worktree"),
+        throttle_cleared_line(1, " from a worktree"),
+    ] {
+        assert!(
+            !line.contains(" them"),
+            "one lost message is described with a plural pronoun: {line:?}"
+        );
+    }
+    for line in [throttle_line(4, ""), throttle_cleared_line(4, "")] {
+        assert!(
+            !line.contains(" it "),
+            "four lost messages are described in the singular: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn the_first_thing_the_one_notification_carries_is_what_he_lost() {
+    // The send is the only part of this he ever feels, and what a lock screen and a chat-list row
+    // show is its beginning. That beginning used to be a hundred and sixteen characters of standing
+    // fact about Telegram's rate limit — a banner indistinguishable from an informational blurb,
+    // with the news below the fold, on the one message engineered to cost a precious send.
+    // Sixty characters, which is about what a phone's lock screen and a chat-list row show before
+    // they run out of width. What has to be inside it is the number and the fact that something was
+    // lost — not the standing explanation, which he can read when he opens it.
+    let banner: String = throttle_line(6, " from a worktree")
+        .chars()
+        .take(60)
+        .collect();
+    assert!(
+        banner.contains('6') && banner.contains("did not get through"),
+        "the first sixty characters of the one notification he gets carry no news: {banner:?}"
+    );
+}
+
+#[test]
+fn a_window_with_a_conversation_it_could_not_name_names_none_of_them() {
+    // Fail closed. A list that named three of four would read as complete, and he would stop
+    // looking after the ones it named — which is worse than a bare count, because a bare count at
+    // least tells him to look everywhere.
+    let mut from = BTreeSet::new();
+    from.insert("a worktree".to_owned());
+    assert_eq!(
+        conversations_that_lost_something(&from, true),
+        " from a worktree"
+    );
+    assert_eq!(conversations_that_lost_something(&from, false), "");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_wait_discovered_while_making_a_topic_is_never_called_permanent() {
+    // Half of this site was closed and half was not. The seconds were carried out as a value and
+    // drained the chat's budget — and then the same arm returned a plain refusal, which the bridge
+    // renders as "his messaging app would not take it. It will not be tried again." about a chat
+    // that reopens inside a minute. It compounded: the sixty-second memo beside it made a
+    // chat-wide condition look like a permanent fact about one conversation, so a worktree that
+    // arrived during a flood wait had its whole first minute acked as dead.
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "topic429"));
+    *h.fake.create_floods_once.lock().await = Some(Duration::from_secs(41));
+
+    let outcome = hub
+        .say(&h.lane("a-worktree"), "Overwrite it?", &a_question())
+        .await;
+    assert_eq!(
+        hub.ack_for(&outcome),
+        (Delivered::No, Some(hub_proto::AckWhy::TooFast)),
+        "a chat Telegram shut for forty-one seconds was acked to the agent as permanent: \
+         {outcome:?}"
+    );
+    assert_eq!(
+        hub.throttle.lock().await.lost,
+        1,
+        "a message the operator will never see was lost and nothing counted it"
+    );
+    assert!(
+        hub.topic_refused.lock().await.is_empty(),
+        "a flood wait belonging to the whole chat was remembered as a permanent fact about one \
+         conversation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_in_another_allowed_chat_is_never_charged_to_the_forums_ceiling() {
+    // The allowlist can hold more than the forum, and the live box's does. Every send the hub is
+    // not allowed to refuse used to be charged to the forum whatever chat it was actually going to,
+    // so a command typed in the operator's other chat took a send off the herd's eighteen — and
+    // imposed the one-second rhythm on the forum too — for a message the forum never carried.
+    const SOMEWHERE_ELSE: i64 = -4242;
+    let h = harness().await;
+    let hub = Arc::new(its_own_hub(&h, "elsewhere").with_budget(2, Duration::from_millis(5)));
+    hub.registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), 1001)
+        .expect("bind");
+
+    for _ in 0..4 {
+        hub.account_for_a_send_that_could_not_be_refused(SOMEWHERE_ELSE)
+            .await;
+    }
+    // Asked with BUTTONS. Prose sits a ceiling out and would arrive either way, a minute later —
+    // a question is the frame that is given up on, so it is the one that can tell the two states
+    // apart without waiting a minute to do it.
+    let outcome = hub.say(&h.own(), "an agent's turn", &a_question()).await;
+    assert!(
+        matches!(outcome, SendOutcome::Sent(_)),
+        "typing in another chat spent the forum's ceiling, so a project was shed for a message \
+         that never touched its chat: {outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bridge_that_goes_away_behind_a_held_frame_lets_go_of_its_conversation_at_once() {
+    // Liveness and shelf life used to be the same question, and the shelf lives made the answer an
+    // order of magnitude worse: a frame the chat could not take yet is worth ninety seconds, and
+    // for all ninety of them its connection's socket went unread — so the EOF saying the bridge had
+    // gone went unread too. The claim it holds is what refuses the session when it comes back, and
+    // `hub-link.ts` redials in the SAME process after a second, so the pid is alive and the
+    // eviction rule cannot help. What the operator saw was a project that went quiet for no visible
+    // reason.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "").await;
+    bridge.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    // Telegram shuts the chat. Prose is worth sitting a flood wait out, so the frame below is held
+    // for as long as the wait lasts — which is the whole point of holding it, and must not also be
+    // how long the hub takes to notice its bridge is gone.
+    h.hub.budgets.lock().await.flood_wait(
+        ALLOWED_CHAT,
+        std::time::Instant::now(),
+        Duration::from_secs(30),
+    );
+    bridge
+        .send(BridgeFrame::Say {
+            text: "a line held behind a shut chat".to_owned(),
+            hint: None,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(bridge);
+
+    let gone_at = std::time::Instant::now();
+    while h.hub.is_claimed(&h.own()).await {
+        assert!(
+            gone_at.elapsed() < Duration::from_secs(3),
+            "the bridge has been gone for {:?} and the hub still holds its conversation",
+            gone_at.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And the half that is the actual harm: the same process dialling back in is admitted rather
+    // than turned away by the connection it has already replaced.
+    let mut again = FakeBridge::connect(&h.sock, &h.secret, "i1", "").await;
+    let came_back = again.next().await.expect("an answer to the second hello");
+    assert!(
+        matches!(came_back.payload, HubFrame::Welcome { .. }),
+        "the session that came back was refused by the connection it replaced: {:?}",
+        came_back.payload
     );
 }

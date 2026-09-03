@@ -79,14 +79,66 @@ use crate::registry::Registry;
 /// How long after `hello` the hub waits for a `pong` before calling a project live.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
 
-/// The longest a send will wait its turn in the pacing queue before shedding instead.
+/// How long a line of an agent's prose is worth holding before it is given up on.
 ///
-/// Not a rate limit — the rate limits live in `queue.rs`. This bounds how long the connection's
-/// read loop can be blocked behind its own outgoing message, because a bridge whose socket goes
-/// unread for minutes is a bridge whose `bye` is missed and whose claim lingers. Ten seconds is
-/// nine more than the one-second rhythm needs and far less than the per-minute ceiling implies, so
-/// a burst that fits under the ceiling drains and a genuine flood still sheds.
-pub const MAX_PACE_WAIT: Duration = Duration::from_secs(10);
+/// **This used to be ten seconds for everything, and ten seconds is a queue position rather than a
+/// judgement.** A turn costs the one-second rhythm, so ten waiters ahead of you is ten seconds:
+/// below eleven live connections nothing could ever be given up on, and at eleven it began — and
+/// since a worktree became a connection of its own, eleven is an ordinary dispatch morning for one
+/// repo. A message was thrown away for its POSITION, with the per-minute ceiling untouched, and the
+/// agent was told it had been sent too fast. That was not true and it was not useful.
+///
+/// Ninety seconds instead, and the number comes from what it has to survive: Telegram's own flood
+/// wait is a sixty-second window (`docs/RATE-PROBE.md`), so prose caught behind one goes out on the
+/// far side of it rather than being lost to a limit nobody here caused, with room for a queue
+/// behind that.
+///
+/// It is still bounded, and what it is bounded for is no longer LIVENESS. A frame used to be
+/// handled inside its connection's own read loop, so a bridge waiting here was a bridge whose next
+/// frame — and whose `bye`, and whose end-of-file — went unread until it finished, and the claim it
+/// held is what refuses the session when it comes back. That made "how long is this worth holding"
+/// and "is this bridge still there" the same question at an order of magnitude's distance, which
+/// they never were: `serve_connection` hands frames to a task of its own now, so the socket is read
+/// while one is in flight and a bridge that goes away is let go of at once.
+///
+/// What remains is the honest reason for a bound at all: a message nobody can send is eventually a
+/// message not worth sending, and a queue of them is a queue of turns some other project could have
+/// had. Ninety seconds is one flood wait plus room to queue behind it. The agent is never blocked
+/// on it either way — the bridge reports a frame as away the moment it is written to the socket, and
+/// corrects itself later from the ack.
+pub const PROSE_SHELF_LIFE: Duration = Duration::from_secs(90);
+
+/// How long the topic opened at connection time will queue for, and it is deliberately the shortest
+/// of the three.
+///
+/// The one send in this file that can afford to be impatient, because it has a designed fallback:
+/// if the topic cannot be made now, the bridge's first actual message makes it instead — greeting
+/// and all — and nothing is lost but a little visibility in the meantime. What it CANNOT afford is
+/// to wait long, because it runs BEFORE that connection's read loop starts, so every second here is
+/// a second the bridge's first frame goes unread and its `bye` goes unseen.
+///
+/// Ten seconds, which is deliberately the number the old flat deadline used. That constant's stated
+/// reason was exactly this one — bounding how long a read loop may be blocked — and this is the one
+/// place in the file where the reason genuinely applies, because it is the one send that runs
+/// outside the loop it would block.
+pub const GREETING_SHELF_LIFE: Duration = Duration::from_secs(10);
+
+/// How long a QUESTION is worth holding. Much less, and it is not a smaller version of the same
+/// judgement — it is the opposite one.
+///
+/// A line of prose that arrives late is still worth reading. A question that arrives late is a
+/// keyboard for a decision that has moved on: the operator taps it, and the answer lands in an
+/// agent that gave up on the question long ago, or in no agent at all. The wire already refuses to
+/// retry an ask it could not confirm for exactly this reason — two live menus for one question is
+/// worse than none — and holding one for a minute and a half manufactures the same thing more
+/// slowly.
+///
+/// Twenty seconds is about the longest a queue can honestly be worth waiting in for something whose
+/// value is that it is CURRENT, and it is comfortably longer than any wait the per-minute bucket can
+/// name on its own. So a question is only ever given up on when the chat is genuinely shut — by a
+/// flood wait, or by a herd deep enough that its turn is most of a minute away — and never merely
+/// for being eleventh.
+pub const QUESTION_SHELF_LIFE: Duration = Duration::from_secs(20);
 
 /// How long Telegram lets a bot edit one of its own messages. Not ours to raise either.
 ///
@@ -116,6 +168,61 @@ pub const LIMITS: Limits = Limits {
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // The surface the hub speaks to the operator through.
 
+/// What a frame is, for the one purpose of deciding how long it is worth waiting to send.
+///
+/// Two, because a queue that only ever holds is its own lie: holding everything for as long as
+/// prose deserves would put a keyboard in front of the operator for a decision the agent behind it
+/// abandoned a minute ago. See [`PROSE_SHELF_LIFE`] and [`QUESTION_SHELF_LIFE`] for the judgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Perishable {
+    /// Something an agent said. Late is fine; missing is not.
+    Prose,
+    /// Something the operator is expected to answer. Late is WORSE than missing.
+    Question,
+}
+
+impl Perishable {
+    /// The kind a message's own shape already tells you.
+    ///
+    /// Buttons are the evidence, and the one caller that knows better — an `ask` whose agent minted
+    /// no options, so the answer comes back as typed words rather than a tap — says so explicitly
+    /// rather than being guessed at from here.
+    pub fn of(buttons: &[AskOption]) -> Self {
+        if buttons.is_empty() {
+            Self::Prose
+        } else {
+            Self::Question
+        }
+    }
+
+    fn shelf_life(self) -> Duration {
+        match self {
+            Self::Prose => PROSE_SHELF_LIFE,
+            Self::Question => QUESTION_SHELF_LIFE,
+        }
+    }
+}
+
+/// Why a Telegram write did not happen, in the two facts the hub acts on.
+///
+/// The seconds are a VALUE rather than part of the sentence, because they have somewhere to go: a
+/// flood wait belongs to the whole CHAT, not to the call that discovered it, so the budget has to
+/// hear it or the very next send walks into the same wall. Before this they survived only as
+/// characters inside an audit line's `why=` field, which nothing reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refused {
+    /// What Telegram said, for the audit and the journal.
+    pub why: String,
+    /// How long it said to wait before anything else is sent to this chat, when it said so.
+    pub flood_wait: Option<Duration>,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.why)
+    }
+}
+
 /// What became of one attempt to put a message in front of the operator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -124,10 +231,17 @@ pub enum SendOutcome {
     /// It landed, but it was shortened first. The bridge is told, because the bridge is the only
     /// party that can decide to say less next time.
     Clamped(MsgId),
-    /// The chat's budget refused it, and this is how long to wait.
+    /// Somebody's rate limit refused it, and this is how long to wait.
     ///
-    /// Sending anyway is how a bot earns a 429, and a 429 on a shared bot punishes every project
-    /// rather than the one that caused it.
+    /// **Either budget can say this, and the caller does not have to care which.** Ours refuses
+    /// before the send, because sending anyway is how a bot earns a 429 and a 429 on a shared bot
+    /// punishes every project rather than the one that caused it. Telegram's refuses after it, and
+    /// that one used to fall through to [`Self::Refused`] — a permanent-sounding answer about
+    /// something that mends itself inside a minute, with the seconds it came with thrown away.
+    ///
+    /// What separates them is WHERE it came from, and the one place that needs to know is
+    /// `send_into`: a `TooFast` handed back by the surface is Telegram's word and drains the chat's
+    /// budget, because ours had already said yes.
     TooFast(Duration),
     /// The topic is gone. Telegram never says so with a service message and offers no way to list
     /// topics, so this is the only way the hub finds out. Handled as a rebinding, exactly once —
@@ -142,11 +256,15 @@ pub enum SendOutcome {
 /// Telegram, behind a trait, so the hub's decisions can be tested without one.
 pub trait Surface: Send + Sync + 'static {
     /// Create the project's topic and return its id.
+    ///
+    /// The failure carries [`Refused::flood_wait`] rather than only a sentence, because this is a
+    /// metered write to the same chat as every other: a `429` here means the chat is shut for
+    /// everybody, and it used to be swallowed into a string that only the audit log ever saw.
     fn create_topic(
         &self,
         title: &str,
         icon_color: u8,
-    ) -> impl std::future::Future<Output = anyhow::Result<i32>> + Send;
+    ) -> impl std::future::Future<Output = Result<i32, Refused>> + Send;
 
     /// Put a message in a topic, with buttons if there are any.
     fn send(
@@ -155,6 +273,26 @@ pub trait Surface: Send + Sync + 'static {
         text: &str,
         buttons: &[AskOption],
     ) -> impl std::future::Future<Output = SendOutcome> + Send;
+
+    /// Say one line in the forum itself, outside every project's topic.
+    ///
+    /// For the one thing the hub has to say that is not any project's: that the chat as a whole is
+    /// carrying more than it will take. Putting that in whichever topic happened to be shed first
+    /// would read as that project's problem, and it would land in a conversation an agent is
+    /// reading back.
+    fn say_in_general(&self, text: &str) -> impl std::future::Future<Output = SendOutcome> + Send;
+
+    /// Rewrite one of this bot's own messages in place, keeping its message id.
+    ///
+    /// **Measured free.** Thirty edits straight after five sends, none refused, and a send still
+    /// went through afterwards (`docs/RATE-PROBE.md`). That is the whole reason the hub can keep a
+    /// running count in front of the operator while it is over the ceiling: the first line is a
+    /// send it has to pay for, and every update after it costs nothing.
+    fn rewrite(
+        &self,
+        msg_id: &MsgId,
+        text: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Strip a stale keyboard AND say what happened to the question.
     ///
@@ -690,6 +828,172 @@ pub fn now_secs() -> u64 {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
+// Telling the operator the chat is full, without spending the chat to say it.
+
+/// How long the chat has to stop losing messages before a cooling-off window counts as over.
+///
+/// A minute, because that is the width of Telegram's own window: anything shorter would declare it
+/// over while the flood wait that caused it was still running, and he would read "it is keeping up
+/// again" about a chat that is still shut.
+pub const THROTTLE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The shortest gap between two updates of the running count.
+///
+/// An edit costs nothing against the per-minute ceiling — that is the measured fact this whole
+/// design rests on — but it is still an HTTPS call, and fourteen agents shedding in the same second
+/// should not be fourteen of them. He is reading a number, not a ticker.
+///
+/// One second, matching the chat's own rhythm.
+///
+/// **It defers a write; it never drops one.** This used to return without writing and without
+/// remembering that it had not, so a burst inside one second updated the number once and threw the
+/// rest away. That is not an edge case at fourteen connections — it is the characteristic shape,
+/// because `until` is minted per message and frames that arrive together expire together — and what
+/// he was left reading was "1 message did not get through" after fifteen had. So the first update
+/// the rhythm turns away BOOKS the write instead, and whichever number the burst has reached by
+/// then is the one that goes out. See [`Throttle::flush_booked`].
+const THROTTLE_EDIT_GAP: Duration = Duration::from_secs(1);
+
+/// The one message in the forum that says the chat is over its ceiling, and what it is counting.
+///
+/// **The shape is one SEND per cooling-off window and free EDITS inside it**, and that shape is the
+/// answer to a recursion: a line saying the chat is full is itself a message, wanting a token from a
+/// budget that is empty precisely when it is worth sending. One line per shed would spend eleven of
+/// eighteen tokens apologising, and each of those is a message from an agent that did not go out.
+///
+/// A window is at least a minute wide, so the send can never cost more than one eighteenth of the
+/// budget, and it is paid for out of [`crate::queue::RESERVED_FOR_THE_OPERATOR`] — held back from
+/// the agents exactly so that this can always go out. Everything after it is an edit of the same
+/// message, which the probe on 3 September measured as free.
+///
+/// **What he sees**: one notification when the window opens, and then that same line quietly
+/// updating in place with the count. An edit does not re-notify and does not move the message down
+/// the topic, so the send is what he feels and the edits are what he finds when he looks — which is
+/// the right way round for something that is by nature one fact repeated.
+#[derive(Debug, Default)]
+struct Throttle {
+    /// The message being kept up to date, once one has gone out.
+    notice: Option<MsgId>,
+    /// How many messages have not gone out during this window.
+    lost: u32,
+    /// The count the operator can actually SEE, which is not the same number.
+    ///
+    /// Kept so that a write the rhythm deferred can tell whether it still has anything to say by
+    /// the time it runs — a burst that has already been written out in full does not need a
+    /// second edit saying the same thing.
+    last_written: u32,
+    /// Which conversations lost something, by the names their topics carry.
+    ///
+    /// A bare count is a number he cannot act on: fourteen topics and no indication of which is
+    /// missing a turn leaves him opening each one in turn, which is the thing this whole line
+    /// exists to save him from.
+    from: BTreeSet<String>,
+    /// Set the first time a loss happens in a conversation the registry could not name.
+    ///
+    /// See [`conversations_that_lost_something`]: a partial list would say "from these two" about
+    /// four, so the list is dropped whole rather than shortened. It is a default of `false` on
+    /// purpose — a window with nothing in it has nothing it failed to name.
+    a_loss_it_could_not_name: bool,
+    /// When the last of them was lost, which is what decides the window is over.
+    last_loss: Option<std::time::Instant>,
+    /// When the count was last written, so a burst of losses is not a burst of edits.
+    last_edit: Option<std::time::Instant>,
+    /// Whether a task is already waiting out [`THROTTLE_EDIT_GAP`] to write the count.
+    ///
+    /// One at a time, chat-wide. Fourteen agents shedding in the same second must not be fourteen
+    /// HTTPS calls — but they must not be one call and thirteen silences either, which is what
+    /// dropping the deferred writes actually produced.
+    flush_booked: bool,
+    /// A window that ought to be open and could not be, because the chat would not take the line.
+    ///
+    /// The honest hole in the design, kept as a flag rather than pretended away: while Telegram has
+    /// the chat shut, the reserve buys nothing — nothing at all goes out — so the one moment he most
+    /// needs telling is the one moment nothing can tell him. It is opened at the next opportunity
+    /// instead, which is the next send or the next loss after the chat reopens.
+    ///
+    /// **A window that is owed is never closed unsaid.** It used to be: the cooling-off check ran
+    /// before the debt was paid and reset the whole record, so a herd that went quiet for a minute
+    /// after a flood — which is exactly what a herd does once everything it says is being shed —
+    /// had the only account of that minute thrown away by the first message that got through.
+    owed: bool,
+}
+
+/// Which conversations went quiet, in the words his topic titles use.
+///
+/// Empty when nothing can be said honestly: a window with even one loss it could not name would
+/// otherwise read as a complete list of a subset, which is worse than no list at all — he would
+/// stop looking after the ones it named.
+fn conversations_that_lost_something(from: &BTreeSet<String>, all_named: bool) -> String {
+    if from.is_empty() || !all_named {
+        return String::new();
+    }
+    let names: Vec<&str> = from.iter().map(String::as_str).collect();
+    match names.as_slice() {
+        [one] => format!(" from {one}"),
+        [one, two] => format!(" from {one} and {two}"),
+        [one, two, ..] => format!(
+            " from {one}, {two} and {} other conversations",
+            names.len() - 2
+        ),
+        [] => String::new(),
+    }
+}
+
+/// What he reads while the chat is over its ceiling.
+///
+/// No ids, no counts of tokens, no word for the thing that happened inside the code. What it has to
+/// carry is: how much he is missing and from where, that this is the chat's limit rather than
+/// anything broken, and that nothing is sitting waiting on him — so he does not go looking for an
+/// answer nobody is waiting to give.
+///
+/// **The count comes first, and that is not a style choice.** The send is the only part of this he
+/// ever feels: it is one notification per cooling-off window, and what a lock screen and a chat-list
+/// row show him is the BEGINNING of it. This began with a hundred and sixteen characters of standing
+/// fact about Telegram's rate limit, so the one message engineered to cost a precious send spent it
+/// on a banner indistinguishable from an informational blurb, with the news below the fold.
+///
+/// It is still deliberately NOT in the present tense about the trouble. This message is edited in
+/// place and is the last thing standing when a herd goes quiet, so a clause reading "more is being
+/// said than this chat will carry" would be a sentence he finds hours later about a chat that has
+/// been idle since. A count of what did not get through is past tense and does not go stale.
+///
+/// The limit is described rather than numbered. The API's ceiling is twenty and this hub sheds at
+/// seventeen for an agent, so printing either number invites him to compare it with the other and
+/// conclude the bot is misconfigured.
+fn throttle_line(lost: u32, whose: &str) -> String {
+    let (thing, it) = if lost == 1 {
+        ("message", "it")
+    } else {
+        ("messages", "them")
+    };
+    format!(
+        "{lost} {thing}{whose} did not get through. This chat will only carry a little under twenty \
+         messages a minute — Telegram's limit for a group, shared by everything running here — and \
+         nothing is waiting on you for {it}."
+    )
+}
+
+/// And what that same line becomes once the chat is keeping up again. One more free edit.
+///
+/// The pronoun is taken from the count for the same reason it is in [`throttle_line`], and this is
+/// the one of the pair that used to get it wrong: "1 message did not get through. Whatever was
+/// saying them was told." That is the commonest value this line ever holds — one shed and a quiet
+/// minute is the low-load shape — and it is the version of the message he is most likely to be
+/// looking at, because it is the last edit and the one that stands afterwards.
+fn throttle_cleared_line(lost: u32, whose: &str) -> String {
+    let (thing, it) = if lost == 1 {
+        ("message", "it")
+    } else {
+        ("messages", "them")
+    };
+    format!(
+        "For a while more was being said here at once than this chat would carry, and {lost} \
+         {thing}{whose} did not get through. Nothing is waiting on you for {it}. It is keeping up \
+         again now."
+    )
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 // Claims.
 
 /// A live connection, and how to reach it.
@@ -843,7 +1147,17 @@ pub struct Hub<S: Surface> {
     budgets: Arc<Mutex<crate::queue::Budgets>>,
     /// Whose turn it is to send. Held for the whole of one send's pacing wait, so that projects
     /// queue for the rhythm instead of racing for it — see `send_into` for what racing cost.
+    ///
+    /// **This is the whole of the queue's fairness, and the guarantee is documented rather than
+    /// hoped for**: `tokio::sync::Mutex` hands the lock out strictly first-come-first-served, so a
+    /// turn belongs to whoever asked for it first. Nothing here sorts, prioritises or rations by
+    /// project, and nothing needs to — arrival order is already what stops one project's backlog
+    /// pushing another project's single line behind it. It mattered less while a wait was capped at
+    /// ten seconds and the queue stayed shallow; it is the load-bearing property now that a frame
+    /// can wait a minute and a half.
     send_permit: Arc<Mutex<()>>,
+    /// The one line in the forum that says the chat is carrying more than it will take.
+    throttle: Arc<Mutex<Throttle>>,
     /// When Telegram last refused to make a topic for an address.
     ///
     /// `topic_for` runs on EVERY message, so without a memory a conversation whose topic cannot be
@@ -885,6 +1199,7 @@ impl<S: Surface> Hub<S> {
             claims: Arc::new(Mutex::new(BTreeMap::new())),
             budgets: Arc::new(Mutex::new(crate::queue::Budgets::default())),
             send_permit: Arc::new(Mutex::new(())),
+            throttle: Arc::new(Mutex::new(Throttle::default())),
             topic_refused: Arc::new(Mutex::new(BTreeMap::new())),
             gist: crate::summarize::Summarizer::from_env().map(Arc::new),
             allowed_chats: Arc::new(allowed_chats),
@@ -1230,6 +1545,23 @@ impl<S: Surface> Hub<S> {
         }
     }
 
+    /// Would a chat take an agent's message right now? Test-only.
+    ///
+    /// The one way to observe from outside this module that a flood wait actually reached the
+    /// budget — which is the property `bot.rs`'s three unrefusable sends now have to hold.
+    #[cfg(test)]
+    pub async fn a_send_would_be_refused(&self, chat_id: i64) -> bool {
+        self.budgets
+            .lock()
+            .await
+            .would_refuse(
+                chat_id,
+                std::time::Instant::now(),
+                crate::queue::Spender::AnAgent,
+            )
+            .is_some()
+    }
+
     /// Test-only, and it stays that way. The DELIVERY path must never ask this: it asks by trying
     /// to deliver, which is the question it actually has, and a "is it connected" read taken a
     /// moment earlier is a fact that can already be wrong by the time it is acted on.
@@ -1337,7 +1669,7 @@ impl<S: Surface> Hub<S> {
     /// * A creation that FAILED is logged with the title, because a `createForumTopic` whose reply
     ///   was lost may have made the topic anyway — and that topic is in his forum with nothing
     ///   pointing at it. Greppable is the least this can be.
-    pub async fn topic_for(&self, addr: &Addr) -> Result<i32, NoTopic> {
+    pub async fn topic_for(&self, addr: &Addr, until: std::time::Instant) -> Result<i32, NoTopic> {
         let (existing, title, colour, project_title) = {
             let registry = self.registry.lock().await;
             let p = registry
@@ -1376,7 +1708,7 @@ impl<S: Surface> Hub<S> {
         // Any refusal at all stops this, not only the one shape it returns today. Matching a single
         // variant here would mean a future one fell through and made the topic anyway, which is the
         // fail-open half of exactly the thing being closed.
-        if let Err(refused) = self.take_a_turn(addr).await {
+        if let Err(refused) = self.take_a_turn(addr, until).await {
             return Err(match refused {
                 SendOutcome::TooFast(wait) => NoTopic::TooFast(wait),
                 other => NoTopic::Failed(format!("{other:?}")),
@@ -1386,17 +1718,45 @@ impl<S: Surface> Hub<S> {
         let id = match self.surface.create_topic(&title, colour).await {
             Ok(id) => id,
             Err(e) => {
+                // A flood wait discovered HERE is still the whole chat's, and it used to be lost:
+                // this call is metered like a send but its failure was an opaque sentence, so a
+                // `429` on it left every other project sending into a chat that was already shut.
+                // The sixty-second memo below happened to be roughly the right backoff for this
+                // address; it did nothing whatever for any other.
+                if let Some(wait) = e.flood_wait {
+                    self.budgets.lock().await.flood_wait(
+                        self.forum_chat,
+                        std::time::Instant::now(),
+                        wait,
+                    );
+                    // NOT memoised, and NOT a refusal. Draining the budget was only half of this:
+                    // the other half returned `Failed`, which the bridge renders as "his messaging
+                    // app would not take it — it will not be tried again" about a chat that reopens
+                    // in under a minute. And the memo made a temporary CHAT-wide condition look
+                    // like a permanent per-ADDRESS one, so a worktree arriving during a flood wait
+                    // had its whole first minute of output acked as permanently dead. The block
+                    // just set is the correct backoff and it covers every conversation, which is
+                    // the scope the trouble actually has.
+                    tracing::warn!(
+                        project = %addr.project, lane = addr.lane_field(), title = %title,
+                        seconds = wait.as_secs(),
+                        "Telegram is refusing this chat for flooding, discovered while making a \
+                         topic; the whole chat is held off for that long"
+                    );
+                    let _ = self.audit.refused(addr, &e.why);
+                    return Err(NoTopic::TooFast(wait));
+                }
                 self.topic_refused
                     .lock()
                     .await
                     .insert(addr.clone(), std::time::Instant::now());
-                let _ = self.audit.refused(addr, &e.to_string());
+                let _ = self.audit.refused(addr, &e.why);
                 tracing::error!(
-                    project = %addr.project, lane = addr.lane_field(), title = %title, error = %e,
+                    project = %addr.project, lane = addr.lane_field(), title = %title, error = %e.why,
                     "asked Telegram for a topic and did not get one; if it was made anyway it is \
                      in the forum with nothing pointing at it"
                 );
-                return Err(NoTopic::Failed(e.to_string()));
+                return Err(NoTopic::Failed(e.why));
             }
         };
         self.topic_refused.lock().await.remove(addr);
@@ -1431,7 +1791,7 @@ impl<S: Surface> Hub<S> {
         // The greeting's outcome is READ, not discarded. A topic that was made, written down, and
         // never greeted is a conversation he cannot find at all: Telegram does not list an empty
         // one. Without this the hub could not tell that state from a healthy topic.
-        match self.send_into(addr, id, &greeting, &[]).await {
+        match self.send_into(addr, id, &greeting, &[], until).await {
             SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {}
             outcome => tracing::error!(
                 project = %addr.project, lane = addr.lane_field(), topic = id, title = %title,
@@ -1443,33 +1803,88 @@ impl<S: Surface> Hub<S> {
         Ok(id)
     }
 
-    /// The one place a message actually goes out: budget, clip, audit, send, audit.
+    /// The one place an agent's message actually goes out: budget, clip, audit, send, audit.
     ///
-    /// Every hub-owned MESSAGE goes through here, and the ceiling is per chat — so a writer this
-    /// cannot see does not cost itself, it costs whichever project happens to send next. That
-    /// sentence used to claim every hub-owned WRITE, which was untrue and is what let unmetered
-    /// writers accumulate; they are listed in `docs/MULTIPLEXER-READINESS.md` §3. Topic creation is
-    /// no longer one of them: it does not come through here, because it is not a message and has no
-    /// text to clip, but it takes a token through [`Self::take_a_turn`] before it calls Telegram.
+    /// **Every hub-owned message that can be REFUSED goes through here**, and the ceiling is per
+    /// chat — so a writer this cannot see does not cost itself, it costs whichever project happens
+    /// to send next. That sentence used to claim every hub-owned WRITE, which was untrue and is what
+    /// let unmetered writers accumulate. The list from `docs/MULTIPLEXER-READINESS.md` §3, settled:
+    ///
+    /// * **Topic creation** does not come through here — it is not a message and has no text to
+    ///   clip — but it takes a token through [`Self::take_a_turn`] first, so the ceiling sees it.
+    /// * **The retirement edits** are not metered and must not be. `editMessageText` is not charged
+    ///   against the per-minute ceiling at all: measured 3 September, thirty edits straight after
+    ///   five sends, none refused, and a send still went through afterwards. The audit graded these
+    ///   as the write that scales, on the stated assumption that an edit spends from the send
+    ///   budget; it does not, so the fix there was this paragraph rather than the code. Metering
+    ///   them would buy nothing and cost the one write that must never be refused — a keyboard that
+    ///   cannot be taken off is a menu answering a question nobody is waiting for any more.
+    /// * **The three real sends in `bot.rs`** — the tap confirmation, the reply to something typed
+    ///   at a disconnected topic, and a command's answer — cannot come through here either, because
+    ///   they are the operator's own and refusing him is not on the table. They call
+    ///   [`Self::account_for_a_send_that_could_not_be_refused`] instead, which takes the token
+    ///   without the right to say no, **for the chat the message is actually going to** — the
+    ///   allowlist holds more than the forum. They also read what Telegram answered and hand a
+    ///   flood wait to [`Self::telegram_shut_this_chat`]: metering them and then discarding their
+    ///   `429` left the backpressure below with two blind spots out of five paths, and they fire
+    ///   precisely when the chat is thin, because the traffic is what made him tap.
+    /// * **The throttle line** is a send and is metered, out of the reserve that exists for it.
+    /// * **`answerCallbackQuery`** is deliberately outside all of this. Whether it is charged at
+    ///   all is unmeasured (`docs/RATE-PROBE.md`), it is one per tap and paced by a thumb, and
+    ///   spending a send for something that may cost nothing takes it off an agent for no reason.
     async fn send_into(
         &self,
         addr: &Addr,
         topic_id: i32,
         text: &str,
         buttons: &[AskOption],
+        until: std::time::Instant,
     ) -> SendOutcome {
-        if let Err(too_fast) = self.take_a_turn(addr).await {
-            return too_fast;
-        }
-
         // Clipped here rather than by the surface, because whether anything was lost is a fact the
         // BRIDGE has to be told, and only this side is holding the ack.
         let (text, clamped) = crate::queue::fit(text, crate::queue::MAX_TEXT);
-        let _ = self.audit.sent(addr, topic_id, text.len());
-        let mut outcome = self.surface.send(topic_id, &text, buttons).await;
-        if clamped && let SendOutcome::Sent(id) = outcome {
-            outcome = SendOutcome::Clamped(id);
+
+        // A loop, because Telegram's own answer can be "not yet" — and when it is, the wait it
+        // names goes into the budget and this frame queues again behind it, exactly like any other
+        // waiter. It is bounded twice over: by the shelf life, which `take_a_turn` checks before it
+        // sleeps at all, and by the flood wait itself, which can only ever move further out. Two
+        // attempts past the first is already more than any real 429 sequence needs, and a fixed
+        // ceiling means a Telegram that answered strangely cannot spin this.
+        for _ in 0..3 {
+            if let Err(too_fast) = self.take_a_turn(addr, until).await {
+                return too_fast;
+            }
+            let _ = self.audit.sent(addr, topic_id, text.len());
+            let mut outcome = self.surface.send(topic_id, &text, buttons).await;
+            if clamped && let SendOutcome::Sent(id) = outcome {
+                outcome = SendOutcome::Clamped(id);
+            }
+            let _ = self.audit.outcome(addr, &outcome);
+
+            // Our budget said yes and Telegram said no, so Telegram is right and our accounting was
+            // wrong. Draining the chat by what it named is the whole of the backpressure: without
+            // it every other project kept sending into the same wall, each one earning the next
+            // refusal, for as long as the herd had anything to say.
+            //
+            // Both write the same `shed` line, and the audit still tells them apart: a flood wait
+            // always follows a `sent` line for the same subject, because it happened after a real
+            // attempt, and our own give-up never does.
+            if let SendOutcome::TooFast(wait) = outcome {
+                self.budgets.lock().await.flood_wait(
+                    self.forum_chat,
+                    std::time::Instant::now(),
+                    wait,
+                );
+                continue;
+            }
+            if matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
+                self.something_got_through().await;
+            }
+            return outcome;
         }
+        // Three times into a wall that keeps moving. Told the chat's own answer to "when could
+        // anything go out", which is the only honest number available here.
+        let outcome = SendOutcome::TooFast(self.what_the_queue_costs().await);
         let _ = self.audit.outcome(addr, &outcome);
         outcome
     }
@@ -1483,10 +1898,11 @@ impl<S: Surface> Hub<S> {
     /// project sends next. A brand-new conversation now pays two tokens before its first word, and
     /// that is the honest price of a topic per lane rather than a hidden one.
     ///
-    /// Worst case it makes a new conversation's first message wait two queue slots instead of one.
-    /// That is bounded at twice `MAX_PACE_WAIT` and only reachable behind a queue ten deep, which is
-    /// far short of the "unread for minutes" this deadline exists to prevent.
-    async fn take_a_turn(&self, addr: &Addr) -> Result<(), SendOutcome> {
+    /// `until` is the whole message's deadline, shared with every turn it has to take. A brand-new
+    /// conversation queues three times — the topic, the greeting, then the message — and each of
+    /// those used to start a fresh ten-second clock of its own, so its real bound was whatever
+    /// nobody had added up. One deadline, minted once in [`Self::say`], is the honest version.
+    async fn take_a_turn(&self, addr: &Addr, until: std::time::Instant) -> Result<(), SendOutcome> {
         // PACE, then shed — and pace in a QUEUE, not as a crowd.
         //
         // Telegram's limit has two halves: no more than one message a second, and about twenty a
@@ -1501,40 +1917,61 @@ impl<S: Surface> Hub<S> {
         // unspent. Six bridges opening with a question left five agents blocked and four topics
         // bound-but-empty, which Telegram does not show in the topic list at all.
         //
-        // The permit is what makes it a queue. `tokio::sync::Mutex` hands it out in order, so each
-        // sender waits its own turn once instead of racing the others for one token. The deadline
-        // bounds the whole thing, because this is called from the connection's read loop and a
-        // bridge whose socket goes unread for minutes is a bridge whose `bye` is missed.
-        // The deadline starts BEFORE the permit is acquired, because the queue is most of the wait.
-        // Starting it afterwards bounded only the sleep, so a bridge behind nine others could sit in
-        // the read loop for a minute and then still be told it was too fast.
-        let give_up_at = std::time::Instant::now() + MAX_PACE_WAIT;
-        let turn = match tokio::time::timeout(MAX_PACE_WAIT, self.send_permit.lock()).await {
+        // The permit is what makes it a queue, and a strictly FIFO one: `tokio::sync::Mutex`
+        // documents that guarantee rather than merely having it, so a turn belongs to whoever asked
+        // for it first and no project's backlog can push another project's single line behind it.
+        // Each sender waits its own turn once instead of racing the others for one token.
+        //
+        // **The deadline is a shelf life now, not a queue position.** It used to be a flat ten
+        // seconds starting here, which is about ten waiters — so a message was thrown away for
+        // being eleventh, with the per-minute ceiling untouched, and its agent was told it had been
+        // sent too fast. Neither half of that was true. What replaces it is how long the message is
+        // still worth sending, which is a property of the message and not of the crowd in front of
+        // it. The deadline still covers the QUEUE and not merely the sleep, because the queue is
+        // most of the wait: bounding only the sleep let a bridge sit behind nine others for a minute
+        // and then be told it was too fast.
+        let turn = match tokio::time::timeout_at(until.into(), self.send_permit.lock()).await {
             Ok(t) => t,
             Err(_) => {
-                let outcome = SendOutcome::TooFast(MAX_PACE_WAIT);
+                // Told how long it actually waited, not a constant. `MAX_PACE_WAIT` went out here
+                // as the retry_after, which was a made-up number unrelated to the real wait.
+                let outcome = SendOutcome::TooFast(self.what_the_queue_costs().await);
                 let _ = self.audit.outcome(addr, &outcome);
                 return Err(outcome);
             }
         };
+        let mut gave_up = None;
         loop {
             let verdict = {
                 let mut budgets = self.budgets.lock().await;
-                budgets.take(self.forum_chat, std::time::Instant::now())
+                budgets.take(
+                    self.forum_chat,
+                    std::time::Instant::now(),
+                    crate::queue::Spender::AnAgent,
+                )
             };
             match verdict {
                 Ok(()) => break,
-                Err(crate::queue::Refusal::Gap(wait))
-                    if std::time::Instant::now() + wait <= give_up_at =>
-                {
-                    tokio::time::sleep(wait).await;
+                // Both refusals are now WAITED OUT rather than one of them being a give-up. The
+                // ceiling used to end a message on the spot however briefly it had to wait, which
+                // is what made a chat one message over its budget lose the next thing anyone said.
+                // What decides is whether the wait fits inside what this message is worth, and the
+                // second half of that condition is the one that used to lie: a sender that had
+                // queued nine and a half seconds was refused for needing a one-second gap and told
+                // to come back in under a second, when the truth was its position in the queue.
+                //
+                // Sleeping out a CEILING while holding the permit is deliberate and costs nothing:
+                // while the chat's bucket is empty the waiters behind cannot send either, and when
+                // a token does arrive the head of the queue is exactly who should have it.
+                Err(refusal) if std::time::Instant::now() + refusal.wait() <= until => {
+                    tokio::time::sleep(refusal.wait()).await;
                 }
+                // Past its shelf life. For prose that means a minute and a half of a chat that
+                // would not take it; for a question it means the answer would arrive too late to be
+                // worth having.
                 Err(refusal) => {
-                    // Either the per-minute ceiling — a real limit — or a queue so long that
-                    // waiting longer would cost the connection more than the message is worth.
-                    let outcome = SendOutcome::TooFast(refusal.wait());
-                    let _ = self.audit.outcome(addr, &outcome);
-                    return Err(outcome);
+                    gave_up = Some(refusal);
+                    break;
                 }
             }
         }
@@ -1543,13 +1980,61 @@ impl<S: Surface> Hub<S> {
         // to serialise Telegram: holding it across `surface.send` made one slow round trip a pause
         // for every other project's read loop.
         drop(turn);
+        if let Some(refusal) = gave_up {
+            let outcome = SendOutcome::TooFast(refusal.wait());
+            let _ = self.audit.outcome(addr, &outcome);
+            return Err(outcome);
+        }
         Ok(())
     }
 
     /// Send into a conversation's topic, with the audit around it and one rebinding if the topic is
     /// gone.
+    ///
+    /// How long it is worth waiting to send is read off the message's own shape — see
+    /// [`Perishable::of`]. The one caller that knows better than its buttons uses [`Self::say_as`].
     pub async fn say(&self, addr: &Addr, text: &str, buttons: &[AskOption]) -> SendOutcome {
-        let topic_id = match self.topic_for(addr).await {
+        self.say_as(addr, text, buttons, Perishable::of(buttons))
+            .await
+    }
+
+    /// The same, for a caller that knows what kind of thing it is saying.
+    ///
+    /// There is exactly one: an `ask` whose agent minted no options is still a QUESTION — the
+    /// operator answers it by typing rather than by tapping — and its buttons cannot say so.
+    pub async fn say_as(
+        &self,
+        addr: &Addr,
+        text: &str,
+        buttons: &[AskOption],
+        kind: Perishable,
+    ) -> SendOutcome {
+        // Minted ONCE, here, and shared by every turn this message has to take. A brand-new
+        // conversation queues three times before its first word — the topic, the greeting, then the
+        // message — and each of those used to start a deadline of its own.
+        let until = std::time::Instant::now() + kind.shelf_life();
+        let outcome = self.try_to_say(addr, text, buttons, until).await;
+        // THE ONE PLACE A LOST MESSAGE IS COUNTED. One call to this function is one thing somebody
+        // wanted to say, however many turns it took, so counting here is what makes the number he
+        // reads the number of messages he missed. Every give-up below funnels into exactly one
+        // `TooFast`, and the writes that are not a message — the topic taken at connection time,
+        // the greeting inside it — never come through here at all.
+        if let SendOutcome::TooFast(_) = outcome {
+            self.note_a_message_nobody_will_see(addr).await;
+        }
+        outcome
+    }
+
+    /// Everything [`Self::say_as`] does except counting the loss. Split out so that the counting
+    /// has exactly one place to happen and every early return passes through it.
+    async fn try_to_say(
+        &self,
+        addr: &Addr,
+        text: &str,
+        buttons: &[AskOption],
+        until: std::time::Instant,
+    ) -> SendOutcome {
+        let topic_id = match self.topic_for(addr, until).await {
             Ok(id) => id,
             // The two are not one: a budget shed mends itself in a minute and is acked
             // `too_fast`, a Telegram refusal does not and is acked as one.
@@ -1563,7 +2048,7 @@ impl<S: Surface> Hub<S> {
                 return SendOutcome::Refused(e.to_string());
             }
         };
-        let outcome = self.send_into(addr, topic_id, text, buttons).await;
+        let outcome = self.send_into(addr, topic_id, text, buttons, until).await;
 
         if outcome == SendOutcome::TopicGone {
             // Exactly once, and never as a retry: Telegram gives no service message when a topic is
@@ -1574,11 +2059,325 @@ impl<S: Surface> Hub<S> {
                 "the topic is gone; making a new one"
             );
             let _ = self.registry.lock().await.unbind_topic(addr);
-            if let Ok(fresh) = self.topic_for(addr).await {
-                return self.send_into(addr, fresh, text, buttons).await;
-            }
+            // The SAME deadline. A rebinding is three more turns — a topic, a greeting, and the
+            // message again — and giving them a fresh shelf life would let one message spend two of
+            // them, which is the doubling this deadline was moved out of `take_a_turn` to stop.
+            return match self.topic_for(addr, until).await {
+                Ok(fresh) => self.send_into(addr, fresh, text, buttons, until).await,
+                // The ceiling refusing the rebinding is a busy chat, not a missing topic, and
+                // saying "there is nowhere in his chat to put it" about it tells the agent to give
+                // up on a thing that mends itself inside a minute.
+                Err(NoTopic::TooFast(wait)) => SendOutcome::TooFast(wait),
+                Err(_) => outcome,
+            };
         }
         outcome
+    }
+
+    /// Roughly how long a turn is worth to whoever could not get one, for the ack's `retry_after`.
+    ///
+    /// The queue's depth is not knowable from inside it — the permit does not count its waiters —
+    /// so this is the chat's own answer to "when could anything go out", which is the thing the
+    /// caller actually wants and is honest either way. It never returns zero: a caller told to come
+    /// back immediately comes back immediately, and does the same thing again.
+    async fn what_the_queue_costs(&self) -> Duration {
+        let refusal = self.budgets.lock().await.would_refuse(
+            self.forum_chat,
+            std::time::Instant::now(),
+            crate::queue::Spender::AnAgent,
+        );
+        // No refusal means there is room right now and the whole wait was the crowd, so the rhythm
+        // is the honest floor: one more turn is at least one gap away.
+        refusal.map_or(crate::queue::MIN_GAP, |r| {
+            r.wait().max(crate::queue::MIN_GAP)
+        })
+    }
+
+    /// Account for a send the hub has already decided to make and cannot call back.
+    ///
+    /// The operator tapped something, or typed something, and the answer to it is not an agent's
+    /// message to be rationed — but it IS a real message against a ceiling that belongs to the whole
+    /// chat, so an unmetered one does not cost itself. It costs whichever project sends next, and
+    /// these fire precisely while he is looking at a busy forum, which is exactly when the budget is
+    /// thin. They do not scale with the size of the herd: one per tap, one per line he types at a
+    /// topic with nothing behind it, one per command.
+    /// `chat_id` is the chat the message actually went to, and passing the wrong one is not a
+    /// rounding error. The allowlist can hold more than the forum — the live box's does — so a
+    /// `/help` typed in the operator's other chat used to take a send off the forum's ceiling for a
+    /// message the forum never carried, and impose the one-second rhythm on it too. `Budgets` is
+    /// keyed per chat precisely so that does not have to happen.
+    pub async fn account_for_a_send_that_could_not_be_refused(&self, chat_id: i64) {
+        self.budgets
+            .lock()
+            .await
+            .spend(chat_id, std::time::Instant::now());
+    }
+
+    /// Telegram has shut a chat for flooding. Hold everything off it for as long as it said.
+    ///
+    /// Public because the three sends the hub is not allowed to refuse live in `bot.rs`, and until
+    /// this existed they threw their `429` away: the budget heard about flood waits from the agent
+    /// path and from nowhere else, so a refusal discovered on the operator's own tap left the very
+    /// next agent message walking into the same wall. Those fire exactly when the chat is thin,
+    /// because he is tapping in response to traffic.
+    pub async fn telegram_shut_this_chat(&self, chat_id: i64, wait: Duration) {
+        tracing::warn!(
+            seconds = wait.as_secs(),
+            "Telegram is refusing this chat for flooding; holding everything off it"
+        );
+        self.budgets
+            .lock()
+            .await
+            .flood_wait(chat_id, std::time::Instant::now(), wait);
+    }
+
+    /// One more message the operator will never see. Open the window, or move the count in it.
+    ///
+    /// **Called once per MESSAGE somebody wanted to send, from [`Self::say_as`] and from nowhere
+    /// else.** It used to live inside [`Self::take_a_turn`] and [`Self::send_into`], which is one
+    /// layer too low: those are the turn-taking primitives for every hub-owned write, so a brand-new
+    /// conversation counted the topic's turn AND its greeting AND the message as three losses for
+    /// one frame, and a worktree that merely connected during a busy minute counted one for a
+    /// message no agent had said and no agent was told about. The number he reads has to be the
+    /// number of things he missed, and the sentence saying nothing is waiting on him has to be true
+    /// of every one of them.
+    async fn note_a_message_nobody_will_see(&self, addr: &Addr) {
+        // Named BEFORE the throttle lock is taken. Two locks held at once is two locks somebody has
+        // to reason about the order of, and there is no reason to here.
+        let named = {
+            let registry = self.registry.lock().await;
+            registry.get(&addr.project).map(|p| match &addr.lane {
+                None => p.title.clone(),
+                Some(lane) => crate::registry::lane_title(&p.title, lane),
+            })
+        };
+
+        let deferred = {
+            let mut throttle = self.throttle.lock().await;
+            // A window that has been quiet for its cooling-off period is over, whatever is
+            // happening now. Closed first so that a new one starts from one rather than inheriting
+            // a count from something the operator watched end ten minutes ago — and never while a
+            // debt is outstanding, which `close_the_window_if_it_has_passed` refuses.
+            self.close_the_window_if_it_has_passed(&mut throttle).await;
+
+            throttle.lost += 1;
+            throttle.last_loss = Some(std::time::Instant::now());
+            match named {
+                Some(title) => {
+                    throttle.from.insert(title);
+                }
+                None => throttle.a_loss_it_could_not_name = true,
+            }
+            self.book_or_write(&mut throttle)
+        };
+        self.write_the_count_when_the_rhythm_allows(deferred).await;
+    }
+
+    /// Something got through, so the chat may have caught up. Free to check, free to act on.
+    async fn something_got_through(&self) {
+        let mut throttle = self.throttle.lock().await;
+        if throttle.notice.is_none() && !throttle.owed {
+            return;
+        }
+        // THE DEBT FIRST. A window that could not be reported when it happened is still a window he
+        // was never told about, and closing it first is what destroyed the only record that it
+        // happened: the reset clears `owed` and `lost` together, and the `if` below then saw a debt
+        // that had already been thrown away. Paying first and closing second leaves him with one
+        // message that says what was lost, immediately edited into the line saying it is over —
+        // a send and a free edit, which is the shape this design already pays for.
+        if throttle.owed {
+            self.open_or_update(&mut throttle).await;
+        }
+        self.close_the_window_if_it_has_passed(&mut throttle).await;
+    }
+
+    /// Decide who writes the count and when: now, later, or not at all.
+    ///
+    /// Returns how long to wait before writing, or `None` for "somebody else is already going to".
+    /// Opening the window is never deferred — it is a send, and the send is the only part of this
+    /// he ever feels.
+    fn book_or_write(&self, throttle: &mut Throttle) -> Option<Duration> {
+        if throttle.notice.is_none() {
+            return Some(Duration::ZERO);
+        }
+        let since = throttle
+            .last_edit
+            .map_or(THROTTLE_EDIT_GAP, |when| when.elapsed());
+        if since >= THROTTLE_EDIT_GAP {
+            return Some(Duration::ZERO);
+        }
+        if throttle.flush_booked {
+            return None;
+        }
+        throttle.flush_booked = true;
+        Some(THROTTLE_EDIT_GAP - since)
+    }
+
+    /// Wait out whatever [`Self::book_or_write`] asked for, then put the current count in front of
+    /// him.
+    ///
+    /// The wait is at most the chat's own rhythm, it falls on a frame that was already being given
+    /// up on, and only one task in the whole hub is ever doing it — so what it costs is a second on
+    /// one connection's read loop, once per second, in exchange for the number in front of him
+    /// being the number he actually lost.
+    async fn write_the_count_when_the_rhythm_allows(&self, deferred: Option<Duration>) {
+        let Some(wait) = deferred else { return };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        let mut throttle = self.throttle.lock().await;
+        throttle.flush_booked = false;
+        // Re-read rather than assume. Anything at all may have happened while this was asleep, and
+        // the one that would be unforgivable is a window closing in the meantime: the reset takes
+        // the count back to nothing, and writing then would put a brand-new message in his forum
+        // saying no messages did not get through. Nothing left to say is a perfectly good answer.
+        if throttle.lost > throttle.last_written {
+            self.open_or_update(&mut throttle).await;
+        }
+    }
+
+    /// Put the line in front of him, or move the number in the line already there.
+    ///
+    /// The send is the only part that costs anything, it happens once per window, and it is paid
+    /// for out of the token held back from the agents for exactly this. Everything after it is an
+    /// edit, which is free.
+    async fn open_or_update(&self, throttle: &mut Throttle) {
+        match throttle.notice.clone() {
+            None => {
+                // The reserved token, and the one-second rhythm is WAITED OUT rather than treated
+                // as a refusal. That distinction is load-bearing here in a way it is nowhere else:
+                // the likeliest moment to want this line is immediately after a send — a message
+                // got through, which is how the hub notices it is owed one — and at that instant
+                // the gap is refusing everybody by construction. Read as a refusal, the line would
+                // be owed for ever while the chat was busy, which is exactly when it is needed.
+                //
+                // A CEILING refusal is different and is not waited out: it means Telegram has the
+                // chat shut, and while that is true nothing at all goes out, so the reserve buys
+                // nothing. That is owed rather than lost, and the next opportunity takes it.
+                let mut allowed = false;
+                for _ in 0..3 {
+                    let verdict = {
+                        let mut budgets = self.budgets.lock().await;
+                        budgets.take(
+                            self.forum_chat,
+                            std::time::Instant::now(),
+                            crate::queue::Spender::TheHub,
+                        )
+                    };
+                    match verdict {
+                        Ok(()) => {
+                            allowed = true;
+                            break;
+                        }
+                        Err(crate::queue::Refusal::Gap(wait)) => {
+                            tokio::time::sleep(wait).await;
+                        }
+                        Err(crate::queue::Refusal::Ceiling(_)) => break,
+                    }
+                }
+                if !allowed {
+                    throttle.owed = true;
+                    return;
+                }
+                let whose = conversations_that_lost_something(
+                    &throttle.from,
+                    !throttle.a_loss_it_could_not_name,
+                );
+                match self
+                    .surface
+                    .say_in_general(&throttle_line(throttle.lost, &whose))
+                    .await
+                {
+                    SendOutcome::Sent(id) | SendOutcome::Clamped(id) => {
+                        throttle.notice = Some(id);
+                        throttle.owed = false;
+                        throttle.last_written = throttle.lost;
+                        throttle.last_edit = Some(std::time::Instant::now());
+                    }
+                    outcome => {
+                        // Not lost quietly. This is the one message whose whole purpose is that a
+                        // silence gets explained, so a silence here is the worst one in the file.
+                        if let SendOutcome::TooFast(wait) = outcome {
+                            self.budgets.lock().await.flood_wait(
+                                self.forum_chat,
+                                std::time::Instant::now(),
+                                wait,
+                            );
+                        }
+                        throttle.owed = true;
+                        tracing::error!(
+                            ?outcome,
+                            lost = throttle.lost,
+                            "the chat is over its ceiling and the line saying so could not go out; \
+                             he is watching messages not arrive with nothing to explain it"
+                        );
+                    }
+                }
+            }
+            Some(id) => {
+                // Nothing to say if the number has not moved since it was last written. That is
+                // the ordinary case for every loss in a burst except the one that booked the
+                // write: they all queue behind it, and by the time they get here it has already
+                // put their number in front of him.
+                if throttle.lost == throttle.last_written {
+                    return;
+                }
+                // Free against the per-minute ceiling, but still an HTTPS call — and fourteen
+                // agents shedding at once should not be fourteen of them. He is reading a number,
+                // not a ticker. Deferred rather than dropped: see [`THROTTLE_EDIT_GAP`] and
+                // [`Self::book_or_write`], which is what decides who arrives here and when.
+                let whose = conversations_that_lost_something(
+                    &throttle.from,
+                    !throttle.a_loss_it_could_not_name,
+                );
+                if let Err(e) = self
+                    .surface
+                    .rewrite(&id, &throttle_line(throttle.lost, &whose))
+                    .await
+                {
+                    tracing::warn!(error = %e, "the count of what he is missing could not be updated");
+                    return;
+                }
+                throttle.last_written = throttle.lost;
+                throttle.last_edit = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// If nothing has been lost for a whole cooling-off window, say so and close it.
+    ///
+    /// One last free edit, on the message that is already there. Deliberately NOT a new message: a
+    /// second notification saying the trouble is over is a second interruption for a fact he did not
+    /// ask to be woken for, and it would cost a token from the budget that has just recovered.
+    async fn close_the_window_if_it_has_passed(&self, throttle: &mut Throttle) {
+        let quiet = throttle
+            .last_loss
+            .is_some_and(|when| when.elapsed() >= THROTTLE_WINDOW);
+        if !quiet {
+            return;
+        }
+        // A window nobody has ever been shown cannot be closed, because closing resets the record
+        // and the record is the only account he will ever get of that minute. This is the ordinary
+        // aftermath of a flood, not a corner: being told too_fast is precisely what makes an agent
+        // stop talking, so a herd that has just been silenced going quiet for a cooling-off window
+        // is the shape of the event. The debt waits for the next opportunity instead.
+        if throttle.owed && throttle.notice.is_none() {
+            return;
+        }
+        if let Some(id) = throttle.notice.take() {
+            let whose = conversations_that_lost_something(
+                &throttle.from,
+                !throttle.a_loss_it_could_not_name,
+            );
+            if let Err(e) = self
+                .surface
+                .rewrite(&id, &throttle_cleared_line(throttle.lost, &whose))
+                .await
+            {
+                tracing::warn!(error = %e, "the line about the chat being full could not be closed off");
+            }
+        }
+        *throttle = Throttle::default();
     }
 
     /// Handle one bridge, from `hello` to the connection closing.
@@ -1790,7 +2589,13 @@ impl<S: Surface> Hub<S> {
         // Two levels, because they are two different things. A busy minute is not a fault and the
         // next message this bridge sends will open the topic; anything else is a conversation that
         // cannot be seen and is not going to mend itself.
-        match self.topic_for(&addr).await {
+        // A short shelf life, and the reason is right above `GREETING_SHELF_LIFE`: this runs before
+        // the read loop, so waiting here is this bridge's first frame going unread — and the next
+        // message it sends opens the topic anyway.
+        match self
+            .topic_for(&addr, std::time::Instant::now() + GREETING_SHELF_LIFE)
+            .await
+        {
             Ok(_) => {}
             Err(NoTopic::TooFast(wait)) => tracing::warn!(
                 project = %addr.project, lane = addr.lane_field(), wait = ?wait,
@@ -1815,19 +2620,47 @@ impl<S: Surface> Hub<S> {
             });
         }
 
+        // FRAMES ARE HANDLED IN A TASK OF THEIR OWN, in the order they arrived.
+        //
+        // They used to be handled inline, which made "how long is this message worth holding" and
+        // "is this bridge still there" the same question. They are not the same question, and the
+        // shelf lives above made the difference an order of magnitude: a frame the chat cannot take
+        // yet is worth ninety seconds, and for all ninety of them the socket went unread — so the
+        // EOF that says the bridge is gone was unread too, and the claim it holds is what refuses
+        // the session when it comes back. `hub-link.ts` redials in the same process after a second,
+        // so what the operator saw was a project that went quiet for no visible reason.
+        //
+        // The channel is bounded at the same 64 as the outbox and the pre-pong buffer: a backlog
+        // deeper than a bridge is allowed to hold still blocks the read loop, and that is correct —
+        // it is the only backpressure there is.
+        let (frames_tx, mut frames_rx) = mpsc::channel::<Envelope<BridgeFrame>>(64);
+        let mut handler = {
+            let hub = Arc::clone(&self);
+            let addr = addr.clone();
+            let instance = instance.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while let Some(frame) = frames_rx.recv().await {
+                    let ack_ref = frame.id.clone();
+                    let (delivered, why) = hub.handle(&addr, &instance, frame.payload).await;
+                    let _ = tx
+                        .send(Envelope::new(
+                            FrameId::new(format!("h{}", next_frame_seq())),
+                            HubFrame::Ack {
+                                r#ref: ack_ref,
+                                delivered,
+                                why,
+                            },
+                        ))
+                        .await;
+                }
+            })
+        };
+
         for frame in waiting {
-            let ack_ref = frame.id.clone();
-            let (delivered, why) = self.handle(&addr, &instance, frame.payload).await;
-            let _ = tx
-                .send(Envelope::new(
-                    FrameId::new(format!("h{}", next_frame_seq())),
-                    HubFrame::Ack {
-                        r#ref: ack_ref,
-                        delivered,
-                        why,
-                    },
-                ))
-                .await;
+            if frames_tx.send(frame).await.is_err() {
+                break;
+            }
         }
 
         // The claim is released on EVERY way out of this loop, not only the tidy one.
@@ -1881,6 +2714,9 @@ impl<S: Surface> Hub<S> {
                     // abandon. And releasing drops the claim's own `Sender`, so the writer's channel
                     // really closes and it ends at once rather than at the timeout.
                     self.release(&addr, pid).await;
+                    drop(frames_tx);
+                    let _ = tokio::time::timeout(PROSE_SHELF_LIFE, &mut handler).await;
+                    handler.abort();
                     drop(tx);
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
                     return Ok(());
@@ -1893,23 +2729,28 @@ impl<S: Surface> Hub<S> {
                     break;
                 }
                 Ok(Some(frame)) => {
-                    let ack_ref = frame.id.clone();
-                    let (delivered, why) = self.handle(&addr, &instance, frame.payload).await;
-                    let _ = tx
-                        .send(Envelope::new(
-                            FrameId::new(format!("h{}", next_frame_seq())),
-                            HubFrame::Ack {
-                                r#ref: ack_ref,
-                                delivered,
-                                why,
-                            },
-                        ))
-                        .await;
+                    if frames_tx.send(frame).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
 
+        // Released the instant the socket ends, and BEFORE waiting on anything in flight. That
+        // ordering is the whole of the fix above: liveness is a fact about the socket, not about
+        // how long the last thing said is worth holding.
         self.release(&addr, pid).await;
+        drop(frames_tx);
+        // Bounded, and not aborted outright. What is usually in flight when a bridge goes away is
+        // the session's own last `done`, and dropping that mid-send loses a message for nothing —
+        // but a backlog belonging to a session that has been gone for a minute and a half is not
+        // worth another project's turn.
+        if tokio::time::timeout(PROSE_SHELF_LIFE, &mut handler)
+            .await
+            .is_err()
+        {
+            handler.abort();
+        }
         writer.abort();
         Ok(())
     }
@@ -2001,7 +2842,12 @@ impl<S: Surface> Hub<S> {
                     return (Delivered::No, Some(hub_proto::AckWhy::TelegramRefused));
                 }
 
-                let outcome = self.say(addr, &text, &options).await;
+                // A QUESTION however the agent minted it. An `ask` with no options is still
+                // something he is expected to answer — by typing rather than by tapping — so its
+                // shelf life is a question's, and the buttons cannot say so on their own.
+                let outcome = self
+                    .say_as(addr, &text, &options, Perishable::Question)
+                    .await;
 
                 // The record is written for the message that actually exists. Recording before the
                 // send would leave a ledger entry for a message nobody can see; recording against a

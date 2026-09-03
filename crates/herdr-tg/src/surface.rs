@@ -23,7 +23,7 @@ use teloxide::types::{
     InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, Rgb, ThreadId,
 };
 
-use crate::hub::{SendOutcome, Surface};
+use crate::hub::{Refused, SendOutcome, Surface};
 use crate::render::escape_html;
 
 /// The six colours Telegram permits for a topic icon, in the order the design's `hash % 6` indexes.
@@ -34,6 +34,42 @@ const TOPIC_COLOURS: [u32; 6] = [0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B
 
 /// What marks a `callback_data` as belonging to the hub rather than to the older pane path.
 pub const CALLBACK_PREFIX: &str = "h";
+
+/// Turn what Telegram answered a send with into the one word the hub acts on.
+///
+/// One function, both send paths — a topic's and General's — because a classification that exists
+/// twice is a classification that will disagree with itself.
+fn what_became_of_it(
+    answered: Result<teloxide::types::Message, teloxide::RequestError>,
+) -> SendOutcome {
+    match answered {
+        Ok(msg) => SendOutcome::Sent(MsgId::new(msg.id.0.to_string())),
+        Err(e) if is_topic_gone(&e) => SendOutcome::TopicGone,
+        Err(teloxide::RequestError::Network(e)) => {
+            // The send went out and could not be checked. Telegram has no idempotency key, so
+            // this may or may not have landed and there is no way to ask. Reporting it as a
+            // failure would invite a retry, and a retried question with buttons is two live
+            // menus for one question, both tappable forever.
+            tracing::warn!(error = %e, "a send could not be confirmed either way");
+            SendOutcome::Unseen
+        }
+        // A flood wait is not a refusal, whatever it looks like from here: it is Telegram saying
+        // "not yet", and it mends itself inside a minute. It used to fall through to the arm below
+        // and reach the agent as "his messaging app would not take it" — a permanent-sounding
+        // sentence about something temporary — while the seconds it came with were destroyed.
+        // `TooFast` is the word for that, and it already carries a duration the budget can act on.
+        Err(e) => match flood_wait(&e) {
+            Some(wait) => {
+                tracing::warn!(
+                    seconds = wait.as_secs(),
+                    "Telegram is refusing sends to this chat for flooding"
+                );
+                SendOutcome::TooFast(wait)
+            }
+            None => SendOutcome::Refused(e.to_string()),
+        },
+    }
+}
 
 /// The real thing.
 pub struct Telegram {
@@ -73,10 +109,67 @@ fn is_topic_gone(err: &teloxide::RequestError) -> bool {
     said.contains("message thread not found") || said.contains("topic_deleted")
 }
 
+/// What to assume when Telegram refuses for flooding and does not say for how long.
+///
+/// The measured shape of the refusal is a sixty-second window: twenty sends were accepted in the
+/// first nineteen seconds and `retry_after` then counted down the rest of the minute
+/// (`docs/RATE-PROBE.md`). So a whole minute is the longest the chat can be shut for by one of
+/// these, and assuming the longest is the fail-closed direction — guessing short means walking
+/// straight back into the wall and earning a fresh one.
+pub const FLOOD_WAIT_WHEN_UNSAID: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Is this a 429, and for how long?
+///
+/// **Both shapes, because the repo has a fixture for the one that loses the number.** teloxide
+/// carries a flood wait two ways and only one of them is typed: `RequestError::RetryAfter` holds
+/// the seconds, while a refusal Telegram sent without `parameters.retry_after` — or one teloxide's
+/// error table does not know — arrives as `Api(Unknown("Too Many Requests: retry after 5"))`, where
+/// `retry_after()` answers `None` and the seconds exist only inside the sentence. Matching only the
+/// typed one would miss exactly the shape `only_a_deleted_topic_looks_like_a_deleted_topic` already
+/// pins as a real thing this bot receives.
+///
+/// Note what the typed variant's `Display` is: `Retry after 41`, with no "too many requests" in it
+/// at all. A phrase match on that alone finds the shape that has already lost the number and misses
+/// the one that kept it.
+///
+/// Fails CLOSED. A 429 whose seconds cannot be recovered is still a 429, and the answer is a
+/// conservative wait rather than a fall through to "Telegram refused this permanently" — which is
+/// what the whole chat used to be told about something that mends itself inside a minute.
+pub fn flood_wait(err: &teloxide::RequestError) -> Option<std::time::Duration> {
+    if let teloxide::RequestError::RetryAfter(seconds) = err {
+        return Some(seconds.duration().max(crate::queue::MIN_FLOOD_WAIT));
+    }
+    let said = err.to_string().to_lowercase();
+    if !said.contains("too many requests") && !said.contains("flood") {
+        return None;
+    }
+    Some(
+        seconds_named_in(&said)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(FLOOD_WAIT_WHEN_UNSAID)
+            .max(crate::queue::MIN_FLOOD_WAIT),
+    )
+}
+
+/// The number of seconds an error sentence names, when it names one.
+///
+/// Reads the run of digits after "retry after". Deliberately narrow: the first number in the
+/// sentence is not necessarily the wait — a chat id is a number too — and a wait read off the wrong
+/// one either reopens the chat far too early or shuts it for a week.
+fn seconds_named_in(said: &str) -> Option<u64> {
+    let after = said.split("retry after").nth(1)?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 impl Surface for Telegram {
-    async fn create_topic(&self, title: &str, icon_color: u8) -> anyhow::Result<i32> {
+    async fn create_topic(&self, title: &str, icon_color: u8) -> Result<i32, Refused> {
         let colour = TOPIC_COLOURS[(icon_color as usize) % TOPIC_COLOURS.len()];
-        let topic = self
+        let made = self
             .bot
             .create_forum_topic(self.forum, title)
             .icon_color(Rgb {
@@ -84,8 +177,17 @@ impl Surface for Telegram {
                 g: ((colour >> 8) & 0xFF) as u8,
                 b: (colour & 0xFF) as u8,
             })
-            .await?;
-        Ok(topic.thread_id.0.0)
+            .await;
+        match made {
+            Ok(topic) => Ok(topic.thread_id.0.0),
+            // The seconds are carried out as a VALUE. This used to be a bare `?`, so a flood wait
+            // on topic creation became an opaque sentence and the chat's budget never heard about
+            // it — while every other project carried on sending into a chat Telegram had shut.
+            Err(e) => Err(Refused {
+                why: e.to_string(),
+                flood_wait: flood_wait(&e),
+            }),
+        }
     }
 
     async fn send(&self, topic_id: i32, text: &str, buttons: &[AskOption]) -> SendOutcome {
@@ -120,19 +222,32 @@ impl Surface for Telegram {
             req = req.reply_markup(InlineKeyboardMarkup::new(rows));
         }
 
-        match req.await {
-            Ok(msg) => SendOutcome::Sent(MsgId::new(msg.id.0.to_string())),
-            Err(e) if is_topic_gone(&e) => SendOutcome::TopicGone,
-            Err(teloxide::RequestError::Network(e)) => {
-                // The send went out and could not be checked. Telegram has no idempotency key, so
-                // this may or may not have landed and there is no way to ask. Reporting it as a
-                // failure would invite a retry, and a retried question with buttons is two live
-                // menus for one question, both tappable forever.
-                tracing::warn!(error = %e, "a send could not be confirmed either way");
-                SendOutcome::Unseen
-            }
-            Err(e) => SendOutcome::Refused(e.to_string()),
-        }
+        what_became_of_it(req.await)
+    }
+
+    async fn say_in_general(&self, text: &str) -> SendOutcome {
+        // No `message_thread_id`, which is what puts a message in the forum's General rather than
+        // in a topic. Escaped like everything else an agent could have influenced the shape of.
+        what_became_of_it(
+            self.bot
+                .send_message(self.forum, escape_html(text))
+                .parse_mode(ParseMode::Html)
+                .await,
+        )
+    }
+
+    async fn rewrite(&self, msg_id: &MsgId, text: &str) -> anyhow::Result<()> {
+        let Ok(raw) = msg_id.as_str().parse::<i32>() else {
+            anyhow::bail!("that message id is not one this bot wrote");
+        };
+        // Clipped for the same reason a retirement is: an edit whose body is over Telegram's limit
+        // FAILS, and a failed edit here leaves the operator reading a stale count.
+        let body = crate::queue::fit(&escape_html(text), crate::queue::MAX_TEXT).0;
+        self.bot
+            .edit_message_text(self.forum, MessageId(raw), body)
+            .parse_mode(ParseMode::Html)
+            .await?;
+        Ok(())
     }
 
     async fn retire_buttons(
@@ -181,6 +296,7 @@ impl Surface for Telegram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn a_long_question_keeps_its_note_when_its_keyboard_is_retired() {
@@ -226,6 +342,64 @@ mod tests {
             assert!(
                 TOPIC_COLOURS.contains(&picked),
                 "colour {picked:#x} is not one of the six"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flood_wait_is_recognised_in_both_the_shapes_telegram_sends_it() {
+        // Two shapes, and only one of them keeps the number where it can be read as a number.
+        // teloxide types the one whose JSON carried `parameters.retry_after`; the other arrives as
+        // an unknown API error with the seconds buried in the sentence, and `retry_after()` answers
+        // None for it. This repo already has a fixture for the second one, four lines below, where
+        // it is pinned as a real thing this bot receives and must not mistake for a deleted topic.
+        let typed = teloxide::RequestError::RetryAfter(teloxide::types::Seconds::from_seconds(41));
+        assert_eq!(
+            flood_wait(&typed),
+            Some(Duration::from_secs(41)),
+            "a 429 that carried its seconds as a number was not recognised as one"
+        );
+
+        let in_the_sentence = teloxide::RequestError::Api(teloxide::ApiError::Unknown(
+            "Too Many Requests: retry after 5".to_owned(),
+        ));
+        assert_eq!(
+            flood_wait(&in_the_sentence),
+            Some(Duration::from_secs(5)),
+            "a 429 whose seconds were only in its text was read as an ordinary refusal"
+        );
+    }
+
+    #[test]
+    fn a_flood_wait_that_will_not_say_how_long_is_given_the_longest_it_could_be() {
+        // Fail closed. Guessing short here means walking back into the wall and earning a fresh
+        // one, so an unreadable number becomes the whole measured window rather than nothing.
+        let no_number = teloxide::RequestError::Api(teloxide::ApiError::Unknown(
+            "Too Many Requests: flood control exceeded".to_owned(),
+        ));
+        assert_eq!(
+            flood_wait(&no_number),
+            Some(FLOOD_WAIT_WHEN_UNSAID),
+            "a 429 with no readable number fell through as if it were not a 429 at all"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_refusal_is_never_mistaken_for_a_flood_wait() {
+        // The mirror of the deleted-topic test below, and it matters for the same reason: a broad
+        // match would silence the whole chat for a minute over a message that was merely malformed,
+        // and tell the agent to come back later about something that will never work.
+        for other in [
+            "Bad Request: message text is empty",
+            "Bad Request: message thread not found",
+            "Forbidden: bot was blocked by the user",
+            "Bad Request: chat not found",
+        ] {
+            let e = teloxide::RequestError::Api(teloxide::ApiError::Unknown(other.to_owned()));
+            assert_eq!(
+                flood_wait(&e),
+                None,
+                "{other} was mistaken for a flood wait, which would silence the chat"
             );
         }
     }

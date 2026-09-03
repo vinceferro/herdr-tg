@@ -29,6 +29,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use teloxide::RequestError;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode, ThreadId};
 use teloxide::utils::command::BotCommands;
@@ -342,18 +343,32 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     };
 
     // Answer the query first, or Telegram leaves a spinner on the button.
+    //
+    // NOT metered, and knowingly: whether `answerCallbackQuery` is charged against the per-minute
+    // group ceiling was not measured on 3 September and is still open (`docs/RATE-PROBE.md`). It is
+    // one per tap and paced by a human thumb, so guessing wrong costs at most one token an operator
+    // action — and spending a token for something that may cost nothing would take that token off
+    // an agent for no reason.
     let _ = bot
         .answer_callback_query(q.id.clone())
         .text(toast(&answer))
         .await;
     if let Some(msg) = q.message.as_ref() {
-        let mut out = bot
-            .send_message(msg.chat().id, &answer)
-            .parse_mode(ParseMode::Html);
+        // This one IS a message, so it comes out of the chat's budget — through the path that
+        // cannot refuse, because he tapped a button and the answer to that is not an agent's
+        // message to be rationed. It fires precisely while he is looking at a busy forum, which is
+        // exactly when the budget is thin: the tap was caused by traffic.
+        let chat = msg.chat().id;
+        told_the_operator(&ctx, chat.0).await;
+        let mut out = bot.send_message(chat, &answer).parse_mode(ParseMode::Html);
         if let Some(thread) = reply_thread {
             out = out.message_thread_id(ThreadId(MessageId(thread)));
         }
-        let _ = out.await;
+        // The answer is READ. It used to be discarded outright, so a flood wait discovered on the
+        // one message that must never be lost left him having tapped a button and been told
+        // nothing — while the ledger already said the question was answered — and the budget never
+        // heard about the refusal either.
+        what_telegram_said(&ctx, chat.0, out.await).await;
     }
     tracing::info!(chat_id, "handled a button");
     Ok(())
@@ -410,13 +425,14 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
                  who you mean.",
             ),
         };
+        told_the_operator(&ctx, chat_id).await;
         let mut out = bot
             .send_message(msg.chat.id, &body)
             .parse_mode(ParseMode::Html);
         if let Some(t) = thread {
             out = out.message_thread_id(ThreadId(MessageId(t)));
         }
-        let _ = out.await;
+        what_telegram_said(&ctx, chat_id, out.await).await;
         return Ok(());
     };
 
@@ -427,8 +443,77 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
     // Answered where it was asked. An unthreaded reply lands in the forum's General, so a `/projects`
     // typed inside a project's topic was answered somewhere the operator was not looking — and once
     // you live inside topics, which is what more than one project means, that is most of the time.
-    reply(&bot, msg.chat.id, msg.thread_id.map(|t| t.0.0), &body).await;
+    told_the_operator(&ctx, chat_id).await;
+    reply(&ctx, &bot, msg.chat.id, msg.thread_id.map(|t| t.0.0), &body).await;
     Ok(())
+}
+
+/// Take a token for a message to the operator that the hub is not allowed to refuse.
+///
+/// Three sends live in this file and none of them could see the budget: the confirmation under a
+/// tap, the answer to a line typed at a topic with nothing behind it, and a command's reply. They do
+/// not scale with the herd — one per tap, one per line, one per command — but the ceiling is per
+/// CHAT, so an unmetered one does not cost itself. It costs whichever project sends next, and all
+/// three fire while the operator is looking at a busy forum, which is when the budget is thinnest.
+///
+/// It cannot refuse and must not: he did something, and the answer is not an agent's message to be
+/// rationed. What it does is make the ceiling able to SEE these, so the pacing that protects
+/// everything else is working from the real number.
+///
+/// A hub of `None` is the box where the forum has never been set up. There is no budget to spend
+/// from because there is no socket half running at all, so there is nothing to account for.
+async fn told_the_operator(ctx: &Ctx, chat_id: i64) {
+    a_send_the_hub_could_not_refuse(ctx.hub.as_ref(), chat_id).await;
+}
+
+/// The same, over any surface, so the seam can be tested without a bot token.
+///
+/// The chat is the one the message is actually going to. It used to be the forum unconditionally,
+/// and the allowlist can hold more than the forum: a command typed in the operator's other chat
+/// took a send off the forum's ceiling — and imposed the one-second rhythm on it — for a message
+/// the forum never carried. `Budgets` is keyed per chat exactly so it does not have to.
+async fn a_send_the_hub_could_not_refuse<S: crate::hub::Surface>(
+    hub: Option<&Arc<crate::hub::Hub<S>>>,
+    chat_id: i64,
+) {
+    if let Some(hub) = hub {
+        hub.account_for_a_send_that_could_not_be_refused(chat_id)
+            .await;
+    }
+}
+
+/// Read what Telegram answered one of the sends the hub is not allowed to refuse.
+///
+/// All three of them used to throw the answer away — two on a bare `let _ =`, one on a log line —
+/// so the `429` the operator's own tap earned never reached the budget, and the very next agent
+/// message walked into the same wall. That is the exact failure the backpressure beside this
+/// exists to close, and it had two blind spots out of five paths.
+async fn what_telegram_said<T>(ctx: &Ctx, chat_id: i64, answered: Result<T, RequestError>) {
+    telegram_answered(ctx.hub.as_ref(), chat_id, answered).await;
+}
+
+/// The same, over any surface. See [`a_send_the_hub_could_not_refuse`] for why the split exists.
+async fn telegram_answered<S: crate::hub::Surface, T>(
+    hub: Option<&Arc<crate::hub::Hub<S>>>,
+    chat_id: i64,
+    answered: Result<T, RequestError>,
+) {
+    let Err(e) = answered else { return };
+    match crate::surface::flood_wait(&e) {
+        // Never silent, and never only a log line. A rejected send used to be one error log and a
+        // drop, and that had already lost 5,164 characters of a real agent's longest message.
+        Some(wait) => {
+            tracing::error!(
+                chat = chat_id,
+                seconds = wait.as_secs(),
+                "the operator was NOT told, because Telegram has shut this chat for flooding"
+            );
+            if let Some(hub) = hub {
+                hub.telegram_shut_this_chat(chat_id, wait).await;
+            }
+        }
+        None => tracing::error!(error = %e, chat = chat_id, "the operator was NOT told"),
+    }
 }
 
 /// Which projects are enrolled, and which have a bridge on the socket right now.
@@ -569,18 +654,14 @@ fn a_tap_that_reached_nobody(what: crate::hub::Withdrawal) -> &'static str {
     }
 }
 
-async fn reply(bot: &Bot, chat: ChatId, thread: Option<i32>, html: &str) {
+async fn reply(ctx: &Ctx, bot: &Bot, chat: ChatId, thread: Option<i32>, html: &str) {
     let mut out = bot
         .send_message(chat, fit(html.to_owned()))
         .parse_mode(ParseMode::Html);
     if let Some(t) = thread {
         out = out.message_thread_id(ThreadId(MessageId(t)));
     }
-    if let Err(e) = out.await {
-        // Never silent. A rejected send used to be one error log and a drop, and that had already
-        // lost 5,164 characters of a real agent's longest message.
-        tracing::error!(error = %e, chat = chat.0, "the operator was NOT told");
-    }
+    what_telegram_said(ctx, chat.0, out.await).await;
 }
 
 /// Clip to what Telegram will take, on a character boundary.
@@ -644,7 +725,11 @@ mod tests {
     struct NoSurface;
 
     impl crate::hub::Surface for NoSurface {
-        async fn create_topic(&self, _title: &str, _icon_color: u8) -> anyhow::Result<i32> {
+        async fn create_topic(
+            &self,
+            _title: &str,
+            _icon_color: u8,
+        ) -> Result<i32, crate::hub::Refused> {
             unreachable!("the project list creates no topics")
         }
         async fn send(
@@ -655,6 +740,12 @@ mod tests {
         ) -> crate::hub::SendOutcome {
             unreachable!("the project list sends nothing")
         }
+        async fn say_in_general(&self, _text: &str) -> crate::hub::SendOutcome {
+            unreachable!("the project list says nothing in the forum")
+        }
+        async fn rewrite(&self, _msg_id: &hub_proto::MsgId, _text: &str) -> anyhow::Result<()> {
+            unreachable!("the project list rewrites nothing")
+        }
         async fn retire_buttons(
             &self,
             _topic_id: i32,
@@ -664,6 +755,78 @@ mod tests {
         ) -> anyhow::Result<()> {
             unreachable!("the project list retires nothing")
         }
+    }
+
+    /// A hub over a surface that never sends, with a forum and one other allowed chat.
+    fn a_hub(dir: &std::path::Path, forum: i64, also: i64) -> Arc<crate::hub::Hub<NoSurface>> {
+        Arc::new(crate::hub::Hub::new(
+            Arc::new(NoSurface),
+            crate::registry::Registry::load(dir.join("projects.json")),
+            crate::hub::AskLedger::load(dir.join("asks.json")),
+            crate::hub::HubAudit::new(dir.join("hub.audit.log")),
+            vec![forum, also],
+            forum,
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_flood_wait_on_a_message_the_hub_could_not_refuse_shuts_the_chat_for_the_agents_too()
+    {
+        // Three sends in this file are the operator's own and cannot be refused — the confirmation
+        // under a tap, the answer to a line typed at a topic with nothing behind it, and a
+        // command's reply — and all three used to throw away whatever Telegram answered them. Two
+        // on a bare `let _ =`, one on a log line. So the `429` his own tap earned never reached the
+        // budget and the very next agent message walked into the same wall, which is the exact
+        // failure the backpressure elsewhere exists to close. They fire while he is looking at a
+        // busy forum, because the traffic is what made him tap.
+        const FORUM: i64 = -1001;
+        let dir = tempfile::tempdir().expect("tmp");
+        let hub = a_hub(dir.path(), FORUM, 77);
+        assert!(
+            !hub.a_send_would_be_refused(FORUM).await,
+            "this test needs a chat with room left in it"
+        );
+
+        telegram_answered::<NoSurface, ()>(
+            Some(&hub),
+            FORUM,
+            Err(RequestError::RetryAfter(
+                teloxide::types::Seconds::from_seconds(41),
+            )),
+        )
+        .await;
+
+        assert!(
+            hub.a_send_would_be_refused(FORUM).await,
+            "a flood wait discovered on the operator's own message never reached the budget, so \
+             the next agent send walks into the same wall"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_in_another_allowed_chat_is_never_charged_to_the_forum() {
+        // The allowlist holds more than the forum on the live box, and every unrefusable send used
+        // to be charged to the forum whatever chat it was going to. A `/help` typed in his other
+        // chat took a send off the herd's ceiling — and imposed the one-second rhythm on the forum
+        // too — for a message the forum never carried.
+        const FORUM: i64 = -1001;
+        const SOMEWHERE_ELSE: i64 = 77;
+        let dir = tempfile::tempdir().expect("tmp");
+        let hub = a_hub(dir.path(), FORUM, SOMEWHERE_ELSE);
+
+        for _ in 0..crate::queue::PER_MINUTE {
+            a_send_the_hub_could_not_refuse(Some(&hub), SOMEWHERE_ELSE).await;
+        }
+        assert!(
+            !hub.a_send_would_be_refused(FORUM).await,
+            "typing in another chat spent the forum's ceiling, so a project would be shed for \
+             messages the forum never carried"
+        );
+        assert!(
+            hub.a_send_would_be_refused(SOMEWHERE_ELSE).await,
+            "the chat that actually carried them did not pay for them either, so nothing is \
+             pacing it at all"
+        );
     }
 
     #[tokio::test]
