@@ -7,10 +7,21 @@
 //! six. Everything here follows from that: the bucket is keyed on the chat, and fairness between
 //! projects has to be arranged rather than assumed.
 //!
-//! Measured before this was written, not inferred from documentation — see the probe in
-//! `docs/HUB-DESIGN.md` §12. If it had turned out to be per-thread, this file would be
-//! over-engineering; because it is per-chat, it is the difference between working at six projects
-//! and not.
+//! **Measured on 3 September 2026, and until then it was not.** This paragraph used to claim the
+//! measurement had already happened and cite `docs/HUB-DESIGN.md` §12 for it; §12 describes that
+//! probe in the future tense, as work to do, and no result was ever recorded. The number every send
+//! is paced against rested on a citation to a plan. It happens to be right, which is why nobody
+//! noticed — and being right is not the same as being checked.
+//!
+//! What the probe found, firing forty sends across FOUR topics of one forum as fast as they would
+//! go: twenty accepted, the twenty-first refused with `429` and `retry_after: 41`. Spreading across
+//! topics bought nothing, so the ceiling is per CHAT. It is also a window rather than a rate — a
+//! burst of twenty is allowed and then nothing until the minute is out, which is what `retry_after`
+//! counts down. A token bucket is the conservative shape for that, not the exact one.
+//!
+//! `editMessageText` is NOT charged against it: thirty edits straight after seeding five messages
+//! were all accepted, no `429`, and a send still went through afterwards. So taking a keyboard off
+//! costs nothing here, and editing a message in place is the cheap way to say something twice.
 //!
 //! # Shedding is never silent
 //!
