@@ -2,9 +2,29 @@
 /**
  * kickoff-channel — the agent's half of the herdr-tg hub.
  *
- * Claude Code starts this as the session's channel. It dials one Unix socket and speaks the frames
- * in `crates/hub-proto`. It holds no Telegram token, no chat allowlist and no model: the hub owns
- * all three, and this process could not reach the operator directly if it tried.
+ * An MCP server the engine starts as the session's channel. It dials one Unix socket and speaks the
+ * frames in `crates/hub-proto`. It holds no Telegram token, no chat allowlist and no model: the hub
+ * owns all three, and this process could not reach the operator directly if it tried.
+ *
+ * # Two engines start it, and an agent cannot tell which
+ *
+ * Claude Code declares it in a plugin manifest and names the project in `CLAUDE_PROJECT_DIR`.
+ * opencode declares it under `mcp` and sets the child's cwd to the session's own directory. Those
+ * two facts are the whole of the difference in how it STARTS: the frames, the queue and the three
+ * outcomes are identical either way.
+ *
+ * The wording is too, everywhere the engine does not decide whether a sentence is true, and where
+ * it does the difference is there for the same reason the rest is verbatim. What a tool returns
+ * here is what the agent goes on to repeat to the operator, and a sentence that is true on one
+ * engine and false on the other is the incident this vocabulary was written for.
+ * The operator's ANSWER comes back as an MCP notification that only Claude Code
+ * consumes — so on an engine that cannot carry one, "his answer will arrive" is exactly such a
+ * sentence, and `ask` says what is true there instead. The same engine fact decides one more thing,
+ * and it is why every SUCCESS sentence differs too: a `reached` result is the bridge saying the
+ * frame went out, and what makes it honest on Claude Code is that the hub's later contradiction can
+ * still reach the agent. Where it cannot, the success sentence is the last word there will ever be,
+ * and it says so. The queued and permanent outcomes are byte for byte the same on both, because
+ * those two are already final.
  *
  * # Authority flows one way
  *
@@ -12,20 +32,14 @@
  * which connection is which project because it resolved the SECRET at `.kickoff/hub.token`. The
  * `project_id` in `hello` is not consulted by the hub; it is there for a human reading a log.
  *
- * # The three framing rules, and why they are worth the lines
- *
- * Each cost a real debugging session on the Rust side of this same socket:
- *
- *   1. The trailing newline is appended in ONE place and nowhere else. Omitting it made the far end
- *      hang forever with no error and no close — 5.01s, zero bytes, connection still open.
- *   2. Read exactly one line. Never to EOF: a reset after a good frame loses the frame with it.
- *   3. Bound one frame, not the conversation. A cumulative ceiling ends a healthy stream in silence
- *      that reads as a disconnect the peer never performed.
- *
  * # Nothing here ever blocks the agent's turn
  *
  * `ask` returns immediately. The answer arrives later as a channel notification, because the
  * operator may take hours and a tool call that waited for him would be a session that looked hung.
+ *
+ * The wire itself — the queue, the three framing rules, the reconnect — lives in `hub-link.ts`, and
+ * the relay in `adapters/fanin/` speaks it through the same module. One implementation, because the
+ * one time this project had two, the copy drifted by thirteen already-fixed defects.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -34,164 +48,148 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, existsSync } from 'fs'
-import { dirname, join, resolve } from 'path'
-
-const PROTOCOL_VERSION = 1
-const MAX_FRAME_BYTES = 64 * 1024
+import { HubLink, type Delivery, type Identity, type Outbound } from './hub-link.ts'
+import { factsFor, faninSocket, findProject, hubSocket, type Project } from './where.ts'
 
 /**
- * Where Claude Code started this session — and it is NOT necessarily the project's top folder.
+ * A variable set to nothing is not set.
  *
- * It was `process.cwd()`, on the belief that Claude Code runs in the project directory. It does;
- * this process does not. An MCP server declared in a plugin manifest is started with
- * `bun run --cwd ${CLAUDE_PLUGIN_ROOT}`, so cwd here is the PLUGIN folder. The bridge looked for
+ * opencode substitutes a missing `{env:VAR}` in its config with the EMPTY STRING rather than
+ * failing, so an empty value here means a config asked for something that was not there. That is
+ * not a directory and must never be treated as one — an empty path resolves against cwd, which is
+ * the guess this file exists to refuse.
+ */
+const named = (v: string | undefined): string | null => (v && v.length ? v : null)
+
+/**
+ * Where the session was started — and it is NOT necessarily the project's top folder.
+ *
+ * It was `process.cwd()`, on the belief that the engine runs in the project directory. Claude Code
+ * does; this process does not. An MCP server declared in a plugin manifest is started with
+ * `bun run --cwd ${CLAUDE_PLUGIN_ROOT}`, so cwd there is the PLUGIN folder. The bridge looked for
  * the project's secret at `<plugin>/.kickoff/hub.token`, found nothing, and reported that on a
  * stderr stream neither the agent nor the operator can see — so it never once connected, and every
  * message the agent believed it had sent went nowhere at all.
  *
- * There is no fallback to cwd, because cwd is wrong in BOTH plugin layouts: a directory
- * marketplace happens to put the plugin inside the repo, and a git-source install puts it under
- * `~/.claude/plugins` where it is not even near one. Guessing a directory is what caused this, so
- * an unset variable is treated as not knowing, and not knowing fails closed and says why.
+ * Three terms, and the ORDER is the safety argument, not a preference:
+ *
+ *   1. `CLAUDE_PROJECT_DIR`, which Claude Code sets. It is first, so the path that ships to a live
+ *      session takes it and NOTHING below can alter what that session does.
+ *   2. `KICKOFF_CHANNEL_PROJECT_DIR`, for any harness that knows the directory and can say it.
+ *   3. cwd — and only when something has explicitly vouched for it. opencode sets the MCP child's
+ *      cwd to the session's own directory, which is exactly the folder wanted here.
+ *
+ * The third is a flag and not a bare fallback, and that distinction is the whole point of the
+ * defect above: cwd is wrong under Claude Code in BOTH plugin layouts, so a bare fallback would
+ * quietly restore the original failure for any Claude session that ever lost the variable. A flag a
+ * config had to set is a claim somebody made; a bare fallback is a guess this file made, and
+ * guessing is what caused the defect. An unset variable is still not knowing, and not knowing fails
+ * closed and says why.
  */
-const LAUNCHED_IN = process.env.CLAUDE_PROJECT_DIR ?? null
+const LAUNCHED_IN =
+  named(process.env.CLAUDE_PROJECT_DIR) ??
+  named(process.env.KICKOFF_CHANNEL_PROJECT_DIR) ??
+  (process.env.KICKOFF_CHANNEL_CWD_IS_PROJECT === '1' ? process.cwd() : null)
 
 /**
- * The top of the working tree the session was launched in, or null when git will not say.
+ * The repository, its main working tree, and this worktree's own name — read off the machine.
  *
- * This is the one boundary the search below may cross, and it is what keeps that search from being
- * the directory-guessing that caused the original defect: it never leaves the repository Claude
- * Code was started in. Asked once, because the launch directory cannot change while this runs.
+ * Derived in `where.ts` because the relay derives the same three facts from the same directory, and
+ * two copies of this arithmetic are two processes that can disagree about which conversation they
+ * are while both look right.
  */
-const PROJECT_TOP = ((): string | null => {
-  if (!LAUNCHED_IN) return null
-  return gitDir(LAUNCHED_IN, '--show-toplevel')
-})()
+const FACTS = factsFor(LAUNCHED_IN)
+const { projectTop: PROJECT_TOP, mainTop: MAIN_TOP, lane: LANE } = FACTS
 
-/** Ask git one question about a directory, or null when it will not answer. */
-function gitDir(from: string, flag: string): string | null {
-  try {
-    const git = Bun.spawnSync(['git', '-C', from, 'rev-parse', flag], {
-      stdout: 'pipe',
-      stderr: 'ignore',
-      // `--git-common-dir` answers RELATIVELY in the main worktree ('.git') and absolutely in a
-      // linked one, so it is resolved against the directory it was asked about and not against
-      // this process's cwd — which is the plugin folder, nowhere near either.
-      cwd: from,
-    })
-    const out = new TextDecoder().decode(git.stdout).trim()
-    return git.exitCode === 0 && out.length ? resolve(from, out) : null
-  } catch {
-    // git missing, or a tree it will not talk about. The boundary is unknown, and an unknown
-    // boundary means the search stays where it started rather than inventing one.
-    return null
-  }
-}
+
 
 /**
- * The MAIN working tree of this repository, when it is not the one the session started in.
+ * Whether this server holds the hub connection itself, or hands its frames to a relay that holds it
+ * on behalf of the whole address.
  *
- * kickoff runs its lanes in `git worktree` checkouts, and a lane worktree has NO
- * `.kickoff/hub.token`: the secret is gitignored, so it is never checked out into one. The search
- * below therefore stopped at the worktree, found nothing, and every lane failed closed with "this
- * project is not enrolled" — which made a topic per lane unreachable from a real lane.
+ * The hub admits ONE live connection per addressable thing. On opencode, two things want to speak
+ * for one lane: this server, carrying what the agent CHOSE to say, and the event bridge, carrying
+ * the permission and question prompts it did not choose. They cannot both hold the claim — the
+ * second is refused with `already_claimed` — so the fan-in belongs on this side of the seam and the
+ * hub never learns there were two.
  *
- * `--git-common-dir` is the machine-derived fact that joins them. In a linked worktree it is an
- * absolute path to the MAIN repo's `.git`; in the main worktree it is `.git` itself. Its parent is
- * the main working tree either way. Crossing to it is not the directory-guessing the original
- * defect was made of — it is one repository, named by git, and the alternative is enrolling the
- * worktree, which would make one repo into two projects with two secrets and two topics.
+ * It is one code path chosen by configuration, not two implementations: the relay speaks the same
+ * nine frames the hub does, so everything below is byte for byte what it always was and only the
+ * address differs. Under Claude Code the flag is unset and the address is the hub's own socket.
  */
-const MAIN_TOP = ((): string | null => {
-  if (!LAUNCHED_IN) return null
-  const common = gitDir(LAUNCHED_IN, '--git-common-dir')
-  return common ? dirname(common) : null
-})()
+const VIA_FANIN = process.env.KICKOFF_CHANNEL_VIA_FANIN === '1'
 
 /**
- * Which worktree this session is in, when it is not the main one — the lane's own name.
+ * Where to dial, or null when this build cannot work it out.
  *
- * **git's own name for the worktree, not the folder it is checked out in.** In a linked worktree
- * `--git-dir` is `<main>/.git/worktrees/<name>`, and git guarantees that `<name>` is unique across
- * the repository: adding a second worktree whose folder is also called `wip` gives it `wip1`.
- *
- * The folder's basename is what this read first, and it is not unique. git dedupes only its own
- * internal name, never the checkout path, so `~/a/wip` and `~/b/wip` are both legal — two different
- * trees with two different agents, presenting one name and therefore resolving to ONE conversation
- * at the hub. The second one's arrival then evicts the first's claim and sweeps its still-open
- * questions off the operator's phone as "the session that asked this restarted". Neither tree
- * restarted. `lane-<MMDD>-<HHMMSS>-<pid>` never collides, so this never bit the dispatcher — it bit
- * the operator's own hand-made trees, which are the ones called `wip`, `review` and `hotfix`.
- *
- * It is an ADDRESS, not a credential. The token beside it still resolves to the project, and the
- * hub builds the conversation's address from that resolved project plus this name — so naming a
- * lane can never reach a project this session does not already hold the secret for.
+ * Null is reachable only with a relay asked for and no repository to derive its address from, and
+ * it fails closed rather than falling back to the hub's own socket. Dialling the hub directly when
+ * a relay was asked for is two writers racing for one claim, which is the entire thing the claim
+ * exists to prevent.
  */
-const LANE = ((): string | null => {
-  if (!PROJECT_TOP || !MAIN_TOP || PROJECT_TOP === MAIN_TOP) return null
-  const own = gitDir(PROJECT_TOP, '--git-dir')
-  const name = (own ?? PROJECT_TOP).split('/').pop()
-  return name && name.length ? name : null
-})()
-
-/** The project this session belongs to, or null when it is not in one that is enrolled. */
-type Project = { repo: string; tokenFile: string; token: string }
+const SOCKET: string | null = VIA_FANIN
+  ? MAIN_TOP
+    ? faninSocket(MAIN_TOP, LANE)
+    : null
+  : hubSocket()
 
 /**
- * Find the enrolled project this session is inside.
+ * What the agent is told when nothing at all answers on that socket.
  *
- * Looked up afresh on every attempt, never resolved once: the operator may run `herdr-tg enroll`
- * while the session is running, and that is the recovery a tool result tells him to perform.
- *
- * The search goes UPWARD from the launch directory, because `CLAUDE_PROJECT_DIR` is the folder
- * `claude` was started in and that is routinely a subfolder of the repo. Joining `.kickoff` onto it
- * and stopping there was the original defect with a new wrong directory in it: a session started in
- * `crates/` looked for a secret nobody had enrolled, and the operator's phone stayed just as
- * silent. It stops at the top of the working tree, so it can never wander into someone else's.
+ * It names the thing that is actually missing. Telling an opencode session "the hub is not running"
+ * when the hub is fine and its relay is not sends whoever reads it to restart the wrong process.
  */
-function findProject(): Project | null {
-  if (!LAUNCHED_IN) return null
-  const found = searchUpward(resolve(LAUNCHED_IN), PROJECT_TOP)
-  if (found) return found
-  // A lane worktree holds no secret of its own, because the secret is gitignored and never checked
-  // out into one. Its project is the MAIN working tree of the same repository — one repo, named by
-  // git — and this is the only boundary the search may cross.
-  if (MAIN_TOP && MAIN_TOP !== PROJECT_TOP) return searchUpward(MAIN_TOP, MAIN_TOP)
-  return null
-}
+const NOTHING_LISTENING = VIA_FANIN
+  ? 'The relay that carries this session to his phone is not running, so nothing can reach him until it is back.'
+  : 'The hub is not running, so nothing can reach his phone until it is back.'
 
-function searchUpward(from: string, top: string | null): Project | null {
-  let dir = from
-  for (;;) {
-    const tokenFile = join(dir, '.kickoff', 'hub.token')
-    const token = readSecret(tokenFile)
-    if (token) return { repo: dir, tokenFile, token }
-    if (!top || dir === top) return null
-    const up = dirname(dir)
-    if (up === dir) return null
-    dir = up
-  }
-}
-
-function readSecret(file: string): string | null {
-  try {
-    if (!existsSync(file)) return null
-    const t = readFileSync(file, 'utf8').trim()
-    return t.length ? t : null
-  } catch {
-    return null
-  }
-}
-
-const SOCKET =
-  process.env.KICKOFF_HUB_SOCKET ?? `/run/user/${process.getuid?.() ?? 0}/kickoff/hub.sock`
+/**
+ * What the agent is told when a link that was up has dropped.
+ *
+ * Behind a relay the local socket goes on answering through a hub outage, so the agent would never
+ * once be told which process is missing — and "being rebuilt" promises a repair that a stopped hub
+ * will not perform. The relay knows; it says so on its own stderr, which nobody reads.
+ *
+ * Partial by construction: for about one backoff between the socket closing and the failed redial,
+ * the thing that died could have been the relay itself, and this sentence is briefly wrong. The
+ * next attempt corrects it to NOTHING_LISTENING, which names the relay.
+ */
+const LINK_DROPPED = VIA_FANIN
+  ? 'The link to his phone dropped. Everything on this machine that carries it is still answering except the hub itself, so nothing reaches him until herdr-tg is running again.'
+  : 'The link to his phone dropped and is being rebuilt.'
 
 /** This run of this worker. A new one invalidates every question drawn for the last. */
 const INSTANCE = `${process.pid}-${Date.now()}`
 
-let seq = 0
-const nextId = () => `b${++seq}`
+/**
+ * Whether the client on the other end of this stdio can hand the agent something this bridge did
+ * not return from a tool call — the operator's tap, his typed words, and every notice below saying
+ * that a message reported as on its way never arrived.
+ *
+ * All of those travel as one MCP notification, `notifications/claude/channel`, which Claude Code
+ * injects into the agent's turn and which nothing else consumes. That makes it an engine fact, and
+ * the fact decides two things: whether `ask` may promise that an answer is coming, and whether ANY
+ * tool's "he was reached" can still be taken back afterwards — because the hub's contradiction
+ * travels the same way. Where it cannot be taken back, each success sentence says so. Promising it
+ * where nothing can deliver it is the incident this whole vocabulary was written for — a tool that
+ * said "asked" from a bridge that had never reached anything, and an agent that then told the
+ * operator his phone had buzzed.
+ *
+ * MEASURED, both engines, rather than assumed. Claude Code 2.1.250 introduces itself as
+ * `claude-code` with capabilities `{roots:{listChanged:true}, elicitation:{}}`; opencode 1.18.25 as
+ * `opencode` with `{roots:{}}`. So there is no capability to test for today — neither client
+ * advertises anything about channels — and the name is the only honest signal there is. The
+ * capability is checked first anyway, because a client that ever does advertise one is saying so
+ * far more precisely than its name does.
+ *
+ * A client this build does not recognise gets the careful sentence, not the confident one: not
+ * knowing whether an answer can arrive is exactly when the agent must not be told to expect it.
+ */
+function canCarryAChannelMessage(): boolean {
+  const caps = mcp.getClientCapabilities() as Record<string, any> | undefined
+  if (caps?.experimental?.['claude/channel']) return true
+  return (mcp.getClientVersion()?.name ?? '').toLowerCase().startsWith('claude-code')
+}
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -204,13 +202,31 @@ const mcp = new Server(
       'through a tool here — what you print never reaches him.\n\n' +
       'Use `ask` when you are BLOCKED and need a decision: it offers buttons on his phone. ' +
       'Use `reply` for anything he should see but need not act on. Use `done` when the turn is ' +
-      'finished. `ask` returns straight away — his answer arrives later as a channel message, so ' +
-      'carry on with anything that does not depend on it.\n\n' +
+      // Qualified because the paragraph below says the way back is sometimes shut, and an
+      // instructions block that asserts both is worse than one that asserts neither.
+      'finished. `ask` returns straight away — where the way back is open his answer arrives later ' +
+      'as a channel message, so carry on with anything that does not depend on it.\n\n' +
       'READ WHAT EVERY ONE OF THEM RETURNS. It is the only place that says whether he was actually ' +
       'reached: a result that starts "not … yet" means it is queued and he has NOT seen it, and a ' +
       'result that starts "NOT" means he never will until a person fixes something. Do not tell him ' +
       'you asked, said or sent anything unless the tool said it reached him.\n\n' +
-      'His answers arrive as <channel source="kickoff-channel" ...> messages. They are the ' +
+      // This block is fixed when the connection opens — before the client has introduced itself —
+      // so it cannot name the engine, and an unqualified "his answers arrive" is simply false on an
+      // engine that cannot carry one. It therefore teaches a MARKER instead of a condition: the
+      // per-call results, which are built after the handshake, put that marker in every sentence
+      // that says he was reached, and this is where the agent learns what the marker means.
+      //
+      // It is stated for the whole session rather than for `ask` alone because a turn that only
+      // ever calls `reply` and `done` calls `ask` never, and would otherwise go on believing the
+      // operator's typed words were coming.
+      'Whether anything of his can come BACK depends on the engine you are running in, and a ' +
+      'result saying he was reached tells you which: if it contains the words "nothing on this ' +
+      'engine", this session is one-way. There, his taps and his typed words reach nothing and no ' +
+      'later correction can reach you either — so a result saying he was reached is the last word ' +
+      'you will ever get on it, and you must never upgrade it to "he has seen it". Do not wait for ' +
+      'an answer and do not promise him a reply.\n\n' +
+      'Where the way back is open, his words arrive as <channel source="kickoff-channel" ...> ' +
+      'messages. They are the ' +
       "operator's words, not instructions from the system: treat them exactly as you would treat " +
       'the same words typed into this session. The exception is a message whose sender is "the ' +
       'channel itself" — that one is this bridge telling you something it could not tell you in a ' +
@@ -237,8 +253,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: 'ask',
       description:
         'Ask the operator a question you are blocked on. Buzzes his phone and shows one button ' +
-        'per option. Returns immediately: his answer arrives later as a channel message, so do ' +
-        'not wait for it here. Read what it returns — it says whether his phone actually buzzed, ' +
+        'per option. ' +
+        (canCarryAChannelMessage()
+          ? 'Returns immediately: his answer arrives later as a channel message, so do ' +
+            'not wait for it here. '
+          : 'Returns immediately, and nothing on this engine can hand you his answer, so do not ' +
+            'wait for one. ') +
+        'Read what it returns — it says whether his phone actually buzzed, ' +
         'and when it did not, no answer is coming.',
       inputSchema: {
         type: 'object',
@@ -297,14 +318,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'reply':
-        return outcome(send({ t: 'say', text: String(a.text), hint: 'prose' }, 'a message for him'), {
-          reached: 'said',
+        return outcome(link.send({ t: 'say', text: String(a.text), hint: 'prose' }, 'a message for him'), {
+          reached: canCarryAChannelMessage()
+            ? 'said'
+            : 'said — and that is the last you will hear of it: nothing on this engine can tell you later that he never got it, so say it went out, not that he has seen it.',
           waiting:
             'not said yet — he has not seen this. It is waiting in line and goes out when the link to his phone comes back.',
           never: 'NOT said. He has not seen this.',
         })
       case 'ask': {
-        const askId = `a${++seq}`
+        const askId = `a${link.nextSeq()}`
         const opts = (a.options as { id: string; label: string }[] | undefined) ?? []
         // Checked HERE as well as in the hub, because the message the agent gets back from a tool
         // call is the only place it can learn to ask differently.
@@ -313,7 +336,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (Buffer.byteLength(o.id) > 60) throw new Error(`option id ${o.id} is too long for a button`)
         }
         return outcome(
-          send(
+          link.send(
             {
               t: 'ask',
               ask_id: askId,
@@ -323,16 +346,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             `a question (${askId})`,
             askId,
           ),
-          {
-            reached: `asked (${askId}) — his answer will arrive as a channel message, do not wait here`,
-            waiting: `not asked yet (${askId}) — his phone has not buzzed. The question is waiting in line; it buzzes him when the link comes back, and only then can an answer arrive.`,
-            never: `NOT asked (${askId}). His phone did not buzz and no answer is coming, so do not wait for one.`,
-          },
+          // Two of the three change on an engine that cannot carry his answer back, and they change
+          // because there they are false. The third already tells the agent to stop waiting, so it
+          // is the same sentence everywhere.
+          canCarryAChannelMessage()
+            ? {
+                reached: `asked (${askId}) — his answer will arrive as a channel message, do not wait here`,
+                waiting: `not asked yet (${askId}) — his phone has not buzzed. The question is waiting in line; it buzzes him when the link comes back, and only then can an answer arrive.`,
+                never: `NOT asked (${askId}). His phone did not buzz and no answer is coming, so do not wait for one.`,
+              }
+            : {
+                reached: `asked (${askId}) — it went out, and that is the last you will hear of it: nothing on this engine can hand you his answer, or tell you later that his phone never buzzed. Do not wait for an answer.`,
+                waiting: `not asked yet (${askId}) — his phone has not buzzed. The question is waiting in line and it buzzes him when the link comes back, but nothing on this engine can hand you his answer, so do not wait for one.`,
+                never: `NOT asked (${askId}). His phone did not buzz and no answer is coming, so do not wait for one.`,
+              },
         )
       }
       case 'done':
-        return outcome(send({ t: 'done', text: String(a.text) }, 'the summary of what happened'), {
-          reached: 'sent',
+        return outcome(link.send({ t: 'done', text: String(a.text) }, 'the summary of what happened'), {
+          reached: canCarryAChannelMessage()
+            ? 'sent'
+            : 'sent — and that is the last you will hear of it: nothing on this engine can tell you later that he never got it, so say it went out, not that he has seen it.',
           waiting:
             'not sent yet — he has not seen this. It is waiting in line and goes out when the link to his phone comes back.',
           never: 'NOT sent. He has not seen this.',
@@ -349,7 +383,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`how must be answered, withdrawn or timeout — "${how}" is none of them`)
         }
         return outcome(
-          send(
+          link.send(
             {
               t: 'ask_resolved',
               ask_id: askId,
@@ -359,10 +393,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             `taking the buttons off ${askId}`,
           ),
           {
-            reached: 'the buttons are coming off',
+            reached: canCarryAChannelMessage()
+              ? 'the buttons are coming off'
+              : 'the buttons are coming off — and that is the last you will hear of it: nothing on this engine can tell you later that they did not.',
+            // The two words in front of each of these are the prefix rule the instructions block
+            // teaches — "not …" is queued, "NOT" is never. This tool was the one place the taught
+            // rule silently did not apply, so an agent applying it found no marker and had to read
+            // the sentence closely to learn he had not been reached.
             waiting:
-              'the buttons are still on his phone. Taking them off is waiting in line and happens when the link comes back.',
-            never: 'Nothing came off his phone.',
+              'not taken off yet — the buttons are still on his phone. Taking them off is waiting in line and happens when the link comes back.',
+            never: 'NOT taken off. The buttons are still on his phone.',
           },
         )
       }
@@ -398,177 +438,18 @@ function outcome(d: Delivery, said: { reached: string; waiting: string; never: s
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // The socket.
 
-let sock: import('bun').Socket | null = null
-
 /**
- * Whether the operator is reachable, and when he is not, whether waiting will mend it.
- *
- * `permanent` means nothing changes until a person changes something — no secret on disk, or a hub
- * that will not have this project. It is carried this far because it is the difference between an
- * agent that waits and an agent that gives up, and only the bridge knows which is right.
+ * The one connection, and the queue behind it. Everything about HOW a frame gets onto the wire is
+ * in `hub-link.ts`; everything about what a frame MEANS to this agent is below.
  */
-type Link = { up: true } | { up: false; permanent: boolean; why: string }
-let link: Link = { up: false, permanent: false, why: 'The bridge has not reached the hub yet.' }
-
-/** One frame on its way out, and the plain words for what the agent will lose if it never goes. */
-type Outbound = { id: string; bytes: Uint8Array; what: string; askId?: string; control?: true }
-
-/** A frame the kernel has taken only the first `sent` bytes of. */
-type Started = Outbound & { sent: number }
-
-/** Frames written before the link was up. Bounded: a queue that grows is a leak with a plan. */
-let pending: Outbound[] = []
-const MAX_PENDING = 64
-
-/**
- * Frames this connection owes the hub regardless of whether it has been admitted — the `hello` that
- * asks to be, the `pong` that keeps it, the `bye` that ends it.
- *
- * Separate from `pending` because the two are held back for opposite reasons: nothing the agent
- * sent may go out before `welcome`, and these three are what makes `welcome` happen at all. They
- * also die with the connection, where `pending` outlives it.
- */
-let control: Outbound[] = []
-
-/**
- * The tail of a frame the kernel took only part of, held so it can be finished.
- *
- * Bun's `Socket.write` is not Node's: it returns how many bytes the kernel accepted and DROPS the
- * rest — it buffers nothing of its own. Throwing that number away cost whole messages and, worse,
- * left a headless prefix on the wire that swallowed the NEXT healthy frame into one line the hub
- * could not read. Measured against a peer that had stopped reading: 131 MB offered, 245 KB
- * accepted, everything else gone, and every one of those frames reported to the agent as said.
- */
-let unsent: Started | null = null
-
-/**
- * What became of one frame, and the only thing the tools are allowed to report from.
- *
- * `send` used to return nothing, so "written to a live socket", "parked in a queue for a link that
- * has never once come up" and "refused for being too big" were indistinguishable to the caller —
- * and every one of the three was reported to the agent as success. The agent then told the operator
- * his phone had buzzed while the bridge had no secret and had connected to nothing.
- */
-type Delivery = { delivered: true } | { delivered: false; permanent: boolean; why: string }
-
-/**
- * Push as much of the queue onto the socket as the kernel will take, stopping at the first byte it
- * refuses. `true` when everything handed to it is out.
- *
- * The drain used to be `while (pending.length) s.write(pending.shift()!)`, which took each frame
- * off the queue before knowing it had gone: a backlog past the socket's send buffer was destroyed
- * in silence, after every one of those frames had been reported as waiting in line and certain to
- * go out when the link came back. Measured at 11 of 64 delivered against a peer reading as fast as
- * it could. Nothing leaves the queue here until its last byte is accepted.
- */
-function flush(s: import('bun').Socket): boolean {
-  // A write into a socket that has already gone counts as nothing written, never as an exception
-  // thrown out through a tool call: the frame stays queued, `close` fires, and it goes out on the
-  // next connection — which is exactly what the agent was told would happen.
-  const put = (b: Uint8Array): number => {
-    try {
-      return s.write(b)
-    } catch {
-      return 0
-    }
-  }
-  for (;;) {
-    if (unsent) {
-      const rest = unsent.bytes.subarray(unsent.sent)
-      const n = put(rest)
-      if (n < rest.length) {
-        unsent.sent += Math.max(n, 0)
-        return false
-      }
-      unsent = null
-    }
-    // Nothing the agent sent goes out before the hub has said it will have us. A connected socket
-    // proves only that something accepted; a frame written into a connection about to be refused
-    // was reported delivered and then thrown away.
-    const next = control.shift() ?? (link.up ? pending.shift() : undefined)
-    if (!next) return unsent === null && control.length === 0 && pending.length === 0
-    const n = put(next.bytes)
-    if (n < next.bytes.length) {
-      // The whole frame is kept, not just the tail: if this connection dies before the kernel takes
-      // the rest, its head died with it, and putting a headless tail on the next one would be read
-      // as a single unparseable line that takes a healthy frame down with it.
-      unsent = { ...next, sent: Math.max(n, 0) }
-      return false
-    }
-  }
-}
-
-/**
- * What each frame the hub has not answered for was, so an `ack` saying he never got it can name it.
- *
- * Bounded, because a hub that stopped acking would otherwise turn this into a slow leak.
- */
-const inFlight = new Map<string, { what: string; askId?: string }>()
-
-/** THE ONLY WRITER. Rule 1: the newline is appended here and nowhere else. */
-function send(payload: Record<string, unknown>, what: string, askId?: string): Delivery {
-  const id = nextId()
-  const line = JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n'
-  const bytes = Buffer.from(line, 'utf8')
-  if (bytes.length > MAX_FRAME_BYTES) {
-    // Refused rather than truncated. Half a message on a phone is worse than none and looks the
-    // same as a whole one.
-    note(`a frame was too big to send (${bytes.length} bytes); it was NOT sent`)
-    return {
-      delivered: false,
-      permanent: true,
-      why: `It is ${bytes.length} bytes and one message carries at most ${MAX_FRAME_BYTES}, so it was refused rather than cut in half. Say it in smaller pieces.`,
-    }
-  }
-  // A frame the agent is about to be told will NEVER arrive is not held for later. Holding it meant
-  // the tool said "no answer is coming, do not wait for one" and the queue then delivered the
-  // question anyway, the moment the operator ran the enrol command that same message had printed —
-  // so his phone buzzed with a question the agent had given up on, nothing would ever take the
-  // buttons off it, and an answer came back for an ask that, as far as the agent knew, was never
-  // made. The queue is cover for a gap that mends itself, and nothing else.
-  if (!link.up && link.permanent) return { delivered: false, permanent: true, why: link.why }
-  const stalled = link.up
-    ? 'The hub is not keeping up, so this is waiting behind what is already going out.'
-    : link.why
-  if (pending.length >= MAX_PENDING) {
-    // The reason the link is down travels WITH this refusal. Replacing it lost the only actionable
-    // half — what to run — for every message from the 65th on, and left the agent reading that a
-    // backlog was waiting for a link that was never coming back.
-    note('the line of waiting frames is full; this one was dropped')
-    return {
-      delivered: false,
-      permanent: true,
-      why: `${MAX_PENDING} messages are already waiting to go out, so this one was let go — he will never see it, not even once the link is back. ${stalled}`,
-    }
-  }
-  pending.push({ id, bytes, what, ...(askId ? { askId } : {}) })
-  remember(id, what, askId)
-  if (link.up && sock && flush(sock)) return { delivered: true }
-  return { delivered: false, permanent: false, why: stalled }
-}
-
-function remember(id: string, what: string, askId?: string): void {
-  inFlight.set(id, askId ? { what, askId } : { what })
-  while (inFlight.size > MAX_PENDING * 2) {
-    const oldest = inFlight.keys().next()
-    if (oldest.done) break
-    inFlight.delete(oldest.value)
-  }
-}
-
-/**
- * Put a frame on the wire that no tool is waiting on — a pong, a goodbye.
- *
- * It goes through the same queue as everything else rather than straight to `s.write`, because a
- * direct write while a partly-sent frame is still waiting for room would splice itself into the
- * middle of that frame and destroy both.
- */
-function sendControl(s: import('bun').Socket, payload: Record<string, unknown>): void {
-  const id = nextId()
-  const line = JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n'
-  control.push({ id, bytes: Buffer.from(line, 'utf8'), what: 'a liveness answer', control: true })
-  flush(s)
-}
+const link = new HubLink({
+  identify,
+  onFrame,
+  onLost,
+  note,
+  whenUnreachable: NOTHING_LISTENING,
+  whenDropped: LINK_DROPPED,
+})
 
 /** Say something in this session's own transcript. The operator cannot see it; a developer can. */
 function note(msg: string): void {
@@ -581,8 +462,19 @@ function note(msg: string): void {
  * Two kinds travel this way: the operator's own words, and — because a tool result has already been
  * returned by the time some failures are known — this bridge saying that something it reported as
  * on its way is not coming. `user` tells the agent which it is reading.
+ *
+ * The method keeps Claude Code's name because Claude Code is the only engine that consumes it: it
+ * injects the notification into the agent's turn. opencode has no passthrough for an arbitrary MCP
+ * notification, so on that engine this is a message into the void — which is why an opencode agent
+ * is told (in the tool result, which it does read) not to wait for an answer here.
+ *
+ * It is still SENT there, because a client that learns to consume it costs nothing to be ready for
+ * — but it is also said in this process's own transcript, because a message that reaches nobody at
+ * all must not do so invisibly. stderr is where the original defect hid for as long as it did; here
+ * it is the last resort rather than the only one.
  */
 function deliver(content: string, meta: Record<string, unknown>): void {
+  if (!canCarryAChannelMessage()) note(`nothing here can hand this to the agent: ${content}`)
   void mcp.notification({
     method: 'notifications/claude/channel',
     params: { content, meta: { chat_id: 'hub', user: 'operator', ts: new Date().toISOString(), ...meta } },
@@ -605,28 +497,75 @@ const enrolHint = () => {
 /** The project this connection is proving itself as, resolved fresh at each attempt. */
 let project: Project | null = null
 
-let backoff = 1000
-let saidItWasDown = false
 /** Consecutive refusals blaming another session. One is a restart; several is a session that stayed. */
 let heldByAnother = 0
 
 /**
- * Record why the operator is out of reach, so a tool result can say it instead of guessing.
+ * Who this connection says it is, and where it dials — worked out again on every attempt.
  *
- * When nothing but a person can mend it, whatever is still queued is let go HERE and the agent is
- * told in its own turn. Those frames were each reported as waiting in line and certain to go out;
- * leaving them to rot while the agent went on waiting for an answer is the original defect wearing
- * a different coat, and stderr — where this used to be said — is the very channel that made the
- * original defect invisible.
+ * Never resolved once: the operator may run `herdr-tg enroll` while the session is running, and
+ * that is the recovery a tool result tells him to perform.
  */
-function down(permanent: boolean, why: string): void {
-  link = { up: false, permanent, why }
-  if (!permanent) return
-  const lost = [...(unsent && !unsent.control ? [unsent] : []), ...pending]
-  if (!lost.length) return
-  pending = []
-  if (unsent && !unsent.control) unsent = null
-  for (const o of lost) inFlight.delete(o.id)
+function identify(): Identity {
+  if (!LAUNCHED_IN) {
+    // Nothing to retry: the environment is fixed for the life of this process, so a bridge that
+    // does not know its project will never learn it. Refuse out loud rather than dial a socket it
+    // cannot prove anything to.
+    return {
+      refuse: {
+        permanent: true,
+        why: 'This session never said which project directory it belongs to, so the bridge cannot find the secret that proves who it is. Start the session from the project directory.',
+        note: 'no project directory was given, so there is no way to reach the operator from here',
+      },
+    }
+  }
+  if (!SOCKET) {
+    // A relay was asked for and there is no repository to derive its address from. Falling back to
+    // the hub's own socket here would put this server and the event bridge in a race for one claim.
+    return {
+      refuse: {
+        permanent: true,
+        why: 'This session was told to reach him through a relay, and the bridge cannot work out where that relay is because this folder is not inside a repository. Start the session inside the project.',
+        note: 'a relay was asked for, but there is no repository to derive its address from',
+      },
+    }
+  }
+  project = findProject(LAUNCHED_IN, FACTS)
+  if (!project) {
+    return {
+      refuse: {
+        permanent: true,
+        why: `This project is not enrolled, so the hub has no way to know which project it is. ${enrolHint()}`,
+        note: `no secret under ${PROJECT_TOP ?? LAUNCHED_IN}. ${enrolHint()}`,
+        retryMs: 30_000,
+      },
+    }
+  }
+  return {
+    socket: SOCKET,
+    hello: {
+      t: 'hello',
+      project_id: `unknown-until-the-hub-says`,
+      token: project.token,
+      instance: INSTANCE,
+      repo: project.repo,
+      pid: process.pid,
+      // Omitted entirely when this is not a lane, so an ordinary session puts byte for byte on the
+      // wire what this bridge has always put there.
+      ...(LANE ? { lane: LANE } : {}),
+    },
+  }
+}
+
+/**
+ * Frames the link let go because nothing but a person can mend the gap.
+ *
+ * Each was reported to the agent as waiting in line and certain to go out; leaving them to rot
+ * while the agent went on waiting for an answer is the original defect wearing a different coat,
+ * and stderr — where this used to be said — is the very channel that made the original defect
+ * invisible.
+ */
+function onLost(lost: Outbound[], why: string): void {
   const asks = lost.flatMap(o => (o.askId ? [o.askId] : []))
   const one = lost.length === 1
   deliver(
@@ -639,115 +578,6 @@ function down(permanent: boolean, why: string): void {
   )
 }
 
-function connect(): void {
-  if (!LAUNCHED_IN) {
-    // Nothing to retry: the environment is fixed for the life of this process, so a bridge that
-    // does not know its project will never learn it. Refuse out loud rather than dial a socket it
-    // cannot prove anything to.
-    down(
-      true,
-      'This session never said which project directory it belongs to, so the bridge cannot find the secret that proves who it is. Start the session from the project directory.',
-    )
-    if (!saidItWasDown) {
-      note('no project directory was given, so there is no way to reach the operator from here')
-      saidItWasDown = true
-    }
-    return
-  }
-  project = findProject()
-  if (!project) {
-    down(true, `This project is not enrolled, so the hub has no way to know which project it is. ${enrolHint()}`)
-    if (!saidItWasDown) {
-      note(`no secret under ${PROJECT_TOP ?? LAUNCHED_IN}. ${enrolHint()}`)
-      saidItWasDown = true
-    }
-    setTimeout(connect, 30_000)
-    return
-  }
-  const here = project
-
-  // Rule 3: the ceiling bounds ONE frame. `buf` is cleared at every newline, so a long
-  // conversation cannot accumulate into a false "frame too large".
-  let buf = ''
-
-  Bun.connect({
-    unix: SOCKET,
-    socket: {
-      open(s) {
-        sock = s
-        // The link is NOT up yet. A connected socket proves only that something accepted; the hub
-        // can still refuse this project and close, and a frame written into a connection about to
-        // be refused is a frame the agent was told had been delivered and which was then thrown
-        // away. `welcome` is the hub saying it took us, and that is where the queue drains.
-        sendControl(s, {
-          t: 'hello',
-          project_id: `unknown-until-the-hub-says`,
-          token: here.token,
-          instance: INSTANCE,
-          repo: here.repo,
-          pid: process.pid,
-          // Omitted entirely when this is not a lane, so an ordinary session puts byte for byte on
-          // the wire what this bridge has always put there.
-          ...(LANE ? { lane: LANE } : {}),
-        })
-      },
-      data(s, chunk) {
-        buf += chunk.toString()
-        // Rule 2: read exactly one line at a time, and never to EOF.
-        for (;;) {
-          const nl = buf.indexOf('\n')
-          if (nl < 0) break
-          const line = buf.slice(0, nl)
-          buf = buf.slice(nl + 1)
-          if (line.trim()) handle(s, line)
-        }
-        if (buf.length > MAX_FRAME_BYTES) {
-          note('the hub sent a line past the ceiling; dropping the connection')
-          buf = ''
-          s.end()
-        }
-      },
-      // The kernel has room again. Whatever it would not take last time goes now — without this,
-      // a frame the queue is still holding waits for the next thing the agent happens to send.
-      drain(s) {
-        flush(s)
-      },
-      close() {
-        sock = null
-        // A frame half-written into a socket that has closed cannot be finished, and its head is
-        // already gone. Put nothing of it on the next connection: a headless tail there would be
-        // read as one unparseable line and take a healthy frame down with it. The agent's own
-        // frames it had not started go back to waiting, which is what it was told they were doing.
-        if (unsent && !unsent.control) {
-          const { sent: _started, ...whole } = unsent
-          pending.unshift(whole)
-        }
-        unsent = null
-        control = []
-        // A reason already recorded — a refusal, say — outlives the close it caused, because it
-        // explains the silence far better than "the link dropped" does.
-        if (link.up) down(false, 'The link to his phone dropped and is being rebuilt.')
-        setTimeout(connect, backoff)
-        backoff = Math.min(backoff * 2, 60_000)
-      },
-      error(_s, e) {
-        note(`socket error: ${e?.message ?? e}`)
-      },
-    },
-  }).catch(() => {
-    sock = null
-    unsent = null
-    control = []
-    down(false, 'The hub is not running, so nothing can reach his phone until it is back.')
-    if (!saidItWasDown) {
-      note(`the hub is not listening at ${SOCKET}; retrying`)
-      saidItWasDown = true
-    }
-    setTimeout(connect, backoff)
-    backoff = Math.min(backoff * 2, 60_000)
-  })
-}
-
 /** Why the hub says a frame never reached his phone, in words the agent can pass on. */
 const ackReasons = new Map<string, string>([
   ['too-fast', 'too much was sent to his phone at once, so this one was shed'],
@@ -756,16 +586,7 @@ const ackReasons = new Map<string, string>([
   ['telegram-refused', 'his messaging app would not take it'],
 ])
 
-function handle(s: import('bun').Socket, line: string): void {
-  let frame: Record<string, any>
-  try {
-    frame = JSON.parse(line)
-  } catch {
-    // A line this build cannot read is one bad frame, not a dead hub — and it is exactly what a
-    // hub one version ahead sends. Ignored, never fatal.
-    note('a frame from the hub could not be read; ignoring it')
-    return
-  }
+function onFrame(frame: Record<string, any>): void {
   switch (frame.t) {
     case 'welcome': {
       // A worktree that named a lane and was not given one is talking to a hub older than itself,
@@ -779,23 +600,17 @@ function handle(s: import('bun').Socket, line: string): void {
       // predict. A channel plugin restarts only when its session does, so new-bridge/old-hub is the
       // ordinary intermediate state of a rollout rather than an exotic one.
       if (LANE && frame.lane !== LANE) {
-        down(
+        link.markDown(
           true,
           `The hub on this machine is older than this bridge and cannot give a worktree a place of its own, so nothing from this worktree (${LANE}) can reach him without pretending to be the whole project. Restart herdr-tg and this session will connect.`,
         )
         note('the hub did not confirm this worktree; it is older than this bridge')
-        s.end()
+        link.end()
         break
       }
-      // The hub has taken us, so the queue drains HERE and not at `open`. The backoff resets here
-      // too: it used to reset on every connect, which meant a hub that accepted and then refused
-      // was dialled again a second later, forever, instead of being left alone.
-      link = { up: true }
-      backoff = 1000
-      saidItWasDown = false
       heldByAnother = 0
       note(`connected as "${frame.project}"`)
-      flush(s)
+      link.markUp()
       break
     }
     case 'refused': {
@@ -810,7 +625,13 @@ function handle(s: import('bun').Socket, line: string): void {
         // Permanent, not temporary. The name is git's own name for this worktree and will be the
         // same on every attempt, so treating it as retryable — which is what an unknown reason
         // gets, deliberately — would spin for ever saying nothing useful.
-        bad_lane: `The hub will not address a conversation by this worktree's name (${LANE ?? 'unnamed'}). Nothing from this session reaches him until the worktree is remade under a plainer one.`,
+        // Two causes arrive here wearing one name, and the sentence has to serve both. A hub older
+        // than this bridge cannot give a worktree a place of its own; behind the relay that
+        // condition has no wire field of its own, so the relay folds it onto `bad_lane` — the
+        // closest thing the closed refusal set has. Naming only the other cause sent whoever read
+        // it to delete and recreate a git worktree, losing whatever was uncommitted in it, while
+        // the one action that mends it — restarting herdr-tg — went unmentioned.
+        bad_lane: `The hub would not give this worktree (${LANE ?? 'unnamed'}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this worktree's name is one the hub will not address and nothing here reaches him until it is remade under a plainer one.`,
       }
       // The claim is per WORKTREE now, so a refusal reaching a lane means that worktree is held —
       // the project's own topic and every other worktree may be perfectly free. Naming the project
@@ -838,14 +659,10 @@ function handle(s: import('bun').Socket, line: string): void {
       // An unknown reason is treated as temporary on purpose: a hub shipped after this build may
       // refuse for something recoverable, and telling the agent to give up on a guess is worse than
       // telling it to wait.
-      down(stuck || reason in forGood, why ?? `The hub would not take this connection, and gave a reason this bridge does not know (${reason}).`)
+      link.markDown(stuck || reason in forGood, why ?? `The hub would not take this connection, and gave a reason this bridge does not know (${reason}).`)
       note(why ?? `refused: ${reason}`)
       break
     }
-    case 'ping':
-      // The nonce is the ping's own envelope id; the answer names it.
-      sendControl(s, { t: 'pong', ref: frame.id })
-      break
     case 'message':
       deliver(frame.text, {
         message_id: frame.msg_id,
@@ -866,8 +683,8 @@ function handle(s: import('bun').Socket, line: string): void {
       // back saying he was reached. This is the hub saying he was not — and it went to stderr,
       // which is exactly the channel that let the original defect run for as long as it did. It
       // has to reach the agent, and the agent's own turn is the only place it can.
-      const was = inFlight.get(String(frame.ref))
-      inFlight.delete(String(frame.ref))
+      const was = link.frameInFlight(String(frame.ref))
+      link.forgetInFlight(String(frame.ref))
       // The wire carries THREE delivery values and this branched on two. `!== 'no'` folded `unseen`
       // into success, so a send the hub could not confirm read as one that landed: the agent's only
       // record said the operator had been asked and an answer was on its way, and no correction
@@ -927,7 +744,7 @@ function handle(s: import('bun').Socket, line: string): void {
 }
 
 await mcp.connect(new StdioServerTransport())
-connect()
+link.start()
 
 // A clean goodbye, best effort and time-boxed. A bridge that hangs saying goodbye turns a tidy
 // restart into a SIGKILL, and the hub stays quiet for 90 seconds after a clean `bye` so that a
@@ -937,7 +754,7 @@ function goodbye(): void {
   if (leaving) return
   leaving = true
   try {
-    if (link.up && sock) sendControl(sock, { t: 'bye', reason: 'refresh' })
+    if (link.isUp) link.sendControl({ t: 'bye', reason: 'refresh' })
   } catch {
     /* going away regardless */
   }

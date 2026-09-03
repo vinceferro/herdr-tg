@@ -75,7 +75,9 @@ unknown field and would admit the worktree AS THE PROJECT, taking its claim and 
 project's own session is turned away. A channel plugin restarts only when its session does, so
 new-bridge/old-hub is the ordinary middle of an upgrade rather than an exotic state.
 
-The opencode adapter sends no lane yet; its per-lane fan-in is the later slice named in seam ②.
+The opencode adapter sends no lane yet, so it attaches to the project's own relay. Making it
+lane-aware means moving it from `/event` to `/api/event`, whose payload carries `location.directory`
+per event — the fact it currently lacks and the reason it cannot route.
 
 ## Seam ② — adapter ↔ engine. Engine-specific by definition.
 
@@ -91,6 +93,57 @@ they are allowed to.
 
 Consequence worth stating plainly: the opencode adapter is **one bridge per project, not per
 lane**, holding one hub connection per lane.
+
+### The fan-in. BUILT, 3 September — and it is on the ADAPTER side, on purpose.
+
+An opencode agent now has the same deliberate tools a Claude agent has: the very same
+`plugins/kickoff-channel/server.ts`, declared under opencode's `mcp` key as a stdio MCP server. The
+operator asked for exactly that — *"I'd rather have a channel like the one for claude code so the
+agent actually invokes sending a telegram message"* — having used a plugin that streamed everything
+and disliked it.
+
+That makes TWO things want to speak for one addressable thing: the tool server, carrying what the
+agent CHOSE to say, and the event bridge, carrying the permission and question prompts it did not
+choose. The hub admits one live claim per address and refuses the second with `already_claimed`.
+
+**The joining belongs to the adapter, and the hub does not change at all.** One relay process per
+addressable thing holds the connection; the producers talk to it over a local socket that speaks
+hub-proto unchanged. The hub sees one `hello`, one pid, one claim — so this is not a seventh
+capability, and the closed list below is still six. `adapters/fanin/`.
+
+The relay is not a pipe: it answers `hello` with the `welcome` it holds (lane echo included),
+rewrites envelope ids, namespaces `ask_id` so a tap on one agent's question can never be delivered
+to the other, answers the hub's `ping` itself so a wedged producer cannot cost the lane its claim,
+and shares the queue out among however many producers are attached.
+
+**Standing in front of the hub means taking on the hub's lifecycle job.** The hub retires a dead
+asker's questions from two facts it reads off the CLAIM — the `instance` in `hello`, and the pid
+holding the socket — and behind a relay both are the relay's, for every producer, for ever. So
+neither sweep can see a producer die, and the operator would keep a keyboard for a question whose
+agent is gone. The relay therefore knows a producer by the `instance` in its own `hello` rather than
+by its socket, withdraws the open questions of one that does not come home within a grace period,
+and writes its own instance and its open questions down beside its socket so that restarting IT
+comes back as the same voice rather than voiding what its producers are still waiting on.
+
+The direct path was never exposed to any of that, and the earlier draft of this paragraph was wrong
+to say it was: a channel plugin mints one `instance` for the life of its session and the hub reloads
+its ledger from disk, so restarting `herdr-tg` under a live Claude session leaves that session's
+questions answerable — its arrival sweep skips its own instance by construction, and a tap resolves
+because the instance on the record still matches the claim.
+
+The sentences an agent reads differ between the engines wherever the ENGINE decides whether they are
+true, and nowhere else. The operator's
+answer comes back as an MCP notification that Claude Code injects into the agent's turn and that
+opencode has no passthrough for — measured, from both real clients, neither of which advertises any
+capability about channels. So `ask` promises an answer is coming only to a client that can be handed
+one, and tells the others to carry on without one. Promising it everywhere would be the incident the
+whole three-outcome vocabulary was written for, one engine further out.
+
+The same notification carries every correction — the hub saying a frame it took never reached his
+phone — so it decides one more thing: whether a "he was reached" sentence can still be taken back.
+Where it cannot, that sentence is the last word there will ever be, and each of the four says so, in
+words the `instructions` block teaches the agent to look for. The queued and permanent sentences are
+byte for byte the same on both engines, because those two are already final.
 
 What the first slice found, 2 September: opencode publishes `question.v2.asked` with real
 `options[{label, description}]` and `permission.v2.asked` with a closed reply set of

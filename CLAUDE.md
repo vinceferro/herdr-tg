@@ -24,8 +24,17 @@ Three crates in one Cargo workspace.
 - `crates/herdr-client` — the typed client for herdr protocol 20. Used ONLY by the read-only
   subcommands now; the bot does not talk to herdr at all.
 
-`plugins/kickoff-channel/` is the Claude Code adapter: an MCP channel plugin that dials the socket.
-It holds no token, no allowlist and no model.
+`plugins/kickoff-channel/` is the MCP tool server — **both** engines start it. Claude Code declares
+it in a plugin manifest and names the project in `CLAUDE_PROJECT_DIR`; opencode declares it under
+`mcp` and sets the child's cwd to the session's directory. It holds no token, no allowlist and no
+model. `hub-link.ts` beside it is the wire, and `where.ts` is the repo/lane/socket derivation; both
+are shared with the fan-in, because the one time this project had two copies of the link, the copy
+drifted by thirteen already-fixed defects.
+
+`adapters/fanin/` is the relay. The hub admits one live connection per addressable thing, and on
+opencode two things want it — the tool server (what the agent chose to say) and the event bridge
+(the prompts it did not choose). The relay holds the claim and both attach to it over a local socket
+speaking hub-proto unchanged, so **the hub never learns there were two**.
 
 Docs, in the order they are worth reading: `docs/INTERFACES.md` (the four seams and the closed list
 of what this project does), `docs/HUB-AND-KICKOFF.md` (how it wires to kickoff, and two questions

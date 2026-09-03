@@ -46,9 +46,9 @@ const until = async (what: string, cond: () => boolean, ms = 8000) => {
  * One bridge, started as the plugin manifest starts it: `cwd` is the plugin directory, never the
  * project. Anything the bridge needs to know about the project it has to get from the environment.
  */
-function startBridge(env: Record<string, string>) {
-  const child = Bun.spawn(['bun', 'server.ts'], {
-    cwd: import.meta.dir,
+function startBridge(env: Record<string, string>, cwd = import.meta.dir) {
+  const child = Bun.spawn(['bun', join(import.meta.dir, 'server.ts')], {
+    cwd,
     env: { ...process.env, ...env },
     stdin: 'pipe',
     stdout: 'pipe',
@@ -73,9 +73,25 @@ function startBridge(env: Record<string, string>) {
   return { child, out, to }
 }
 
-async function handshake(b: ReturnType<typeof startBridge>) {
+/**
+ * Claude Code introducing itself, CAPTURED from the real client rather than imagined.
+ *
+ * `claude mcp list` was pointed at a server that wrote down the `initialize` it received: version
+ * 2.1.250 of Claude Code sends exactly this. It matters because the bridge now reads the client's
+ * name to decide whether it may promise the agent that an answer is coming, and a fixture invented
+ * here would only prove this file agrees with itself.
+ */
+const CLAUDE_CODE = {
+  capabilities: { roots: { listChanged: true }, elicitation: {} },
+  clientInfo: { name: 'claude-code', title: 'Claude Code', version: '2.1.250' },
+}
+
+/** opencode 1.18.25 introducing itself, captured the same way from a real `opencode serve`. */
+const OPENCODE = { capabilities: { roots: {} }, clientInfo: { name: 'opencode', version: '1.18.25' } }
+
+async function handshake(b: ReturnType<typeof startBridge>, who = CLAUDE_CODE) {
   b.to({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
-    protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '0' } } })
+    protocolVersion: '2025-11-25', ...who } })
   await until('the MCP handshake', () => b.out.some(l => l.id === 1))
   b.to({ jsonrpc: '2.0', method: 'notifications/initialized' })
 }
@@ -127,6 +143,13 @@ check('done does not say it was sent either', doneInVain.text !== 'sent', doneIn
 const offInVain = await call(orphan, 13, 'ask_resolved', { ask_id: 'a1', how: 'withdrawn' })
 check('ask_resolved does not say buttons came off a phone that never had any',
   offInVain.text !== 'the buttons are coming off', offInVain.text)
+// The instructions block teaches ONE test — "not …" is queued, "NOT" is never — and this was the
+// only tool that did not obey it, so an agent applying the rule it was taught found no marker here
+// and had to read the sentence closely to learn nothing had happened.
+//
+// RED, before the fix: 'Nothing came off his phone. The hub does not know this project. …'
+check('and it fails in the same first word every other tool fails in',
+  /^NOT /.test(offInVain.text), offInVain.text)
 orphan.child.kill()
 
 // Enrolled, but the hub is not running. This one CAN mend itself, and the words have to say so:
@@ -143,6 +166,12 @@ check('it says it is waiting rather than delivered',
   /waiting/i.test(queued.text), queued.text)
 check('and a gap that can mend itself is not reported as an error',
   !queued.isError, queued.text)
+// The same prefix rule, on the tool that used to be the one exception to it.
+//
+// RED, before the fix: 'the buttons are still on his phone. Taking them off is waiting in line …'
+const offQueued = await call(waiting, 15, 'ask_resolved', { ask_id: 'a1', how: 'withdrawn' })
+check('a retirement queued while the hub is down begins in the same two words a message does',
+  /^not /.test(offQueued.text) && !offQueued.isError, offQueued.text)
 waiting.child.kill()
 
 // ── Part 2: the round trip, against a fake hub ────────────────────────────────────────────────
@@ -467,6 +496,14 @@ for (let i = 0; i < 60 && !badSaid.isError; i++) {
 }
 check('a lane the hub will not address is told for good rather than retried',
   badSaid.isError && /worktree/.test(badSaid.text) && !/waiting/i.test(badSaid.text), badSaid.text)
+// Two causes wear this one name. The relay has no wire field for "the hub is older than me", so it
+// folds that onto `bad_lane` too — and a sentence naming only the other cause tells whoever reads
+// it to delete and recreate a git worktree, losing whatever is uncommitted in it, while the one
+// action that actually mends it goes unmentioned.
+//
+// RED, before the fix: '… until the worktree is remade under a plainer one.' — and nothing else.
+check('and it names restarting the hub, not only remaking the worktree',
+  /herdr-tg/.test(badSaid.text) && /remade/.test(badSaid.text), badSaid.text)
 badBridge.child.kill()
 badHub.stop()
 
@@ -541,6 +578,197 @@ check('a worktree told its link is already held is told WHICH thing is holding i
   /worktree/.test(heldSaid.text) && heldSaid.text.includes('lane-0902-201212-2783563'), heldSaid.text)
 heldBridge.child.kill()
 heldHub.stop()
+
+// ── Part 5: the same server, started by the other engine ──────────────────────────────────────
+//
+// opencode declares this file under `mcp` and sets the MCP child's cwd to the session's own
+// directory. It sets no `CLAUDE_PROJECT_DIR`, so the only way it can name the project is the cwd it
+// already set — and a BARE cwd fallback is wrong under Claude Code in both plugin layouts, which is
+// the defect that made every message an agent believed it had sent go nowhere. So the cwd term is a
+// flag something had to set, and these check that the flag is the only thing that unlocks it.
+console.log('\nwhichever engine started it:')
+
+const neutralSock = join(dir, 'neutral.sock')
+const neutralHub = fakeHub(neutralSock, (_h, s) => welcome(s))
+
+// THE ANTI-REGRESSION ONE. The path that ships to a live Claude session must take
+// `CLAUDE_PROJECT_DIR` and nothing else, so this hands it the truth and hands both new terms a lie.
+// Reverse the order of the three terms and this is the check that goes red.
+const decoy = join(dir, 'decoy')
+mkdirSync(join(decoy, '.kickoff'), { recursive: true })
+writeFileSync(join(decoy, '.kickoff', 'hub.token'), 'd'.repeat(64))
+Bun.spawnSync(['git', '-C', decoy, 'init', '-q'])
+
+const claudeWay = startBridge(
+  {
+    CLAUDE_PROJECT_DIR: repo,
+    KICKOFF_CHANNEL_PROJECT_DIR: decoy,
+    KICKOFF_CHANNEL_CWD_IS_PROJECT: '1',
+    KICKOFF_HUB_SOCKET: neutralSock,
+  },
+  decoy,
+)
+await handshake(claudeWay)
+await until('the claude-way hello', () => neutralHub.got.some(f => f.t === 'hello'))
+const claudeHello = neutralHub.got.find(f => f.t === 'hello')!
+check('a_claude_session_keeps_working_exactly_as_it_did_before',
+  claudeHello.repo === repo && claudeHello.token === 'a'.repeat(64),
+  `${claudeHello.repo} / ${claudeHello.token?.slice(0, 4)}`)
+
+// The second term, for a harness that knows the directory and can say it.
+const namedWay = startBridge({ KICKOFF_CHANNEL_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock })
+await handshake(namedWay)
+await until('the named-way hello', () => neutralHub.got.filter(f => f.t === 'hello').length >= 2)
+check('a_harness_that_names_the_project_directory_is_believed',
+  neutralHub.got.filter(f => f.t === 'hello')[1].repo === repo)
+
+// The third term, and only with the flag. cwd here is a SUBFOLDER of the repo, because that is what
+// opencode does when the session is opened on one — and the upward search is what turns it into the
+// project.
+const sub = join(repo, 'crates', 'deep')
+mkdirSync(sub, { recursive: true })
+const cwdWay = startBridge(
+  { KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', KICKOFF_HUB_SOCKET: neutralSock },
+  sub,
+)
+await handshake(cwdWay)
+await until('the cwd-way hello', () => neutralHub.got.filter(f => f.t === 'hello').length >= 3)
+check('a_tool_server_told_its_cwd_is_the_project_finds_the_secret_by_searching_upward_from_it',
+  neutralHub.got.filter(f => f.t === 'hello')[2].repo === repo,
+  neutralHub.got.filter(f => f.t === 'hello')[2].repo)
+
+// And WITHOUT the flag it still refuses to guess, which is the whole safety argument for the flag.
+const guessing = startBridge({ KICKOFF_HUB_SOCKET: neutralSock }, repo)
+await handshake(guessing)
+const guessed = await call(guessing, 700, 'reply', { text: 'anything' })
+check('a_tool_server_that_was_not_vouched_for_still_refuses_to_guess_its_own_project',
+  guessed.isError && /never said which project directory/.test(guessed.text), guessed.text)
+await Bun.sleep(400)
+check('and it never said hello to anything',
+  neutralHub.got.filter(f => f.t === 'hello').length === 3,
+  String(neutralHub.got.filter(f => f.t === 'hello').length))
+guessing.child.kill()
+
+// MEASURED ON THE MACHINE, not reasoned about: an opencode server started from inside a Claude
+// Code session inherits `CLAUDE_PROJECT_DIR`, and its whole environment reaches the MCP child. The
+// first term then wins and the child resolves ANOTHER repository's secret — silently, because it
+// really does find one. opencode's config can only overlay a variable, never remove it, and a
+// missing `{env:VAR}` there substitutes to the empty string, so "set to nothing" has to mean unset
+// or there is no way to close this at all.
+const blanked = startBridge(
+  { CLAUDE_PROJECT_DIR: '', KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', KICKOFF_HUB_SOCKET: neutralSock },
+  repo,
+)
+await handshake(blanked)
+await until('the blanked hello', () => neutralHub.got.filter(f => f.t === 'hello').length >= 4)
+check('a_project_directory_the_config_blanked_out_is_treated_as_unset',
+  neutralHub.got.filter(f => f.t === 'hello')[3].repo === repo,
+  neutralHub.got.filter(f => f.t === 'hello')[3].repo)
+blanked.child.kill()
+
+// A lane worktree opened by opencode is still named by git, not by its folder.
+const laneCwd = startBridge(
+  { KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', KICKOFF_HUB_SOCKET: neutralSock },
+  laneDir,
+)
+await handshake(laneCwd)
+await until('the lane-by-cwd hello', () => neutralHub.got.filter(f => f.t === 'hello').length >= 5)
+const laneByCwd = neutralHub.got.filter(f => f.t === 'hello')[4]
+check('a_tool_server_told_its_cwd_is_a_lane_worktree_names_the_lane_git_names',
+  laneByCwd.lane === 'lane-0902-201212-2783563' && laneByCwd.repo === laneRepo,
+  `${laneByCwd.lane} / ${laneByCwd.repo}`)
+laneCwd.child.kill()
+
+// The words. What a tool returns is what the agent goes on to repeat to the operator, so a wording
+// that drifted per engine would be an agent saying his phone had buzzed in a sentence that is true
+// on one engine and not on the other. The same calls in the same order, so even the minted ask id
+// has to match.
+async function whatItSays(b: ReturnType<typeof startBridge>) {
+  b.to({ jsonrpc: '2.0', id: 900, method: 'tools/list' })
+  await until('a tool list', () => b.out.some(l => l.id === 900))
+  const tools = b.out.find(l => l.id === 900)!.result.tools
+  const said = [
+    (await call(b, 901, 'reply', { text: 'progress' })).text,
+    (await call(b, 902, 'ask', { text: 'go on?', options: [{ id: 'y', label: 'Yes' }] })).text,
+    (await call(b, 903, 'done', { text: 'finished' })).text,
+    (await call(b, 904, 'ask_resolved', { ask_id: 'a3', how: 'withdrawn' })).text,
+  ]
+  return JSON.stringify({ tools, said })
+}
+
+const claudeWords = await whatItSays(claudeWay)
+const opencodeWords = await whatItSays(cwdWay)
+check('the_words_an_agent_reads_are_the_same_whichever_engine_it_is',
+  claudeWords === opencodeWords,
+  `${claudeWords.slice(0, 200)}\n  vs\n  ${opencodeWords.slice(0, 200)}`)
+// Belt and braces: the sentences must be the SUCCESS ones, or two identically broken bridges would
+// pass the check above.
+check('and those words are the ones that say he was reached',
+  /"said"/.test(claudeWords) && /asked \(a\d+\)/.test(claudeWords) &&
+    /"sent"/.test(claudeWords) && /the buttons are coming off/.test(claudeWords),
+  claudeWords.slice(-260))
+
+// ── The one sentence that cannot be the same on both engines ──────────────────────────────────
+//
+// The operator's ANSWER comes back as `notifications/claude/channel`. Claude Code injects that into
+// the agent's turn; opencode has no passthrough for an arbitrary MCP notification, so there it goes
+// nowhere at all. Both clients were asked what they are — that is where the two handshakes above
+// came from — and neither advertises a capability about channels, so the name is the only honest
+// signal there is. "His answer will arrive" is therefore true on one engine and false on the other,
+// and an agent repeating the false one to the operator is the incident this vocabulary exists for.
+const onOpencode = startBridge({ KICKOFF_CHANNEL_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock })
+await handshake(onOpencode, OPENCODE)
+const askedThere = await call(onOpencode, 910, 'ask',
+  { text: 'go on?', options: [{ id: 'y', label: 'Yes' }] })
+const askedHere = await call(claudeWay, 911, 'ask',
+  { text: 'go on?', options: [{ id: 'y', label: 'Yes' }] })
+check('an_agent_is_never_promised_an_answer_on_an_engine_that_cannot_deliver_one',
+  !/answer will arrive/.test(askedThere.text) && /do not wait for an answer/i.test(askedThere.text),
+  askedThere.text)
+check('and it is still told, in the same first words, whether his phone actually buzzed',
+  /^asked \(a\d+\)/.test(askedThere.text), askedThere.text)
+check('while a claude session is told his answer is coming, in the sentence it always was',
+  askedHere.text === `asked (${askedHere.text.match(/\((a\d+)\)/)![1]}) — his answer will arrive as a channel message, do not wait here`,
+  askedHere.text)
+
+// The other three tools' SUCCESS sentences are a pair, not a copy, and calling them a copy is what
+// hid a defect for a whole slice. "Said" is honest on Claude Code because the hub can still
+// contradict it afterwards — `ack{delivered:'no'}` reaches the agent as a channel message and takes
+// it back. Where nothing can carry that correction, the same word is the last thing the agent will
+// ever hear on the subject, and it has to say so or the agent upgrades "it went out" to "he has
+// seen it" and tells the operator his phone buzzed when it did not.
+//
+// So: the opencode sentence must OPEN with the claude one — the claim itself does not drift — and
+// must then carry the marker the `instructions` block teaches the agent to look for.
+//
+// RED, before the fix: every one of these was byte for byte "said" / "sent" / "the buttons are
+// coming off" on both engines, and the correction went to stderr.
+const successes = async (b: ReturnType<typeof startBridge>, id: number) => [
+  (await call(b, id, 'reply', { text: 'progress' })).text,
+  (await call(b, id + 1, 'done', { text: 'finished' })).text,
+  (await call(b, id + 2, 'ask_resolved', { ask_id: 'a3', how: 'withdrawn' })).text,
+]
+const thereWords = await successes(onOpencode, 920)
+const hereWords = await successes(claudeWay, 930)
+check('a_claude_session_is_told_he_was_reached_in_the_plainest_words_there_are',
+  JSON.stringify(hereWords) === JSON.stringify(['said', 'sent', 'the buttons are coming off']),
+  JSON.stringify(hereWords))
+check('an_engine_that_can_never_take_a_success_back_says_so_in_the_same_breath',
+  thereWords.every((t, i) => t.startsWith(hereWords[i]) && /nothing on this engine/.test(t)),
+  JSON.stringify(thereWords))
+// The marker has to be the one the instructions block hands the agent, or the teaching points at
+// nothing. Read out of the running server's own handshake rather than restated here — and the
+// teaching has to be there for a turn that never calls `ask`, which is the common shape.
+const taught: string = onOpencode.out.find(l => l.id === 1)!.result.instructions ?? ''
+check('and the marker is the one the instructions block taught it to look for',
+  /nothing on this engine/.test(taught) && !/^.*`ask` says in its own result/.test(taught),
+  JSON.stringify(taught.slice(0, 200)))
+onOpencode.child.kill()
+
+claudeWay.child.kill()
+namedWay.child.kill()
+cwdWay.child.kill()
+neutralHub.stop()
 
 rmSync(dir, { recursive: true, force: true })
 console.log(`\n${failures === 0 ? 'all checks passed' : `${failures} FAILED`}`)

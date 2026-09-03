@@ -11,6 +11,23 @@ bun bridge.ts
 Both variables have defaults: the repo is the working directory, and the server is
 `http://127.0.0.1:9700`. The hub socket is derived from the uid and is never configured.
 
+## It is one of two voices now, and it shares a slot
+
+An opencode agent also has a DELIBERATE voice — `plugins/kickoff-channel/server.ts`, declared under
+opencode's `mcp` key, carrying what the agent chose to say rather than what it was asked. Both want
+to speak for one addressable thing, and the hub admits one live connection per address.
+
+So neither dials the hub: `adapters/fanin/` holds the claim and both attach to it. **Nothing in this
+bridge changes** — the relay speaks the same nine frames the hub does, so pointing
+`KICKOFF_HUB_SOCKET` at the relay's socket is the whole of it. That is proved in
+`adapters/fanin/test-two-producers.ts`, with this file spawned unmodified.
+
+Its own copy of the hub link is a FORK of an early `server.ts`, and it has drifted: no `drain`
+handler, no recovery of a half-written frame on close, backoff reset at the wrong moment, an unknown
+`refused` reason treated as permanent, and a `bye` that exits before the kernel takes it. The
+reviewed version now lives in `plugins/kickoff-channel/hub-link.ts` and the relay shares it. Moving
+this bridge onto it is the obvious next job and is not done here.
+
 ## What it maps
 
 | opencode publishes | reaches the phone as |

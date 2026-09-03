@@ -1,0 +1,9 @@
+{
+  "name": "kickoff-fanin",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun fanin.ts",
+    "test": "bun test-two-producers.ts && bun test-what-breaks-it.ts"
+  }
+}
