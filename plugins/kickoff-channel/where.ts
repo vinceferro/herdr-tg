@@ -2,16 +2,15 @@
  * Which repository, which worktree, and which socket — the machine facts every part of this
  * adapter has to agree on, derived in ONE place.
  *
- * Two processes now derive the same address from the same directory: the tool server, which dials
- * it, and the fan-in, which listens on it. A second copy of this arithmetic is a pair of processes
- * that disagree about where to meet and fail by both being silently right — the failure this
- * project already had with `XDG_RUNTIME_DIR`, which does not survive an `env -i` boundary.
+ * Three processes now ask the same questions about the same directory — the tool server, the relay
+ * and the opencode bridge — and a second copy of this arithmetic is a set of processes that
+ * disagree about which conversation they are while every one of them looks right.
  *
- * Nothing here names an engine. The tool server is started by Claude Code and by opencode, and both
- * of them get repo and lane out of a directory and nothing else.
+ * Nothing here names an engine, and nothing here reads the environment: which directory to ask
+ * about, and what to call the conversation, are `attach.ts`'s job. This file answers only what the
+ * MACHINE says once a directory has been named.
  */
 
-import { createHash } from 'crypto'
 import { readFileSync, existsSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 
@@ -91,32 +90,6 @@ export function factsFor(launchedIn: string | null): Facts {
   return { projectTop, mainTop, lane }
 }
 
-const uid = () => process.getuid?.() ?? 0
-
-/** `/run/user/<uid>/kickoff/hub.sock`, derived and never configured. */
-export const hubSocket = (): string =>
-  process.env.KICKOFF_HUB_SOCKET ?? `/run/user/${uid()}/kickoff/hub.sock`
-
-/** Where the per-address fan-in sockets live. Overridable ONLY so a test can own a directory. */
-export const faninDir = (): string =>
-  process.env.KICKOFF_FANIN_DIR ?? `/run/user/${uid()}/kickoff/fanin`
-
-/**
- * The socket for the fan-in that speaks for one addressable thing.
- *
- * Hashed rather than spelled out because `sun_path` caps at 108 bytes, and a repo path plus a lane
- * name goes past that easily — a limit this project has already been bitten by. Both sides derive
- * it from the same two machine facts they already compute, so neither has to be configured with
- * the other's answer.
- *
- * The two facts are joined by a NUL, which cannot occur in either, so no pair of (repo, lane) can
- * be spelled two ways and land on one socket.
- */
-export function faninSocket(mainTop: string, lane: string | null): string {
-  const digest = createHash('sha256').update(`${mainTop}\0${lane ?? ''}`).digest('hex').slice(0, 16)
-  return join(faninDir(), `${digest}.sock`)
-}
-
 /** The enrolled project a directory belongs to, or null when it is not inside one. */
 export type Project = { repo: string; tokenFile: string; token: string }
 
@@ -157,7 +130,13 @@ function searchUpward(from: string, top: string | null): Project | null {
   }
 }
 
-function readSecret(file: string): string | null {
+/**
+ * The secret in a file, or null when there is not one there.
+ *
+ * Exported because an adapter may be TOLD where its secret is rather than searching for it — the
+ * container case, and the only way to attach from a machine where git is not a fact.
+ */
+export function readSecret(file: string): string | null {
   try {
     if (!existsSync(file)) return null
     const t = readFileSync(file, 'utf8').trim()

@@ -3,13 +3,19 @@
 Seam ② for the other engine. One opencode server, one project, one hub connection.
 
 ```
-OPENCODE_BRIDGE_REPO=/path/to/the/enrolled/repo \
+KICKOFF_HUB_PROJECT_DIR=/path/to/the/enrolled/repo \
 OPENCODE_URL=http://127.0.0.1:9700 \
 bun bridge.ts
 ```
 
-Both variables have defaults: the repo is the working directory, and the server is
-`http://127.0.0.1:9700`. The hub socket is derived from the uid and is never configured.
+`KICKOFF_HUB_PROJECT_DIR` is **required** and there is no default: this bridge used to fall back to
+its own working directory, and an opencode server is routinely started from somewhere that is not
+the repo — so the guess would authenticate as whatever repository happened to be above it. Every
+other setting is in `docs/ATTACHING.md` §2, read by the one reader all three adapters share.
+
+`OPENCODE_URL` is the exception that stays outside the `KICKOFF_HUB_` namespace on purpose: it is
+seam ②, the engine's own endpoint, and the attach interface does not own engine endpoints. It
+defaults to `http://127.0.0.1:9700`.
 
 ## It is one of two voices now, and it shares a slot
 
@@ -18,15 +24,18 @@ opencode's `mcp` key, carrying what the agent chose to say rather than what it w
 to speak for one addressable thing, and the hub admits one live connection per address.
 
 So neither dials the hub: `adapters/fanin/` holds the claim and both attach to it. **Nothing in this
-bridge changes** — the relay speaks the same nine frames the hub does, so pointing
-`KICKOFF_HUB_SOCKET` at the relay's socket is the whole of it. That is proved in
+bridge changes** — the relay speaks the same nine frames the hub does, so `KICKOFF_HUB_RELAY=1` plus
+`KICKOFF_HUB_RELAY_SOCKET` is the whole of it. That is proved in
 `adapters/fanin/test-two-producers.ts`, with this file spawned unmodified.
 
-Its own copy of the hub link is a FORK of an early `server.ts`, and it has drifted: no `drain`
-handler, no recovery of a half-written frame on close, backoff reset at the wrong moment, an unknown
-`refused` reason treated as permanent, and a `bye` that exits before the kernel takes it. The
-reviewed version now lives in `plugins/kickoff-channel/hub-link.ts` and the relay shares it. Moving
-this bridge onto it is the obvious next job and is not done here.
+**The fork is gone.** This file used to carry its own copy of the wire, drifted from the reviewed one
+by twelve invariants — no `drain` handler, a half-written frame resumed rather than re-sent, backoff
+reset on connect instead of on `welcome`, an unknown `refused` reason treated as permanent, a missing
+secret treated as permanent so that enrolling while it ran could never mend it, a send whose result
+every caller discarded, no ack correlation, queued frames never released, and a `bye` abandoned on
+the same tick it was written. It is `plugins/kickoff-channel/hub-link.ts` now, the same module the
+tool server and the relay use, and `test-against-fakes.ts` fails if any adapter starts writing its
+own again.
 
 ## What it maps
 

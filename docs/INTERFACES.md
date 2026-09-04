@@ -63,9 +63,16 @@ project's own voice, and a `hello` that names one parses on a build that has nev
 A lane the hub will not address — empty, over-long, or carrying a control character that would forge
 a line in the audit — is refused with `bad_lane`, permanently rather than as something to retry.
 
-The Claude adapter learns its lane from **git's own name for the worktree** — the last segment of
-`--git-dir`, which git guarantees unique across a repository — crossing to the main worktree via
-`--git-common-dir` to find the secret: a lane worktree has no `.kickoff/hub.token` in it, because
+**Where the address comes from, since 4 September: whoever dispatched, and git only as a fallback.**
+`KICKOFF_HUB_ADDRESS` is the dispatcher's word and goes on the wire verbatim; `docs/ATTACHING.md` is
+the contract, and it is the same contract for all three adapters because they share one reader.
+An adapter checks the address against the hub's own shape rules BEFORE it dials, because `bad_lane`
+is permanent and learning it from a refusal costs a claim and a round trip to be told something that
+was readable off the configuration.
+
+With nobody dispatching, an adapter learns its lane from **git's own name for the worktree** — the
+last segment of `--git-dir`, which git guarantees unique across a repository — crossing to the main
+worktree via `--git-common-dir` to find the secret: a lane worktree has no `.kickoff/hub.token` in it, because
 the secret is gitignored and never checked out into one. Not the checkout's folder name, which git
 does not dedupe: `~/a/wip` and `~/b/wip` are two trees that would have presented one address.
 
@@ -75,9 +82,11 @@ unknown field and would admit the worktree AS THE PROJECT, taking its claim and 
 project's own session is turned away. A channel plugin restarts only when its session does, so
 new-bridge/old-hub is the ordinary middle of an upgrade rather than an exotic state.
 
-The opencode adapter sends no lane yet, so it attaches to the project's own relay. Making it
-lane-aware means moving it from `/event` to `/api/event`, whose payload carries `location.directory`
-per event — the fact it currently lacks and the reason it cannot route.
+The opencode adapter can now be TOLD its address, like any other — one bridge per conversation,
+named by whoever started it. What it still cannot do is serve SEVERAL conversations from one event
+stream: that needs `/api/event`, whose payload carries `location.directory` per event, and without
+that fact there is nothing to route on. Told nothing, it speaks for the project and attaches to the
+project's own relay, exactly as before.
 
 ## Seam ② — adapter ↔ engine. Engine-specific by definition.
 

@@ -417,10 +417,11 @@ Not sold. In order of how likely each is to be mistaken for something this desig
    process may rebuild, a miss scans, a scan repairs, a disagreement logs and loses. Worth taking
    later, on its own, with that rule attached; not here, because a second routing source in a slice
    that already moves credentials is how this repo shipped its registry-drift bug once already.
-9. **The container story is incomplete, and identity is not what breaks first in it.** Both bridges
-   derive the socket from their **own** `getuid()` (`where.ts:96-98`, `bridge.ts:49-50`), which is 0
+9. **The container story is incomplete, and identity is not what breaks first in it.** Every adapter
+   derives the socket from its **own** `getuid()` — one derivation now, in `attach.ts:119` and
+   `attach.ts:338-339`, which is the point of the one-namespace slice — and that is 0
    under `--unshare-user`; the dispatcher must bind-mount the socket and set `KICKOFF_HUB_SOCKET`, and
-   `KICKOFF_FANIN_DIR` must move inside too. From **"The door is the credential"**, and it is a
+   `KICKOFF_HUB_RELAY_DIR` must move inside too (`docs/ATTACHING.md` §10 works the container through). From **"The door is the credential"**, and it is a
    production requirement for any container work regardless of which design wins: **bind-mount the
    DIRECTORY holding a socket, never the socket file.** `bind` unlinks and rebinds on every start
    (`hub.rs:816`), so a mounted socket file pins a dead inode and the container gets ECONNREFUSED for

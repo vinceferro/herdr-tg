@@ -18,7 +18,7 @@
  * other suite so the two can never come to disagree about what the wire is.
  */
 
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, existsSync } from 'fs'
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync } from 'fs'
 import { join } from 'path'
 
 import {
@@ -54,10 +54,10 @@ console.log('\nwith a relay in front of it:')
 const hubSock = join(dir, 'hub.sock')
 const faninDir = join(dir, 'fanin')
 const hub = claimingHub(hubSock)
-const relay = startFanin(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_FANIN_DIR: faninDir })
+const relay = startFanin(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
 await until('the relay to say hello to the hub', () => hub.got.some(f => f.t === 'hello'))
 
-const viaRelay = { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_FANIN_DIR: faninDir, KICKOFF_CHANNEL_VIA_FANIN: '1' }
+const viaRelay = { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir, KICKOFF_HUB_RELAY: '1' }
 
 // Producer A is started the way CLAUDE CODE starts one: cwd is somewhere else entirely and the
 // project is named only by the variable.
@@ -67,7 +67,7 @@ await handshake(A, CLAUDE_CODE.capabilities, CLAUDE_CODE.clientInfo)
 // session's directory, and a flag saying so. Same file, same wire — and the same claim in the same
 // first word, with one difference the ENGINE decides: nothing there can take a success back later,
 // so the sentence that reports one says it is the last word there will be.
-const B = startServer({ KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', ...viaRelay }, laneDir)
+const B = startServer({ KICKOFF_HUB_PROJECT_DIR: '.', ...viaRelay }, laneDir)
 await handshake(B, OPENCODE.capabilities, OPENCODE.clientInfo)
 
 const saidA = await call(A, 'reply', { text: 'A is halfway through' })
@@ -166,11 +166,11 @@ check('and the relay never passed the goodbye on',
 const flooded = join(dir, 'flood.sock')
 const floodDir = join(dir, 'flood-fanin')
 let floodHub = claimingHub(flooded)
-const relayF = startFanin(laneDir, { KICKOFF_HUB_SOCKET: flooded, KICKOFF_FANIN_DIR: floodDir })
+const relayF = startFanin(laneDir, { KICKOFF_HUB_SOCKET: flooded, KICKOFF_HUB_RELAY_DIR: floodDir })
 await until('the flood relay to reach its hub', () => floodHub.got.some(f => f.t === 'hello'))
-const viaFlood = { KICKOFF_HUB_SOCKET: flooded, KICKOFF_FANIN_DIR: floodDir, KICKOFF_CHANNEL_VIA_FANIN: '1' }
+const viaFlood = { KICKOFF_HUB_SOCKET: flooded, KICKOFF_HUB_RELAY_DIR: floodDir, KICKOFF_HUB_RELAY: '1' }
 const loud = startServer({ CLAUDE_PROJECT_DIR: laneDir, ...viaFlood })
-const quiet = startServer({ KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', ...viaFlood }, laneDir)
+const quiet = startServer({ KICKOFF_HUB_PROJECT_DIR: '.', ...viaFlood }, laneDir)
 await handshake(loud)
 await handshake(quiet)
 // Both must be admitted BEFORE the hub goes, or the relay simply holds them un-greeted and nothing
@@ -215,15 +215,15 @@ await Bun.sleep(200)
 //
 // The tool server carries what the agent CHOSE to say; the event bridge carries the prompts it did
 // not choose. Those are the two things that could not both hold the claim, and this is the pair the
-// operator asked for. The bridge below is the SHIPPING `bridge.ts` with not one line changed — only
-// `KICKOFF_HUB_SOCKET` pointed at the relay instead of the hub.
+// operator asked for. The bridge below is the SHIPPING `bridge.ts` with not one line changed — it
+// is told to join a relay, and where that relay listens.
 console.log('\nthe two voices, through one slot:')
 
-// The bridge speaks for a PROJECT and names no lane, so its relay is the project's own.
+// The bridge speaks for a PROJECT and names no address, so its relay is the project's own.
 const projSock = join(dir, 'proj.sock')
 const projDir = join(dir, 'proj-fanin')
 const projHub = claimingHub(projSock)
-const relayP = startFanin(repo, { KICKOFF_HUB_SOCKET: projSock, KICKOFF_FANIN_DIR: projDir })
+const relayP = startFanin(repo, { KICKOFF_HUB_SOCKET: projSock, KICKOFF_HUB_RELAY_DIR: projDir })
 await until('the project relay to reach the hub', () => projHub.got.some(f => f.t === 'hello'))
 const projRelaySock = join(projDir, readdirSync(projDir).find(f => f.endsWith('.sock'))!)
 
@@ -244,14 +244,18 @@ const oc = Bun.serve({
   },
 })
 
+// cwd is deliberately NOT the repo. This adapter used to fall back to its own cwd when nothing
+// named a project, and the folder it is started in here is inside THIS repository, which is really
+// enrolled — so a bare-cwd fallback would authenticate as herdr-tg against a relay holding somebody
+// else's conversation, and be turned away for a reason that named the wrong thing.
 const eventBridge = Bun.spawn(['bun', join(HERE, '..', 'opencode-bridge', 'bridge.ts')], {
-  cwd: repo,
-  env: { ...process.env, OPENCODE_BRIDGE_REPO: repo, OPENCODE_URL: `http://127.0.0.1:${oc.port}`,
-    KICKOFF_HUB_SOCKET: projRelaySock },
+  cwd: HERE,
+  env: { ...process.env, KICKOFF_HUB_PROJECT_DIR: repo, OPENCODE_URL: `http://127.0.0.1:${oc.port}`,
+    KICKOFF_HUB_RELAY: '1', KICKOFF_HUB_RELAY_SOCKET: projRelaySock },
   stdout: 'inherit', stderr: 'inherit',
 })
-const voice = startServer({ KICKOFF_CHANNEL_CWD_IS_PROJECT: '1',
-  KICKOFF_FANIN_DIR: projDir, KICKOFF_CHANNEL_VIA_FANIN: '1' }, repo)
+const voice = startServer({ KICKOFF_HUB_PROJECT_DIR: '.',
+  KICKOFF_HUB_RELAY_DIR: projDir, KICKOFF_HUB_RELAY: '1' }, repo)
 await handshake(voice, OPENCODE.capabilities, OPENCODE.clientInfo)
 
 const chose = await call(voice, 'reply', { text: 'what the agent chose to say' })
@@ -278,6 +282,52 @@ check('and both voices came through ONE claim at the hub',
 const ids = projHub.got.filter(f => ['say', 'ask'].includes(f.t)).map(f => f.id)
 check('and every frame the hub saw carried an id of its own',
   new Set(ids).size === ids.length, JSON.stringify(ids))
+
+// THE STRANGER'S TEST, and it is the one that matters most. `docs/examples/attach-from-the-document.ts`
+// was written from `docs/ATTACHING.md` alone and imports nothing from this repository — not the
+// wire, not the configuration reader, not a type. An interface is only abstract if somebody who has
+// never read our TypeScript can attach from the document, so what is under test here is the
+// DOCUMENT. Its peer is the real relay and, behind that, the whole real path to the hub.
+const strangerSource = readFileSync(join(HERE, '..', '..', 'docs', 'examples', 'attach-from-the-document.ts'), 'utf8')
+check('the stranger really did write it without reading our code',
+  !/from '\.\.?\//.test(strangerSource) && !/hub-link|attach\.ts|where\.ts/.test(strangerSource),
+  JSON.stringify(strangerSource.match(/^import .*$/gm)))
+
+const strangerSaid: string[] = []
+const stranger = Bun.spawn(['bun', join(HERE, '..', '..', 'docs', 'examples', 'attach-from-the-document.ts')], {
+  // Started somewhere that is not the project, and told nothing but the three things §2 and §9 name.
+  cwd: HERE,
+  env: { ...process.env, KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_RELAY: '1',
+    KICKOFF_HUB_RELAY_SOCKET: projRelaySock },
+  stdout: 'pipe', stderr: 'inherit',
+})
+;(async () => {
+  const dec = new TextDecoder()
+  let acc = ''
+  for await (const chunk of stranger.stdout as any) {
+    acc += dec.decode(chunk)
+    for (;;) {
+      const nl = acc.indexOf('\n')
+      if (nl < 0) break
+      const l = acc.slice(0, nl); acc = acc.slice(nl + 1)
+      strangerSaid.push(l)
+      console.log(`    [stranger] ${l}`)
+    }
+  }
+})()
+await until('the stranger to be welcomed', () => strangerSaid.some(l => l.startsWith('WELCOME')), 15000)
+  .catch(() => {})
+check('an_adapter_written_from_the_document_alone_attaches_and_is_heard',
+  strangerSaid.some(l => l.startsWith('WELCOME')) &&
+    projHub.got.some(f => f.t === 'say' && f.text === 'attached from the document alone'),
+  JSON.stringify(strangerSaid))
+await until('the stranger to be acked', () => strangerSaid.some(l => l.startsWith('ACK')), 8000).catch(() => {})
+check('and it is told what became of what it said, in the three values the document names',
+  strangerSaid.some(l => l === 'ACK reached'), JSON.stringify(strangerSaid))
+check('and it still cost the hub exactly one claim, with three adapters behind it',
+  projHub.got.filter(f => f.t === 'hello').length === 1 && projHub.refusals.length === 0,
+  `${projHub.got.filter(f => f.t === 'hello').length} hellos, ${projHub.refusals.length} refusals`)
+stranger.kill()
 
 eventBridge.kill(); voice.child.kill(); relayP.kill(); oc.stop(true); projHub.stop()
 await Bun.sleep(200)
@@ -318,7 +368,7 @@ check('a producer that never said hello is not relayed',
   !hub.got.some(f => f.t === 'say' && f.text === 'no hello first'))
 
 // Two relays for one address hold two claims and race, which is the whole thing this prevents.
-const second_relay = startFanin(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_FANIN_DIR: faninDir })
+const second_relay = startFanin(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
 const rc = await second_relay.exited
 check('a_second_relay_for_one_conversation_refuses_to_start_rather_than_racing_the_first',
   rc === 2, `exit ${rc}`)
@@ -337,7 +387,7 @@ console.log('\nwith no relay at all:')
 const emptyDir = join(dir, 'no-relay')
 mkdirSync(emptyDir, { recursive: true })
 const orphan = startServer(
-  { CLAUDE_PROJECT_DIR: laneDir, KICKOFF_FANIN_DIR: emptyDir, KICKOFF_CHANNEL_VIA_FANIN: '1',
+  { CLAUDE_PROJECT_DIR: laneDir, KICKOFF_HUB_RELAY_DIR: emptyDir, KICKOFF_HUB_RELAY: '1',
     KICKOFF_HUB_SOCKET: hubSock },
   HERE,
 )

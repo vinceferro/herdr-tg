@@ -48,90 +48,59 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { readFileSync } from 'fs'
+
+import { readConfig, secretFor, type Attachment } from './attach.ts'
 import { HubLink, type Delivery, type Identity, type Outbound } from './hub-link.ts'
-import { factsFor, faninSocket, findProject, hubSocket, type Project } from './where.ts'
+import { type Project } from './where.ts'
 
 /**
- * A variable set to nothing is not set.
+ * What this session is — read from the environment ONCE, in the one place that reads it.
  *
- * opencode substitutes a missing `{env:VAR}` in its config with the EMPTY STRING rather than
- * failing, so an empty value here means a config asked for something that was not there. That is
- * not a directory and must never be treated as one — an empty path resolves against cwd, which is
- * the guess this file exists to refuse.
+ * Which project, which conversation, where the secret is and what to dial all come out of
+ * `attach.ts`, which every adapter in this repo shares. Three copies of this reading is what there
+ * used to be, and no two of them agreed: three names for "which directory am I", two vouching
+ * flags, and one adapter that simply guessed from cwd. `docs/ATTACHING.md` is the contract.
+ *
+ * Null here is not a gap to fill in later. The environment is fixed for the life of this process,
+ * so a session that cannot say which project it belongs to will never learn it — it refuses out
+ * loud, in the agent's own turn, naming the one setting whoever started it has to change.
  */
-const named = (v: string | undefined): string | null => (v && v.length ? v : null)
+const READ = readConfig()
+const CONFIG: Attachment | null = 'config' in READ ? READ.config : null
+const PROBLEM = 'problem' in READ ? READ.problem : null
+
+/** The top of the working tree, for the one message that has to name a folder to enrol. */
+const PROJECT_TOP = CONFIG?.facts.projectTop ?? null
+
+/** The conversation this session speaks for, or null when it speaks for the project itself. */
+const LANE = CONFIG?.address ?? null
 
 /**
- * Where the session was started — and it is NOT necessarily the project's top folder.
+ * What to call the thing this session speaks for, in a sentence a person reads.
  *
- * It was `process.cwd()`, on the belief that the engine runs in the project directory. Claude Code
- * does; this process does not. An MCP server declared in a plugin manifest is started with
- * `bun run --cwd ${CLAUDE_PLUGIN_ROOT}`, so cwd there is the PLUGIN folder. The bridge looked for
- * the project's secret at `<plugin>/.kickoff/hub.token`, found nothing, and reported that on a
- * stderr stream neither the agent nor the operator can see — so it never once connected, and every
- * message the agent believed it had sent went nowhere at all.
- *
- * Three terms, and the ORDER is the safety argument, not a preference:
- *
- *   1. `CLAUDE_PROJECT_DIR`, which Claude Code sets. It is first, so the path that ships to a live
- *      session takes it and NOTHING below can alter what that session does.
- *   2. `KICKOFF_CHANNEL_PROJECT_DIR`, for any harness that knows the directory and can say it.
- *   3. cwd — and only when something has explicitly vouched for it. opencode sets the MCP child's
- *      cwd to the session's own directory, which is exactly the folder wanted here.
- *
- * The third is a flag and not a bare fallback, and that distinction is the whole point of the
- * defect above: cwd is wrong under Claude Code in BOTH plugin layouts, so a bare fallback would
- * quietly restore the original failure for any Claude session that ever lost the variable. A flag a
- * config had to set is a claim somebody made; a bare fallback is a guess this file made, and
- * guessing is what caused the defect. An unset variable is still not knowing, and not knowing fails
- * closed and says why.
+ * Three answers, because there are three things it can be and each takes a different action. It is
+ * a worktree only when the name was DERIVED from one — a dispatcher that minted "CEO-steering"
+ * would otherwise be told to go and remake a worktree that does not exist — and it is the project
+ * itself when there is no name at all, which no session in a worktree can be.
  */
-const LAUNCHED_IN =
-  named(process.env.CLAUDE_PROJECT_DIR) ??
-  named(process.env.KICKOFF_CHANNEL_PROJECT_DIR) ??
-  (process.env.KICKOFF_CHANNEL_CWD_IS_PROJECT === '1' ? process.cwd() : null)
-
-/**
- * The repository, its main working tree, and this worktree's own name — read off the machine.
- *
- * Derived in `where.ts` because the relay derives the same three facts from the same directory, and
- * two copies of this arithmetic are two processes that can disagree about which conversation they
- * are while both look right.
- */
-const FACTS = factsFor(LAUNCHED_IN)
-const { projectTop: PROJECT_TOP, mainTop: MAIN_TOP, lane: LANE } = FACTS
-
-
+const WHAT_WE_ARE = !CONFIG?.address ? 'project' : CONFIG.addressWasGiven ? 'conversation' : 'worktree'
 
 /**
  * Whether this server holds the hub connection itself, or hands its frames to a relay that holds it
  * on behalf of the whole address.
  *
  * The hub admits ONE live connection per addressable thing. On opencode, two things want to speak
- * for one lane: this server, carrying what the agent CHOSE to say, and the event bridge, carrying
- * the permission and question prompts it did not choose. They cannot both hold the claim — the
- * second is refused with `already_claimed` — so the fan-in belongs on this side of the seam and the
- * hub never learns there were two.
+ * for one conversation: this server, carrying what the agent CHOSE to say, and the event bridge,
+ * carrying the permission and question prompts it did not choose. They cannot both hold the claim —
+ * the second is refused with `already_claimed` — so the fan-in belongs on this side of the seam and
+ * the hub never learns there were two.
  *
  * It is one code path chosen by configuration, not two implementations: the relay speaks the same
  * nine frames the hub does, so everything below is byte for byte what it always was and only the
- * address differs. Under Claude Code the flag is unset and the address is the hub's own socket.
+ * address differs.
  */
-const VIA_FANIN = process.env.KICKOFF_CHANNEL_VIA_FANIN === '1'
-
-/**
- * Where to dial, or null when this build cannot work it out.
- *
- * Null is reachable only with a relay asked for and no repository to derive its address from, and
- * it fails closed rather than falling back to the hub's own socket. Dialling the hub directly when
- * a relay was asked for is two writers racing for one claim, which is the entire thing the claim
- * exists to prevent.
- */
-const SOCKET: string | null = VIA_FANIN
-  ? MAIN_TOP
-    ? faninSocket(MAIN_TOP, LANE)
-    : null
-  : hubSocket()
+const VIA_FANIN = CONFIG?.viaRelay ?? false
 
 /**
  * What the agent is told when nothing at all answers on that socket.
@@ -488,10 +457,40 @@ function deliver(content: string, meta: Record<string, unknown>): void {
  */
 const enrolHint = () => {
   // The top of the working tree first; failing that, the folder a secret was actually found in —
-  // which is the project, not a guess. Only when neither is known does it decline to name one,
-  // because naming the wrong folder is what put the secret somewhere nobody had enrolled.
-  const dir = PROJECT_TOP ?? project?.repo ?? null
+  // which is the project, not a guess; failing both, the directory this session was TOLD it speaks
+  // for, which is a fact somebody wrote down rather than one this process inferred.
+  //
+  // That last term is the difference between an instruction and a blank. The first two are git's
+  // answer and a found secret, and this hint exists for exactly the case where there is no secret;
+  // in a container, or any directory git will not talk about, both are null and what an agent read
+  // — and then repeated to the operator — was the literal words "<the project folder>". Only when
+  // nothing at all named a directory does it still decline, and there it is the truth: this
+  // session never said which project it belongs to, and no folder here would be more than a guess.
+  const dir = PROJECT_TOP ?? project?.repo ?? CONFIG?.projectDir ?? null
   return dir ? `Run:  herdr-tg enroll ${dir}` : 'Run:  herdr-tg enroll <the project folder>'
+}
+
+/**
+ * Whether a process is right now listening on a Unix socket path — not merely whether a file is
+ * sitting there.
+ *
+ * The difference is the whole point. A relay killed outright leaves its socket file behind, so
+ * "the file exists" would tell an agent that something is carrying its conversation when nothing
+ * is, and send whoever read it to change a setting that was never wrong. `/proc/net/unix` lists
+ * what is actually bound: state `01` is a listening stream socket, and a leftover file appears in
+ * no line of it. Unreadable for any reason, this says no — a diagnosis it cannot prove is one it
+ * must not make.
+ */
+function somethingIsListeningOn(path: string): boolean {
+  try {
+    for (const line of readFileSync('/proc/net/unix', 'utf8').split('\n')) {
+      const f = line.trim().split(/\s+/)
+      if (f.length >= 8 && f[5] === '01' && f[f.length - 1] === path) return true
+    }
+  } catch {
+    /* no /proc, or no permission: say nothing rather than guess */
+  }
+  return false
 }
 
 /** The project this connection is proving itself as, resolved fresh at each attempt. */
@@ -507,42 +506,26 @@ let heldByAnother = 0
  * that is the recovery a tool result tells him to perform.
  */
 function identify(): Identity {
-  if (!LAUNCHED_IN) {
+  if (!CONFIG) {
     // Nothing to retry: the environment is fixed for the life of this process, so a bridge that
-    // does not know its project will never learn it. Refuse out loud rather than dial a socket it
-    // cannot prove anything to.
-    return {
-      refuse: {
-        permanent: true,
-        why: 'This session never said which project directory it belongs to, so the bridge cannot find the secret that proves who it is. Start the session from the project directory.',
-        note: 'no project directory was given, so there is no way to reach the operator from here',
-      },
-    }
+    // cannot work out what it is will never learn it. Refuse out loud rather than dial a socket it
+    // cannot prove anything to — and say which setting has to change, because the person who can
+    // change it is not the one reading this.
+    return { refuse: { permanent: true, why: PROBLEM!.why, note: PROBLEM!.note } }
   }
-  if (!SOCKET) {
-    // A relay was asked for and there is no repository to derive its address from. Falling back to
-    // the hub's own socket here would put this server and the event bridge in a race for one claim.
-    return {
-      refuse: {
-        permanent: true,
-        why: 'This session was told to reach him through a relay, and the bridge cannot work out where that relay is because this folder is not inside a repository. Start the session inside the project.',
-        note: 'a relay was asked for, but there is no repository to derive its address from',
-      },
-    }
-  }
-  project = findProject(LAUNCHED_IN, FACTS)
+  project = secretFor(CONFIG)
   if (!project) {
     return {
       refuse: {
         permanent: true,
         why: `This project is not enrolled, so the hub has no way to know which project it is. ${enrolHint()}`,
-        note: `no secret under ${PROJECT_TOP ?? LAUNCHED_IN}. ${enrolHint()}`,
+        note: `no secret under ${PROJECT_TOP ?? CONFIG.projectDir}. ${enrolHint()}`,
         retryMs: 30_000,
       },
     }
   }
   return {
-    socket: SOCKET,
+    socket: CONFIG.dial,
     hello: {
       t: 'hello',
       project_id: `unknown-until-the-hub-says`,
@@ -550,8 +533,8 @@ function identify(): Identity {
       instance: INSTANCE,
       repo: project.repo,
       pid: process.pid,
-      // Omitted entirely when this is not a lane, so an ordinary session puts byte for byte on the
-      // wire what this bridge has always put there.
+      // Omitted entirely when there is no address, so a session speaking for the project puts byte
+      // for byte on the wire what this bridge has always put there. Never `"lane": null`.
       ...(LANE ? { lane: LANE } : {}),
     },
   }
@@ -602,9 +585,9 @@ function onFrame(frame: Record<string, any>): void {
       if (LANE && frame.lane !== LANE) {
         link.markDown(
           true,
-          `The hub on this machine is older than this bridge and cannot give a worktree a place of its own, so nothing from this worktree (${LANE}) can reach him without pretending to be the whole project. Restart herdr-tg and this session will connect.`,
+          `The hub on this machine is older than this bridge and cannot give a ${WHAT_WE_ARE} a place of its own, so nothing from this ${WHAT_WE_ARE} (${LANE}) can reach him without pretending to be the whole project. Restart herdr-tg and this session will connect.`,
         )
-        note('the hub did not confirm this worktree; it is older than this bridge')
+        note(`the hub did not confirm this ${WHAT_WE_ARE}; it is older than this bridge`)
         link.end()
         break
       }
@@ -622,23 +605,38 @@ function onFrame(frame: Record<string, any>): void {
         bad_token: `The secret at ${project?.tokenFile ?? '.kickoff/hub.token'} is not one the hub knows. Re-run:  ${enrolHint().replace('Run:  ', '')}`,
         not_enabled: 'This project is enrolled with the hub but switched off, so nothing is delivered for it.',
         version_skew: 'The hub speaks a different version of this protocol than the bridge. Run:  kickoff pull',
-        // Permanent, not temporary. The name is git's own name for this worktree and will be the
-        // same on every attempt, so treating it as retryable — which is what an unknown reason
-        // gets, deliberately — would spin for ever saying nothing useful.
-        // Two causes arrive here wearing one name, and the sentence has to serve both. A hub older
-        // than this bridge cannot give a worktree a place of its own; behind the relay that
-        // condition has no wire field of its own, so the relay folds it onto `bad_lane` — the
-        // closest thing the closed refusal set has. Naming only the other cause sent whoever read
-        // it to delete and recreate a git worktree, losing whatever was uncommitted in it, while
-        // the one action that mends it — restarting herdr-tg — went unmentioned.
-        bad_lane: `The hub would not give this worktree (${LANE ?? 'unnamed'}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this worktree's name is one the hub will not address and nothing here reaches him until it is remade under a plainer one.`,
+        // Permanent, not temporary: the same name is refused on every attempt, so treating it as
+        // retryable — which is what an unknown reason gets, deliberately — would spin for ever
+        // saying nothing useful.
+        //
+        // THREE causes arrive here wearing one name, and each needs a different action, so this
+        // must not collapse to one sentence. The name was checked against the hub's own rules
+        // before the connection was dialled, so a name the hub will not address is the rarest of
+        // the three; the other two are a hub older than this bridge, which cannot give any
+        // conversation a place of its own, and a relay that holds a conversation this session did
+        // not name. Neither of those has a wire field of its own, so the relay folds both onto
+        // `bad_lane` — the closest thing the closed refusal set has. An earlier version named only
+        // the worktree cause, and sent whoever read it to delete and recreate a git worktree,
+        // losing whatever was uncommitted in it, while the one action that mends it went
+        // unmentioned.
+        bad_lane: !LANE
+          ? // No name was sent at all, so the hub cannot be the one refusing: it only checks a name
+            // that is there. This is the relay, holding one conversation of a project, turning away
+            // a session that speaks for the project as a whole. Nothing about the hub's age or a
+            // worktree's name is true here, and telling him to remake a worktree that does not
+            // exist is the exact harm the split is for.
+            'This session speaks for the project as a whole, and the relay it was pointed at carries one conversation of that project, so it was turned away and nothing here reaches him. Whoever starts this session has to name the same conversation the relay carries, with KICKOFF_HUB_ADDRESS, or point it at the relay for the project itself.'
+          : CONFIG?.addressWasGiven
+            ? `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this is a name the hub will not address and nothing here reaches him until whoever started this session gives it a different one.`
+            : `The hub would not give this worktree (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this worktree's name is one the hub will not address and nothing here reaches him until it is remade under a plainer one.`,
       }
-      // The claim is per WORKTREE now, so a refusal reaching a lane means that worktree is held —
-      // the project's own topic and every other worktree may be perfectly free. Naming the project
-      // here would point him at up to thirteen candidate holders with nothing saying which.
+      // The claim is per CONVERSATION now, so a refusal reaching one means that conversation is
+      // held — the project's own topic and every other conversation of it may be perfectly free.
+      // Naming the project here would point him at up to thirteen candidate holders with nothing
+      // saying which.
       const forNow: Record<string, string> = {
         already_claimed: LANE
-          ? `Another session in this worktree (${LANE}) is holding the link to his phone.`
+          ? `Another session in this ${WHAT_WE_ARE} (${LANE}) is holding the link to his phone.`
           : 'Another session for this project is holding the link to his phone.',
         frame_too_large: 'The last frame was over the size ceiling and was refused, not truncated.',
       }
@@ -649,17 +647,32 @@ function onFrame(frame: Record<string, any>): void {
       // to keep waiting for that is how every message in the new session ends up queued forever.
       heldByAnother = reason === 'already_claimed' ? heldByAnother + 1 : 0
       const stuck = heldByAnother >= 3
+      // The holder is not a stray session at all when a relay for this very conversation is
+      // listening: it is the relay, running on purpose, and this session was configured to dial
+      // past it. The two settings that used to be one line are now two, so naming the folder and
+      // missing the relay line is the ordinary way to arrive here — and every other sentence in
+      // this branch sends whoever reads it hunting for a session that does not exist.
+      const joinTheRelay =
+        reason === 'already_claimed' &&
+        !VIA_FANIN &&
+        !!CONFIG?.relaySocket &&
+        somethingIsListeningOn(CONFIG.relaySocket)
       // This one is an INSTRUCTION, so naming the wrong thing sends him to close a session that is
       // not the holder — and the box has already had a stray bridge squat a claim once.
-      const why = stuck
-        ? LANE
-          ? `Another session in this worktree (${LANE}) has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.`
-          : 'Another session for this project has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.'
-        : (forGood[reason] ?? forNow[reason])
+      const why = joinTheRelay
+        ? `Something else on this machine is already carrying this ${WHAT_WE_ARE} to his phone, and this session was started to reach the hub directly rather than to join it, so nothing from here reaches him. Whoever starts this session has to join it, by setting KICKOFF_HUB_RELAY to 1 — or stop the thing that is carrying it.`
+        : stuck
+          ? LANE
+            ? `Another session in this ${WHAT_WE_ARE} (${LANE}) has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.`
+            : 'Another session for this project has been holding the link to his phone across several attempts and is not letting go. Nothing here can reach him until it does: close that session, or if none is open, its bridge outlived it and needs to be ended.'
+          : (forGood[reason] ?? forNow[reason])
       // An unknown reason is treated as temporary on purpose: a hub shipped after this build may
       // refuse for something recoverable, and telling the agent to give up on a guess is worse than
       // telling it to wait.
-      link.markDown(stuck || reason in forGood, why ?? `The hub would not take this connection, and gave a reason this bridge does not know (${reason}).`)
+      // Permanent when a relay is proven to be holding this conversation: waiting cannot mend a
+      // setting, and telling the agent its message "goes out when the link comes back" is a promise
+      // about a link that is never coming back on this configuration.
+      link.markDown(stuck || joinTheRelay || reason in forGood, why ?? `The hub would not take this connection, and gave a reason this bridge does not know (${reason}).`)
       note(why ?? `refused: ${reason}`)
       break
     }

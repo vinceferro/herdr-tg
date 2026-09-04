@@ -27,40 +27,52 @@
  * to serve several projects from one server. It is not used for that, and must not be: `directory`
  * is data the server reports, and identity here is a secret the hub resolves. One bridge process
  * per project, addressed by URL, is also what survives each agent moving into its own container.
- */
-
-import { readFileSync, existsSync } from 'fs'
-import { join } from 'path'
-
-const PROTOCOL_VERSION = 1
-const MAX_FRAME_BYTES = 64 * 1024
-const MAX_PENDING = 64
-
-/** The project this bridge speaks for. Its secret lives in the repo, not in this process's argv. */
-const REPO = process.env.OPENCODE_BRIDGE_REPO ?? process.cwd()
-const TOKEN_FILE = process.env.KICKOFF_HUB_TOKEN_FILE ?? join(REPO, '.kickoff', 'hub.token')
-
-/**
- * `/run/user/<uid>/kickoff/hub.sock`, derived and never configured.
  *
- * Derived rather than read from `XDG_RUNTIME_DIR`, which does not survive an `env -i` boundary —
- * the two sides would then derive different paths with neither being wrong.
+ * # The wire is not written here any more
+ *
+ * This file used to carry its own copy of the queue, the framing and the reconnect. It drifted from
+ * the reviewed one by twelve invariants, every one of them a defect that had already been found and
+ * fixed on the other side: no drain handler, so a frame the kernel refused sat unsent until
+ * something else happened to be sent; a half-written frame resumed rather than re-sent, which put a
+ * headless tail on the next connection and made the hub close in silence; a backoff reset on
+ * connect rather than on `welcome`, so a squatting claim became a permanent 1 Hz hammer; an unknown
+ * refusal treated as permanent; a missing secret treated as permanent, which made "run herdr-tg
+ * enroll while it is running" a lie for this adapter alone; and a `bye` written and then abandoned
+ * on the same tick. It is `hub-link.ts` now — the same module the tool server and the relay use.
+ *
+ * What stays here is what is genuinely opencode's: which events become questions, where an answer
+ * is posted, and the fact that a tap needs no retirement because the hub already made one.
  */
-const SOCKET =
-  process.env.KICKOFF_HUB_SOCKET ?? `/run/user/${process.getuid?.() ?? 0}/kickoff/hub.sock`
 
-/** The one opencode server this bridge watches. */
-const OPENCODE = (process.env.OPENCODE_URL ?? 'http://127.0.0.1:9700').replace(/\/$/, '')
-
-/** This run. A new instance invalidates every question the last one left open. */
-const INSTANCE = `${process.pid}-${Date.now()}`
-
-let seq = 0
-const nextId = () => `f${++seq}`
+import { readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
+import { HubLink, MAX_FRAME_BYTES, type Delivery, type Outbound } from '../../plugins/kickoff-channel/hub-link.ts'
 
 function note(msg: string): void {
   process.stderr.write(`opencode-bridge: ${msg}\n`)
 }
+
+function die(msg: string): never {
+  note(msg)
+  process.exit(2)
+}
+
+/**
+ * Which project, which conversation, and what to dial — from the one reader every adapter shares.
+ *
+ * `docs/ATTACHING.md` is the contract. This adapter used to fall back to its own cwd when nothing
+ * named a project, which is the guess the other two refuse to make: an opencode server is routinely
+ * started from somewhere that is not the repo, and a bridge that guessed would authenticate as
+ * whatever repository happened to be above it.
+ */
+const READ = readConfig()
+if ('problem' in READ) die(READ.problem.note)
+const CONFIG = READ.config
+
+/** The one opencode server this bridge watches. Seam ②, and deliberately outside the namespace. */
+const OPENCODE = (process.env.OPENCODE_URL ?? 'http://127.0.0.1:9700').replace(/\/$/, '')
+
+/** This run. A new instance invalidates every question the last one left open. */
+const INSTANCE = `${process.pid}-${Date.now()}`
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // What the operator was offered, so a tap can be turned back into an opencode reply.
@@ -98,209 +110,161 @@ function remember(askId: string, o: Open): void {
   }
 }
 
+/**
+ * Forget a question nothing can ever answer, and say so where a developer will see it.
+ *
+ * A record kept for a question that never reached a phone is worse than no record: it stays
+ * answerable HERE for the next hundred questions, while no keyboard for it has ever existed. The
+ * agent is meanwhile blocked on a permission prompt, and there is nobody this bridge can tell —
+ * opencode has no channel back into a turn — so the loudest thing available is this line.
+ */
+function giveUpOn(askId: string, why: string): void {
+  if (!open.delete(askId)) return
+  note(`nothing can answer ${askId} any more: ${why}`)
+}
+
 // ───────────────────────────────────────────────────────────────────────────────────────────────
-// The hub link.
+// The hub link — the shared one.
 
-type Framed = { id: string; bytes: Uint8Array; what: string }
+/** The address this bridge names, so a `welcome` that does not echo it can be caught. */
+const ADDRESS = CONFIG.address
 
-let sock: import('bun').Socket | null = null
-let up = false
-let permanent: string | null = null
-const pending: Framed[] = []
-const control: Framed[] = []
-let unsent: (Framed & { sent: number }) | null = null
+const link = new HubLink({
+  // Opaque to the hub, and only ever read in a log. Kept as it was so an existing transcript still
+  // matches this process's frames.
+  framePrefix: 'f',
+  note,
+  whenUnreachable: CONFIG.viaRelay
+    ? 'The relay that carries this project to his phone is not running.'
+    : 'The hub is not running, so nothing reaches his phone until it is back.',
+  identify() {
+    const project = secretFor(CONFIG)
+    if (!project) {
+      // Retried, NOT permanent. The documented recovery from "this project is not enrolled" is to
+      // run `herdr-tg enroll` while the adapter is running, and the old fork made that impossible
+      // for this adapter alone: it set a permanent flag, never scheduled another attempt, and said
+      // so only on stderr.
+      const where = CONFIG.tokenFile ?? `${CONFIG.projectDir}/.kickoff/hub.token`
+      return {
+        refuse: {
+          permanent: true,
+          why: `This project is not enrolled, so nothing from it reaches his phone. Run:  herdr-tg enroll ${CONFIG.projectDir}`,
+          note: `no secret at ${where}. Run:  herdr-tg enroll ${CONFIG.projectDir}`,
+          retryMs: 30_000,
+        },
+      }
+    }
+    return {
+      socket: CONFIG.dial,
+      hello: {
+        t: 'hello',
+        project_id: 'unknown-until-the-hub-says',
+        token: project.token,
+        instance: INSTANCE,
+        repo: project.repo,
+        pid: process.pid,
+        // Omitted entirely when there is no address, which is byte for byte what this bridge sent
+        // before addresses existed. Never `"lane": null`.
+        ...(ADDRESS ? { lane: ADDRESS } : {}),
+      },
+    }
+  },
+  onFrame: fromHub,
+  onLost,
+})
 
 /**
- * Write whole frames only.
+ * Frames the link let go because nothing but a person can mend the gap.
  *
- * A short write is normal on a socket under load, and treating one as sent is how a queue reports
- * every frame delivered while the peer receives a stream of spliced halves. Nothing leaves the
- * queue until its last byte is accepted, and a frame half-written into a connection that then dies
- * is kept whole rather than resumed — a headless tail on the next connection reads as one
- * unparseable line and takes a healthy frame down with it.
+ * Every one of them was a question or a permission prompt an agent is still blocked on, and the old
+ * fork simply kept them: they rotted in a queue whose reconnect could never happen, because the
+ * same code path had already decided the failure was permanent.
  */
-function flush(s: import('bun').Socket): boolean {
-  const put = (b: Uint8Array): number => {
-    try {
-      return s.write(b)
-    } catch {
-      return 0
-    }
-  }
-  for (;;) {
-    if (unsent) {
-      const rest = unsent.bytes.subarray(unsent.sent)
-      const n = put(rest)
-      if (n < rest.length) {
-        unsent.sent += Math.max(n, 0)
-        return false
-      }
-      unsent = null
-    }
-    // Nothing goes out before `welcome`. A connected socket proves only that something accepted;
-    // the hub can still refuse this project and close.
-    const next = control.shift() ?? (up ? pending.shift() : undefined)
-    if (!next) return unsent === null && control.length === 0 && pending.length === 0
-    const n = put(next.bytes)
-    if (n < next.bytes.length) {
-      unsent = { ...next, sent: Math.max(n, 0) }
-      return false
-    }
-  }
+function onLost(lost: Outbound[], why: string): void {
+  for (const o of lost) if (o.askId) giveUpOn(o.askId, why)
+  note(`${lost.length} frame(s) will never go out: ${why}`)
 }
 
-/** THE ONLY WRITER. The newline is appended here and nowhere else. */
-function send(payload: Record<string, unknown>, what: string): boolean {
-  const id = nextId()
-  const bytes = Buffer.from(JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n', 'utf8')
-  if (bytes.length > MAX_FRAME_BYTES) {
-    // Refused rather than truncated. Half a message on a phone is worse than none and looks the
-    // same as a whole one.
-    note(`a frame was ${bytes.length} bytes and was NOT sent`)
-    return false
+/** Send, and act on what actually happened to it. */
+function say(payload: Record<string, unknown>, what: string, askId?: string): Delivery {
+  const d = link.send(payload, what, askId)
+  // "Written to a live socket", "parked in a queue" and "refused outright" are three different
+  // things, and the old fork returned one boolean for all three which every caller then discarded.
+  if (!d.delivered && d.permanent) {
+    note(`not sent (${what}): ${d.why}`)
+    if (askId) giveUpOn(askId, d.why)
   }
-  if (permanent) {
-    note(`not sent (${what}): ${permanent}`)
-    return false
-  }
-  if (pending.length >= MAX_PENDING) {
-    note(`the line of waiting frames is full; dropped ${what}`)
-    return false
-  }
-  pending.push({ id, bytes, what })
-  return up && sock ? flush(sock) : false
+  return d
 }
 
-/** A frame nothing is waiting on — a pong, a hello, a goodbye. Same queue, so it cannot splice. */
-function sendControl(s: import('bun').Socket, payload: Record<string, unknown>): void {
-  const id = nextId()
-  control.push({
-    id,
-    bytes: Buffer.from(JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n', 'utf8'),
-    what: 'a control frame',
-  })
-  flush(s)
-}
-
-function secret(): { token: string; repo: string } | null {
-  if (!existsSync(TOKEN_FILE)) return null
-  const t = readFileSync(TOKEN_FILE, 'utf8').trim()
-  return t ? { token: t, repo: REPO } : null
-}
-
-let backoff = 1000
-let saidItWasDown = false
-
-function connect(): void {
-  const here = secret()
-  if (!here) {
-    // Permanent: no amount of waiting writes a secret. Said once, with the command that fixes it.
-    permanent = `no secret at ${TOKEN_FILE}. Run:  herdr-tg enroll ${REPO}`
-    note(permanent)
-    return
-  }
-  let buf = ''
-  Bun.connect({
-    unix: SOCKET,
-    socket: {
-      open(s) {
-        sock = s
-        backoff = 1000
-        saidItWasDown = false
-        sendControl(s, {
-          t: 'hello',
-          project_id: 'unknown-until-the-hub-says',
-          token: here.token,
-          instance: INSTANCE,
-          repo: here.repo,
-          pid: process.pid,
-        })
-      },
-      data(s, chunk) {
-        buf += chunk.toString()
-        // Read exactly one line at a time, and never to EOF.
-        for (;;) {
-          const nl = buf.indexOf('\n')
-          if (nl < 0) break
-          const line = buf.slice(0, nl)
-          buf = buf.slice(nl + 1)
-          if (line.trim()) onHubFrame(s, line)
-        }
-        if (buf.length > MAX_FRAME_BYTES) {
-          note('the hub sent a line past the ceiling; dropping the connection')
-          buf = ''
-          s.end()
-        }
-      },
-      close() {
-        sock = null
-        up = false
-        retry()
-      },
-      error(_s, e) {
-        note(`socket error: ${(e as Error)?.message ?? e}`)
-      },
-    },
-  }).catch(() => {
-    sock = null
-    up = false
-    if (!saidItWasDown) {
-      note(`the hub is not listening at ${SOCKET}; retrying`)
-      saidItWasDown = true
-    }
-    retry()
-  })
-}
-
-function retry(): void {
-  if (permanent) return
-  setTimeout(connect, backoff)
-  backoff = Math.min(backoff * 2, 30_000)
-}
-
-function onHubFrame(s: import('bun').Socket, line: string): void {
-  let f: Record<string, unknown>
-  try {
-    f = JSON.parse(line)
-  } catch {
-    // An unreadable frame is dropped, never fatal: a hub shipped after this bridge must not be
-    // able to kill the link just by being newer.
-    note('a frame from the hub could not be read; ignoring it')
-    return
-  }
+function fromHub(f: Record<string, any>): void {
   switch (f.t) {
-    case 'welcome':
-      up = true
-      note(`connected as "${f.project}"`)
-      flush(s)
+    case 'welcome': {
+      // A bridge that named an address and was not given it back is talking to a hub older than
+      // itself, and it must NOT go up: that hub ignored the unknown field and admitted this process
+      // AS THE WHOLE PROJECT, taking the project's one claim and its topic while the project's own
+      // voice is then refused.
+      if (ADDRESS && f.lane !== ADDRESS) {
+        link.markDown(
+          true,
+          `The hub on this machine is older than this bridge and cannot give ${ADDRESS} a place of its own.`,
+        )
+        note(`the hub did not confirm ${ADDRESS}; it is older than this bridge`)
+        link.end()
+        return
+      }
+      // The claim counter counts a RUN of consecutive refusals, and a connection that succeeded is
+      // the end of any run. Without this line it is a lifetime tally instead: two ordinary
+      // restarts months apart add up, the third trips "this holder is not letting go", and the
+      // bridge takes itself down for good — emptying its queue and giving up on the question an
+      // agent is blocked on, while telling whoever reads stderr to kill a process that does not
+      // exist. opencode has no channel into a turn, so that agent simply hangs.
+      heldByAnother = 0
+      note(`connected as "${f.project}"${ADDRESS ? ` · ${ADDRESS}` : ''}`)
+      link.markUp()
       return
+    }
     case 'refused': {
       const why = String(f.reason)
-      // Two of these mend themselves and the rest do not. Saying so is the difference between a
-      // bridge that waits usefully and one that spins forever against a door that will not open.
-      const mends = why === 'already_claimed'
-      const said: Record<string, string> = {
-        unknown_project: `the hub does not know ${REPO}. Run:  herdr-tg enroll ${REPO}`,
-        bad_token: `the secret at ${TOKEN_FILE} is not one the hub knows. Re-run:  herdr-tg enroll ${REPO}`,
-        already_claimed: 'another bridge already holds this project; waiting for it to go',
-        version_skew: 'this bridge and the hub do not speak the same version; upgrade one of them',
+      const forGood: Record<string, string> = {
+        unknown_project: `the hub does not know ${CONFIG.projectDir}. Run:  herdr-tg enroll ${CONFIG.projectDir}`,
+        bad_token: `the secret for ${CONFIG.projectDir} is not one the hub knows. Re-run:  herdr-tg enroll ${CONFIG.projectDir}`,
         not_enabled: 'this project is enrolled but switched off',
+        version_skew: 'this bridge and the hub do not speak the same version; upgrade one of them',
+        bad_lane: `the hub will not address a conversation called ${ADDRESS ?? 'this one'}; if the hub is older than this bridge, restarting herdr-tg is the whole of the fix`,
+      }
+      const forNow: Record<string, string> = {
+        already_claimed: 'another bridge already holds this conversation; waiting for it to go',
         frame_too_large: 'the hub refused a frame for being too large',
       }
-      const msg = Object.prototype.hasOwnProperty.call(said, why) ? said[why] : `the hub refused this connection (${why})`
-      note(msg)
-      if (!mends) permanent = msg
+      // One refusal blaming another bridge is an ordinary restart racing its predecessor. Several
+      // in a row is a bridge that outlived its server, and this box has had one squat a claim.
+      heldByAnother = why === 'already_claimed' ? heldByAnother + 1 : 0
+      const stuck = heldByAnother >= 3
+      const said = stuck
+        ? 'another bridge has held this conversation across several attempts and is not letting go; if no opencode server is running, its bridge outlived it and needs to be ended'
+        : (forGood[why] ?? forNow[why])
+      // An unknown reason is treated as TEMPORARY on purpose: a hub shipped after this bridge may
+      // refuse for something recoverable, and giving up on a guess is worse than waiting.
+      link.markDown(stuck || why in forGood, said ?? `the hub refused this connection for a reason this bridge does not know (${why})`)
+      note(said ?? `refused: ${why}`)
       return
     }
-    case 'ping':
-      sendControl(s, { t: 'pong', ref: f.id })
-      return
     case 'ack': {
-      // The hub says what became of a frame. `unseen` is not success: it means the send went out
-      // and could not be checked, and treating it as delivered is how an agent comes to report
-      // that the operator was reached when nobody knows whether he was.
-      if (f.delivered === 'no') note(`the hub did not deliver a frame (${f.why ?? 'no reason given'})`)
-      if (f.delivered === 'unseen') note('the hub could not confirm a frame arrived; it will not be sent again')
+      // The hub says what became of a frame. `unseen` is NOT success: it means the send went out and
+      // could not be confirmed, and it is never retried, because Telegram has no idempotency key and
+      // a second copy of a question would leave two live keyboards for it.
+      const was = link.frameInFlight(String(f.ref))
+      link.forgetInFlight(String(f.ref))
+      if (f.delivered === 'yes') {
+        if (f.why === 'clamped' && was) note(`${was.what} arrived on his phone clipped short`)
+        return
+      }
+      const why = f.delivered === 'no' ? String(f.why ?? 'no reason given') : 'the hub could not confirm it arrived'
+      note(`the hub did not deliver ${was?.what ?? 'a frame'} (${why})`)
+      // Without this, a question the operator never saw stayed answerable here — the record aged
+      // out a hundred questions later while the agent waited on a keyboard that never existed.
+      if (was?.askId) giveUpOn(was.askId, why)
       return
     }
     case 'choice':
@@ -313,9 +277,15 @@ function onHubFrame(s: import('bun').Socket, line: string): void {
       note('the operator typed something; passing typed steering to opencode is not built yet')
       return
     default:
+      // Unknown kind: ignored, so a hub shipped after this bridge cannot kill the link by being
+      // newer. `ping` never arrives here — `hub-link.ts` answers it itself, so liveness never waits
+      // on this switch.
       return
   }
 }
+
+/** Consecutive refusals blaming another bridge. One is a restart; several is one that stayed. */
+let heldByAnother = 0
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // opencode.
@@ -416,7 +386,7 @@ export function onOpencodeEvent(ev: Record<string, any>): void {
       const more =
         questions.length > 1 ? `\n\n(it asked ${questions.length} things at once; this is the first)` : ''
       const trimmed = q.options.length > options.length ? `\n\n(showing ${options.length} of ${q.options.length} choices)` : ''
-      send({ t: 'ask', ask_id: askId, text: `${q.question}${more}${trimmed}`, options }, `a question (${askId})`)
+      say({ t: 'ask', ask_id: askId, text: `${q.question}${more}${trimmed}`, options }, `a question (${askId})`, askId)
       return
     }
     case 'permission.v2.asked':
@@ -439,7 +409,7 @@ export function onOpencodeEvent(ev: Record<string, any>): void {
       const what = Array.isArray(data.resources) && data.resources.length
         ? `${data.action}: ${data.resources.join(', ')}`
         : String(data.action ?? 'something')
-      send(
+      say(
         {
           t: 'ask',
           ask_id: askId,
@@ -451,6 +421,7 @@ export function onOpencodeEvent(ev: Record<string, any>): void {
           ],
         },
         `a permission request (${askId})`,
+        askId,
       )
       return
     }
@@ -463,14 +434,14 @@ export function onOpencodeEvent(ev: Record<string, any>): void {
       const askId = (type.startsWith('question') ? 'q' : 'p') + id
       if (!open.has(askId)) return
       open.delete(askId)
-      send(
+      say(
         { t: 'ask_resolved', ask_id: askId, how: type.endsWith('rejected') ? 'withdrawn' : 'answered' },
         `retiring ${askId}`,
       )
       return
     }
     case 'session.idle':
-      send({ t: 'beat', state: 'idle' }, 'a heartbeat')
+      say({ t: 'beat', state: 'idle' }, 'a heartbeat')
       return
     default:
       return
@@ -518,12 +489,23 @@ async function watch(): Promise<void> {
 }
 
 if (import.meta.main) {
-  connect()
+  link.start()
   void watch()
-  for (const sig of ['SIGTERM', 'SIGINT'] as const) {
-    process.on(sig, () => {
-      if (sock) sendControl(sock, { t: 'bye', reason: 'stopping' })
-      process.exit(0)
-    })
+  // A clean goodbye, best effort and time-boxed. `process.exit()` on the same tick as the write
+  // loses the `bye` to a short write, which is what this used to do: the frame was handed to the
+  // kernel and the process was gone before the kernel had taken it. A relay in front of the hub
+  // acts on that frame — it detaches this producer and starts its grace clock — so losing it makes
+  // an ordinary restart look like a bridge that vanished.
+  let leaving = false
+  const goodbye = (): void => {
+    if (leaving) return
+    leaving = true
+    try {
+      if (link.isUp) link.sendControl({ t: 'bye', reason: 'stopping' })
+    } catch {
+      /* going away regardless */
+    }
+    setTimeout(() => process.exit(0), 200)
   }
+  for (const sig of ['SIGTERM', 'SIGINT'] as const) process.on(sig, goodbye)
 }

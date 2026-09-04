@@ -9,7 +9,7 @@
  *     bun test-against-fakes.ts
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -69,6 +69,10 @@ const hub = Bun.listen({
               id: 'h1',
               t: 'welcome',
               project: 'the-fake-project',
+              // Echoed, because a bridge that names an address and is not given it back is talking
+              // to a hub that admitted it AS THE WHOLE PROJECT, and it refuses rather than
+              // impersonating one. A fake that swallowed the echo would keep this bridge down.
+              ...(f.lane ? { lane: f.lane } : {}),
               limits: { max_frame: 65536, max_text: 4000, frames_per_min: 18 },
             }) + '\n',
           )
@@ -122,7 +126,7 @@ const oc = Bun.serve({
 const child = Bun.spawn(['bun', join(import.meta.dir, 'bridge.ts')], {
   env: {
     ...process.env,
-    OPENCODE_BRIDGE_REPO: repo,
+    KICKOFF_HUB_PROJECT_DIR: repo,
     KICKOFF_HUB_SOCKET: sockPath,
     OPENCODE_URL: `http://127.0.0.1:${oc.port}`,
   },
@@ -143,8 +147,181 @@ const until = async (what: string, cond: () => boolean, ms = 5000): Promise<bool
 const frame = (t: string) => seen.find(f => f.t === t)
 const frames = (t: string) => seen.filter(f => f.t === t)
 
+// ── one wire, and one file that writes it ──────────────────────────────────────────────────────
+//
+// This file used to carry its own copy of the queue, the framing and the reconnect, and it drifted
+// from the reviewed one by twelve invariants — every one of them a defect already found and fixed
+// on the other side. Prose cannot hold that line; the moment somebody dials for themselves again
+// the drift starts over, so the check is mechanical: no adapter opens its own connection, and every
+// adapter takes the wire from the same module.
+console.log('one wire, and one file that writes it')
+const REPO_TOP = join(import.meta.dir, '..', '..')
+const ADAPTERS = [
+  'plugins/kickoff-channel/server.ts',
+  'adapters/fanin/fanin.ts',
+  'adapters/opencode-bridge/bridge.ts',
+]
+const sources = ADAPTERS.map(f => ({ f, src: readFileSync(join(REPO_TOP, f), 'utf8') }))
+// Three marks of a file that has started writing the wire again, and each was on the fork. Not
+// `Bun.connect` itself: the relay opens one to knock on its OWN door and tell a leftover socket file
+// apart from a second relay still answering, and that connection never speaks a frame.
+const sharing = sources.filter(x => /from '[^']*hub-link\.ts'/.test(x.src)).map(x => x.f)
+const answering = sources.filter(x => /t: 'pong'/.test(x.src)).map(x => x.f)
+const redeclaring = sources
+  .filter(x => /const (PROTOCOL_VERSION|MAX_FRAME_BYTES|MAX_PENDING)\s*=/.test(x.src))
+  .map(x => x.f)
+check(
+  'every_adapter_speaks_the_same_wire_from_the_same_file',
+  sharing.length === ADAPTERS.length && answering.length === 0 && redeclaring.length === 0,
+  `sharing hub-link.ts: ${sharing.length} of ${ADAPTERS.length}; answering a ping themselves: ${answering.join(', ') || 'none'}; declaring the protocol themselves: ${redeclaring.join(', ') || 'none'}`,
+)
+
 try {
-  console.log('the bridge and the hub agree on the handshake')
+  console.log('\na refusal from a hub newer than this bridge is waited out, not given up on')
+  // The fork treated any reason it did not recognise as permanent and stopped for the life of the
+  // process — so a hub shipped after it, refusing for something recoverable, took the project's
+  // voice off the phone until somebody noticed. The shared wire waits, and backs off while it does.
+  const skewSock = join(dir, 'newer-hub.sock')
+  const attempts: number[] = []
+  const skewHub = Bun.listen({
+    unix: skewSock,
+    socket: {
+      open() {},
+      data(s, chunk) {
+        for (const line of chunk.toString().split('\n')) {
+          if (!line.trim()) continue
+          if (JSON.parse(line).t !== 'hello') continue
+          attempts.push(Date.now())
+          s.write(JSON.stringify({ v: 1, id: 'r1', t: 'refused', reason: 'the-registry-is-resyncing' }) + '\n')
+          s.end()
+        }
+      },
+    },
+  })
+  const skewChild = Bun.spawn(['bun', join(import.meta.dir, 'bridge.ts')], {
+    env: {
+      ...process.env,
+      KICKOFF_HUB_PROJECT_DIR: repo,
+      KICKOFF_HUB_SOCKET: skewSock,
+      // Deliberately nowhere. This bridge is here for its HUB behaviour, and pointing it at the fake
+      // opencode would make it the last subscriber to that one event stream — every event the tests
+      // below push would then go to this process instead of the one under test.
+      OPENCODE_URL: 'http://127.0.0.1:9',
+    },
+    stdout: 'ignore',
+    stderr: 'ignore',
+  })
+  check(
+    'an_unknown_refusal_is_waited_out_rather_than_ending_this_bridge_for_good',
+    await until('a third attempt after an unknown refusal', () => attempts.length >= 3, 12000),
+    `${attempts.length} attempt(s)`,
+  )
+  // And the waits GROW. The fork reset its backoff on connect rather than on `welcome`, so a hub
+  // that accepted and then refused was redialled at a flat one second for ever — a claim squatted
+  // by a stray process became a permanent 1 Hz hammer on the hub, each round costing it a full
+  // admission.
+  const gaps = attempts.slice(1).map((t, i) => t - attempts[i])
+  check(
+    'and each wait is longer than the last, rather than a flat one-second hammer',
+    gaps.length >= 2 && gaps[1] > gaps[0] * 1.5,
+    JSON.stringify(gaps),
+  )
+  skewChild.kill()
+  skewHub.stop(true)
+
+  console.log('\na claim waited out and then let go is not a claim held for ever')
+  // The counter that decides "this holder is not letting go" has to count a RUN of consecutive
+  // refusals, never a lifetime tally. Its sibling in `server.ts` clears it on `welcome`; the copy
+  // here dropped that line, so two ordinary restarts months apart could add up to three and take
+  // the bridge down for good — emptying its queue and giving up on the question an agent was
+  // blocked on, while telling whoever read stderr to go and kill a process that does not exist.
+  //
+  // The script below is what an ordinary box produces: herdr-tg restarting with a lingering claim,
+  // this bridge restarting and racing its predecessor. The connection SUCCEEDS twice in between,
+  // which is exactly what tells a run apart from a tally.
+  const claimSock = join(dir, 'restarting-hub.sock')
+  const script = ['refuse', 'refuse', 'welcome-then-close', 'refuse', 'welcome']
+  let hellos = 0
+  const claimSeen: Record<string, any>[] = []
+  const claimHub = Bun.listen({
+    unix: claimSock,
+    socket: {
+      open() {},
+      data(s, chunk) {
+        for (const line of chunk.toString().split('\n')) {
+          if (!line.trim()) continue
+          const f = JSON.parse(line)
+          claimSeen.push(f)
+          if (f.t !== 'hello') {
+            s.write(JSON.stringify({ v: 1, id: `a${claimSeen.length}`, t: 'ack', ref: f.id, delivered: 'yes' }) + '\n')
+            continue
+          }
+          const step = script[Math.min(hellos, script.length - 1)]
+          hellos++
+          if (step === 'refuse') {
+            s.write(JSON.stringify({ v: 1, id: 'c1', t: 'refused', reason: 'already_claimed' }) + '\n')
+            s.end()
+            continue
+          }
+          s.write(JSON.stringify({ v: 1, id: 'c2', t: 'welcome', project: 'the-fake-project',
+            limits: { max_frame: 65536, max_text: 4000, frames_per_min: 18 } }) + '\n')
+          if (step === 'welcome-then-close') setTimeout(() => s.end(), 150)
+        }
+      },
+    },
+  })
+  // Its own opencode: the bridge subscribes to one event stream and the last subscriber wins, so
+  // sharing the one above would take every event away from the process the rest of this file tests.
+  let claimPush: ((e: unknown) => void) | null = null
+  const claimOc = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname === '/event') {
+        return new Response(
+          new ReadableStream({
+            start(c) {
+              const enc = new TextEncoder()
+              claimPush = e => c.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`))
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      }
+      if (req.method === 'POST') return new Response('{}', { headers: { 'content-type': 'application/json' } })
+      return new Response('not found', { status: 404 })
+    },
+  })
+  const claimChild = Bun.spawn(['bun', join(import.meta.dir, 'bridge.ts')], {
+    env: {
+      ...process.env,
+      KICKOFF_HUB_PROJECT_DIR: repo,
+      KICKOFF_HUB_SOCKET: claimSock,
+      OPENCODE_URL: `http://127.0.0.1:${claimOc.port}`,
+    },
+    stdout: 'ignore',
+    stderr: 'ignore',
+  })
+  // The question is minted in the gap after the LAST refusal, which is the moment a lifetime tally
+  // has reached three and a run has reached one.
+  await until('the fourth hello', () => hellos >= 4, 20000)
+  await until('the fake opencode stream', () => claimPush !== null, 20000)
+  claimPush!({
+    id: 'evt_claim',
+    type: 'permission.v2.asked',
+    properties: { id: 'pper_x', sessionID: 'ses_c', action: 'run a command', resources: ['ls'] },
+  })
+  check(
+    'a_question_asked_while_a_claim_is_being_waited_out_still_reaches_the_hub',
+    await until('the ask through the mended link', () => claimSeen.some(f => f.t === 'ask'), 20000),
+    `hellos=${hellos}  ask frames at the hub: ${claimSeen.filter(f => f.t === 'ask').length}`,
+  )
+  claimChild.kill()
+  claimHub.stop(true)
+  claimOc.stop(true)
+
+  console.log('\nthe bridge and the hub agree on the handshake')
   check('it says hello with the secret and no name of its own', await until('hello', () => !!frame('hello')))
   check('the hello carries no display name', frame('hello') !== undefined && !('title' in (frame('hello') ?? {})))
   check('nothing at all went out before the hub said welcome', beforeWelcome === 0, `${beforeWelcome} frame(s) did`)

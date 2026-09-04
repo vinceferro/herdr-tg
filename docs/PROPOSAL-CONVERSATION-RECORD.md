@@ -1,3 +1,6 @@
+<!-- SUPERSEDED IN PART, 4 September 2026. The variable this proposal calls
+     `KICKOFF_CHANNEL_CONVERSATION` shipped as `KICKOFF_HUB_ADDRESS`, in the one namespace
+     `docs/ATTACHING.md` defines. Everything else here is still a proposal. -->
 <!-- PROPOSAL, 3 September 2026. One of four competing answers to "rooms cannot connect". This is the
      CONSERVATIVE one: it moves the secret and nothing else. No production code was changed to write
      it; every behavioural claim carries a file:line or was measured on this box and says which. -->

@@ -199,7 +199,7 @@ export const noticesTo = (b: Srv) =>
 export function startFanin(projectDir: string, env: Record<string, string>, capture = false) {
   const child = Bun.spawn(['bun', FANIN], {
     cwd: HERE,
-    env: { ...process.env, KICKOFF_FANIN_PROJECT_DIR: projectDir, ...env },
+    env: { ...process.env, KICKOFF_HUB_PROJECT_DIR: projectDir, ...env },
     stdout: 'inherit', stderr: capture ? 'pipe' : 'inherit',
   })
   const said: string[] = []

@@ -24,20 +24,27 @@ Three crates in one Cargo workspace.
 - `crates/herdr-client` — the typed client for herdr protocol 20. Used ONLY by the read-only
   subcommands now; the bot does not talk to herdr at all.
 
-`plugins/kickoff-channel/` is the MCP tool server — **both** engines start it. Claude Code declares
-it in a plugin manifest and names the project in `CLAUDE_PROJECT_DIR`; opencode declares it under
-`mcp` and sets the child's cwd to the session's directory. It holds no token, no allowlist and no
-model. `hub-link.ts` beside it is the wire, and `where.ts` is the repo/lane/socket derivation; both
-are shared with the fan-in, because the one time this project had two copies of the link, the copy
-drifted by thirteen already-fixed defects.
+`plugins/kickoff-channel/` is the MCP tool server — **both** engines start it. It holds no token, no
+allowlist and no model. Three files beside it are the attach surface, and **all three adapters share
+all three**: `attach.ts` is the only file in the repo that reads a configuration variable, `where.ts`
+answers what the machine says once a directory has been named, and `hub-link.ts` is the wire. One
+copy of each, because the one time this project had two copies of the link, the copy drifted by
+thirteen already-fixed defects — and a test now fails if any adapter starts writing its own again.
 
 `adapters/fanin/` is the relay. The hub admits one live connection per addressable thing, and on
 opencode two things want it — the tool server (what the agent chose to say) and the event bridge
 (the prompts it did not choose). The relay holds the claim and both attach to it over a local socket
 speaking hub-proto unchanged, so **the hub never learns there were two**.
 
-Docs, in the order they are worth reading: `docs/INTERFACES.md` (the four seams and the closed list
-of what this project does), `docs/HUB-AND-KICKOFF.md` (how it wires to kickoff, and two questions
+**One namespace, `KICKOFF_HUB_`, and one document.** `docs/ATTACHING.md` is the contract an adapter
+attaches by — eight variables of which a normal adopter sets one, the address a dispatcher mints, the
+credential rule, the handshake, and the twelve wire rules. It is written to be implementable by a
+stranger, and `docs/examples/attach-from-the-document.ts` is a stranger's adapter that imports
+nothing of ours and is run against the real relay by the fan-in's own suite.
+
+Docs, in the order they are worth reading: `docs/ATTACHING.md` (how anything attaches),
+`docs/CAPABILITIES.md` (what the hub offers, requires and refuses),
+`docs/INTERFACES.md` (the four seams and the closed list of what this project does), `docs/HUB-AND-KICKOFF.md` (how it wires to kickoff, and two questions
 still open), `docs/HUB-DESIGN.md` (the original redesign — historical, and it predates the
 deletion), `docs/SLICE-3-REVIEW.md` and `docs/SLICE-3-FIXES.md` (why the scraper died).
 
@@ -91,9 +98,9 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   worktree name, which git guarantees unique — never the folder basename, which is not.
 - **The opencode adapter is `adapters/opencode-bridge/`.** It maps `question.v2.asked` and
   `permission.v2.asked` onto `ask`, and a tap back onto opencode's own reply endpoints. Proven
-  against a real opencode server and a real phone. It does not yet carry what an agent *chooses* to
-  say — opencode takes a local stdio MCP server, so the same `reply`/`ask`/`done` tools can be given
-  to it, and that is the next slice.
+  against a real opencode server and a real phone. **Its fork of the wire is gone** — it drifted by
+  twelve invariants and now shares `hub-link.ts` — and it can name an address, so it is no longer
+  confined to a project's own relay.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.

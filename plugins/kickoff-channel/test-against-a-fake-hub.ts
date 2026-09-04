@@ -591,23 +591,16 @@ console.log('\nwhichever engine started it:')
 const neutralSock = join(dir, 'neutral.sock')
 const neutralHub = fakeHub(neutralSock, (_h, s) => welcome(s))
 
-// THE ANTI-REGRESSION ONE. The path that ships to a live Claude session must take
-// `CLAUDE_PROJECT_DIR` and nothing else, so this hands it the truth and hands both new terms a lie.
-// Reverse the order of the three terms and this is the check that goes red.
+// A decoy repository, enrolled and complete, for the checks that turn on WHICH directory won.
 const decoy = join(dir, 'decoy')
 mkdirSync(join(decoy, '.kickoff'), { recursive: true })
 writeFileSync(join(decoy, '.kickoff', 'hub.token'), 'd'.repeat(64))
 Bun.spawnSync(['git', '-C', decoy, 'init', '-q'])
 
-const claudeWay = startBridge(
-  {
-    CLAUDE_PROJECT_DIR: repo,
-    KICKOFF_CHANNEL_PROJECT_DIR: decoy,
-    KICKOFF_CHANNEL_CWD_IS_PROJECT: '1',
-    KICKOFF_HUB_SOCKET: neutralSock,
-  },
-  decoy,
-)
+// Claude Code sets its own variable and nothing else, and a plugin manifest cannot be edited from
+// here — so a session that names its project only that way has to keep attaching. It is the engine's
+// variable, read only when nothing in this interface's own namespace has spoken.
+const claudeWay = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock }, decoy)
 await handshake(claudeWay)
 await until('the claude-way hello', () => neutralHub.got.some(f => f.t === 'hello'))
 const claudeHello = neutralHub.got.find(f => f.t === 'hello')!
@@ -615,20 +608,20 @@ check('a_claude_session_keeps_working_exactly_as_it_did_before',
   claudeHello.repo === repo && claudeHello.token === 'a'.repeat(64),
   `${claudeHello.repo} / ${claudeHello.token?.slice(0, 4)}`)
 
-// The second term, for a harness that knows the directory and can say it.
-const namedWay = startBridge({ KICKOFF_CHANNEL_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock })
+// The one variable a normal adopter sets, and the only one that is required.
+const namedWay = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock })
 await handshake(namedWay)
 await until('the named-way hello', () => neutralHub.got.filter(f => f.t === 'hello').length >= 2)
 check('a_harness_that_names_the_project_directory_is_believed',
   neutralHub.got.filter(f => f.t === 'hello')[1].repo === repo)
 
-// The third term, and only with the flag. cwd here is a SUBFOLDER of the repo, because that is what
-// opencode does when the session is opened on one — and the upward search is what turns it into the
-// project.
+// The dot, which is the whole of what "my cwd is the project, and I vouch for it" now costs. cwd
+// here is a SUBFOLDER of the repo, because that is what opencode does when the session is opened on
+// one — and the upward search is what turns it into the project.
 const sub = join(repo, 'crates', 'deep')
 mkdirSync(sub, { recursive: true })
 const cwdWay = startBridge(
-  { KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', KICKOFF_HUB_SOCKET: neutralSock },
+  { KICKOFF_HUB_PROJECT_DIR: '.', KICKOFF_HUB_SOCKET: neutralSock },
   sub,
 )
 await handshake(cwdWay)
@@ -642,7 +635,7 @@ const guessing = startBridge({ KICKOFF_HUB_SOCKET: neutralSock }, repo)
 await handshake(guessing)
 const guessed = await call(guessing, 700, 'reply', { text: 'anything' })
 check('a_tool_server_that_was_not_vouched_for_still_refuses_to_guess_its_own_project',
-  guessed.isError && /never said which project directory/.test(guessed.text), guessed.text)
+  guessed.isError && /never said which project/.test(guessed.text), guessed.text)
 await Bun.sleep(400)
 check('and it never said hello to anything',
   neutralHub.got.filter(f => f.t === 'hello').length === 3,
@@ -656,7 +649,7 @@ guessing.child.kill()
 // missing `{env:VAR}` there substitutes to the empty string, so "set to nothing" has to mean unset
 // or there is no way to close this at all.
 const blanked = startBridge(
-  { CLAUDE_PROJECT_DIR: '', KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', KICKOFF_HUB_SOCKET: neutralSock },
+  { CLAUDE_PROJECT_DIR: '', KICKOFF_HUB_PROJECT_DIR: '.', KICKOFF_HUB_SOCKET: neutralSock },
   repo,
 )
 await handshake(blanked)
@@ -668,7 +661,7 @@ blanked.child.kill()
 
 // A lane worktree opened by opencode is still named by git, not by its folder.
 const laneCwd = startBridge(
-  { KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', KICKOFF_HUB_SOCKET: neutralSock },
+  { KICKOFF_HUB_PROJECT_DIR: '.', KICKOFF_HUB_SOCKET: neutralSock },
   laneDir,
 )
 await handshake(laneCwd)
@@ -716,7 +709,7 @@ check('and those words are the ones that say he was reached',
 // came from — and neither advertises a capability about channels, so the name is the only honest
 // signal there is. "His answer will arrive" is therefore true on one engine and false on the other,
 // and an agent repeating the false one to the operator is the incident this vocabulary exists for.
-const onOpencode = startBridge({ KICKOFF_CHANNEL_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock })
+const onOpencode = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: neutralSock })
 await handshake(onOpencode, OPENCODE)
 const askedThere = await call(onOpencode, 910, 'ask',
   { text: 'go on?', options: [{ id: 'y', label: 'Yes' }] })
@@ -764,6 +757,297 @@ check('and the marker is the one the instructions block taught it to look for',
   /nothing on this engine/.test(taught) && !/^.*`ask` says in its own result/.test(taught),
   JSON.stringify(taught.slice(0, 200)))
 onOpencode.child.kill()
+
+// ── Part 6: one namespace, and an address whoever dispatched us minted ────────────────────────
+//
+// Eleven variables across five prefixes said the same three things in three different ways, and
+// not one of them could tell this bridge WHICH CONVERSATION it was — the address was read off git
+// and nothing else could supply one. `docs/ATTACHING.md` is the interface that replaced them; these
+// are the four properties an adopter writing a third adapter has to be able to rely on.
+console.log('\nattached the way the interface says:')
+
+const oneSock = join(dir, 'onenamespace.sock')
+// It echoes the address back, which is what the real hub does and what a bridge that named one
+// checks before it will go up.
+const oneHub = fakeHub(oneSock, (h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-w', t: 'welcome', project: 'repo', lane: h.lane,
+    limits: { max_frame_bytes: 65536, per_minute: 20 } }) + '\n'))
+
+// The directory handed over IS a linked worktree, and git's own name for it is
+// `lane-0902-201212-2783563`. So if the address were still read off git — or read off git first and
+// overridden second — this check reads that name back instead of the dispatcher's.
+const dispatched = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: laneDir,
+  KICKOFF_HUB_ADDRESS: 'CEO-steering',
+  KICKOFF_HUB_SOCKET: oneSock,
+})
+await handshake(dispatched)
+await until('the dispatched hello', () => oneHub.got.some(f => f.t === 'hello')).catch(() => {})
+const dispatchedHello = oneHub.got.find(f => f.t === 'hello')
+check('a_dispatcher_can_name_the_conversation_and_git_is_not_consulted',
+  dispatchedHello?.lane === 'CEO-steering', JSON.stringify(dispatchedHello?.lane))
+check('and it still proves itself with the secret in the main working tree',
+  dispatchedHello?.token === 'b'.repeat(64), String(dispatchedHello?.token).slice(0, 8))
+dispatched.child.kill()
+
+// The container case, which is where git is not a fact and the derived default cannot exist: a
+// directory that is inside no repository at all, told where its secret is and what it is called.
+// Nothing about attaching may require git.
+const nogit = join(dir, 'no-git-anywhere')
+mkdirSync(join(nogit, '.kickoff'), { recursive: true })
+writeFileSync(join(nogit, '.kickoff', 'hub.token'), 'e'.repeat(64), { mode: 0o600 })
+const container = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: nogit,
+  KICKOFF_HUB_TOKEN_FILE: join(nogit, '.kickoff', 'hub.token'),
+  KICKOFF_HUB_ADDRESS: 'room-7',
+  KICKOFF_HUB_SOCKET: oneSock,
+})
+await handshake(container)
+await until('the container hello', () => oneHub.got.filter(f => f.t === 'hello').length >= 2)
+  .catch(() => {})
+const containerHello = oneHub.got.filter(f => f.t === 'hello')[1]
+check('an_adapter_outside_a_repository_attaches_from_the_two_paths_it_was_handed',
+  containerHello?.lane === 'room-7' && containerHello?.token === 'e'.repeat(64),
+  JSON.stringify([containerHello?.lane, String(containerHello?.token).slice(0, 8)]))
+container.child.kill()
+
+// Told nothing at all, and started in a directory that would have been the right guess. The guess
+// is refused anyway — it is wrong under Claude Code in both plugin layouts, which is the defect
+// that made every message an agent believed it had sent go nowhere — and what it says instead has
+// to be enough for whoever configured this to fix it without reading our source.
+const untold = startBridge({ KICKOFF_HUB_SOCKET: oneSock }, repo)
+await handshake(untold)
+const untoldSaid = await call(untold, 800, 'reply', { text: 'anything' })
+check('an_adapter_told_nothing_at_all_says_what_it_needed_rather_than_guessing',
+  untoldSaid.isError && untoldSaid.text.includes('KICKOFF_HUB_PROJECT_DIR'), untoldSaid.text)
+untold.child.kill()
+
+// The hub refuses five shapes of address, and `bad_lane` is permanent — the same name is refused
+// every time, so a bridge that learned it from a refusal frame would have spent a claim, a round
+// trip and a reconnect to be told something it could have read off its own configuration. Each one
+// below is a rule in `lane_is_addressable`, and the adapter has to name what is wrong with the name
+// it was given rather than repeating the hub's enum at the agent.
+const badAddresses: [string, string][] = [
+  ['CEO/steering', 'a separator'],
+  ['..', 'the name of a directory above'],
+  ['x'.repeat(65), 'too long'],
+  ['two\tnames', 'a control character'],
+]
+let refusedBeforeTheWire = 0
+let sampleRefusal = ''
+const helloesBefore = oneHub.got.filter(f => f.t === 'hello').length
+for (const [i, [address]] of badAddresses.entries()) {
+  const bad = startBridge({
+    KICKOFF_HUB_PROJECT_DIR: repo,
+    KICKOFF_HUB_ADDRESS: address,
+    KICKOFF_HUB_SOCKET: oneSock,
+  })
+  await handshake(bad)
+  const said = await call(bad, 810 + i, 'reply', { text: 'anything' })
+  if (said.isError && said.text.includes(address.slice(0, 12))) refusedBeforeTheWire++
+  if (!i) sampleRefusal = said.text
+  bad.child.kill()
+}
+await Bun.sleep(300)
+check('an_address_the_hub_would_refuse_is_refused_before_it_reaches_the_wire',
+  refusedBeforeTheWire === badAddresses.length,
+  `${refusedBeforeTheWire} of ${badAddresses.length}; first said: ${sampleRefusal}`)
+check('and not one of them cost the hub a connection to say so',
+  oneHub.got.filter(f => f.t === 'hello').length === helloesBefore,
+  String(oneHub.got.filter(f => f.t === 'hello').length - helloesBefore))
+
+// A setting that expanded to nothing is not a setting, and for a variable whose unset behaviour is
+// a WORKING DEFAULT that has to be its own refusal rather than a fall-through — otherwise a
+// container told exactly where its secret is, by a config whose variable failed to expand, quietly
+// goes looking for one instead and attaches with whatever it finds. opencode substitutes a missing
+// `{env:VAR}` with the empty string rather than failing, so this is the ordinary way it happens.
+const helloesBeforeBlank = oneHub.got.filter(f => f.t === 'hello').length
+const blankSetting = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: repo,
+  KICKOFF_HUB_TOKEN_FILE: '',
+  KICKOFF_HUB_SOCKET: oneSock,
+})
+await handshake(blankSetting)
+const blankSaid = await call(blankSetting, 830, 'reply', { text: 'anything' })
+check('a_setting_that_expanded_to_nothing_is_refused_rather_than_quietly_defaulted',
+  blankSaid.isError && blankSaid.text.includes('KICKOFF_HUB_TOKEN_FILE'), blankSaid.text)
+await Bun.sleep(300)
+check('and it never went looking for a secret it was not pointed at',
+  oneHub.got.filter(f => f.t === 'hello').length === helloesBeforeBlank,
+  String(oneHub.got.filter(f => f.t === 'hello').length - helloesBeforeBlank))
+blankSetting.child.kill()
+
+// The one ordering that is a safety argument rather than a preference. `CLAUDE_PROJECT_DIR` is the
+// engine's variable and it crosses engine boundaries: an opencode server started inside a Claude
+// session inherits it, its MCP child inherits the server's whole environment, and the child then
+// resolved ANOTHER repository's secret — silently, because it really did find one. A dispatcher's
+// explicit word has to beat an engine's ambient one, so the decoy goes in the engine's variable.
+const bothWays = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: repo,
+  CLAUDE_PROJECT_DIR: decoy,
+  KICKOFF_HUB_SOCKET: oneSock,
+})
+await handshake(bothWays)
+await until('the both-ways hello',
+  () => oneHub.got.filter(f => f.t === 'hello').length > helloesBefore).catch(() => {})
+check('a_directory_the_dispatcher_names_outranks_the_one_an_engine_left_lying_around',
+  oneHub.got.filter(f => f.t === 'hello')[helloesBefore]?.repo === repo,
+  oneHub.got.filter(f => f.t === 'hello')[helloesBefore]?.repo)
+bothWays.child.kill()
+
+// ── Part 7: the ways a promiscuous environment reaches in, and what a session says instead ─────
+//
+// A namespace does not stop a variable crossing an engine boundary; it only gives the crossing one
+// prefix instead of five. Every check here is a way the environment or the machine hands this
+// bridge something nobody meant it to have, and what it must do about it.
+console.log('\nwhat it does with what it was never meant to be handed:')
+
+// An empty value is what opencode substitutes for a `{env:VAR}` that is not there, and for the
+// project directory the fall-through is not a refusal at all — it lands on the ENGINE's own
+// variable, which is the exact environment this ordering exists for. Silently, because it really
+// does find a secret: the second incident, through the one variable the rule had exempted.
+const helloesBeforeEmptyDir = oneHub.got.filter(f => f.t === 'hello').length
+const emptyDir = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: '',
+  CLAUDE_PROJECT_DIR: decoy,
+  KICKOFF_HUB_SOCKET: oneSock,
+})
+await handshake(emptyDir)
+const emptyDirSaid = await call(emptyDir, 840, 'reply', { text: 'anything' })
+await Bun.sleep(300)
+check('an_empty_project_directory_is_refused_rather_than_falling_back_to_an_engines_own',
+  emptyDirSaid.isError && emptyDirSaid.text.includes('KICKOFF_HUB_PROJECT_DIR') &&
+    oneHub.got.filter(f => f.t === 'hello').length === helloesBeforeEmptyDir,
+  emptyDirSaid.text)
+emptyDir.child.kill()
+
+// The other half of the same problem. A config that starts a second engine INHERITS whatever the
+// first was dispatched with, and an opencode-shaped config can only overlay a variable, never
+// remove one — so without a spelling for "ignore this", a session speaks into a conversation
+// nobody opened for it and proves itself with a repository it has never seen. The empty string
+// cannot be that spelling, because empty is what a failed substitution produces.
+const helloesBeforeUninherit = oneHub.got.filter(f => f.t === 'hello').length
+const uninherited = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: laneDir,
+  // Both left behind by an outer session: an address minted for a different conversation, and a
+  // secret belonging to a different repository.
+  KICKOFF_HUB_ADDRESS: '-',
+  KICKOFF_HUB_TOKEN_FILE: '-',
+  KICKOFF_HUB_SOCKET: oneSock,
+})
+await handshake(uninherited)
+await until('the un-inherited hello',
+  () => oneHub.got.filter(f => f.t === 'hello').length > helloesBeforeUninherit).catch(() => {})
+const uninheritedHello = oneHub.got.filter(f => f.t === 'hello')[helloesBeforeUninherit]
+check('a_variable_an_outer_session_left_behind_can_be_ignored_without_unsetting_it',
+  uninheritedHello?.lane === 'lane-0902-201212-2783563' && uninheritedHello?.token === 'b'.repeat(64),
+  JSON.stringify([uninheritedHello?.lane, String(uninheritedHello?.token).slice(0, 8)]))
+uninherited.child.kill()
+
+// A path that does not start with "/" is worked out against whichever folder this process happens
+// to be sitting in — under a plugin manifest, the plugin folder, which is the one directory this
+// whole interface exists to stop guessing from. Nothing listens at the answer, so the link reports
+// itself as merely down and every message is "waiting in line" for ever.
+let refusedRelative = 0
+let relativeSaid = ''
+for (const [i, name] of ['KICKOFF_HUB_SOCKET', 'KICKOFF_HUB_RELAY_SOCKET', 'KICKOFF_HUB_RELAY_DIR'].entries()) {
+  const rel = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, [name]: 'relative.sock' })
+  await handshake(rel)
+  const said = await call(rel, 850 + i, 'reply', { text: 'anything' })
+  if (said.isError && said.text.includes(name)) refusedRelative++
+  if (!i) relativeSaid = said.text
+  rel.child.kill()
+}
+check('a_socket_path_that_is_not_a_full_path_is_refused_rather_than_dialled_from_wherever_this_process_sits',
+  refusedRelative === 3, `${refusedRelative} of 3; first said: ${relativeSaid}`)
+
+// The folder a session was started in can be deleted while the session is still running, and for a
+// product whose unit of work is a `git worktree` that is an ordinary Tuesday. Asking the machine
+// for it on every start — before anything has looked at whether it was even wanted — turns that
+// into a stdio server that exits before it can say a word: no refusal, no sentence for the agent,
+// a stack trace on a stream nobody reads.
+const doomed = join(dir, 'a-worktree-that-gets-removed')
+mkdirSync(doomed, { recursive: true })
+const probeFile = join(dir, 'gone-cwd-probe.ts')
+writeFileSync(probeFile, [
+  `import { rmSync } from 'fs'`,
+  `process.chdir(${JSON.stringify(doomed)})`,
+  `rmSync(${JSON.stringify(doomed)}, { recursive: true, force: true })`,
+  `const { readConfig } = await import(${JSON.stringify(join(import.meta.dir, 'attach.ts'))})`,
+  `const told = readConfig({ CLAUDE_PROJECT_DIR: ${JSON.stringify(repo)} })`,
+  `const dotted = readConfig({ KICKOFF_HUB_PROJECT_DIR: '.' })`,
+  `console.log(JSON.stringify({`,
+  `  told: 'config' in told ? told.config.projectDir : told.problem.note,`,
+  `  dotted: 'config' in dotted ? dotted.config.projectDir : dotted.problem.why,`,
+  `}))`,
+].join('\n'))
+const goneCwd = Bun.spawnSync(['bun', probeFile], { env: { ...process.env }, stdout: 'pipe', stderr: 'pipe' })
+const goneOut = new TextDecoder().decode(goneCwd.stdout).trim()
+let gone: { told?: string; dotted?: string } = {}
+try { gone = JSON.parse(goneOut) } catch { /* it died before it could say anything */ }
+check('a_session_whose_folder_was_deleted_says_so_rather_than_dying_before_it_can_speak',
+  gone.told === repo && typeof gone.dotted === 'string' && gone.dotted.includes('no longer there'),
+  JSON.stringify(gone.told ? gone : { exitCode: goneCwd.exitCode, stderr: new TextDecoder().decode(goneCwd.stderr).slice(0, 200) }))
+
+// Two settings that used to be one line are now two, and pasting the folder while missing the
+// relay line is the ordinary way to arrive here. What the holder actually is, is the relay the
+// operator is running on purpose — so every sentence about "another session" sends him hunting for
+// something that does not exist, and none of them names the line that is missing.
+const claimedSock = join(dir, 'claimed.sock')
+const claimedHub = fakeHub(claimedSock, (_h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-c', t: 'refused', reason: 'already_claimed' }) + '\n'))
+const standIn = join(dir, 'a-relay-is-listening.sock')
+// Something really listening, because a leftover socket FILE is not a relay and must not be
+// diagnosed as one — a relay killed outright leaves its file behind.
+const standInRelay = Bun.listen({ unix: standIn, socket: { open(s) { s.end() }, data() {}, close() {} } })
+const dialledPast = startBridge({
+  KICKOFF_HUB_PROJECT_DIR: repo,
+  KICKOFF_HUB_SOCKET: claimedSock,
+  KICKOFF_HUB_RELAY_SOCKET: standIn,
+})
+await handshake(dialledPast)
+await Bun.sleep(600)
+const dialledPastSaid = await call(dialledPast, 860, 'reply', { text: 'anything' })
+check('a_session_dialling_past_a_running_relay_is_told_which_setting_joins_it',
+  dialledPastSaid.text.includes('KICKOFF_HUB_RELAY') && !/another session/i.test(dialledPastSaid.text),
+  dialledPastSaid.text)
+dialledPast.child.kill()
+standInRelay.stop(true)
+claimedHub.stop()
+
+// `bad_lane` when NO name was sent cannot be the hub: the hub only checks a name that is there.
+// It is a relay carrying one conversation of a project, turning away a session that speaks for the
+// project as a whole. Telling that session to remake a worktree names a thing that does not exist
+// and prescribes an action that has already once cost somebody uncommitted work.
+const foldedSock = join(dir, 'relay-holding-a-lane.sock')
+const foldedRelay = fakeHub(foldedSock, (_h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-b', t: 'refused', reason: 'bad_lane' }) + '\n'))
+const noName = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: foldedSock })
+await handshake(noName)
+await Bun.sleep(600)
+const noNameSaid = await call(noName, 870, 'reply', { text: 'anything' })
+check('a_session_that_named_no_conversation_is_never_told_to_remake_a_worktree',
+  !/worktree/.test(noNameSaid.text) && !/unnamed/.test(noNameSaid.text) &&
+    noNameSaid.text.includes('KICKOFF_HUB_ADDRESS'),
+  noNameSaid.text)
+noName.child.kill()
+foldedRelay.stop()
+
+// The one refusal an agent reads that has to carry a command a person can run. Its two sources are
+// git's answer and a secret it just failed to find, so in a container — or any directory git will
+// not talk about — both are empty and what the agent read, and then repeated to the operator, was
+// the literal words "<the project folder>".
+const nowhere = join(dir, 'no-git-and-no-secret')
+mkdirSync(nowhere, { recursive: true })
+const unenrolled = startBridge({ KICKOFF_HUB_PROJECT_DIR: nowhere, KICKOFF_HUB_SOCKET: oneSock })
+await handshake(unenrolled)
+const unenrolledSaid = await call(unenrolled, 880, 'reply', { text: 'anything' })
+check('an_instruction_to_enrol_names_a_folder_even_where_git_cannot_answer',
+  unenrolledSaid.text.includes(`herdr-tg enroll ${nowhere}`) && !unenrolledSaid.text.includes('<the project folder>'),
+  unenrolledSaid.text)
+unenrolled.child.kill()
+
+oneHub.stop()
 
 claudeWay.child.kill()
 namedWay.child.kill()

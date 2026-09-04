@@ -41,8 +41,8 @@
 import { mkdirSync, statSync, unlinkSync } from 'fs'
 import { dirname } from 'path'
 
+import { readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
 import { HubLink, MAX_FRAME_BYTES, PROTOCOL_VERSION, type Outbound } from '../../plugins/kickoff-channel/hub-link.ts'
-import { factsFor, faninSocket, findProject, hubSocket } from '../../plugins/kickoff-channel/where.ts'
 import { Ledger } from './ledger.ts'
 
 /** Say something in this process's own transcript. The operator cannot see it; a developer can. */
@@ -55,23 +55,31 @@ function die(msg: string): never {
   process.exit(2)
 }
 
-const named = (v: string | undefined): string | null => (v && v.length ? v : null)
-
 /**
- * The directory whose (repo, lane) this fan-in speaks for.
+ * Which conversation this relay holds, read by the same reader every adapter uses.
  *
- * Required, and refused when absent rather than defaulted to cwd: a fan-in that guessed its address
- * would hold the claim for a conversation nobody meant it to, and every producer that dialled the
- * address it MEANT would find nothing there.
+ * `attach.ts` is the one place the environment is read; `docs/ATTACHING.md` is the contract. Every
+ * refusal below names the setting whoever started this has to change, because a relay that guessed
+ * its address would hold the claim for a conversation nobody meant it to, and every producer that
+ * dialled the address it MEANT would find nothing there.
  */
-const PROJECT_DIR = named(process.env.KICKOFF_FANIN_PROJECT_DIR)
-if (!PROJECT_DIR) die('KICKOFF_FANIN_PROJECT_DIR is not set, so there is no way to know which conversation to hold')
+const READ = readConfig()
+if ('problem' in READ) die(READ.problem.note)
+const CONFIG = READ.config
 
-const FACTS = factsFor(PROJECT_DIR)
-if (!FACTS.mainTop) die(`${PROJECT_DIR} is not inside a repository, so its address cannot be derived`)
+// A relay is what a producer attaches TO. One that was told to attach to a relay itself would dial
+// its own door, or somebody else's, and hold a claim for a conversation twice over.
+if (CONFIG.viaRelay) {
+  die('KICKOFF_HUB_RELAY is set on the relay itself; it belongs on the producers that attach to it')
+}
+if (!CONFIG.relaySocket) {
+  die(`${CONFIG.projectDir} is not inside a repository, so this relay's own address cannot be worked out. Name it with KICKOFF_HUB_RELAY_SOCKET.`)
+}
 
-const OUR_LANE = FACTS.lane
-const LISTEN = faninSocket(FACTS.mainTop!, OUR_LANE)
+const PROJECT_DIR = CONFIG.projectDir
+const FACTS = CONFIG.facts
+const OUR_LANE = CONFIG.address
+const LISTEN = CONFIG.relaySocket
 
 /** What this relay knows that must outlive it: who it is, and which questions are still open. */
 const REMEMBERED = `${LISTEN}.state`
@@ -80,9 +88,12 @@ const REMEMBERED = `${LISTEN}.state`
  * How long a producer has to come home before its open questions are taken off the phone.
  *
  * Overridable ONLY so a test can watch a withdrawal happen without waiting out a producer's own
- * reconnect backoff, which is what the default is sized against.
+ * reconnect backoff, which is what the default is sized against. A value that is not a positive
+ * whole number is refused rather than coerced: `Number("")` is 0 and `Number("x")` is NaN, so the
+ * old parse turned a garbled setting into either withdrawing every question the instant a producer
+ * blinked, or never withdrawing one at all — and said nothing either way.
  */
-const GRACE_MS = Number(process.env.KICKOFF_FANIN_GRACE_MS ?? 90_000)
+const GRACE_MS = CONFIG.relayGraceMs
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // Writing to a producer.
@@ -252,13 +263,16 @@ const link = new HubLink({
   note,
   whenUnreachable: 'The hub is not running, so nothing can reach his phone until it is back.',
   identify() {
-    const project = findProject(PROJECT_DIR, FACTS)
+    const project = secretFor(CONFIG)
     if (!project) {
       return {
         refuse: {
           permanent: true,
-          why: `This project is not enrolled, so the hub has no way to know which project it is. Run:  herdr-tg enroll ${FACTS.mainTop}`,
-          note: `no secret under ${FACTS.mainTop}. Run:  herdr-tg enroll ${FACTS.mainTop}`,
+          // The main working tree when git says there is one, and the directory this relay was
+          // pointed at when it does not — a container has no git, and "enroll undefined" is an
+          // instruction nobody can carry out.
+          why: `This project is not enrolled, so the hub has no way to know which project it is. Run:  herdr-tg enroll ${FACTS.mainTop ?? PROJECT_DIR}`,
+          note: `no secret under ${FACTS.mainTop ?? PROJECT_DIR}. Run:  herdr-tg enroll ${FACTS.mainTop ?? PROJECT_DIR}`,
           // Retried, because the operator may enrol the project while this is running and that is
           // the recovery the message prescribes.
           retryMs: 30_000,
@@ -267,7 +281,7 @@ const link = new HubLink({
     }
     secretHeld = project.token
     return {
-      socket: hubSocket(),
+      socket: CONFIG.hubSocket,
       hello: {
         t: 'hello',
         project_id: `unknown-until-the-hub-says`,
@@ -686,7 +700,7 @@ async function bind(): Promise<void> {
       },
     },
   })
-  note(`listening on ${LISTEN} for ${FACTS.mainTop}${OUR_LANE ? ` · ${OUR_LANE}` : ''}`)
+  note(`listening on ${LISTEN} for ${FACTS.mainTop ?? PROJECT_DIR}${OUR_LANE ? ` · ${OUR_LANE}` : ''}`)
 }
 
 await bind()

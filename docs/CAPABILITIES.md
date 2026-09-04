@@ -1,4 +1,6 @@
-<!-- SURFACE, v1, 3 September 2026. What another org may rely on, what it must bring, and what will
+<!-- SURFACE, v2, 4 September 2026. v2 adds the one thing this file promised and nothing could do:
+     a dispatcher-supplied address, `KICKOFF_HUB_ADDRESS`, defined in docs/ATTACHING.md.
+     v1, 3 September 2026. What another org may rely on, what it must bring, and what will
      never be built here. Written to be mirrored: kickoff publishes the same three sections in its
      own repo, and a change to either is a diff rather than a letter. A capability listed under
      OFFERS is a promise; one under REFUSES will not be reconsidered by mail. -->
@@ -31,6 +33,11 @@ its shape beyond what a Telegram button and an audit line can carry.
 So a room is addressed by whatever kickoff calls it. Two rooms colliding is kickoff's bug, and the
 hub's job is to say so rather than to prevent it.
 
+**How a dispatcher actually supplies one, since 4 September: `KICKOFF_HUB_ADDRESS`.** Until then
+nothing could — there was no variable for it, and the Claude adapter derived one from git with no way
+to override it. `docs/ATTACHING.md` is the interface: one namespace, the shape rules an address must
+keep, and how an adapter checks them before it dials rather than being refused.
+
 **Git is not part of this contract.** The Claude adapter derives an address from the git worktree
 name as a *default*, because a developer who opens a session by hand still needs one and git
 guarantees the name is unique. That derivation lives in the adapter (`plugins/kickoff-channel/`),
@@ -42,7 +49,7 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | --- | --- | --- |
 | 1 | **A conversation of its own.** A forum topic per address, created on first LIVE connection and greeted so it appears in the list. | Connect with a secret and an address. |
 | 2 | **Exclusivity.** One live connection per address. A second is refused with a reason it can branch on; a dead one is evicted, a live one is never displaced. | `refused{reason}` on the wire. |
-| 3 | **Delivery you can trust.** Every frame acked exactly once, with three values — `yes`, `no`, `unseen`. `unseen` means it went out and could not be confirmed, and it is never retried. | `ack{ref, delivered, why}`. |
+| 3 | **Delivery you can trust.** Every frame after `hello` acked exactly once, with three values — `yes`, `no`, `unseen`. `unseen` means it went out and could not be confirmed, and it is never retried. `hello` is answered by `welcome` or `refused` instead, and is the one frame no ack is coming for. | `ack{ref, delivered, why}`. |
 | 4 | **A question with buttons.** Options you mint; a tap resolves against a written record, and a question answered once can never be answered twice. | `ask` up, `choice` down. |
 | 5 | **Retirement.** Buttons come off a question that has stopped being open, whoever closed it — which no screen-reading design can do. | `ask_resolved{how}`. |
 | 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. | `message{text, from}` down. |

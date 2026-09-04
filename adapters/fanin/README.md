@@ -27,21 +27,29 @@ contract to review, and `crates/hub-proto` is not touched.
 ## Running one
 
 ```
-KICKOFF_FANIN_PROJECT_DIR=<the repo, or one of its lane worktrees> bun adapters/fanin/fanin.ts
+KICKOFF_HUB_PROJECT_DIR=<the repo, or one of its lane worktrees> bun adapters/fanin/fanin.ts
 ```
 
-One process per **addressable thing** — per repo, and per lane worktree of it. It derives everything
-else: the repo and the lane from git, the secret by searching upward from that directory, the hub
-socket from the uid, and its own address by hashing `(main worktree, lane)`. Nothing is guessed: a
-directory that is not inside a repository is refused, and so is a second relay for an address that
-already has a live one.
+One process per **addressable thing** — per repo, and per conversation of it. It derives everything
+else: the repo and, when nobody dispatched one, the address from git; the secret by searching upward
+from that directory; the hub socket from the uid; and its own door by hashing `(main worktree,
+address)`. Nothing is guessed: a directory that is not inside a repository and was given no door of
+its own is refused, and so is a second relay for an address that already has a live one.
+
+Every variable it reads is in `docs/ATTACHING.md` §2 and is read by `plugins/kickoff-channel/
+attach.ts`, the one reader all three adapters share. The ones that matter here:
 
 | variable | for |
 | --- | --- |
-| `KICKOFF_FANIN_PROJECT_DIR` | **required.** Which conversation this relay holds. |
-| `KICKOFF_HUB_SOCKET` | override the hub's socket. Tests only. |
-| `KICKOFF_FANIN_DIR` | override where the relay sockets live. Tests only. |
-| `KICKOFF_FANIN_GRACE_MS` | how long a departed producer has to come home, default 90 s. Tests only. |
+| `KICKOFF_HUB_PROJECT_DIR` | **required.** Which project this relay speaks for. |
+| `KICKOFF_HUB_ADDRESS` | which conversation of it, when a dispatcher minted one. Otherwise git's name for the worktree, or none. |
+| `KICKOFF_HUB_SOCKET` | override the hub's socket. Tests, and a container. |
+| `KICKOFF_HUB_RELAY_DIR` | override where the relay doors live. Tests, and a container. |
+| `KICKOFF_HUB_RELAY_SOCKET` | name this relay's door outright, instead of deriving it. |
+| `KICKOFF_HUB_RELAY_GRACE_MS` | how long a departed producer has to come home, default 90 s. Refused rather than coerced when it is not a positive whole number. |
+
+`KICKOFF_HUB_RELAY=1` is what makes a process a **producer**, so it is the one variable a relay must
+NOT have: a relay told to attach to a relay would dial its own door. It refuses to start.
 
 ## Wiring opencode to it
 
@@ -55,8 +63,14 @@ already is. Declare it in the **global** config, `~/.config/opencode/opencode.js
       "type": "local",
       "command": ["bun", "<repo>/plugins/kickoff-channel/server.ts"],
       "environment": {
-        "KICKOFF_CHANNEL_CWD_IS_PROJECT": "1",
-        "KICKOFF_CHANNEL_VIA_FANIN": "1",
+        "KICKOFF_HUB_PROJECT_DIR": ".",
+        "KICKOFF_HUB_RELAY": "1",
+        "KICKOFF_HUB_ADDRESS": "-",
+        "KICKOFF_HUB_TOKEN_FILE": "-",
+        "KICKOFF_HUB_SOCKET": "-",
+        "KICKOFF_HUB_RELAY_SOCKET": "-",
+        "KICKOFF_HUB_RELAY_DIR": "-",
+        "KICKOFF_HUB_RELAY_GRACE_MS": "-",
         "CLAUDE_PROJECT_DIR": ""
       },
       "enabled": true
@@ -74,15 +88,28 @@ rather than assumed:
 * **A project-level `opencode.json` does not reach a lane worktree.** This repo gitignores that file
   (it carries a provider key), so it is never checked out into one, and a lane worktree got no MCP
   child at all. The global config has no such problem and needs no per-lane file.
-* **`CLAUDE_PROJECT_DIR: ""` is not decoration.** An opencode server started from inside a Claude
-  Code session inherits that variable, and the child inherits the server's whole environment — so
-  the tool server resolved *another repository's* secret, silently, because it really did find one.
-  opencode can only overlay a variable, never remove it, and a missing `{env:VAR}` there substitutes
-  to the empty string — so the tool server treats "set to nothing" as unset, and blanking it here is
-  how that footgun is closed.
+* **`KICKOFF_HUB_PROJECT_DIR: "."` is the whole of "my cwd is the project".** A literal dot is a
+  claim somebody wrote in a file; a bare fallback to cwd is a guess, and cwd is the *plugin* folder
+  under Claude Code in both layouts — the defect that made every message an agent believed it had
+  sent go nowhere. The dot also cannot be produced by opencode substituting a variable that was not
+  there, which the empty string can.
+* **`CLAUDE_PROJECT_DIR: ""` is now the second lock rather than the only one.** An opencode server
+  started from inside a Claude Code session inherits that variable, and the child inherits the
+  server's whole environment — so the tool server resolved *another repository's* secret, silently,
+  because it really did find one. `KICKOFF_HUB_PROJECT_DIR` outranks it now, so a dispatcher's
+  explicit word beats an engine's ambient one; blanking it costs nothing and closes the same door
+  twice.
+* **The six `-` entries are the same lock on the rest of the namespace.** `KICKOFF_HUB_` does not
+  stop a variable crossing that boundary; it only gives the crossing one prefix. A Claude Code
+  session dispatched with `KICKOFF_HUB_ADDRESS` hands that name to every opencode session started
+  from inside it, which then speaks into a conversation nobody opened for it. opencode can only
+  overlay a variable, never remove one, and the empty string is taken — it is what a failed
+  `{env:VAR}` substitution produces — so `-` means "as if unset". `docs/ATTACHING.md` §2 is the
+  rule; the point here is that a config which starts a second engine overlays **all** of them, not
+  just the one it needs.
 
-Then, per project or lane, start a relay. The event bridge joins the same relay by pointing its
-`KICKOFF_HUB_SOCKET` at the relay's socket; not a line of it changes.
+Then, per project or conversation, start a relay. The event bridge joins the same relay with
+`KICKOFF_HUB_RELAY=1` and `KICKOFF_HUB_RELAY_SOCKET`; not a line of it changes.
 
 ## What it does that a straight pipe does not
 

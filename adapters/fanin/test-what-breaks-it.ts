@@ -31,7 +31,7 @@ function scenario(name: string, projectDir: string, opts: { hub?: boolean; env?:
   const faninDir = join(dir, `${name}-fanin`)
   const hub = opts.hub === false ? null : claimingHub(hubSock)
   const relay = startFanin(projectDir, {
-    KICKOFF_HUB_SOCKET: hubSock, KICKOFF_FANIN_DIR: faninDir, ...(opts.env ?? {}),
+    KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir, ...(opts.env ?? {}),
   }, true)
   const sockOf = async () => {
     await until('the relay to open its door', () => {
@@ -63,7 +63,7 @@ console.log('\nwhen the hub goes away under the relay:')
 {
   const s = scenario('drop', laneDir)
   await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
-  const via = { KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_FANIN_DIR: s.faninDir, KICKOFF_CHANNEL_VIA_FANIN: '1' }
+  const via = { KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_HUB_RELAY_DIR: s.faninDir, KICKOFF_HUB_RELAY: '1' }
   const A = startServer({ CLAUDE_PROJECT_DIR: laneDir, ...via })
   await handshake(A, CLAUDE_CODE.capabilities, CLAUDE_CODE.clientInfo)
   const before = await call(A, 'reply', { text: 'while everything is up' })
@@ -91,7 +91,7 @@ console.log('\nwhen the hub goes away under the relay:')
 
   // A producer that arrives DURING the outage was greeted out of a `welcome` from a connection that
   // had been dead for minutes.
-  const B = startServer({ KICKOFF_CHANNEL_CWD_IS_PROJECT: '1', ...via }, laneDir)
+  const B = startServer({ KICKOFF_HUB_PROJECT_DIR: '.', ...via }, laneDir)
   await handshake(B, CLAUDE_CODE.capabilities, CLAUDE_CODE.clientInfo)
   await Bun.sleep(1200)
   const late = await call(B, 'done', { text: 'the lane is finished' })
@@ -126,7 +126,7 @@ console.log('\nwhen the hub goes away under the relay:')
 console.log('\nwhen a producer goes away with a question open:')
 
 {
-  const s = scenario('gone', repo, { env: { KICKOFF_FANIN_GRACE_MS: '2000' } })
+  const s = scenario('gone', repo, { env: { KICKOFF_HUB_RELAY_GRACE_MS: '2000' } })
   await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
   const sock = await s.sockOf()
 
@@ -282,7 +282,7 @@ console.log('\nwith three producers and no hub:')
 console.log('\nwhen the relay itself restarts:')
 
 {
-  const s = scenario('again', repo, { env: { KICKOFF_FANIN_GRACE_MS: '30000' } })
+  const s = scenario('again', repo, { env: { KICKOFF_HUB_RELAY_GRACE_MS: '30000' } })
   await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
   const sock = await s.sockOf()
   const P = rawProducer(sock)
@@ -299,7 +299,7 @@ console.log('\nwhen the relay itself restarts:')
   await Bun.sleep(300)
 
   const again = startFanin(repo, {
-    KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_FANIN_DIR: s.faninDir, KICKOFF_FANIN_GRACE_MS: '30000',
+    KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_HUB_RELAY_DIR: s.faninDir, KICKOFF_HUB_RELAY_GRACE_MS: '30000',
   }, true)
   await until('the relay to say hello again',
     () => s.hub!.got.filter(f => f.t === 'hello').length >= 2, 20000)
