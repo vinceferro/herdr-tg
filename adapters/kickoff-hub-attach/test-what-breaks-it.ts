@@ -1,23 +1,24 @@
 #!/usr/bin/env bun
 /**
- * The relay under the failures four reviewers found in it.
+ * attach's door under the failures four reviewers found in the relay it used to be.
  *
  *     bun test-what-breaks-it.ts
  *
  * `test-two-producers.ts` proves the design: one slot at the hub, two producers behind it, ids and
  * taps kept apart. Every property here is one that suite could not see, because it only ever ran
  * two producers, never lost one, never lost the hub under them, and never asked more than a handful
- * of questions.
+ * of questions. `startAttach` starts `main.ts` with no `--run` and no `--opencode`, which is the
+ * whole of what the relay was.
  *
  * Each is written as the sentence that has to stay true. They were watched failing first, against
  * the relay as it stood, and what each one printed then is recorded beside it.
  */
 
-import { mkdtempSync, readdirSync, rmSync } from 'fs'
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs'
 import { join } from 'path'
 
 import {
-  CLAUDE_CODE, call, check, claimingHub, failed, handshake, makeRepo, rawProducer, startFanin,
+  CLAUDE_CODE, call, check, claimingHub, failed, handshake, makeRepo, rawProducer, startAttach,
   startServer, until,
 } from './test-harness.ts'
 
@@ -30,7 +31,7 @@ function scenario(name: string, projectDir: string, opts: { hub?: boolean; env?:
   const hubSock = join(dir, `${name}.sock`)
   const faninDir = join(dir, `${name}-fanin`)
   const hub = opts.hub === false ? null : claimingHub(hubSock)
-  const relay = startFanin(projectDir, {
+  const relay = startAttach(projectDir, {
     KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir, ...(opts.env ?? {}),
   }, true)
   const sockOf = async () => {
@@ -298,7 +299,7 @@ console.log('\nwhen the relay itself restarts:')
   P.end()
   await Bun.sleep(300)
 
-  const again = startFanin(repo, {
+  const again = startAttach(repo, {
     KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_HUB_RELAY_DIR: s.faninDir, KICKOFF_HUB_RELAY_GRACE_MS: '30000',
   }, true)
   await until('the relay to say hello again',
@@ -318,6 +319,81 @@ console.log('\nwhen the relay itself restarts:')
     P2.got.some(f => f.t === 'choice' && f.ask_id === 'a7'), JSON.stringify(P2.got))
 
   P2.end(); again.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+// ── F. a claim held for good ──────────────────────────────────────────────────────────────────
+//
+// The `already_claimed` run-counter moved here from the bridge as "three refusals in a row". Three
+// dials with the link's backoff is a claim held for THREE SECONDS — shorter than the ten seconds a
+// predecessor attach gets to stop, so an ordinary restart tripped it. And when it tripped, the
+// producers were ended FIRST and their queued frames let go second, so the "no" had no socket to
+// travel on and the agent kept reading "waiting in line" for a frame nothing would ever carry.
+//
+// So: a run is stuck when it has lasted longer than a predecessor's stop, and the moment it is, a
+// producer still here hears `ack no` for what it queued BEFORE its socket ends.
+//
+// RED, before the fix:
+//   FAIL a_claim_held_for_good_is_given_longer_than_a_predecessor_gets_to_stop  stuck after 3.0s
+//   FAIL and_the_producer_hears_no_for_its_queued_frame_before_its_socket_ends  producer saw []
+console.log('\nwhen another connection holds the claim and never lets go:')
+
+{
+  const hubSock = join(dir, 'squat.sock')
+  const t0 = Date.now()
+  const refusedAt: number[] = []
+  // Every hello refused: the squatter never leaves.
+  const squatter = Bun.listen({
+    unix: hubSock,
+    socket: {
+      open() {},
+      data(s: any, chunk: any) {
+        for (const line of chunk.toString().split('\n')) {
+          if (!line.trim()) continue
+          if (JSON.parse(line).t !== 'hello') continue
+          refusedAt.push(Date.now() - t0)
+          s.write(JSON.stringify({ v: 1, id: 'sq', t: 'refused', reason: 'already_claimed' }) + '\n')
+          s.end()
+        }
+      },
+      close() {}, error() {},
+    },
+  })
+  const door = join(dir, 'squat-door.sock')
+  const relay = startAttach(repo, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_SOCKET: door }, true)
+  await until('the door', () => existsSync(door), 15000)
+
+  // A producer that comes straight back every time the door ends it, as a real one does with
+  // backoff — the same instance, so the door knows it is the same voice. It queues ONE frame, once.
+  const heard: { at: number; f: Record<string, any> }[] = []
+  let queued = false
+  const redial = async (): Promise<void> => {
+    const p = rawProducer(door)
+    await p.ready.catch(() => {})
+    if (!p.connected) { await Bun.sleep(100); return redial() }
+    p.send(hello({ instance: 'the-one-that-waits' }))
+    if (!queued) { queued = true; p.send({ v: 1, id: 'p-say', t: 'say', text: 'queued while the claim is held' }) }
+    while (p.connected) await Bun.sleep(25)
+    for (const f of p.got) heard.push({ at: Date.now() - t0, f })
+    if (!stopped) { await Bun.sleep(50); return redial() }
+  }
+  let stopped = false
+  void redial()
+
+  await until('the door to give up on the claim', () => relay.said.some(l => /is not letting go/.test(l)), 45000).catch(() => {})
+  const stuckAt = Date.now() - t0
+  await Bun.sleep(500)
+  stopped = true
+  const ackNo = heard.find(h => h.f.t === 'ack' && h.f.delivered === 'no' && h.f.ref === 'p-say')
+  const lastRefused = heard.filter(h => h.f.t === 'refused').at(-1)
+  check('a_claim_held_for_good_is_given_longer_than_a_predecessor_gets_to_stop',
+    relay.said.some(l => /is not letting go/.test(l)) && stuckAt >= 30_000 && refusedAt.length >= 5,
+    `stuck after ${(stuckAt / 1000).toFixed(1)}s; refusals at ${refusedAt.map(ms => (ms / 1000).toFixed(1) + 's').join(' ')}`)
+  check('and_the_producer_hears_no_for_its_queued_frame_before_its_socket_ends',
+    ackNo !== undefined && !relay.said.some(l => /nothing could be told/.test(l)),
+    `producer saw ${JSON.stringify(heard.map(h => `${h.f.t}${h.f.reason ? `(${h.f.reason})` : ''}${h.f.delivered ? `(${h.f.delivered} ref=${h.f.ref})` : ''}`))}; ${relay.said.filter(l => /let go|told/.test(l)).join(' | ')}`)
+  void lastRefused
+  relay.kill(); squatter.stop(true)
   await Bun.sleep(300)
 }
 

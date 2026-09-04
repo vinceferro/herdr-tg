@@ -1,14 +1,18 @@
 /**
- * The real bridge, against a fake hub on a real Unix socket and a fake opencode over real HTTP.
+ * The real attach watching a fake opencode, against a fake hub on a real Unix socket and a fake
+ * opencode over real HTTP.
  *
- * Nothing here is mocked inside the bridge's own process: it is spawned as `bun bridge.ts`, exactly
- * as it will run, and everything is observed from outside. A test that reached into the module
+ * Nothing here is mocked inside attach's own process: it is spawned as `bun main.ts --opencode …`,
+ * exactly as it will run, and everything is observed from outside. attach holds the claim, opens its
+ * door, and its in-process watcher turns the fake opencode's events into `ask` through that door —
+ * so what the fake hub sees is what a wall's hub would see. A test that reached into the module
  * would prove the mapping and miss the two things that have actually broken this project — the
  * handshake, and what goes on the wire before `welcome`.
  *
  *     bun test-against-fakes.ts
  */
 
+import { Glob } from 'bun'
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -121,14 +125,20 @@ const oc = Bun.serve({
   },
 })
 
-// ── run the real bridge ────────────────────────────────────────────────────────────────────────
-
-const child = Bun.spawn(['bun', join(import.meta.dir, 'bridge.ts')], {
+// ── run the real attach, watching the fake opencode ──────────────────────────────────────────────
+//
+// `main.ts --opencode <url>` is the whole thing: attach dials the fake hub as the relay, and its
+// in-process watcher dials attach's own door as a producer and turns the fake opencode's events into
+// `ask`. So the fake hub sees ONE connection — attach's — and the watcher's asks reach it through
+// the door, their ids namespaced on the way, exactly as any producer's would.
+const child = Bun.spawn(['bun', join(import.meta.dir, 'main.ts'), '--opencode', `http://127.0.0.1:${oc.port}`], {
   env: {
     ...process.env,
     KICKOFF_HUB_PROJECT_DIR: repo,
     KICKOFF_HUB_SOCKET: sockPath,
-    OPENCODE_URL: `http://127.0.0.1:${oc.port}`,
+    // The test repo is not a git checkout, so no door derives from it; attach is told its door
+    // outright, which is the container answer §10 documents.
+    KICKOFF_HUB_RELAY_SOCKET: join(dir, 'door.sock'),
   },
   stdout: 'pipe',
   stderr: 'pipe',
@@ -156,24 +166,38 @@ const frames = (t: string) => seen.filter(f => f.t === t)
 // adapter takes the wire from the same module.
 console.log('one wire, and one file that writes it')
 const REPO_TOP = join(import.meta.dir, '..', '..')
+// The files that ARE allowed to speak the wire — each holds a `HubLink` and a `hello`. Everything
+// else under `adapters/` and `plugins/` must not.
 const ADAPTERS = [
   'plugins/kickoff-channel/server.ts',
-  'adapters/fanin/fanin.ts',
-  'adapters/opencode-bridge/bridge.ts',
+  'adapters/kickoff-hub-attach/relay.ts',
+  'adapters/kickoff-hub-attach/opencode.ts',
+  'adapters/kickoff-hub-attach/check.ts',
 ]
 const sources = ADAPTERS.map(f => ({ f, src: readFileSync(join(REPO_TOP, f), 'utf8') }))
 // Three marks of a file that has started writing the wire again, and each was on the fork. Not
-// `Bun.connect` itself: the relay opens one to knock on its OWN door and tell a leftover socket file
-// apart from a second relay still answering, and that connection never speaks a frame.
+// `Bun.connect` itself: the door opens one to knock on its OWN address and tell a leftover socket
+// file apart from a second attach still answering, and that connection never speaks a frame.
 const sharing = sources.filter(x => /from '[^']*hub-link\.ts'/.test(x.src)).map(x => x.f)
 const answering = sources.filter(x => /t: 'pong'/.test(x.src)).map(x => x.f)
 const redeclaring = sources
   .filter(x => /const (PROTOCOL_VERSION|MAX_FRAME_BYTES|MAX_PENDING)\s*=/.test(x.src))
   .map(x => x.f)
+// And the other half of the rule, now that attach is several files: no OTHER `.ts` under
+// `adapters/` or `plugins/` — test files and the harness aside — may mint a `hello`. A second file
+// that says `t: 'hello'` is a second adapter dialling for itself, which is exactly how the drift
+// began. The one listed hello per file above is the only wire mouth this repo has.
+const others = [...new Glob('{adapters,plugins}/**/*.ts').scanSync(REPO_TOP)].filter(
+  f =>
+    !f.includes('node_modules') &&
+    !/(^|\/)test-/.test(f) &&
+    !ADAPTERS.includes(f),
+)
+const rogueHello = others.filter(f => /t: 'hello'/.test(readFileSync(join(REPO_TOP, f), 'utf8')))
 check(
   'every_adapter_speaks_the_same_wire_from_the_same_file',
-  sharing.length === ADAPTERS.length && answering.length === 0 && redeclaring.length === 0,
-  `sharing hub-link.ts: ${sharing.length} of ${ADAPTERS.length}; answering a ping themselves: ${answering.join(', ') || 'none'}; declaring the protocol themselves: ${redeclaring.join(', ') || 'none'}`,
+  sharing.length === ADAPTERS.length && answering.length === 0 && redeclaring.length === 0 && rogueHello.length === 0,
+  `sharing hub-link.ts: ${sharing.length} of ${ADAPTERS.length}; answering a ping themselves: ${answering.join(', ') || 'none'}; declaring the protocol themselves: ${redeclaring.join(', ') || 'none'}; minting a hello elsewhere: ${rogueHello.join(', ') || 'none'}`,
 )
 
 try {
@@ -198,15 +222,16 @@ try {
       },
     },
   })
-  const skewChild = Bun.spawn(['bun', join(import.meta.dir, 'bridge.ts')], {
+  const skewChild = Bun.spawn(['bun', join(import.meta.dir, 'main.ts'), '--opencode', 'http://127.0.0.1:9'], {
     env: {
       ...process.env,
       KICKOFF_HUB_PROJECT_DIR: repo,
       KICKOFF_HUB_SOCKET: skewSock,
-      // Deliberately nowhere. This bridge is here for its HUB behaviour, and pointing it at the fake
-      // opencode would make it the last subscriber to that one event stream — every event the tests
-      // below push would then go to this process instead of the one under test.
-      OPENCODE_URL: 'http://127.0.0.1:9',
+      // The `--opencode` URL is deliberately nowhere. This attach is here for its HUB behaviour, and
+      // pointing its watcher at the fake opencode would make it the last subscriber to that one
+      // event stream — every event the tests below push would then go here instead of the process
+      // under test.
+      KICKOFF_HUB_RELAY_SOCKET: join(dir, 'skew-door.sock'),
     },
     stdout: 'ignore',
     stderr: 'ignore',
@@ -293,12 +318,12 @@ try {
       return new Response('not found', { status: 404 })
     },
   })
-  const claimChild = Bun.spawn(['bun', join(import.meta.dir, 'bridge.ts')], {
+  const claimChild = Bun.spawn(['bun', join(import.meta.dir, 'main.ts'), '--opencode', `http://127.0.0.1:${claimOc.port}`], {
     env: {
       ...process.env,
       KICKOFF_HUB_PROJECT_DIR: repo,
       KICKOFF_HUB_SOCKET: claimSock,
-      OPENCODE_URL: `http://127.0.0.1:${claimOc.port}`,
+      KICKOFF_HUB_RELAY_SOCKET: join(dir, 'claim-door.sock'),
     },
     stdout: 'ignore',
     stderr: 'ignore',
@@ -398,22 +423,34 @@ try {
   )
   // Tapped while the question is still open, so this proves the option lookup refuses it — not
   // merely that the record was already consumed, which is what an answered question would prove.
+  // It is its OWN permission ask, because the door — like the real hub — resolves a question the
+  // instant it is tapped and drops any second `choice` for it; a real tap cannot land twice, and
+  // the reject below is a fresh question rather than a second tap on this one.
   const beforeBogus = posted.length
   tap(perm.ask_id, 'an-option-nobody-minted')
   await new Promise(r => setTimeout(r, 300))
   check('a tap naming an option it never offered posts nothing', posted.length === beforeBogus, `${posted.length - beforeBogus} did`)
 
-  tap(perm.ask_id, 'reject')
-  check('a tap replies at the permission endpoint', await until('the permission reply', () => posted.length > before + 0 && posted.some(p => p.path.includes('permission'))))
+  pushEvent!({
+    id: 'evt_3',
+    type: 'permission.v2.asked',
+    properties: { id: 'per_2', sessionID: 'ses_1', action: 'delete a file', resources: ['build/'] },
+  })
+  await until('the second permission ask', () => frames('ask').length > 2)
+  const perm2 = frames('ask').filter(f => Array.isArray(f.options) && f.options.some((o: any) => o.option_id === 'reject')).at(-1)
+  const beforeReject = posted.length
+  tap(perm2!.ask_id, 'reject')
+  check('a tap replies at the permission endpoint', await until('the permission reply', () => posted.length > beforeReject && posted.some(p => p.path.includes('permission'))))
   const pr = posted.find(p => p.path.includes('permission'))
   check(
     'at the endpoint the spec names, carrying the ids opencode published',
-    pr?.path === '/api/session/ses_1/permission/per_1/reply',
+    pr?.path === '/api/session/ses_1/permission/per_2/reply',
     pr?.path,
   )
   check('with the enum opencode accepts', JSON.stringify(pr?.body) === JSON.stringify({ reply: 'reject' }), JSON.stringify(pr?.body))
 
   console.log('\na question answered at the keyboard has its buttons taken off the phone')
+  const asksBeforeShip = frames('ask').length
   pushEvent!({
     type: 'question.v2.asked',
     properties: {
@@ -422,7 +459,7 @@ try {
       questions: [{ question: 'Ship it?', header: 'Ship', options: [{ label: 'Yes', description: 'go' }] }],
     },
   })
-  await until('the second question', () => frames('ask').length > 2)
+  await until('the ship question', () => frames('ask').length > asksBeforeShip)
   const retiredBefore = frames('ask_resolved').length
   // Deliberately the `data` shape: the durable stream uses it, and the bridge must read both.
   pushEvent!({ type: 'question.v2.replied', data: { sessionID: 'ses_1', requestID: 'que_2', answers: [['Yes']] } })

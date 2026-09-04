@@ -1,14 +1,16 @@
 /**
- * The rig both fan-in suites run on: a fake hub, real producers, real relays.
+ * The rig the attach suites run on: a fake hub, real producers, real relays.
  *
- * It lives in its own file because there are now two suites — the design (`test-two-producers.ts`)
- * and the failures four reviewers found (`test-what-breaks-it.ts`) — and a second copy of a fake
- * hub is how two suites come to disagree about what the wire is. That is not a hypothetical here:
- * the opencode bridge forked this project's link once and drifted by thirteen fixed defects.
+ * It lives in its own file because several suites share it — the design (`test-two-producers.ts`),
+ * the failures four reviewers found (`test-what-breaks-it.ts`), the opencode mapping
+ * (`test-against-fakes.ts`), and `--check` / `--run` — and a second copy of a fake hub is how two
+ * suites come to disagree about what the wire is. That is not a hypothetical here: the opencode
+ * bridge forked this project's link once and drifted by thirteen fixed defects.
  *
- * What is real in both suites: the relay process, the tool-server processes, their MCP stdio
- * handshakes, the Unix sockets and the framing on all of them. Only the hub is faked, because a
- * test that needed a bot token would never run — and the operator's phone is not a test fixture.
+ * What is real in every suite: `kickoff-hub-attach` itself (started by `startAttach`, which spawns
+ * `main.ts`), the tool-server processes, their MCP stdio handshakes, the Unix sockets and the
+ * framing on all of them. Only the hub is faked, because a test that needed a bot token would never
+ * run — and the operator's phone is not a test fixture.
  */
 
 import { mkdirSync, writeFileSync } from 'fs'
@@ -16,7 +18,7 @@ import { join } from 'path'
 
 export const HERE = import.meta.dir
 export const SERVER = join(HERE, '..', '..', 'plugins', 'kickoff-channel', 'server.ts')
-export const FANIN = join(HERE, 'fanin.ts')
+export const ATTACH = join(HERE, 'main.ts')
 
 let failures = 0
 export const check = (name: string, ok: boolean, detail = '') => {
@@ -189,15 +191,16 @@ export const noticesTo = (b: Srv) =>
   channelMessages(b).filter(l => l.params?.meta?.user === 'the channel itself')
 
 /**
- * The relay, as its own process.
+ * attach, as its own process — the relay with no `--run` and no `--opencode`, which is the whole of
+ * what `adapters/fanin/` used to be.
  *
  * Its stderr is captured rather than inherited when asked for, because some of what it does — a tap
  * that reached nobody, a question withdrawn because its asker never came back — is reportable ONLY
  * where a developer can see it, and a test that could not read it would be asserting the absence of
  * a crash instead of the presence of a note.
  */
-export function startFanin(projectDir: string, env: Record<string, string>, capture = false) {
-  const child = Bun.spawn(['bun', FANIN], {
+export function startAttach(projectDir: string, env: Record<string, string>, capture = false, args: string[] = []) {
+  const child = Bun.spawn(['bun', ATTACH, ...args], {
     cwd: HERE,
     env: { ...process.env, KICKOFF_HUB_PROJECT_DIR: projectDir, ...env },
     stdout: 'inherit', stderr: capture ? 'pipe' : 'inherit',
@@ -214,7 +217,7 @@ export function startFanin(projectDir: string, env: Record<string, string>, capt
           if (nl < 0) break
           const l = acc.slice(0, nl); acc = acc.slice(nl + 1)
           said.push(l)
-          console.log(`    [relay] ${l}`)
+          console.log(`    [attach] ${l}`)
         }
       }
     })()

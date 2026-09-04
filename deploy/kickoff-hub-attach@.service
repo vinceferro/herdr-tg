@@ -1,0 +1,36 @@
+[Unit]
+Description=kickoff-hub-attach — the worker "%i", wired to the hub
+Documentation=https://github.com/vinceferro/herdr-tg/blob/main/docs/ATTACHING.md
+After=default.target
+# Never give up. The same reasoning as herdr-tg.service: the operator is on a phone, and a
+# start-limit burst would leave a worker dead until he reaches a keyboard.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The whole of one worker's configuration: docs/ATTACHING.md §2, KEY=VALUE, one file per instance.
+# `-` so that a missing file is attach's own sentence ("nothing named a project directory") on the
+# journal rather than systemd's opaque refusal to start.
+EnvironmentFile=-%h/.config/kickoff-hub-attach/%i.env
+# OPENCODE_PORT is the one line in that file that is not §2's: the port belongs to the engine, not
+# the hub. It appears twice on the line so the server and the watcher can never disagree about it.
+# `opencode serve` without --port picks a random port, so it is not optional here — and it is
+# checked before the start, because an unset ${OPENCODE_PORT} expands to NOTHING: the watcher would
+# then dial port 80 while `opencode serve --port ''` listens on 4096, and the worker would hold the
+# claim, get its topic, and deliver nothing. attach refuses the port-less URL too; this line is the
+# one that names the variable and the file. (`$$` is a literal `$` for the shell.)
+ExecStartPre=/bin/sh -c 'test -n "$$OPENCODE_PORT" || { echo "OPENCODE_PORT is not set; put it in %h/.config/kickoff-hub-attach/%i.env" >&2; exit 2; }'
+ExecStart=%h/.local/bin/kickoff-hub-attach --opencode http://127.0.0.1:${OPENCODE_PORT} --run opencode serve --port ${OPENCODE_PORT}
+# SIGTERM goes to attach ONLY; it forwards to the engine, waits, and says bye. SIGKILL to whatever
+# is left after TimeoutStopSec. The default, control-group, would hit the engine and attach at the
+# same instant and the goodbye would never be said.
+KillMode=mixed
+TimeoutStopSec=20
+Restart=always
+RestartSec=5
+# No hardening block, on purpose. This unit runs an agent's shell, and every line of
+# herdr-tg.service's hardening is a line that agent would trip. The wall is the safety, and the
+# wall is kickoff's; this unit is for a worker on the operator's own desk.
+
+[Install]
+WantedBy=default.target

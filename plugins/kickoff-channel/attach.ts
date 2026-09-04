@@ -101,6 +101,16 @@ export type Attachment = {
   hubSocket: string
   /** Where a relay for this conversation listens — null when it cannot be worked out. */
   relaySocket: string | null
+  /** Whether `relaySocket` was TOLD (`KICKOFF_HUB_RELAY_SOCKET`) rather than worked out from git. */
+  relaySocketWasGiven: boolean
+  /**
+   * The directory a derived relay socket lives under.
+   *
+   * Exposed so that a caller asking "which door would a tool server derive here?" asks with the
+   * same directory this reader used, rather than with a second copy of the default — which is how
+   * a check comes to name a door nothing derives.
+   */
+  relayDir: string
   /** The secret's path when something named it, or null to search for it. */
   tokenFile: string | null
   /** How long a relay gives a vanished producer to come home. */
@@ -224,6 +234,23 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
     )
   }
 
+  // ── the credential travels as a PATH, never a value ───────────────────────────────────────────
+  //
+  // The environment is promiscuous: every variable here is inherited by every descendant of every
+  // process, across engines and wrappers (§5's two incidents). A secret pasted into a variable is
+  // therefore a secret in every child's environment and every crash dump — so there is no variable
+  // for the secret's value, and there never will be. `KICKOFF_HUB_TOKEN_FILE` names a FILE, which
+  // the filesystem protects at 0600. A promiscuous box can still leave `KICKOFF_HUB_TOKEN` behind,
+  // so refuse it loudly rather than ever authenticate with a by-value secret. `-` is the one value
+  // that means "as if unset" (AS_IF_UNSET), so it is not a real setting and is not refused.
+  const byValue = env0.KICKOFF_HUB_TOKEN
+  if (byValue !== undefined && byValue.length && byValue !== AS_IF_UNSET) {
+    return problem(
+      'The secret for this session was handed to it as a value in KICKOFF_HUB_TOKEN, and the secret must never travel that way — the environment is inherited by every process below this one. Put the secret in a file and name the file with KICKOFF_HUB_TOKEN_FILE.',
+      'KICKOFF_HUB_TOKEN is set, and the secret never travels as a value; put it in a file and name the file with KICKOFF_HUB_TOKEN_FILE',
+    )
+  }
+
   // ── which directory ─────────────────────────────────────────────────────────────────────────
   //
   // The ORDER is the fix for the second incident in the header, not a preference. A dispatcher's
@@ -320,6 +347,16 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
 
   // ── the secret ──────────────────────────────────────────────────────────────────────────────
   const tokenFile = named(env.KICKOFF_HUB_TOKEN_FILE)
+  // A path, not the secret. 64 hex characters is what a token IS, and a token in the variable that
+  // names the token's file is the by-value credential wearing the path variable's name — caught
+  // with its own sentence rather than the generic "not a full path" below, because the fix is
+  // different: this one is not a mistyped path, it is a secret that must go in a file.
+  if (tokenFile && /^[0-9a-f]{64}$/i.test(tokenFile)) {
+    return problem(
+      'KICKOFF_HUB_TOKEN_FILE was set to what looks like the secret itself rather than the path to the file that holds it. It takes the path to the file; the secret never travels as a value.',
+      'KICKOFF_HUB_TOKEN_FILE looks like the secret itself; it takes the path to the file',
+    )
+  }
   if (tokenFile && !isAbsolute(tokenFile)) {
     return problem(
       `The secret was said to be at "${tokenFile}", which is not a full path, so the bridge cannot find it. Set KICKOFF_HUB_TOKEN_FILE to the whole path.`,
@@ -349,9 +386,8 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
   // the two sides would then derive different paths with neither being wrong.
   const hubSocket = named(env.KICKOFF_HUB_SOCKET) ?? `/run/user/${uid()}/kickoff/hub.sock`
   const relayDir = named(env.KICKOFF_HUB_RELAY_DIR) ?? `/run/user/${uid()}/kickoff/fanin`
-  const relaySocket =
-    named(env.KICKOFF_HUB_RELAY_SOCKET) ??
-    (facts.mainTop ? relaySocketPath(relayDir, facts.mainTop, address) : null)
+  const toldSocket = named(env.KICKOFF_HUB_RELAY_SOCKET)
+  const relaySocket = toldSocket ?? (facts.mainTop ? relaySocketPath(relayDir, facts.mainTop, address) : null)
 
   const relayFlag = env.KICKOFF_HUB_RELAY
   if (relayFlag !== undefined && relayFlag.length && relayFlag !== '1') {
@@ -397,10 +433,26 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
       dial: viaRelay ? relaySocket! : hubSocket,
       hubSocket,
       relaySocket,
+      relaySocketWasGiven: toldSocket !== null,
+      relayDir,
       tokenFile,
       relayGraceMs,
     },
   }
+}
+
+/**
+ * The door a tool server that works its own out from git would look for, in this directory — or
+ * null when git says nothing here.
+ *
+ * With the address it would derive, `facts.lane`, and NOT the address this configuration holds: a
+ * dispatcher can mint an address that is not git's name, and then the two doors differ. That is the
+ * split-brain nobody would diagnose in under an hour — the prompts reach the phone and the agent's
+ * own `reply` says "not said yet" for ever — so both `--check` and attach's own start-up ask this
+ * one function, and cannot disagree about the answer.
+ */
+export function doorDerivedFromGit(c: Attachment): string | null {
+  return c.facts.mainTop ? relaySocketPath(c.relayDir, c.facts.mainTop, c.facts.lane) : null
 }
 
 /**

@@ -1,0 +1,10 @@
+{
+  "name": "kickoff-hub-attach",
+  "private": true,
+  "type": "module",
+  "bin": { "kickoff-hub-attach": "./main.ts" },
+  "scripts": {
+    "start": "bun main.ts",
+    "test": "bun test-two-producers.ts && bun test-what-breaks-it.ts && bun test-against-fakes.ts && bun test-check.ts && bun test-run.ts"
+  }
+}

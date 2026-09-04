@@ -31,16 +31,20 @@ answers what the machine says once a directory has been named, and `hub-link.ts`
 copy of each, because the one time this project had two copies of the link, the copy drifted by
 thirteen already-fixed defects — and a test now fails if any adapter starts writing its own again.
 
-`adapters/fanin/` is the relay. The hub admits one live connection per addressable thing, and on
-opencode two things want it — the tool server (what the agent chose to say) and the event bridge
-(the prompts it did not choose). The relay holds the claim and both attach to it over a local socket
-speaking hub-proto unchanged, so **the hub never learns there were two**.
+`adapters/kickoff-hub-attach/` is **the** adapter — one command that is all three jobs an opencode
+worker used to hand-start. It holds the claim and opens a door (the relay, `relay.ts`); it watches an
+opencode server and relays the prompts the agent did not choose (`opencode.ts`, an in-process
+producer at its own door); and with `--run` it starts the engine as its child so a wall has one
+entrypoint (`run.ts`). The tool server (what the agent chose to say) and the watcher both attach to
+the door over a local socket speaking hub-proto unchanged, so **the hub never learns there were
+several**. `--check` proves an environment can reach the hub without creating a topic. There is one
+thing to run under `adapters/`, on purpose.
 
 **One namespace, `KICKOFF_HUB_`, and one document.** `docs/ATTACHING.md` is the contract an adapter
 attaches by — eight variables of which a normal adopter sets one, the address a dispatcher mints, the
-credential rule, the handshake, and the twelve wire rules. It is written to be implementable by a
-stranger, and `docs/examples/attach-from-the-document.ts` is a stranger's adapter that imports
-nothing of ours and is run against the real relay by the fan-in's own suite.
+credential rule, the handshake, and the twelve wire rules; §13 is `kickoff-hub-attach` itself. It is
+written to be implementable by a stranger, and `docs/examples/attach-from-the-document.ts` is a
+stranger's adapter that imports nothing of ours and is run against the real door by attach's own suite.
 
 Docs, in the order they are worth reading: `docs/ATTACHING.md` (how anything attaches),
 `docs/CAPABILITIES.md` (what the hub offers, requires and refuses),
@@ -96,11 +100,14 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   of one throwaway ran at the same moment and each got its own forum topic beside the project's,
   both delivering. Before that, the second was refused. The bridge takes the lane from git's own
   worktree name, which git guarantees unique — never the folder basename, which is not.
-- **The opencode adapter is `adapters/opencode-bridge/`.** It maps `question.v2.asked` and
-  `permission.v2.asked` onto `ask`, and a tap back onto opencode's own reply endpoints. Proven
-  against a real opencode server and a real phone. **Its fork of the wire is gone** — it drifted by
-  twelve invariants and now shares `hub-link.ts` — and it can name an address, so it is no longer
-  confined to a project's own relay.
+- **The opencode adapter, the relay and the entrypoint are one command: `adapters/kickoff-hub-attach/`.**
+  `--opencode <url>` watches a server and maps `question.v2.asked` and `permission.v2.asked` onto
+  `ask`, a tap back onto opencode's own reply endpoints — the old event bridge, now an in-process
+  producer at attach's own door. The door itself is the old fan-in (`relay.ts` + `ledger.ts`), moved
+  in unchanged. `--run` starts the engine as attach's child so a wall has one entrypoint; `--check`
+  proves reachability and makes no topic. `adapters/fanin/` and `adapters/opencode-bridge/` are
+  **gone** — a stranger opening `adapters/` finds one thing to run. Every check the two suites held
+  survives, moved to attach; the systemd template is `deploy/kickoff-hub-attach@.service`.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.

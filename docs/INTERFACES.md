@@ -98,7 +98,7 @@ they are allowed to.
 | attachment | MCP channel plugin, in-process | HTTP + `/event` stream, out-of-process |
 | lifetime | dies with the session | outlives sessions |
 | granularity | one session | one server, many sessions |
-| status | BUILT, proven against the real hub | first slice BUILT, `adapters/opencode-bridge/` |
+| status | BUILT, proven against the real hub | BUILT, `adapters/kickoff-hub-attach/ --opencode` |
 
 Consequence worth stating plainly: the opencode adapter is **one bridge per project, not per
 lane**, holding one hub connection per lane.
@@ -115,10 +115,12 @@ That makes TWO things want to speak for one addressable thing: the tool server, 
 agent CHOSE to say, and the event bridge, carrying the permission and question prompts it did not
 choose. The hub admits one live claim per address and refuses the second with `already_claimed`.
 
-**The joining belongs to the adapter, and the hub does not change at all.** One relay process per
-addressable thing holds the connection; the producers talk to it over a local socket that speaks
-hub-proto unchanged. The hub sees one `hello`, one pid, one claim — so this is not a seventh
-capability, and the closed list below is still six. `adapters/fanin/`.
+**The joining belongs to the adapter, and the hub does not change at all.** One process per
+addressable thing holds the connection and opens a door; the producers talk to it over a local socket
+that speaks hub-proto unchanged. The hub sees one `hello`, one pid, one claim — so this is not a
+seventh capability, and the closed list below is still six. That process is
+`adapters/kickoff-hub-attach/` (the door was `adapters/fanin/`; both it and the opencode event
+bridge folded into the one command — see `docs/ATTACHING.md` §13).
 
 The relay is not a pipe: it answers `hello` with the `welcome` it holds (lane echo included),
 rewrites envelope ids, namespaces `ask_id` so a tap on one agent's question can never be delivered

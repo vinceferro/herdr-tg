@@ -67,8 +67,8 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
    because a process that boots and exits in a tenth of a second would otherwise leave an empty
    topic bound forever.
 4. **One connection per address.** If two producers must speak for one conversation, join them on
-   your side. `adapters/fanin/` is our implementation and the local socket speaks hub-proto
-   unchanged, so a producer needs no second wire contract.
+   your side. `adapters/kickoff-hub-attach/` is our implementation — it holds the claim and opens a
+   local door that speaks hub-proto unchanged, so a producer needs no second wire contract.
 
 ## REFUSES — settled, and not reconsidered by mail
 

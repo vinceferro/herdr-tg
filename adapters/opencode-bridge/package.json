@@ -1,9 +1,0 @@
-{
-  "name": "opencode-bridge",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "start": "bun bridge.ts",
-    "test": "bun test-against-fakes.ts"
-  }
-}

@@ -1,5 +1,37 @@
-<!-- INTERFACE, v3, 4 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v6, 4 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v6 is v5 attacked — three reviewers against the built `kickoff-hub-attach`, every change a
+     defect reproduced against the running code:
+
+       §13.4 — `--check` blessed three environments the start then refused with exit 2 (a relay flag
+               on attach itself, a TMPDIR no private door can be made under, an `--opencode` URL
+               with no port); it printed a phantom "closed without a word" line after every refusal
+               it had already named; it read a 0700 hub directory as "not mounted"; it spoke to a
+               person in the register written for an agent. Every sentence in its table is now the
+               one the code prints.
+       §13.3 — the private door is `mkdtemp`, not a folder named by pid: under `--unshare-pid` every
+               wall is PID 2. The pinned `KICKOFF_HUB_TOKEN_FILE` is the path attach FOUND, not `-`.
+               The paste block of §2 is for the hand-started shape only; under `--run`, paste
+               nothing. The start-time warning this section promised now exists.
+       §13.5 — bwrap's init reaps and forwards NOTHING: a signal to bwrap ends bwrap and leaves the
+               wall running with the claim held. How a bwrap wall is actually stopped is written
+               down, and pinned by a test. A uid-remapped bwrap wall needs a fourth variable.
+       §13.2 — "stuck" on `already_claimed` is elapsed time, not three refusals (which was three
+               seconds, shorter than a predecessor's stop), and the producers hear "no" for what
+               they queued before their sockets end.
+
+     v5 BUILDS §13. `kickoff-hub-attach` is now code — `adapters/kickoff-hub-attach/`, the one
+     process that holds the claim, opens the door, watches an opencode server, can be a wall's
+     entrypoint, and proves reachability with `--check`. `adapters/fanin/` and
+     `adapters/opencode-bridge/` are gone; both folded into it, every check they held moved across.
+     The interface changes v4 named are in place: the `KICKOFF_HUB_TOKEN` refusal (a secret handed
+     by value), a `KICKOFF_HUB_TOKEN_FILE` that is the secret rather than its path, and the
+     container worked example (§10) now uses attach as its entrypoint, so the relay socket is no
+     longer something a container must be told. §13 remains, describing what was built.
+
+     v4 added §13 as a design; every reference to `adapters/fanin/` and `adapters/opencode-bridge/`
+     outside §13 is now `adapters/kickoff-hub-attach/`.
 
      v3 is v2 attacked. Every change below is a defect somebody reproduced against the running code
      rather than a rewording:
@@ -62,7 +94,7 @@ speak; `ping` is a question you answer whenever it is asked.
 
 That is about sixty lines in any language, and `docs/examples/attach-from-the-document.ts` is those
 sixty lines — written from this file alone, importing nothing from this repository, and run against
-the real relay by `adapters/fanin/test-two-producers.ts`. It gets a forum topic of its own, delivery
+the real door by `adapters/kickoff-hub-attach/test-two-producers.ts`. It gets a forum topic of its own, delivery
 you can trust, and a question with buttons. Everything after §7 is what you add to make it survive a
 bad day.
 
@@ -87,6 +119,7 @@ accident. It is not up for a second discussion.
 | `KICKOFF_HUB_RELAY_SOCKET` | no | derived, see §9 | Where the relay's socket **is**; an absolute path, a relative one refused. The relay listens on it; a producer behind one dials it. It does not by itself make you a producer: that is `KICKOFF_HUB_RELAY`, and both sides of a relay read this one. |
 | `KICKOFF_HUB_RELAY_DIR` | no | `/run/user/<uid>/kickoff/fanin` | Where derived relay sockets live; an absolute path, a relative one refused. `<uid>` as above. |
 | `KICKOFF_HUB_RELAY_GRACE_MS` | no | `90000` | Relay only: how long a producer that vanished has to come home before its open questions come off the phone. |
+| `KICKOFF_HUB_TOKEN` | **never** | — | There is no by-value secret and there never will be. Set to anything (other than `-`), it is a **refusal** naming the fix, because the environment is promiscuous and a secret in a variable is a secret in every child's environment. The credential travels as a PATH, `KICKOFF_HUB_TOKEN_FILE`. A `KICKOFF_HUB_TOKEN_FILE` that is 64 hex characters and no path is refused the same way. See §5. |
 
 **A relative path is refused, never resolved.** That goes for all four path variables above. A
 relative path is worked out against whichever folder the process happens to be sitting in, which
@@ -105,9 +138,11 @@ Two variables live outside the namespace on purpose:
 
 * **`CLAUDE_PROJECT_DIR`** is Claude Code's, not ours. An adapter may read it as a project directory
   **only when `KICKOFF_HUB_PROJECT_DIR` is unset**. That ordering is a fix, not a detail — see §5.
-* **`OPENCODE_URL`** is seam ②, the engine's own endpoint. The attach interface does not own engine
-  endpoints; an adapter for a new engine names its own variable and documents it beside its own
-  code. Do not put an engine endpoint in `KICKOFF_HUB_`.
+* **The engine's own endpoint** is seam ②, and the attach interface does not own it. For
+  `kickoff-hub-attach` watching opencode it is the value of the `--opencode` flag (§13.1), not an
+  environment variable at all; the old `OPENCODE_URL` retired with the bridge. An adapter for a new
+  engine names its own flag or variable and documents it beside its own code. Do not put an engine
+  endpoint in `KICKOFF_HUB_`.
 
 ### The empty-string rule
 
@@ -191,15 +226,17 @@ accepted aliases" — they are listed here, and marked, but they are not read.
 | `KICKOFF_HUB_SOCKET` | | `KICKOFF_HUB_SOCKET` | kept, **narrowed**: it means the hub and only the hub. Pointing it at a relay is no longer how you join one — `KICKOFF_HUB_RELAY_SOCKET` is |
 | `KICKOFF_HUB_TOKEN_FILE` | | `KICKOFF_HUB_TOKEN_FILE` | kept, and generalised from one adapter to all of them. It was already the right shape |
 | `CLAUDE_PROJECT_DIR` | | unchanged | kept as an **engine-owned** read, demoted below the namespace |
-| `OPENCODE_URL` | | unchanged | kept, outside the namespace, seam ② |
+| `OPENCODE_URL` | | `--opencode <url>` | retired, and the endpoint is a flag on `kickoff-hub-attach`, not a variable — seam ② |
 
 Eleven variables across five prefixes become eight in one, of which a normal adopter sets one.
 
-**On our side this is done.** All three adapters read `plugins/kickoff-channel/attach.ts`, and it is
-the only file any of them reads a variable in; `where.ts` beside it answers only what the MACHINE
-says once a directory has been named, and `hub-link.ts` is the one wire (§8). The one other file in
-the repo that reads these variables is `docs/examples/attach-from-the-document.ts`, and it does so
-deliberately — it is a stranger's adapter, written from this document, importing nothing of ours.
+**On our side this is done.** Both adapters that remain — the Claude tool server
+`plugins/kickoff-channel/server.ts` and the one command `adapters/kickoff-hub-attach/` — read
+`plugins/kickoff-channel/attach.ts`, and it is the only file either of them reads a variable in;
+`where.ts` beside it answers only what the MACHINE says once a directory has been named, and
+`hub-link.ts` is the one wire (§8). The one other file in the repo that reads these variables is
+`docs/examples/attach-from-the-document.ts`, and it does so deliberately — it is a stranger's
+adapter, written from this document, importing nothing of ours.
 If it ever needed to import `attach.ts`, this document would have failed.
 **The edit on kickoff's side** is one: wherever the dispatcher starts an agent, it now exports
 `KICKOFF_HUB_PROJECT_DIR` and — this is the new part — `KICKOFF_HUB_ADDRESS`.
@@ -213,6 +250,17 @@ to avoid, and the failure if he does not paste is loud and safe — the tool ser
 connect and every tool call returns a sentence saying the session never said which project it
 belongs to. A missed paste is a session that visibly cannot reach him, never a session whose words
 go to the wrong topic.
+
+**This paste is for the hand-started shape only** — `opencode serve` started by hand beside a
+relay, the shape `kickoff-hub-attach` retires. Under `kickoff-hub-attach --run` (§13) **paste
+nothing**: attach pins all eight variables into the engine, the tool server inherits them, and his
+file as it stands — the three dropped names are inert, `CLAUDE_PROJECT_DIR: ""` is harmless under a
+pinned `KICKOFF_HUB_PROJECT_DIR` — attaches unchanged. The block below would *break* that shape:
+its six `-` entries overlay the pinned door, address and token path with "derive it yourself",
+which is exactly wrong for a minted address (the tool server derives git's name, looks for another
+door, and the agent reads "not said yet" for ever) and for a wall (no git to derive from, so it
+refuses outright). §13.3 has the seven measured cases. If he wants one file for both shapes, the
+only block that works in all of them is one with no `-` overlays — the file he has.
 
 Replace the `environment` block of the `kickoff-channel` entry with exactly this, and **leave the
 `command` line alone** — the path to `server.ts` is unchanged and nothing here renames or moves it:
@@ -665,7 +713,9 @@ being awake.
 ## 8. Writing the wire — the twelve rules
 
 There is **one** implementation of this wire in the repo — `plugins/kickoff-channel/hub-link.ts` —
-and all three adapters share it. A test fails if any of them starts writing its own again.
+and every file that speaks the wire shares it: the Claude tool server, and attach's `relay.ts`,
+`opencode.ts` and `check.ts`. A test fails if any of them starts writing its own again, or if any
+other file under `adapters/` or `plugins/` so much as mints a `hello`.
 
 That rule was bought. `adapters/opencode-bridge/bridge.ts` carried a fork of an early version for a
 day, and in that day it drifted by twelve invariants — every one of them a defect that had already
@@ -725,9 +775,10 @@ The hub admits one live connection per address. If two processes must speak for 
 **join them on your side** — the hub never learns there were two, and this is not a seventh hub
 capability.
 
-`adapters/fanin/` is our relay. One process per addressable thing holds the claim; producers attach
-to it over a local socket that **speaks hub-proto unchanged**, so a producer needs no second wire
-contract and nothing in it changes but the address it dials.
+`adapters/kickoff-hub-attach/` is our relay — the door it opens is `relay.ts` inside it. One process
+per addressable thing holds the claim; producers attach to it over a local socket that **speaks
+hub-proto unchanged**, so a producer needs no second wire contract and nothing in it changes but the
+address it dials.
 
 * The **relay** gets `KICKOFF_HUB_PROJECT_DIR` and, if the conversation has one,
   `KICKOFF_HUB_ADDRESS`. It listens on `KICKOFF_HUB_RELAY_SOCKET`, or on the derived path below.
@@ -806,7 +857,9 @@ Written down here because none of them is stated anywhere else:
 
 ## 10. A container, worked
 
-One adapter, one conversation, in a container, talking to a hub on the host.
+One conversation, in a container, talking to a hub on the host — with `kickoff-hub-attach` as the
+container's entrypoint (§13.1). attach holds the claim, opens a door of its own, and starts the
+engine as its child, so the wall has one process to run and one to stop.
 
 **Mount two things.**
 
@@ -815,24 +868,36 @@ One adapter, one conversation, in a container, talking to a hub on the host.
 | the host's `/run/user/<uid>/kickoff/` **directory** | the same path inside | Never the socket **file**: the hub unlinks and rebinds it on every start, and a bind-mounted file becomes a stale inode the moment the hub restarts. The directory is `0700`. |
 | the token file, read-only | anywhere, e.g. `/run/secrets/hub.token`, mode `0600` | The credential is a file the filesystem protects, not a variable the environment leaks. |
 
-**Set three things — four if you are behind a relay.**
+**Set three things**, and run attach as the entrypoint with the engine after `--run`:
 
 ```
 KICKOFF_HUB_PROJECT_DIR=/workspace          # where the repo is mounted; for the audit record
 KICKOFF_HUB_TOKEN_FILE=/run/secrets/hub.token
 KICKOFF_HUB_ADDRESS=<the name your dispatcher minted>
-KICKOFF_HUB_RELAY=1                         # only if a relay holds the claim (§9)
-KICKOFF_HUB_RELAY_SOCKET=/run/user/<uid>/kickoff/fanin/<the relay's socket>
+
+# entrypoint (docker: behind --init, which reaps AND forwards signals; bwrap: without --as-pid-1,
+# whose init reaps and forwards NOTHING — §13.5 says how a bwrap wall is actually stopped):
+kickoff-hub-attach --opencode http://127.0.0.1:9700 --run opencode serve --port 9700 --hostname 0.0.0.0
 ```
 
-**`KICKOFF_HUB_RELAY_SOCKET` is not optional in a container.** §9's derived path is computed from a
-git fact, and a container that has the repo mounted but no git binary — the ordinary case — cannot
-compute it. Get the path from whoever started the relay; it is on the relay's own first line of
-output.
+**The relay socket is NOT one of them, under `--run`.** §9's derived path is a git fact, and a
+container with the repo mounted but no git binary — the ordinary case — cannot compute one. attach
+does not need it to: with a child to hand it to, it makes a **private** door of its own under the
+temporary directory and pins it into the child's environment, so the tool server the engine spawns
+finds it with nothing configured (§13.3). Nothing outside the wall dials that door, so nothing
+outside the wall needs its name. (Without `--run` — a bare producer in a container — you would still
+be told the door with `KICKOFF_HUB_RELAY_SOCKET`, off the relay's own first line of output.)
 
 **Run as the same uid as the hub.** This is not optional: the hub reads the peer credentials and
 closes a connection from another uid **with no reply at all** — you will see a socket that accepts and
-then does nothing, which is the least debuggable failure in this system.
+then does nothing, which is the least debuggable failure in this system. Before that, the directory
+is `0700`, so a foreign uid cannot even look inside it; `--check` says so in words.
+
+**And if the wall remaps the uid** (`bwrap --unshare-user --uid 0`), the hub still reads the
+operator's uid — measured — but the *path* is derived from the tenant's: `/run/user/0/kickoff/hub.sock`,
+where nothing is. Either keep the operator's uid (do not pass `--uid`/`--gid`), or bind the directory
+at `/run/user/<tenant uid>/kickoff/`, or set a fourth variable, `KICKOFF_HUB_SOCKET`, to where it
+really is.
 
 **What happens if each is missing:**
 
@@ -845,7 +910,7 @@ then does nothing, which is the least debuggable failure in this system.
 | `KICKOFF_HUB_TOKEN_FILE` | the search starts at `KICKOFF_HUB_PROJECT_DIR`; with no git in the container it checks that one directory and stops. Set the variable. |
 | `KICKOFF_HUB_PROJECT_DIR` | refuse to start, and say which variable. Never guess from cwd. |
 | `KICKOFF_HUB_ADDRESS` | you connect as **the project itself** — taking its claim and its topic. Inside a container there is usually no git to derive a default from, so this is the variable to get right. |
-| `KICKOFF_HUB_RELAY_SOCKET`, behind a relay | with no git in the container the derived path cannot be computed, so the adapter refuses to start and names the variable. |
+| `KICKOFF_HUB_RELAY_SOCKET`, a bare producer behind a relay (no `--run`) | with no git in the container the derived path cannot be computed, so the adapter refuses to start and names the variable. Under `--run`, attach makes its own private door instead, so this is not needed. |
 | a JSON type wrong in `hello` (`"pid":"12345"`) | **exactly what a uid mismatch looks like**: accepted, one line read, then silence. A first line that will not decode is closed with no `refused` frame at all. §6 has one worked `hello` with every type in it; check yours against it before you go looking for anything else. |
 
 One caution this document flags rather than asserts: the hub identifies your process by the pid it
@@ -870,16 +935,18 @@ file and the `crates/hub-proto` docs and nothing else.
    only true on some engines, read that file before writing them.
 3. **There is no conformance suite you can run**, and there is one worked example.
    `docs/examples/attach-from-the-document.ts` is the smallest adapter of §1, written from this file
-   and importing nothing of ours; `adapters/fanin/test-two-producers.ts` runs it against the real
-   relay, and that run is what found the ordering defect now fixed in §1. It is an example, not a
-   suite: it covers the good-day path and none of §8. Our own suites are
-   `bun test-against-a-fake-hub.ts`, `bun test-two-producers.ts`, `bun test-against-fakes.ts` and
-   `cargo test -p herdr-tg the_real_plugin -- --ignored` — the last is the real bridge against the
-   real hub with only Telegram faked. A third-party adapter has no equivalent, and a fake written
-   from your own reading of this document proves only that you agree with yourself.
+   and importing nothing of ours; `adapters/kickoff-hub-attach/test-two-producers.ts` runs it against
+   the real door, and that run is what found the ordering defect now fixed in §1. It is an example,
+   not a suite: it covers the good-day path and none of §8. Our own suites are
+   `bun test-against-a-fake-hub.ts` and, under `adapters/kickoff-hub-attach/`, `bun
+   test-two-producers.ts`, `bun test-what-breaks-it.ts`, `bun test-against-fakes.ts`,
+   `bun test-check.ts`, `bun test-run.ts`, plus `cargo test -p herdr-tg the_real_plugin -- --ignored`
+   — the last is the real tool server against the real hub with only Telegram faked. A third-party
+   adapter has no equivalent, and a fake written from your own reading of this document proves only
+   that you agree with yourself.
 4. **The relay's local protocol is hub-proto, but its lifecycle rules are not in `hub-proto`.** §9
-   lists the four differences; they live in `adapters/fanin/`, and if you write your own relay you are
-   re-deriving them from prose.
+   lists the four differences; they live in `adapters/kickoff-hub-attach/` (`relay.ts` and
+   `ledger.ts`), and if you write your own relay you are re-deriving them from prose.
 5. **`limits` is told to you, not enforceable in advance.** `max_text` counts characters, `max_frame`
    counts bytes, and the option-id ceiling is in neither — it is Telegram's, and you learn it by
    being refused.
@@ -898,8 +965,645 @@ Said plainly so nobody looks for it here.
 * **`crates/`.** This is adapter-side. The hub already accepts an address and nothing on the wire
   changes.
 * **The conversations redesign** (`docs/CONVERSATIONS.md`), rooms, enrolment and topic cleanup.
-* **Supervision and systemd units.** Real, and a separate slice.
 * **The pre-pong 256 KiB bound.** Real, hub-side, and a separate slice.
+
+(Supervision and systemd units used to be listed here; they are built — `kickoff-hub-attach` and its
+`deploy/kickoff-hub-attach@.service` template, §13.)
+
+---
+
+## 13. One command
+
+<!-- BUILT, 4 September 2026. This section was a design; it is now code. Every file it names under
+     `adapters/kickoff-hub-attach/` exists; `adapters/fanin/` and `adapters/opencode-bridge/` are
+     gone, folded into it, every check they held moved across. It reads as a design in places (the
+     tense of "becomes", the table of "what the build must touch") because it was written before the
+     build; that is left as the record of the decisions, and where it says a file "is today" the
+     file is now `adapters/kickoff-hub-attach/`. Written against one test: an adopter who reads this
+     section and nothing else can start a worker. -->
+
+The operator looked at what it takes to put one opencode agent on his phone and asked, in his
+words, *"is there a way I don't have to type all of that stuff?"* — because a Claude worker is one
+command and an opencode worker is **three hand-started processes** for one conversation:
+
+| today | what it does | who starts it |
+| --- | --- | --- |
+| `adapters/fanin/fanin.ts` | holds the one slot at the hub for this address | he does, by hand |
+| `opencode serve` | the engine; its MCP tool server attaches to the relay | he does, by hand |
+| `adapters/opencode-bridge/bridge.ts` | watches the server's event stream, relays its prompts | he does, by hand |
+
+That is a design smell, not a documentation one. This box has the corpse of it right now: an event
+bridge still retrying against a relay socket whose relay died hours ago, because when one of three
+hand-started processes goes, the other two hang.
+
+**`kickoff-hub-attach` is one process that does all three jobs**, and can start the engine as its
+child so that a wall — bwrap or docker, the machinery the operator is building — has exactly one
+entrypoint. It reads the namespace of §2 through the one reader, holds the claim, exposes the door
+of §9 so the engine's tool server attaches to it unchanged, watches the opencode server when told
+to, and proves an environment can reach the hub before anyone trusts it.
+
+Three things do not change. **The Claude path**: `plugins/kickoff-channel/server.ts` dials the hub
+directly, is already one command, and is not touched — it ships to the session the operator is in
+as this is written. **The wire**: `crates/` and `hub-proto` are untouched, and
+`plugins/kickoff-channel/hub-link.ts` stays the one implementation, guarded by a test. **The
+stranger's adapter**: `docs/examples/attach-from-the-document.ts` must still attach to attach's door
+without a line of it changing, and it is run twice below — once as a producer at the door and once
+as the "engine" a wall starts.
+
+### 13.1 The command line
+
+```
+kickoff-hub-attach [--opencode <url>] [--run <command...>]
+kickoff-hub-attach --check [--opencode <url>] [--run <command...>]
+```
+
+Everything about *which* project, *which* conversation, *where* the secret is and *what* to dial
+comes from the environment, §2, and only from there — `plugins/kickoff-channel/attach.ts` is the
+only file that reads a variable, and this command adds no way round it. So a project directory is
+never a flag: it is `KICKOFF_HUB_PROJECT_DIR`, and `.` means "the directory I was started in, and
+whoever typed this vouches for it".
+
+| flag | what it does | default |
+| --- | --- | --- |
+| *(none)* | Hold the claim for `(project, address)` and open the door. This alone is what `adapters/fanin/` is today, and it is what a Claude worker in a wall needs. | — |
+| `--opencode <url>` | Also watch the opencode server at `<url>`: its questions and permission prompts go to the phone as `ask`, a tap goes back to the server's own reply endpoint. This is what `adapters/opencode-bridge/` is today, minus its process. The URL is the flag's value and nothing else; `OPENCODE_URL` retires with the bridge. | not watching |
+| `--run <command...>` | Start `<command...>` as this process's child, in the project directory, with the namespace pinned in its environment so that any adapter descending from it finds the door (§13.3). When the child exits, say `bye`, close the door, exit with the child's status (§13.5). Everything after `--run` is the command; nothing after it is read as a flag. | no child |
+| `--check` | Prove this environment can reach the hub, one plain line per fact, then exit 0 if every fact holds and 1 if any does not. Sends `hello` and `bye` and nothing else; creates no topic (§13.4). `--opencode` and `--run` may stay on the line — the check reads them for what it can verify and starts nothing — so a wrapper runs its real line with `--check` in front of it. | — |
+
+**Exit status.** `0` a clean end; `1` a `--check` that found something to fix; `2` a refusal to
+start, with the sentence naming the variable on stderr — the same `2` the relay and the bridge use
+today; `127` the `--run` command could not be found; otherwise **the child's own status**, with a
+child killed by signal *n* reported as `128 + n`, which is what `docker stop` and systemd read.
+
+**Its first lines** say what it is speaking for, and where the door is — because §10 says a
+container behind a relay is told the door "from the relay's own first line of output", and that has
+to stay true:
+
+```
+kickoff-hub-attach: speaking for /home/<you>/scratch/oc-dogfood · lane-0904-1200
+kickoff-hub-attach: the door is /run/user/<uid>/kickoff/fanin/9dcb04a8b0e28966.sock
+kickoff-hub-attach: connected as "oc-dogfood · lane-0904-1200"
+```
+
+The name in quotes is the hub's own title for the conversation — the project's title, a separator,
+and the address, which the hub clips from the left with an ellipsis when it is long
+(`…fy-0904-check`). It is printed once, as the hub sent it.
+
+Every line it prints for itself is prefixed `kickoff-hub-attach:`; the child's output passes
+through unprefixed, so a journal shows both and a reader can tell them apart.
+
+#### Worked invocation 1 — a local worker on this box
+
+Once, per project, at a terminal: `herdr-tg enroll <repo>`. Once, per box: bun and opencode on
+`PATH`, and the shim `~/.local/bin/kickoff-hub-attach` that `scripts/install-attach.sh` writes
+(§13.6). Then, in the worktree the worker is for:
+
+```
+cd ~/scratch/oc-dogfood
+KICKOFF_HUB_PROJECT_DIR=. kickoff-hub-attach --check --opencode http://127.0.0.1:9711 --run opencode serve --port 9711
+KICKOFF_HUB_PROJECT_DIR=. kickoff-hub-attach         --opencode http://127.0.0.1:9711 --run opencode serve --port 9711
+```
+
+The second line is the worker: the claim, the door, the server, the watcher, and the tool server the
+server spawns — one process tree, one command, and when the server dies the whole thing says
+goodbye and exits with its status. The address is git's name for the worktree, or none in the main
+tree, exactly as §4 says; a dispatcher that minted one sets `KICKOFF_HUB_ADDRESS` in front of the
+same line. `--port` is not optional: `opencode serve` without it picks a random port, and the
+watcher would then be watching nothing. The number appears twice on the line so the server and the
+watcher can never disagree about it.
+
+#### Worked invocation 2 — a wall's entrypoint
+
+This is the shape kickoff's wrapper copies. docker is shown because it is the one everyone can
+read; the bwrap differences are the two sentences after it.
+
+```
+docker run --rm --init \
+  --user "$(id -u):$(id -g)" \
+  -v "/run/user/$(id -u)/kickoff:/run/user/$(id -u)/kickoff" \
+  -v "$repo/.kickoff/hub.token:/run/secrets/hub.token:ro" \
+  -v "$worktree:/workspace" \
+  -p "127.0.0.1:$hostport:9700" \
+  -e KICKOFF_HUB_PROJECT_DIR=/workspace \
+  -e KICKOFF_HUB_ADDRESS="$address" \
+  -e KICKOFF_HUB_TOKEN_FILE=/run/secrets/hub.token \
+  <image> kickoff-hub-attach --opencode http://127.0.0.1:9700 --run opencode serve --port 9700 --hostname 0.0.0.0
+```
+
+Line by line, each is one of §10's rules or one of the measurements in `docs/TAXONOMY.md`:
+
+* `--init` — the wall's own reaper. attach forwards signals and propagates the child's status; it
+  does not reap orphans, and refuses to be PID 1 with a child (§13.5). docker's init (tini) also
+  forwards the signal `docker stop` sends, so the wall stops the way a desk does. **bwrap is not
+  docker here**: without `--as-pid-1` its init sits at PID 1 and reaps — so do not pass
+  `--as-pid-1` — but it forwards **nothing**, and a signal to the bwrap process ends bwrap and leaves
+  the wall running with the claim held. §13.5 says how a bwrap wall is stopped; it is not by
+  signalling bwrap.
+* `--user "$(id -u)"` — the hub reads the peer's uid **in its own namespace** and closes any other
+  uid without a word, and the directory is `0700` and the socket `0600` besides. A foreign uid fails
+  before any of that: it cannot stat inside the directory, and the check says "this user may not
+  look inside … run as the same user as the hub" when it sees that; a foreign uid that can (root
+  in a rootful container) is closed in silence, and the check names that too. Under
+  `bwrap --unshare-user --uid 0` the tenant sees itself as uid 0 and the hub still reads the
+  operator's uid, measured — but the tenant derives `/run/user/0/kickoff/hub.sock`, where nothing
+  is; §10 gives the three ways out (keep the uid, bind the directory at the tenant's path, or set
+  `KICKOFF_HUB_SOCKET`). The check does not compare uid numbers, for exactly that reason.
+* the **directory** `/run/user/<uid>/kickoff/`, never the socket file — the hub unlinks and rebinds
+  its socket on every start, and a bind-mounted file is a stale inode after the first restart.
+* the secret as a **file**, read-only, and its **path** in `KICKOFF_HUB_TOKEN_FILE`. The value never
+  travels in the environment; attach refuses if anyone tries (§13.4).
+* the worktree at `/workspace`, and `KICKOFF_HUB_PROJECT_DIR` naming it. A linked worktree's `.git`
+  is a file pointing at the main repository's `.git/worktrees/<name>` — which is **not** in the
+  wall — so git answers nothing here, no address can be derived, and `KICKOFF_HUB_ADDRESS` is the
+  variable to get right: without it the wall speaks as the whole project and takes its claim.
+* no `KICKOFF_HUB_RELAY_SOCKET`. Under `--run`, when git cannot derive a door and nothing named one,
+  attach makes a **private** door in a folder of its own and hands it to the child (§13.3). Nothing
+  outside the wall needs to reach that door, so nothing outside the wall needs to know its name.
+  The wrapper therefore sets **three** variables, the three §10 always required — four when it
+  remaps the uid, as the bullet above says.
+* `--hostname 0.0.0.0` and `-p` — so kickoff on the host can reach the server to open sessions and
+  send prompts. The watcher still dials `127.0.0.1:9700` inside. Under bwrap without
+  `--unshare-net` the wall shares the host's loopback and there is no `-p`; then every wall needs a
+  port of its own, and kickoff mints it the way it mints the address.
+* the image holds bun, opencode, `plugins/kickoff-channel/` and `adapters/kickoff-hub-attach/` —
+  the tool server is a bun script the engine spawns, so bun is in the image whatever attach is. It
+  holds **no** copy of the operator's `~/.config/opencode/opencode.json`: that file carries his
+  provider keys, and its `environment` block is built for the host, not a wall (§13.3).
+
+### 13.2 What becomes of `adapters/fanin/` and `adapters/opencode-bridge/`
+
+The criterion the operator set is *"a clean house, and an house that makes sense"*, and the test of
+it is that a stranger opening `adapters/` finds **one thing to run**. Two directories each with a
+`start` script is two things. So both go, and their logic becomes modules of the one command:
+
+```
+adapters/kickoff-hub-attach/
+  main.ts            the command: flags, the order of operations, signals, exit  (run this)
+  relay.ts           the door — producers, envelope ids, ask-id namespacing, the queue share
+  ledger.ts          who the producers are and what they wait on; survives a restart
+  opencode.ts        the watcher — events to asks, taps to replies
+  check.ts           --check
+  run.ts             --run, and the ONE place anything is spawned
+  README.md          the operator's page: what to type
+  package.json       start and test
+  test-harness.ts    the shared rig (fake hub, real producers, a real worktree)
+  test-two-producers.ts · test-what-breaks-it.ts · test-against-fakes.ts   moved, §13.7
+  test-check.ts · test-run.ts                                                new, §13.7
+```
+
+| today | becomes | why |
+| --- | --- | --- |
+| `adapters/fanin/fanin.ts` | `relay.ts` (the door, lines "Writing to a producer" through "The door") + the startup, signal and `bye` code folded into `main.ts` | The relay's logic is the product; its process was only a process. |
+| `adapters/fanin/ledger.ts` | `ledger.ts`, moved unchanged | It already knows nothing about sockets. |
+| `adapters/fanin/test-harness.ts` | moved; `FANIN` becomes `ATTACH`, `startFanin` becomes `startAttach` | Same rig, same spawn, new path. |
+| `adapters/fanin/README.md` | folded into the new `README.md` | One page for one command. |
+| `adapters/fanin/package.json` | gone | |
+| `adapters/opencode-bridge/bridge.ts` | `opencode.ts` — the mapping (`onOpencodeEvent`), `answer()`, `watch()` and the open-question record; its `HubLink`, startup and signals go | What is genuinely opencode's stays; the wire was already shared. |
+| `adapters/opencode-bridge/README.md` | folded into the new `README.md` | |
+| `adapters/opencode-bridge/package.json`, `.gitignore` | gone | |
+| `adapters/opencode-bridge/test-against-fakes.ts` | moved; spawns `main.ts --opencode <fake url>` | §13.7 |
+
+**How the watcher joins the relay: as a producer, at the door, in the same process.** Today the
+bridge attaches to the relay with two variables and not a line of its own changing, proven by
+`test-two-producers.ts` Part 2c. Collapsing the process boundary changes nothing on the wire: the
+watcher in `opencode.ts` holds a `HubLink` whose socket is attach's own door and whose `hello`
+carries the same secret, the same address and an instance of its own. The relay half greets it,
+numbers it, namespaces its ask ids, shares the queue with it and — when the hub link drops — ends
+its connection exactly as it ends every other producer's, so the watcher's queued asks go back to
+waiting rather than being reported as said. One routing path for a tap, one greeting path, one
+ledger, and the machinery that exists for two producers is not duplicated for a third that happens
+to live in-process. The relay's refusal "a relay told to attach to a relay would dial its own door"
+stays for attach as a *whole* — `KICKOFF_HUB_RELAY=1` in attach's own environment is still refused
+— because that sentence is about who holds the claim, and the watcher does not.
+
+What this costs, said plainly: the watcher's asks carry a producer number like anyone else's, and
+the `already_claimed` rule that lived in the bridge moves into attach's hub link, where the relay
+never had one — the relay waited on a squatter for ever, saying only "the hub would not take this
+relay". The rule changed on the way: the bridge counted **three refusals in a row**, and with the
+link's backoff that is a claim held for three *seconds* — shorter than the ten a predecessor attach
+gets to stop, so an ordinary restart tripped it. A squatter is a claim held longer than anything
+legitimate holds one, so attach calls a run stuck by **elapsed time** (30 seconds; with the backoff
+that is the sixth refusal, at about 31), and at that moment answers every frame its producers had
+queued with an `ack` saying no *before* it ends their sockets — the first version ended the sockets
+first, and the "no" had nothing to travel on. The watcher keeps no counter of its own: every
+refusal it sees is the door relaying the hub's, and the door decides.
+
+### 13.3 How the engine's tool server finds the door
+
+The tool server is the same `plugins/kickoff-channel/server.ts` under both engines, and it reaches
+the door in the same way it always has: `KICKOFF_HUB_RELAY=1` plus a door it is either **told**
+(`KICKOFF_HUB_RELAY_SOCKET`) or **derives** (§9's formula, from git). attach's job is to make sure
+one of those is true, and it does it two ways at once.
+
+**Under `--run`, attach pins the whole namespace in the child's environment.** The eight variables
+of §2, every one set explicitly, so nothing is derived twice and nothing is inherited from above:
+
+```
+KICKOFF_HUB_PROJECT_DIR=<attach's project directory, absolute>
+KICKOFF_HUB_ADDRESS=<the address attach holds, or - when it holds none>
+KICKOFF_HUB_TOKEN_FILE=<the path attach was told, or the one it found — never - while it holds one>
+KICKOFF_HUB_SOCKET=<the hub socket attach dials>
+KICKOFF_HUB_RELAY=1
+KICKOFF_HUB_RELAY_SOCKET=<the door>
+KICKOFF_HUB_RELAY_DIR=-
+KICKOFF_HUB_RELAY_GRACE_MS=-
+```
+
+The engine inherits that, and the tool server it spawns inherits the engine's. A Claude engine's
+plugin, which has no `environment` block of its own, therefore finds the door with no further
+configuration — and so does any adapter a stranger writes, including
+`docs/examples/attach-from-the-document.ts`, which is why §13.7 runs it as a `--run` child, once
+from a directory with no git and once from a lane worktree. The lane is why the token path is the
+one attach *found*: a lane holds no secret of its own, attach finds the main tree's by the search,
+and a child that does not search (§5 says being told is cheaper) would otherwise refuse "no secret
+at `<lane>/.kickoff/hub.token`" while attach above it had just authenticated with that very file.
+
+**On this box, under `--run`, the operator pastes nothing.** His file as it stands — an
+`environment` block carrying three dropped names and `CLAUDE_PROJECT_DIR: ""` — works: opencode
+gives its MCP child the server's whole environment with the block overlaid on top, the block
+touches no `KICKOFF_HUB_` name, so the tool server inherits the pinned door and attaches. Measured
+with the real engine, seven ways:
+
+| the engine's config, and how it was started | what the tool server did |
+| --- | --- |
+| his file, hand-started beside a bare attach | refuses: "never said which project" — the shape attach retires |
+| **his file, `--run`** | **attached, `said`, the hub logged the `say`** |
+| his file, `--run`, in a directory with no git (a wall's shape) | attached, `said` |
+| the §2 paste block, hand-started | attached, `said` |
+| the §2 paste block, `--run`, address = git's name | attached, `said` |
+| the §2 paste block, `--run`, **a minted address** | the tool server derives git's door, dials one nothing opens, `reply` says "not said yet … the relay is not running" for ever |
+| the §2 paste block, `--run`, **no git** | the tool server refuses: "cannot work out where that relay is" |
+
+So the eight-`-` block is the hand-started shape's answer to inheritance, and under attach it is
+the wrong one: attach's pinning **is** the un-inherit that block exists for, with the right values
+in it. When a dispatcher mints an address that is not git's name, or a wall has no git, a config
+that overlays the pinned door with `-` makes the tool server look for a door nothing opens — the
+split-brain nobody would diagnose in under an hour. attach cannot read the engine's config, so it
+cannot refuse this; **`--check` prints the fact in words (§13.4), and attach prints the same
+sentence as a warning when it starts** — the same function produces both, so they cannot drift.
+The one thing this section retires is a variable the block never carried: `OPENCODE_URL`, which
+becomes the value of `--opencode`.
+
+**In a wall, the config is kickoff's, and its entry needs no `environment` block at all:**
+
+```json
+"kickoff-channel": {
+  "type": "local",
+  "command": ["bun", "/opt/herdr-tg/plugins/kickoff-channel/server.ts"],
+  "enabled": true
+}
+```
+
+There is nothing to overlay because there is nothing to un-inherit: attach is the outermost thing
+in the wall, it pinned all eight, and the tool server takes them as they are. The `-` block exists
+for a config that must serve every project and every lane on a host where an outer session may
+have left variables behind; a wall has one project, one address and no outer session. Hand it to
+the engine however kickoff prefers — the wall's own `~/.config/opencode/opencode.json`, or
+`OPENCODE_CONFIG=<path>`, or `OPENCODE_CONFIG_CONTENT='{"mcp":{…}}'` on the environment; the
+installed opencode reads all three, checked against its binary. **Do not mount the host's file
+into the wall**: its `-` block would make the tool server derive a door from git, there is no git
+to ask in a wall, and it would refuse to attach with a sentence about `KICKOFF_HUB_RELAY_SOCKET`
+that the block itself prevents anyone from setting.
+
+**Where the door is, in order:**
+
+1. **Told.** `KICKOFF_HUB_RELAY_SOCKET`, verbatim, as today.
+2. **Derived from git.** §9's formula, as today. This is the host case, and it is what makes the
+   paste block meet attach with no variable set.
+3. **Made, under `--run` only.** When neither of the above can say, and there is a child to hand it
+   to, attach makes a folder of its own under the temporary directory — `mkdtemp`, mode `0700`,
+   `kickoff-hub-attach-<six random characters>/` — and puts the door there: nothing else needs to
+   dial it, so nothing else needs to know its name, and two walls cannot collide on it *because the
+   name is random*. The first version named the folder by pid, and under `bwrap --unshare-pid`
+   attach is PID 2 in every wall, so two walls sharing the host's `/tmp` derived one folder and the
+   second died "another attach is already holding it". It is unlinked on exit; a wall killed
+   outright leaves its folder behind, and no later wall reuses it. A temporary directory that is
+   not absolute, or that does not exist, or that puts the path past the 108-byte ceiling, is a
+   refusal naming `TMPDIR` — this box has already met the literal string `%h/.cache/tmp` there —
+   and `--check` makes the same refusal without making the folder. Without `--run` there is no
+   third option and attach refuses as the relay does today, naming `KICKOFF_HUB_RELAY_SOCKET`.
+
+The private door of option 3 is never derived from the mount path: two walls with different
+projects mounted at `/workspace` and the same address name would derive one door under the
+mounted `fanin/` directory and the second would refuse "another attach holds it" — true, and the
+wrong reason.
+
+### 13.4 `--check`
+
+**What it proves, and how it proves it without a topic.** The hub's admission is ordered, and the
+order is what makes this clean (`hub.rs`, `admit` and `serve_connection`): peer credentials off the
+socket, uid first — another uid is closed without a reply — then version, then secret to project,
+then enabled, then the address shape; then the claim is taken and **`welcome` is sent**; then
+`ping`; and **the topic is created only after the pong**, inside the `if live` branch. A connection
+that ends before the pong is released and audited, and nothing reaches Telegram. So `--check`
+connects, sends `hello`, treats the arrival of `welcome` as proof — socket reachable, uid admitted,
+secret resolved to an enabled project, address well-formed and echoed, claim free — sends `bye`,
+and closes **without ever ponging**. Confirmed in the code, not assumed.
+
+Two costs, so that nobody is surprised by them. The check **holds the claim for the length of one
+round trip**; the hub releases it the instant the connection ends, so a wrapper that runs the check
+and then starts the worker is not refused. And it leaves one line in the hub's audit log —
+*"connected but never answered; it is probably not allowed to talk to me"* — which is the hub's
+honest reading of a deliberate check. Telling the hub the difference would be a new frame, which is
+`crates/`, which is out of this slice; the line is noted here so that whoever reads that log knows
+what a check looks like.
+
+**What it prints.** One line per fact, in the order the facts are established, each beginning `ok`
+or `NOT`; a `NOT` line carries the sentence that says what to do. The last line is the count. Exit
+`0` when every line is `ok`, `1` otherwise. In order:
+
+| fact | `ok` reads | `NOT` reads |
+| --- | --- | --- |
+| the configuration | *(no line of its own)* | the reader's own sentence, in the register `main.ts` dies with, e.g. `NOT  nothing named a project directory (KICKOFF_HUB_PROJECT_DIR), so there is no way to reach the operator from here` · `NOT  KICKOFF_HUB_ADDRESS is "CEO/steering", which cannot be addressed: it has a slash in it, and a conversation name cannot contain one` — the five shape rules of §4, before dialling · `NOT  KICKOFF_HUB_PROJECT_DIR is set to the empty string; a variable set to nothing is not a value` |
+| attach as a producer | *(no line)* | `NOT  KICKOFF_HUB_RELAY is set on attach itself; it belongs on a producer that attaches to attach, not on attach` — the start refuses this, so the check does; it arrives by inheritance, since every `--run` child has it pinned |
+| the project | `ok   speaking for /workspace (not inside a repository)` — or `(the main tree of a repository)`, `(a linked worktree of <main>)` | *(a refusal is the configuration row above)* |
+| the address | `ok   the conversation: lane-0904-1200 (named by KICKOFF_HUB_ADDRESS)` — or `(git's name for this worktree)`, or `ok   the conversation: the project itself` | *(a refusal is the configuration row above)* |
+| the secret | `ok   the secret: /run/secrets/hub.token (told by KICKOFF_HUB_TOKEN_FILE)` — or `(found above /home/<you>/proj)` | `NOT  no secret at /run/secrets/hub.token; mount the project's .kickoff/hub.token there, or run: herdr-tg enroll <dir>` |
+| the secret, by value | *(no line)* | `NOT  KICKOFF_HUB_TOKEN is set, and the secret never travels as a value; put it in a file and name the file with KICKOFF_HUB_TOKEN_FILE` — and a `KICKOFF_HUB_TOKEN_FILE` that is 64 hex characters and no path reads `NOT  KICKOFF_HUB_TOKEN_FILE looks like the secret itself; it takes the path to the file` |
+| the hub's socket | `ok   the hub's socket: /run/user/<uid>/kickoff/hub.sock is there` | `NOT  nothing at /run/user/<uid>/kickoff/hub.sock; the hub is not running, or the directory /run/user/<uid>/kickoff/ is not mounted here (mount the directory, never the socket file)` · a directory this uid cannot look into (it is `0700`): `NOT  this user may not look inside /run/user/<uid>/kickoff/ (it is the hub's, mode 0700); run as the same user as the hub` — the first thing a foreign uid hits, before any connect |
+| reached | `ok   reached the hub` | `EACCES`: `NOT  the hub's socket refused this user; run as the same user as the hub` · `ECONNREFUSED`: `NOT  a socket file is there but nothing is listening behind it; the hub is not running` |
+| admitted | `ok   admitted as "oc-dogfood · lane-0904-1200"` — the hub's own title for the conversation, once | closed after `hello` with no frame: `NOT  the hub took the hello and closed without a word; either this process is not running as the hub's user, or the hello was malformed, and from outside the two cannot be told apart` — and *only* then: the close that follows a `refused` is not reported, so a refusal is exactly one line · accepted and mute: `NOT  the hub accepted the connection and said nothing for 6 seconds; it is running but wedged — restart herdr-tg` · `unknown_project`: `NOT  the hub does not know this project; run: herdr-tg enroll <dir>` · `bad_token`: `NOT  the secret is not one the hub knows; re-run: herdr-tg enroll <dir>` · `not_enabled`: `NOT  this project is enrolled but switched off` · `version_skew`: `NOT  this command and the hub do not speak the same version; upgrade one of them` · `bad_lane`: `NOT  the hub will not address a conversation called <x>; if the hub is older than this command, restart herdr-tg` · `already_claimed`: `NOT  another connection holds this conversation right now; if it is your own worker, run the check before it and not beside it; if nothing of yours is running, a stray process is squatting the claim` · echo missing: `NOT  the hub did not give <x> a place of its own; it is older than this command` · anything else: `NOT  the hub refused for a reason this command does not know (<reason>)` |
+| the door | `ok   the door: <path> (worked out from git), free` — or `(named by KICKOFF_HUB_RELAY_SOCKET), free`, or under `--run` with no git `ok   the door: will be made in a private folder under <TMPDIR> when the worker starts, and handed to its engine` | `NOT  another attach already holds the door at <path>; this conversation has a worker already` · no git, no `--run`: `NOT  this folder is not inside a repository and nothing named a door; set KICKOFF_HUB_RELAY_SOCKET` · under `--run` with no git: `NOT  TMPDIR is "%h/.cache/tmp", which is not an absolute path, so a private door cannot be made under it; set TMPDIR to a real directory` (or "does not exist", or "past the 108-byte socket limit") — the start's own refusal, made here without making the folder |
+| the tool server | `ok   a tool server that works out its door from git here finds this one` — or, with no git, `ok   a tool server here must be told the door, and a worker started with --run tells it` / `ok   a tool server here cannot work out a door from git, so it must be given the same KICKOFF_HUB_RELAY_SOCKET=<door>` — or, when attach's door is not git's: under `--run`, `ok   the tool server the engine spawns is told this door by --run; a config that overlays KICKOFF_HUB_RELAY_SOCKET with - would look for <other> instead and never find this one`; told without `--run`, `ok   the door was named by KICKOFF_HUB_RELAY_SOCKET, so a tool server that works one out from git would look for <other>; give the engine the same KICKOFF_HUB_RELAY_SOCKET=<door>` | derived from a minted address, without `--run`: `NOT  a tool server that works out its door from git here would look for <other>; either use the worktree's own name as the address, or give the engine a config that names KICKOFF_HUB_RELAY_SOCKET=<door>`. Whichever line prints, attach prints the same sentence as a warning when it starts, from the same function. |
+| the engine's address, with `--opencode` | `ok   the engine's address: http://127.0.0.1:9711` | `NOT  --opencode http://127.0.0.1: names no port; the watcher would dial the wrong server. Give it the port opencode serve was given, e.g. --opencode http://127.0.0.1:9711` — the start refuses the same URL; the unit's `${OPENCODE_PORT}` unset is how it arrives |
+| the engine, with `--run` | `ok   the engine: opencode, found at <path>` | `NOT  the engine: opencode is not on PATH` |
+| PID 1, with `--run` | `ok   not PID 1` | `NOT  this process is PID 1 and nothing reaps for it; put the wall's own init in front (docker run --init; bwrap without --as-pid-1, which reaps and forwards nothing — stop a bwrap wall by signalling attach itself)` |
+| the count | `everything a worker here needs is in place` | `<n> thing(s) to fix before a worker here can reach him` |
+
+The uid line is deliberately **not** a comparison of numbers. Under `bwrap --unshare-user` this
+process sees uid 0, the mounted socket's owner reads as the overflow uid, and the connection
+succeeds once the socket is where the tenant derives it — `KICKOFF_HUB_SOCKET`, or the directory
+bound at `/run/user/0/kickoff/` — because the hub reads the credential in its own namespace. A
+numeric check would say `NOT` to a wall that works; the connect and the `welcome` say what is true.
+
+`--check` is what a wrapper runs before trusting a wall, and it is also the first thing a person
+runs when a worker is silent: every failure this document has spent ten sections describing —
+the silent close, the stale inode, the missing mount, the empty variable, the door nothing listens
+at — prints as one line that names the fix.
+
+### 13.5 `--run`
+
+**The order of operations.** Read the namespace, and refuse with the variable's name if it is
+wrong. Refuse if this process is PID 1 and there is a child to start. Open the door — dialling any
+socket file already there, so that a live attach for this address is refused with exit 2 and a
+leftover file is unlinked, exactly as the relay does today. Start the hub link. **Spawn the child.**
+Start the watcher, if `--opencode`. The door is bound before the child exists, so the first tool
+server the engine spawns finds it; the hub link need not be up — a child whose hub is down is told
+"not said yet" by its tool server, which is the honest sentence, and the link keeps dialling.
+
+**The child** runs in the project directory, inherits attach's stdin, stdout and stderr, and gets
+attach's environment plus the eight pinned variables of §13.3. attach never reads stdin itself: it
+is not an MCP server and nothing on that stream is for it.
+
+**Signals.** attach installs handlers for `SIGTERM` and `SIGINT` — both, because a process with no
+handler for them at PID 1 ignores them, measured on this box with bun, and a wall that cannot be
+stopped is a wall that gets killed with its questions still open. On either, it forwards the same
+signal to the child, waits up to ten seconds, then sends `SIGKILL`, and proceeds as if the child
+had exited on its own. It does **not** reap orphans: a grandchild the engine leaves behind reparents
+to PID 1, and if PID 1 is a JavaScript runtime it stays a zombie for ever — also measured. Waiting
+on a process this runtime did not start means reaching into libc from the process that holds the
+hub's claim, for one job an init does in a kilobyte of C, so this design declines it: `--run`
+refuses at PID 1 and names the fix, and `--check` says the same thing before it gets that far.
+
+**Behind `docker --init`** attach is PID 2, tini forwards the signal `docker stop` sends, and every
+signal and every exit behaves as it does on a desk; docker ends the container when PID 1 exits.
+
+**Behind bwrap's init it does not**, measured on this box (bubblewrap 0.12) and pinned by
+`test-run.ts` so it cannot drift again. bwrap's init reaps zombies and does nothing else: it
+forwards no signal, and it ignores `SIGTERM` itself. So —
+
+* a `SIGTERM` to the bwrap process **ends bwrap (143) and reaches nothing inside**: attach and the
+  engine keep running, the door stays bound, the claim stays held — the corpse squatting the claim
+  that this section opens with, and the successor's `already_claimed` run follows;
+* **stop a bwrap wall by signalling attach's own host pid** — the *child* of the pid bwrap reports
+  on `--info-fd` (that pid is the init). attach then forwards, waits, says `bye`, and the wall is
+  empty; bwrap returns the child's status;
+* pass **`--die-with-parent`**, so a wall whose wrapper dies is killed with it rather than left
+  squatting. That is `SIGKILL` to the wall — no `bye` — and the hub releases the claim when the
+  socket closes, which is the right outcome for a wrapper that is gone;
+* do **not** read bwrap's return as "the wall is empty": when attach exits, bwrap returns at once
+  while the engine's orphans stay inside with bwrap's init until they exit on their own.
+
+Said plainly, the decision: the wrapper owns the host-pid lookup. The alternative — `--as-pid-1`,
+with attach at PID 1 signalable by its host pid and orphans dying with it — costs zombies for the
+life of the wall, since attach does not reap, and an agent's shell spawns constantly; attach keeps
+refusing `--run` at PID 1. The wrapper is kickoff's (§13.9); these four bullets are what it copies.
+
+**When the child exits**, for any reason: the ledger is written down first (the questions open at
+this instant are what the next run has to route taps for); `bye` goes on the hub link if it is up,
+and attach waits for the kernel to take it — the same 200 ms both processes use today, because
+`process.exit()` on the same tick loses the frame to a short write; the door is unlinked, and a
+private door's folder with it; and attach exits **with the child's status** — its exit code, or
+`128 + n` for a signal. A child that could not be started at all is `127` and one line saying so.
+attach's own exit takes the door with it, so the next start of the same address finds either
+nothing or a leftover file, never a live socket with nobody behind it.
+
+**Where the spawn is, and why it may be there.** In `run.ts`, one call site, and the comment on it
+says this: *the ADAPTER may spawn; the HUB never does.* The hub's closed list of capabilities
+(`docs/INTERFACES.md`) puts "spawning, supervising, or killing anything" under things the hub is
+not, and its argument is that no string from the wire may ever reach a command line. Nothing here
+contradicts that: the command attach runs comes from **its own argv**, typed by a person or written
+by a wrapper, and no frame from the hub can add to it, change it or start it — a `choice` reaches
+an opencode reply endpoint or a tool server's turn, never `run.ts`. The hub still has zero
+`Command` in its binary, and the test that pins the deletion of the keystroke path does not know
+`adapters/` exists. This is seam ④'s own proposal, arrived at from the other side: the thing that
+starts an engine is an adapter, holding a hub connection like any other, and the hub cannot tell
+it from one that does not.
+
+### 13.6 The unit
+
+`deploy/kickoff-hub-attach@.service`, a `systemd --user` **template**, so that a worker on a box is
+supervised the way `herdr-tg.service` already is: restarted on a crash, started at login, its
+output in a journal. It reads the same namespace and nothing else; the only thing it adds is the one
+number that is the engine's rather than the hub's.
+
+```ini
+[Unit]
+Description=kickoff-hub-attach — the worker "%i", wired to the hub
+Documentation=https://github.com/vinceferro/herdr-tg/blob/main/docs/ATTACHING.md
+After=default.target
+# Never give up. The same reasoning as herdr-tg.service: the operator is on a phone, and a
+# start-limit burst would leave a worker dead until he reaches a keyboard.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# The whole of one worker's configuration: docs/ATTACHING.md §2, KEY=VALUE, one file per instance.
+# `-` so that a missing file is attach's own sentence ("nothing named a project directory") on the
+# journal rather than systemd's opaque refusal to start.
+EnvironmentFile=-%h/.config/kickoff-hub-attach/%i.env
+# OPENCODE_PORT is the one line in that file that is not §2's: the port belongs to the engine, not
+# the hub. It appears twice on the line so the server and the watcher can never disagree about it.
+# `opencode serve` without --port picks a random port, so it is not optional here — and it is
+# checked before the start, because an unset ${OPENCODE_PORT} expands to NOTHING: the watcher would
+# then dial port 80 while `opencode serve --port ''` listens on 4096, and the worker would hold the
+# claim, get its topic, and deliver nothing. attach refuses the port-less URL too; this line is the
+# one that names the variable and the file. (`$$` is a literal `$` for the shell.)
+ExecStartPre=/bin/sh -c 'test -n "$$OPENCODE_PORT" || { echo "OPENCODE_PORT is not set; put it in %h/.config/kickoff-hub-attach/%i.env" >&2; exit 2; }'
+ExecStart=%h/.local/bin/kickoff-hub-attach --opencode http://127.0.0.1:${OPENCODE_PORT} --run opencode serve --port ${OPENCODE_PORT}
+# SIGTERM goes to attach ONLY; it forwards to the engine, waits, and says bye. SIGKILL to whatever
+# is left after TimeoutStopSec. The default, control-group, would hit the engine and attach at the
+# same instant and the goodbye would never be said.
+KillMode=mixed
+TimeoutStopSec=20
+Restart=always
+RestartSec=5
+# No hardening block, on purpose. This unit runs an agent's shell, and every line of
+# herdr-tg.service's hardening is a line that agent would trip. The wall is the safety, and the
+# wall is kickoff's; this unit is for a worker on the operator's own desk.
+
+[Install]
+WantedBy=default.target
+```
+
+**How an instance is named.** The instance is a short label the operator picks for one worker —
+`oc-dogfood`, `herdr-tg-main` — and the label names one file, `~/.config/kickoff-hub-attach/<label>.env`,
+that holds that worker's namespace. The label is not the address and not the directory; those are
+in the file, which is why two workers for two worktrees of one project are two labels and two
+files. A file, written out in full because an environment file is not a shell and expands nothing:
+
+```
+KICKOFF_HUB_PROJECT_DIR=/home/<you>/scratch/oc-dogfood
+OPENCODE_PORT=9711
+```
+
+Add `KICKOFF_HUB_ADDRESS=` when a dispatcher minted one; leave it out to take git's name for the
+worktree. Every other §2 variable may appear and means what §2 says. On this box the user manager's
+`PATH` already carries mise's shims, checked, so `bun` and `opencode` resolve; on a box where it
+does not, `PATH=` goes in the same file — a `--user` manager does not inherit a login shell's
+environment, which the watchdog unit already had to learn.
+
+```
+scripts/install-attach.sh                       # writes ~/.local/bin/kickoff-hub-attach and installs the unit; starts nothing
+systemctl --user enable --now kickoff-hub-attach@oc-dogfood
+journalctl --user -u kickoff-hub-attach@oc-dogfood -f
+```
+
+The unit is the **opencode** worker. A Claude worker on a desk is the operator's own interactive
+session with the channel plugin, which is not a service and is not this unit's business; a Claude
+worker in a wall is `--run claude …` under the entrypoint of §13.1, which the unit does not need
+either.
+
+### 13.7 The tests
+
+**Survive unchanged, not a line.** `plugins/kickoff-channel/test-against-a-fake-hub.ts` and
+`cargo test -p herdr-tg the_real_plugin -- --ignored` — the Claude path, which this section does
+not touch, and the proof that the two shared files it does touch (below) changed nothing that path
+uses. Everything under `crates/`. And `docs/examples/attach-from-the-document.ts`, the stranger,
+which is run twice: once as a producer at attach's door, where it is heard beside the tool server
+and the watcher with one claim at the hub, and once as the "engine" attach starts with `--run` in a
+directory with no git, where it inherits the private door and is heard. **If that file has to change,
+the interface changed, and that needs saying loudly** — it is the alarm this section is designed
+against.
+
+**Move, subject renamed, checks kept.** Every behavioural check in `adapters/fanin/` survives,
+because attach *is* the relay:
+
+* `test-two-producers.ts`, 37 checks: Part 1 (two producers dialling the hub race), Part 2 (one
+  claim, both reached, verbatim text, distinct ids for one minted `a1`, a tap to the asker only, an
+  ack naming the producer's frame, typed words to every producer, a ping answered while all are
+  silent, one goodbye not taking the lane down, the queue share under a flood), Part 3 (wrong lane,
+  wrong secret, no hello, a second attach refused with exit 2) and Part 4 (a producer whose door is
+  gone says "waiting" and names the door). One rename:
+  `a_second_relay_for_one_conversation_refuses_to_start_rather_than_racing_the_first` becomes
+  `a_second_attach_for_one_conversation_refuses_to_start_rather_than_racing_the_first`.
+* `test-what-breaks-it.ts`, 17 checks: A (the hub goes away under attach), B (a producer dies with
+  a question open), C (260 open questions), D (three producers, no hub), E (attach restarts and comes
+  back under the same instance).
+* `test-against-fakes.ts`, 23 checks, now spawning `main.ts --opencode <fake url>` against the fake
+  hub: the handshake (secret in `hello`, no display name, nothing before `welcome`), an unknown
+  refusal waited out with growing backoff, the `already_claimed` counter counting a run, and every
+  mapping check — question to ask with published labels, tap to the v2 reply endpoint carrying the
+  label, no second retirement on a tap, a re-tap posting nothing, permission to three buttons, a
+  bogus option posting nothing, reject to the permission endpoint, a keyboard answered elsewhere
+  retired reading both `properties` and `data`. Every one of them reads the ask id off the wire and
+  never predicts it, so the producer number attach now prefixes changes nothing they assert.
+  `every_adapter_speaks_the_same_wire_from_the_same_file` keeps its name and changes its list to
+  `plugins/kickoff-channel/server.ts`, `adapters/kickoff-hub-attach/relay.ts`,
+  `adapters/kickoff-hub-attach/opencode.ts` and `adapters/kickoff-hub-attach/check.ts`, and gains
+  one rule: no other `.ts` under `adapters/` or `plugins/` that is not a test or the harness may
+  carry `t: 'hello'`.
+
+**Retired, because the subject is gone.** One check:
+`the_real_event_bridge_attaches_to_the_relay_without_a_line_of_its_own_changing` proved that a bridge
+*process* joins a relay *process* unmodified, and there are no longer two processes. The property
+it protected — the event voice and the chosen voice share one claim and their ids stay apart — is
+covered in the same part of the same suite by
+`the_event_voice_and_the_chosen_voice_share_one_claim_inside_one_process`, which starts attach with
+`--opencode` against a fake server, has the tool server say one thing and the server raise one
+question, and checks the fake hub saw one `hello`, one `say`, one `ask`, and two ids.
+
+**New.** Two suites, and each RED is watched failing for its reason before it goes green:
+
+* `test-check.ts` — the facts of §13.4, one at a time, against fakes: every line `ok` and exit 0
+  when all is well, and the fake hub saw exactly `hello` then `bye` — **no `pong`, nothing else** —
+  which is the proof that no topic could have been made; no socket; a socket file with mode `0` so
+  `connect()` fails `EACCES` and the line says "run as the same user as the hub"; a hub that reads
+  the `hello` and closes; each refusal reason and its sentence; a bad address refused before the
+  hub saw anything; `KICKOFF_HUB_TOKEN` set, refused before the hub saw anything; a token file that
+  is the secret itself; a live attach on the door; a held claim.
+* `test-run.ts` — the lifecycle of §13.5: `--run sh -c 'exit 7'` exits 7 after the hub saw `bye`;
+  `--run sleep 60` sent `SIGTERM` exits 143 with the child gone; a child that traps `SIGTERM` is
+  killed after the wait and attach exits 137; `--run env` shows the eight pinned variables and the
+  door; the child's cwd is the project directory; the stranger as the engine, with no git and no
+  door named, is welcomed through a private door and heard, with one claim at the hub; a command
+  that does not exist exits 127; the stranger again from a *lane* worktree, where the pinned token
+  path is the one attach found; and, when `bwrap` is on the box, attach under
+  `bwrap --unshare-pid --as-pid-1` refuses `--run` with the PID 1 sentence, under the default
+  reaper runs, two walls sharing one TMPDIR each get a private door, a `SIGTERM` to bwrap itself
+  is measured to reach nothing inside while attach's own host pid stops the wall with a `bye`, and
+  `--die-with-parent` kills the wall and releases the claim without one. When `opencode` is on the
+  box, the real engine runs under `--run` with the operator's own `environment` block copied
+  read-only from his file (or none, where there is no file), a session is opened, and the tool
+  server the engine spawns is seen attaching at attach's door with the pinned door in its
+  environment (read from `/proc`), and a tool server given exactly that environment is heard at
+  the hub. Each is skipped, and says so, where its binary is absent.
+* `test-what-breaks-it.ts` gains one: a hub that answers every `hello` with `already_claimed` is
+  given more than thirty seconds before the door calls it stuck, and a producer that queued a frame
+  meanwhile hears `ack no` for it before its socket ends.
+* `test-check.ts` also holds the three refusals the start makes that the first check did not (a
+  relay flag on attach, a TMPDIR that is not a path, an `--opencode` URL with no port), every
+  refusal reason beside a live door with exactly one line each, a `0700` directory, the reader's
+  register, a mute hub, a told door, and the hub's composed title printed once.
+
+### 13.8 What the build must touch outside the new directory
+
+Listed so that nobody discovers it in a diff.
+
+* **`plugins/kickoff-channel/attach.ts`** — the one reader, shared with the Claude path — gains
+  one refusal: `KICKOFF_HUB_TOKEN` set to anything, and a `KICKOFF_HUB_TOKEN_FILE` that is the
+  secret rather than a path, each with the sentence in §13.4. No correctly configured session sets
+  either, so `server.ts` does not change behaviour and its two suites are the proof. §2 gains the
+  row, marked *never*.
+* **`plugins/kickoff-channel/hub-link.ts`** — the one wire, shared with the Claude path — gains two
+  optional things, neither of which `server.ts` uses: a `once` mode that dials one time and never
+  redials, and a callback that reports how a dial ended — the error's code (`ENOENT`, `EACCES`,
+  `ECONNREFUSED`) or "closed before `welcome`" — which the module today discards at line 454, the
+  defect `docs/TAXONOMY.md` §8 already named. The sentences the agent reads (`whenUnreachable`,
+  `whenDropped`) do not change.
+* **`docs/ATTACHING.md`** — §1, §9 and §11 name `adapters/fanin/`; §2 names `OPENCODE_URL` and
+  says "all three adapters"; §10's worked container gets attach as its entrypoint (the shape in
+  §13.1) and loses the sentence that `KICKOFF_HUB_RELAY_SOCKET` is not optional in a container,
+  which stops being true under `--run`; §12 stops listing supervision as a separate slice.
+* **`docs/CAPABILITIES.md`** REQUIRES 4, **`docs/INTERFACES.md`** and **`CLAUDE.md`**'s layout name
+  the two directories that go.
+* **`deploy/kickoff-hub-attach@.service`** and **`scripts/install-attach.sh`**, new. The installer
+  writes the two-line shim (`exec bun <repo>/adapters/kickoff-hub-attach/main.ts "$@"`), copies the
+  unit to `~/.config/systemd/user/`, runs `daemon-reload`, and **starts nothing** — the same
+  discipline as `install-channel-plugin.sh`, which proves the plugin before installing it and
+  never opens the door itself.
+
+### 13.9 Not in this section, said plainly
+
+* **The wrapper.** bwrap and docker lines are kickoff's; §13.1's second invocation is the shape it
+  copies, not a script this repo ships.
+* **The launcher** that starts a wall from a tap — seam ④ — is kickoff's adapter. attach is what it
+  starts.
+* **Typed steering into opencode.** A `message` that reaches the watcher is dropped with a line on
+  stderr, exactly as the bridge drops it today. Prompting a session by text is a second decision.
+* **`session.idle` as `beat`.** Still acked and dropped by the hub, as `docs/TAXONOMY.md` §7 records.
+* **Reaping at PID 1.** Declined, §13.5, and the wall's init does it.
+* **Telling the hub a check from a real connection.** A new frame, `crates/`, another slice.
 
 ## Changing this file
 

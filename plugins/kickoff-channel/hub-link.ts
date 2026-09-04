@@ -81,6 +81,17 @@ export type Identity =
   | { socket: string; hello: Record<string, unknown> }
   | { refuse: { permanent: boolean; why: string; note: string; retryMs?: number } }
 
+/**
+ * How one dial ended, for a caller that has to REPORT reachability rather than keep trying.
+ *
+ * The errno is the fact `--check` turns into a sentence: `ENOENT` is no socket file (the hub is not
+ * running, or its directory is not mounted), `ECONNREFUSED` is a file with nothing behind it,
+ * `EACCES` is the wrong user against a 0600 socket. `closedBeforeWelcome` is the silent close —
+ * a uid mismatch and a malformed `hello` are indistinguishable from outside, as `docs/ATTACHING.md`
+ * §10 says. The module used to discard the errno entirely (the defect `docs/TAXONOMY.md` §8 named).
+ */
+export type DialEnd = { code: string } | { closedBeforeWelcome: true }
+
 export type HubLinkOptions = {
   /**
    * Resolved AFRESH on every attempt, never once: the operator may run `herdr-tg enroll` while the
@@ -118,6 +129,21 @@ export type HubLinkOptions = {
   /** Letter the frame ids on this connection start with. Opaque to the hub; useful in a log. */
   framePrefix?: string
   maxPending?: number
+  /**
+   * Dial ONCE and never redial, and do not answer the hub's `ping`.
+   *
+   * For a caller that is PROVING reachability rather than holding a claim — `--check`. It must not
+   * redial (a check is one round trip, not a supervised link) and it must not `pong`: the hub
+   * creates the topic only AFTER a pong, so a check that answered the ping would greet a topic on
+   * the operator's phone, which is the one thing a check must never do. `welcome` arriving is proof
+   * enough; the check sends `bye` and closes without ponging.
+   */
+  once?: boolean
+  /**
+   * How a dial ended, when it did not reach `welcome`. Called at most once per dial, so a caller
+   * that only ever dials once (see `once`) hears exactly what to report.
+   */
+  onDial?: (end: DialEnd) => void
 }
 
 export class HubLink {
@@ -160,6 +186,17 @@ export class HubLink {
   private backoff = 1000
   private saidItWasDown = false
   private seq = 0
+
+  /** Has this link ever been welcomed? Tells a close-before-welcome from a live link dropping. */
+  private reachedWelcome = false
+
+  /**
+   * Did THIS dial hear a `refused` before it closed? The hub closes right after refusing, and that
+   * close is not the silent one: reporting it as such made `--check` print, after the refusal it
+   * had already named, a second line blaming the uid — a fix that was not the fix, with the count
+   * one too many. Reset on every dial, so a later dial's genuinely silent close is still reported.
+   */
+  private sawRefusal = false
 
   constructor(o: HubLinkOptions) {
     this.o = o
@@ -365,6 +402,7 @@ export class HubLink {
    */
   markUp(): void {
     this.state = { up: true }
+    this.reachedWelcome = true
     this.backoff = 1000
     this.saidItWasDown = false
     if (this.sock) this.flush(this.sock)
@@ -396,6 +434,7 @@ export class HubLink {
     // Rule 3: the ceiling bounds ONE frame. `buf` is cleared at every newline, so a long
     // conversation cannot accumulate into a false "frame too large".
     let buf = ''
+    this.sawRefusal = false
 
     Bun.connect({
       unix: who.socket,
@@ -430,6 +469,7 @@ export class HubLink {
           this.flush(s)
         },
         close: () => {
+          const wasUp = this.state.up
           this.sock = null
           // A frame half-written into a socket that has closed cannot be finished, and its head is
           // already gone. Put nothing of it on the next connection: a headless tail there would be
@@ -443,7 +483,15 @@ export class HubLink {
           this.control = []
           // A reason already recorded — a refusal, say — outlives the close it caused, because it
           // explains the silence far better than "the link dropped" does.
-          if (this.state.up) this.markDown(false, this.o.whenDropped ?? 'The link to his phone dropped and is being rebuilt.')
+          if (wasUp) this.markDown(false, this.o.whenDropped ?? 'The link to his phone dropped and is being rebuilt.')
+          // A socket that opened and then closed before `welcome` is the silent close: a uid the
+          // hub reads as another user, or a `hello` it could not decode, look identical from here.
+          // Reported so a caller proving reachability can say so; not reported when it closed after
+          // `welcome` (a live link dropping) or after a `refused` the caller already heard — the
+          // hub closes right after refusing, and that close explains nothing the refusal did not.
+          else if (!this.reachedWelcome && !this.sawRefusal) this.o.onDial?.({ closedBeforeWelcome: true })
+          // A caller proving reachability dials once and stops; a caller holding a claim redials.
+          if (this.o.once) return
           setTimeout(() => this.connect(), this.backoff)
           this.backoff = Math.min(this.backoff * 2, 60_000)
         },
@@ -451,15 +499,20 @@ export class HubLink {
           this.o.note(`socket error: ${(e as Error)?.message ?? e}`)
         },
       },
-    }).catch(() => {
+    }).catch((e: unknown) => {
       this.sock = null
       this.unsent = null
       this.control = []
       this.markDown(false, this.o.whenUnreachable)
+      // The errno, not just "something is down". `ENOENT`, `ECONNREFUSED` and `EACCES` are three
+      // different fixes, and the module used to throw the distinction away (TAXONOMY §8).
+      const code = (e as { code?: string })?.code ?? 'UNKNOWN'
+      this.o.onDial?.({ code })
       if (!this.saidItWasDown) {
-        this.o.note(`nothing is listening at ${who.socket}; retrying`)
+        this.o.note(`nothing is listening at ${who.socket} (${code}); retrying`)
         this.saidItWasDown = true
       }
+      if (this.o.once) return
       setTimeout(() => this.connect(), this.backoff)
       this.backoff = Math.min(this.backoff * 2, 60_000)
     })
@@ -476,12 +529,17 @@ export class HubLink {
       return
     }
     if (frame.t === 'ping') {
+      // A caller proving reachability (`once`) must NOT pong: the hub makes the topic only after a
+      // pong, so answering would greet a topic on the phone — the one thing a check must not do.
+      // `welcome` is proof enough there; the ping is simply ignored.
+      if (this.o.once) return
       // Answered HERE and never handed upstairs. The nonce is the ping's own envelope id; the
       // answer names it. Liveness is what keeps the claim, so it must not wait on anything above
       // this module being awake — a fan-in with a wedged producer would otherwise lose the lane.
       this.sendControl({ t: 'pong', ref: frame.id })
       return
     }
+    if (frame.t === 'refused') this.sawRefusal = true
     this.o.onFrame(frame)
   }
 }

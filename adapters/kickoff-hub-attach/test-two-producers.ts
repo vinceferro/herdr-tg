@@ -23,7 +23,7 @@ import { join } from 'path'
 
 import {
   CLAUDE_CODE, HERE, OPENCODE, call, channelMessages, check, claimingHub, failed, handshake,
-  makeRepo, noticesTo, rawProducer, startFanin, startServer, until,
+  makeRepo, noticesTo, rawProducer, startAttach, startServer, until,
 } from './test-harness.ts'
 
 const dir = mkdtempSync('/tmp/fi-')
@@ -54,7 +54,7 @@ console.log('\nwith a relay in front of it:')
 const hubSock = join(dir, 'hub.sock')
 const faninDir = join(dir, 'fanin')
 const hub = claimingHub(hubSock)
-const relay = startFanin(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
+const relay = startAttach(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
 await until('the relay to say hello to the hub', () => hub.got.some(f => f.t === 'hello'))
 
 const viaRelay = { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir, KICKOFF_HUB_RELAY: '1' }
@@ -166,7 +166,7 @@ check('and the relay never passed the goodbye on',
 const flooded = join(dir, 'flood.sock')
 const floodDir = join(dir, 'flood-fanin')
 let floodHub = claimingHub(flooded)
-const relayF = startFanin(laneDir, { KICKOFF_HUB_SOCKET: flooded, KICKOFF_HUB_RELAY_DIR: floodDir })
+const relayF = startAttach(laneDir, { KICKOFF_HUB_SOCKET: flooded, KICKOFF_HUB_RELAY_DIR: floodDir })
 await until('the flood relay to reach its hub', () => floodHub.got.some(f => f.t === 'hello'))
 const viaFlood = { KICKOFF_HUB_SOCKET: flooded, KICKOFF_HUB_RELAY_DIR: floodDir, KICKOFF_HUB_RELAY: '1' }
 const loud = startServer({ CLAUDE_PROJECT_DIR: laneDir, ...viaFlood })
@@ -211,21 +211,20 @@ check('and the flooding producer is told which of its own messages were shed, wh
 loud.child.kill(); quiet.child.kill(); relayF.kill(); floodHub.stop()
 await Bun.sleep(200)
 
-// ── Part 2c: the two voices this slice exists for ─────────────────────────────────────────────
+// ── Part 2c: the two voices this slice exists for, now inside ONE process ─────────────────────
 //
-// The tool server carries what the agent CHOSE to say; the event bridge carries the prompts it did
+// The tool server carries what the agent CHOSE to say; the event watcher carries the prompts it did
 // not choose. Those are the two things that could not both hold the claim, and this is the pair the
-// operator asked for. The bridge below is the SHIPPING `bridge.ts` with not one line changed — it
-// is told to join a relay, and where that relay listens.
-console.log('\nthe two voices, through one slot:')
+// operator asked for. There is no longer a separate bridge PROCESS: attach is started with
+// `--opencode`, and the watcher is an in-process producer at attach's own door — the Part 2c shape
+// with the process boundary removed. If the two voices still keep one claim and their ids apart, the
+// collapse changed nothing on the wire.
+console.log('\nthe two voices, through one slot, inside one process:')
 
-// The bridge speaks for a PROJECT and names no address, so its relay is the project's own.
+// attach speaks for a PROJECT and names no address, so its door is the project's own.
 const projSock = join(dir, 'proj.sock')
 const projDir = join(dir, 'proj-fanin')
 const projHub = claimingHub(projSock)
-const relayP = startFanin(repo, { KICKOFF_HUB_SOCKET: projSock, KICKOFF_HUB_RELAY_DIR: projDir })
-await until('the project relay to reach the hub', () => projHub.got.some(f => f.t === 'hello'))
-const projRelaySock = join(projDir, readdirSync(projDir).find(f => f.endsWith('.sock'))!)
 
 // A fake opencode that publishes ONE real event. The payload is the shape captured off a real
 // `/event` stream — `properties`, not `data` — because a fixture invented here would only prove
@@ -244,16 +243,15 @@ const oc = Bun.serve({
   },
 })
 
-// cwd is deliberately NOT the repo. This adapter used to fall back to its own cwd when nothing
-// named a project, and the folder it is started in here is inside THIS repository, which is really
-// enrolled — so a bare-cwd fallback would authenticate as herdr-tg against a relay holding somebody
-// else's conversation, and be turned away for a reason that named the wrong thing.
-const eventBridge = Bun.spawn(['bun', join(HERE, '..', 'opencode-bridge', 'bridge.ts')], {
-  cwd: HERE,
-  env: { ...process.env, KICKOFF_HUB_PROJECT_DIR: repo, OPENCODE_URL: `http://127.0.0.1:${oc.port}`,
-    KICKOFF_HUB_RELAY: '1', KICKOFF_HUB_RELAY_SOCKET: projRelaySock },
-  stdout: 'inherit', stderr: 'inherit',
-})
+// ONE attach: it holds the claim, opens the door, AND watches the fake opencode in-process.
+const attachP = startAttach(repo, { KICKOFF_HUB_SOCKET: projSock, KICKOFF_HUB_RELAY_DIR: projDir },
+  false, ['--opencode', `http://127.0.0.1:${oc.port}`])
+await until('attach to reach the hub', () => projHub.got.some(f => f.t === 'hello'))
+const projRelaySock = join(projDir, readdirSync(projDir).find(f => f.endsWith('.sock'))!)
+
+// The tool server finds attach's door by the same git derivation attach used — same RELAY_DIR, same
+// repo, no address — so it meets the door with no socket named, exactly as the operator's paste
+// block does on his own box.
 const voice = startServer({ KICKOFF_HUB_PROJECT_DIR: '.',
   KICKOFF_HUB_RELAY_DIR: projDir, KICKOFF_HUB_RELAY: '1' }, repo)
 await handshake(voice, OPENCODE.capabilities, OPENCODE.clientInfo)
@@ -262,7 +260,7 @@ const chose = await call(voice, 'reply', { text: 'what the agent chose to say' }
 check('the voice the agent chooses reaches the operator',
   chose.text.startsWith('said') && !chose.isError, chose.text)
 
-await until('the bridge to be watching', () => pushEvent !== null, 15000)
+await until('the watcher to be watching', () => pushEvent !== null, 15000)
 pushEvent!({
   id: 'evt_1',
   type: 'permission.v2.asked',
@@ -270,18 +268,15 @@ pushEvent!({
 })
 await until('the prompt the agent did not choose',
   () => projHub.got.some(f => f.t === 'ask' && /rm -rf build/.test(String(f.text))), 15000).catch(() => {})
-check('the_real_event_bridge_attaches_to_the_relay_without_a_line_of_its_own_changing',
-  projHub.got.some(f => f.t === 'ask' && /rm -rf build/.test(String(f.text))),
-  JSON.stringify(projHub.got.map(f => f.t)))
-check('and both voices came through ONE claim at the hub',
-  projHub.got.filter(f => f.t === 'hello').length === 1 && projHub.refusals.length === 0 &&
-    projHub.got.some(f => f.t === 'say' && f.text === 'what the agent chose to say'),
-  `${projHub.got.filter(f => f.t === 'hello').length} hellos, ${projHub.refusals.length} refusals`)
-// The two producers mint ids from their own counters — `b*` and `f*` — and both would have been
-// `f1`/`b1` at the hub without rewriting.
+// The two producers mint ids from their own counters — the tool server's and the watcher's — and
+// both would have collided at the hub without the door rewriting them.
 const ids = projHub.got.filter(f => ['say', 'ask'].includes(f.t)).map(f => f.id)
-check('and every frame the hub saw carried an id of its own',
-  new Set(ids).size === ids.length, JSON.stringify(ids))
+check('the_event_voice_and_the_chosen_voice_share_one_claim_inside_one_process',
+  projHub.got.filter(f => f.t === 'hello').length === 1 && projHub.refusals.length === 0 &&
+    projHub.got.some(f => f.t === 'say' && f.text === 'what the agent chose to say') &&
+    projHub.got.some(f => f.t === 'ask' && /rm -rf build/.test(String(f.text))) &&
+    new Set(ids).size === ids.length,
+  `${projHub.got.filter(f => f.t === 'hello').length} hellos, ${projHub.refusals.length} refusals, ids ${JSON.stringify(ids)}`)
 
 // THE STRANGER'S TEST, and it is the one that matters most. `docs/examples/attach-from-the-document.ts`
 // was written from `docs/ATTACHING.md` alone and imports nothing from this repository — not the
@@ -329,10 +324,10 @@ check('and it still cost the hub exactly one claim, with three adapters behind i
   `${projHub.got.filter(f => f.t === 'hello').length} hellos, ${projHub.refusals.length} refusals`)
 stranger.kill()
 
-eventBridge.kill(); voice.child.kill(); relayP.kill(); oc.stop(true); projHub.stop()
+attachP.kill(); voice.child.kill(); oc.stop(true); projHub.stop()
 await Bun.sleep(200)
 
-// ── Part 3: who the relay will not speak for ──────────────────────────────────────────────────
+// ── Part 3: who the door will not speak for ───────────────────────────────────────────────────
 console.log('\nwho it turns away:')
 
 // Found by looking, not by re-deriving: exactly one socket for exactly one address is itself the
@@ -367,10 +362,10 @@ await Bun.sleep(400)
 check('a producer that never said hello is not relayed',
   !hub.got.some(f => f.t === 'say' && f.text === 'no hello first'))
 
-// Two relays for one address hold two claims and race, which is the whole thing this prevents.
-const second_relay = startFanin(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
-const rc = await second_relay.exited
-check('a_second_relay_for_one_conversation_refuses_to_start_rather_than_racing_the_first',
+// Two attaches for one address hold two claims and race, which is the whole thing this prevents.
+const second_attach = startAttach(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
+const rc = await second_attach.exited
+check('a_second_attach_for_one_conversation_refuses_to_start_rather_than_racing_the_first',
   rc === 2, `exit ${rc}`)
 check('and the hub still sees exactly one connection for the lane',
   hub.got.filter(f => f.t === 'hello').length === 1,
