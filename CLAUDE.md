@@ -107,7 +107,8 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   in unchanged. `--run` starts the engine as attach's child so a wall has one entrypoint; `--check`
   proves reachability and makes no topic. `adapters/fanin/` and `adapters/opencode-bridge/` are
   **gone** — a stranger opening `adapters/` finds one thing to run. Every check the two suites held
-  survives, moved to attach; the systemd template is `deploy/kickoff-hub-attach@.service`.
+  survives, moved to attach; the systemd template is `deploy/kickoff-hub-attach@.service`. It ran for real on 5 September: enabled for the opencode throwaway it held the claim,
+  started the engine as its child, attached the watcher, and created no topic.
 - **Typed steering reaches an opencode worker** (5 September). The watcher carries a `message` to
   `POST /session/{id}/prompt_async` verbatim, in the session the server lists for the project
   directory; a reply typed under a question — the hub sets `in_reply_to_ask` from the message he
