@@ -1898,6 +1898,27 @@ mod tests {
         let anonymous: Message = serde_json::from_value(anonymous).expect("a message");
         assert_eq!(who_sent(&anonymous), None, "an anonymous admin is somebody");
 
+        // The same shape with a PERSON as `from`. Telegram always pairs `sender_chat` with the
+        // anonymous-admin bot, so the case above is refused on `is_bot` before `sender_chat` is
+        // ever read — and the `sender_chat` guard was unpinned: removed, nothing failed. This is
+        // the one assertion that reaches it. It holds because the guard is defence in depth: a
+        // future Telegram that put a real user in `from` beside a `sender_chat` would otherwise
+        // let the group's own voice through as that person.
+        let mut fronted = message_json(
+            THE_FORUM,
+            None,
+            a_person(OPERATOR),
+            serde_json::json!({"text": "hi"}),
+        );
+        fronted["sender_chat"] =
+            serde_json::json!({"id": THE_FORUM, "type": "supergroup", "title": "forum"});
+        let fronted: Message = serde_json::from_value(fronted).expect("a message");
+        assert_eq!(
+            who_sent(&fronted),
+            None,
+            "a message posted on behalf of a chat is somebody, whoever is named in from"
+        );
+
         assert_eq!(
             who_tapped(&tapped(THE_FORUM, None, a_person(OPERATOR), "h|y")),
             Some(OPERATOR)
