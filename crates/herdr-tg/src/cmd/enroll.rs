@@ -1,10 +1,12 @@
-//! `herdr-tg enroll <repo>`, `disable <repo>` and `enable <repo>` — the terminal-only door.
+//! `herdr-tg enroll <repo>`, `disable <repo>`, `enable <repo>`, `allow <repo> <user>` and
+//! `disallow <repo> <user>` — the terminal-only door.
 //!
 //! Admission is the one thing no message can do. Nothing arriving over Telegram or over the hub's
-//! socket can add a project, mint a secret, or switch one on or off: inbound content selects from
-//! what the machine already knows, and it never names something new. That boundary is only real
-//! if the way in is argv, at a keyboard, which is what this file is. The listing that reads what
-//! this file wrote is `projects.rs`.
+//! socket can add a project, mint a secret, switch one on or off, or let a person speak: inbound
+//! content selects from what the machine already knows, and it never names something new. That
+//! boundary is only real if the way in is argv, at a keyboard, which is what this file is — and
+//! `nothing_inbound_can_add_a_person.rs` fails the build if the bot or the hub ever names the
+//! setter this file calls. The listing that reads what this file wrote is `projects.rs`.
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -133,6 +135,57 @@ fn switch_in(
 ) -> anyhow::Result<crate::registry::Project> {
     let mut registry = Registry::load(registry_path);
     Ok(registry.set_enabled(repo, on)?)
+}
+
+/// `herdr-tg allow <repo> <user>` and `herdr-tg disallow <repo> <user>`: who may speak in a
+/// project's conversations, decided at the keyboard.
+///
+/// A registry write and nothing else, like the switch. The running hub watches the file and
+/// answers "may this person speak here" from the copy it holds, so the person is heard — or no
+/// longer heard — within about a second, in the project's own topic and in every one of its
+/// worktrees', with no restart. A person let into one project has no standing anywhere else: not
+/// in another project, not in General, and not to give the bot a command. The people who may do
+/// those things are named in the configuration, never in this file.
+pub(crate) fn let_speak(repo: &Path, user: i64, may: bool) -> anyhow::Result<()> {
+    let project = let_speak_in(&Registry::default_path(), repo, user, may)?;
+    if may {
+        println!("allowed        {user} may now speak in {}", project.title);
+        println!(
+            "               In its topic and in its worktrees' topics; nowhere else, and not to \
+             give me commands. Heard within a second — no restart."
+        );
+        println!(
+            "               Take it back with:  herdr-tg disallow {} {user}",
+            project.repo.display()
+        );
+    } else {
+        println!(
+            "disallowed     {user} may no longer speak in {}",
+            project.title
+        );
+        println!("               From now on. What was already relayed stays relayed.");
+    }
+    let people: Vec<String> = project.allowed_users.iter().map(i64::to_string).collect();
+    println!(
+        "               May speak there now: {}",
+        if people.is_empty() {
+            "nobody beyond the people who may speak anywhere".to_owned()
+        } else {
+            people.join(", ")
+        }
+    );
+    Ok(())
+}
+
+/// The same, against a named registry, so it can be tested without touching the operator's own.
+fn let_speak_in(
+    registry_path: &Path,
+    repo: &Path,
+    user: i64,
+    may: bool,
+) -> anyhow::Result<crate::registry::Project> {
+    let mut registry = Registry::load(registry_path);
+    Ok(registry.set_may_speak(repo, user, may)?)
 }
 
 /// What git says about whether this project's own secret would be committed.
@@ -340,6 +393,59 @@ mod tests {
             crate::registry::Registry::load(&registry).all().count(),
             1,
             "a switch enrolled something"
+        );
+    }
+
+    #[test]
+    fn letting_a_person_in_at_the_terminal_is_written_where_the_hub_reads_it() {
+        // Like the switch: a registry write and nothing else, because the hub re-reads that file
+        // and answers from its copy. And like the switch, only for a project that is enrolled —
+        // letting someone into nothing must not enrol something — and only a person, never a
+        // group, refused in plain words.
+        let d = tempfile::tempdir().expect("tmp");
+        let registry = d.path().join("projects.json");
+        let dir = d.path().join("a-room");
+        std::fs::create_dir_all(&dir).expect("dir");
+        crate::registry::Registry::load(&registry)
+            .enrol(&dir)
+            .expect("enrols");
+        const GUEST: i64 = 555_001;
+
+        let with = let_speak_in(&registry, &dir, GUEST, true).expect("lets in");
+        assert!(with.allowed_users.contains(&GUEST));
+        assert!(
+            crate::registry::Registry::load(&registry)
+                .get(&with.id)
+                .expect("still enrolled")
+                .allowed_users
+                .contains(&GUEST),
+            "the person was not written where the hub reads it"
+        );
+
+        let without = let_speak_in(&registry, &dir, GUEST, false).expect("shuts out");
+        assert!(without.allowed_users.is_empty());
+        assert!(
+            crate::registry::Registry::load(&registry)
+                .get(&without.id)
+                .expect("still enrolled")
+                .allowed_users
+                .is_empty(),
+            "the file still lets the person in"
+        );
+
+        let said = let_speak_in(&registry, &dir, -1009, true)
+            .expect_err("a group was let in")
+            .to_string();
+        assert!(said.contains("not a person"), "{said}");
+
+        let said = let_speak_in(&registry, &d.path().join("nobody"), GUEST, true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert_eq!(
+            crate::registry::Registry::load(&registry).all().count(),
+            1,
+            "letting someone in enrolled something"
         );
     }
 

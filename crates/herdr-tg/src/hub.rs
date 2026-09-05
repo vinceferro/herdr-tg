@@ -628,8 +628,37 @@ pub enum TapRefusal {
     /// It has already been answered — from the phone or at the terminal — and the keyboard is only
     /// still there because taking it away failed.
     AlreadyAnswered,
-    /// The tap came from a chat this bot does not answer.
+    /// The tap came from a chat this bot does not answer, or from a person who may not speak
+    /// there. Silence either way: a reply confirms something is listening.
     NotYours,
+}
+
+/// Whether a person may speak, and where. What the sender gate answers.
+///
+/// Three answers and not two, because a command and a line typed at an agent need different ones.
+/// A person let into one project's conversations may type at that project's agents; he may not
+/// run `/projects` and read every other project's name and state, and he may not speak in General
+/// or in a topic the hub cannot place. Only the bot-wide list opens those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Not on any list that covers where this arrived. Silence and one audit line.
+    Stranger,
+    /// On the list of the project this conversation belongs to, and nothing wider.
+    InThisConversation,
+    /// On the bot-wide list: may speak wherever this bot listens, and may give it commands.
+    Anywhere,
+}
+
+impl Standing {
+    /// May this person type at the agent in this conversation?
+    pub fn may_speak_here(self) -> bool {
+        !matches!(self, Self::Stranger)
+    }
+
+    /// May this person give the bot a command — which is answered with facts about every project?
+    pub fn may_command(self) -> bool {
+        matches!(self, Self::Anywhere)
+    }
 }
 
 impl TapRefusal {
@@ -969,6 +998,29 @@ impl HubAudit {
         self.line(&format!("refused\t{}\twhy={why}", subject(addr)))
     }
 
+    /// Something arrived from a person who may not speak where it arrived, and was dropped.
+    ///
+    /// The one line a stranger leaves. He gets silence on the phone — a reply confirms something
+    /// is listening — so this file is the only place the operator can learn that somebody in his
+    /// forum is typing at his agents, and WHO: the user id is written down exactly so that
+    /// `herdr-tg allow <repo> <that id>` is a copy from this line, and so that a teammate who says
+    /// "the bot ignores me" can be found without guessing. `project=-` when the words had no
+    /// conversation to belong to (General, a command, a button nothing was written down beside),
+    /// so a search for a project's lines still finds every line about it and nothing else.
+    pub fn stranger(
+        &self,
+        user: Option<i64>,
+        chat_id: i64,
+        at: Option<&Addr>,
+        what: &str,
+    ) -> std::io::Result<()> {
+        let sender = name_the_sender(user);
+        let at = at.map_or("project=-".to_owned(), subject);
+        self.line(&format!(
+            "refused\t{at}\tsender={sender}\tchat={chat_id}\twhat={what}\twhy=not allowed to speak here"
+        ))
+    }
+
     fn line(&self, body: &str) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
@@ -983,6 +1035,17 @@ impl HubAudit {
         let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600));
         writeln!(f, "{}\t{body}", now_iso())
     }
+}
+
+/// How a sender is written down wherever the operator may read an id back: the number itself, or
+/// `unknown` when the update carried no person the bot could vouch for.
+///
+/// One function for the audit line and the journal line, so the two places he can copy an id
+/// from say the same thing. The journal printed the `Option` as it was — `Some(555001)`, `None` —
+/// which is not a number anyone can paste into `herdr-tg allow`, on the one line whose stated
+/// purpose is that he does exactly that.
+pub fn name_the_sender(user: Option<i64>) -> String {
+    user.map_or("unknown".to_owned(), |u| u.to_string())
 }
 
 /// Who a line is about, as the fields an incident is grepped by.
@@ -1452,6 +1515,10 @@ pub struct Hub<S: Surface> {
     reaction_refusal_said: Arc<AtomicBool>,
     /// Which chats this bot answers. Checked first, before any state is touched.
     allowed_chats: Arc<Vec<i64>>,
+    /// The people who may speak ANYWHERE this bot listens: the operator, and whoever he listed
+    /// beside himself. A project's own people live in the registry, not here. Checked second, for
+    /// every typed line and every tap, and never learned from a message.
+    people: Arc<BTreeSet<i64>>,
     /// The one forum every topic lives in. Routing is a single rule — topic, inside this chat —
     /// and every other rule this bridge used to have is deleted rather than tested against.
     forum_chat: i64,
@@ -1468,6 +1535,7 @@ impl<S: Surface> Hub<S> {
         ledger: AskLedger,
         audit: HubAudit,
         allowed_chats: Vec<i64>,
+        people: Vec<i64>,
         forum_chat: i64,
     ) -> Self {
         // Beside the audit log, because every state file of this hub lives in one directory and
@@ -1501,6 +1569,7 @@ impl<S: Surface> Hub<S> {
             reactions: Arc::new(Mutex::new(crate::queue::ReactionBudget::default())),
             reaction_refusal_said: Arc::new(AtomicBool::new(false)),
             allowed_chats: Arc::new(allowed_chats),
+            people: Arc::new(people.into_iter().collect()),
             forum_chat,
             settle: DEFAULT_SETTLE,
             pre_pong: (PRE_PONG_FRAMES, PRE_PONG_BYTES),
@@ -1612,10 +1681,47 @@ impl<S: Surface> Hub<S> {
         self.allowed_chats.contains(&chat_id)
     }
 
+    /// May this person speak here — and if so, here only, or anywhere?
+    ///
+    /// `user` is the sender as the bot established it: `None` when the update carried no person
+    /// it could vouch for (a channel post, a bot, an anonymous admin posting as the group), and
+    /// `None` is a stranger, always. `at` is the conversation the words or the tap belong to, when
+    /// there is one; a line in General, a command and a tap on a button nothing was written down
+    /// beside have none, and for those only the bot-wide list can answer.
+    ///
+    /// The bot-wide list is read first because it needs no lock. A project's own people are read
+    /// from the registry copy this process holds, which the watcher refreshes within about a
+    /// second of a terminal write — so `herdr-tg allow` is live without a restart, and there is no
+    /// re-read here on the hot path of every line he types.
+    pub async fn standing_of(&self, user: Option<i64>, at: Option<&Addr>) -> Standing {
+        // Fail closed on the shape of the number itself, before any list is consulted: nothing on
+        // any list can be zero or negative — the parser and the setter both refuse them — and
+        // refusing here as well means a hand-edited file cannot make "no sender" match.
+        let Some(user) = user.filter(|u| crate::config::is_a_persons_id(*u)) else {
+            return Standing::Stranger;
+        };
+        if self.people.contains(&user) {
+            return Standing::Anywhere;
+        }
+        let Some(at) = at else {
+            return Standing::Stranger;
+        };
+        let registry = self.registry.lock().await;
+        if registry
+            .get(&at.project)
+            .is_some_and(|p| p.allowed_users.contains(&user))
+        {
+            Standing::InThisConversation
+        } else {
+            Standing::Stranger
+        }
+    }
+
     /// Turn a tap into an answer, or into a sentence saying why not.
     pub async fn resolve_tap(
         &self,
         chat_id: i64,
+        user: Option<i64>,
         msg_id: &MsgId,
         option_id: &OptionId,
     ) -> Result<(Addr, AskId, OptionId), TapRefusal> {
@@ -1629,6 +1735,18 @@ impl<S: Surface> Hub<S> {
             let ledger = self.ledger.lock().await;
             ledger.get(chat_id, msg_id).cloned()
         };
+        // The person second, and BEFORE "no record": Telegram lets anyone who can see an inline
+        // keyboard tap it, and the ledger writes down which topic a question was asked in, never
+        // who may answer it — so until this check, anyone in the forum could answer "overwrite
+        // it?" for the agent with every appearance of being the operator. Checked here, with the
+        // record's conversation in hand, so a project's own people can answer their project's
+        // questions; and before the record is judged, so a stranger learns nothing from the
+        // difference between a button that was written down and one that was not.
+        let at = record.as_ref().map(AskRecord::addr);
+        if !self.standing_of(user, at.as_ref()).await.may_speak_here() {
+            let _ = self.audit.stranger(user, chat_id, at.as_ref(), "a tap");
+            return Err(TapRefusal::NotYours);
+        }
         let Some(record) = record else {
             return Err(TapRefusal::NoRecord);
         };
@@ -1879,7 +1997,12 @@ impl<S: Surface> Hub<S> {
     pub fn watch_the_registry(self: Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let path = self.registry.lock().await.path().to_path_buf();
-            let mut seen = registry_fingerprint(&path);
+            // Nothing seen yet, so the first tick always re-reads once. The baseline used to be
+            // taken here, on the task's first run — which is not when it was spawned: a write
+            // that lands between the two is baked into the baseline and never noticed, so a
+            // person let in at the terminal in that window stayed a stranger until the next
+            // unrelated write. One re-read of a few kilobytes at boot is the price of no window.
+            let mut seen: Option<(u64, u64, Option<std::time::SystemTime>)> = None;
             loop {
                 tokio::time::sleep(every).await;
                 let now = registry_fingerprint(&path);
@@ -2114,7 +2237,7 @@ impl<S: Surface> Hub<S> {
         &self,
         addr: &Addr,
         chat_id: i64,
-        user_id: i64,
+        user: Option<i64>,
         msg_id: &MsgId,
         text: &str,
         replied_to: Option<&MsgId>,
@@ -2122,6 +2245,15 @@ impl<S: Surface> Hub<S> {
         if !self.chat_is_allowed(chat_id) {
             return false;
         }
+        // The person, checked HERE and not only in the handler above, for the reason the chat is:
+        // a second caller is a second way around. `From.user_id` used to be whatever the update
+        // carried, written down for an audit nothing read; now it is a person who has passed this
+        // check, or the frame is never built.
+        let standing = self.standing_of(user, Some(addr)).await;
+        let Some(user_id) = user.filter(|_| standing.may_speak_here()) else {
+            let _ = self.audit.stranger(user, chat_id, Some(addr), "words");
+            return false;
+        };
         let in_reply_to_ask = match replied_to {
             Some(under) => self.ask_replied_to(addr, chat_id, under).await,
             None => None,

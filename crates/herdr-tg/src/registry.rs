@@ -10,10 +10,13 @@
 //!
 //! # Enrolment is terminal-only
 //!
-//! Nothing that arrives over Telegram or over the socket can add a project, mint a token, or flip
-//! `enabled`. Inbound content selects from what the machine already knows; it never names something
-//! new. The only way in is `herdr-tg enroll <repo>`, run by a human at a keyboard — and the only
-//! way off, or back on, is `herdr-tg disable <repo>` / `enable <repo>` at the same keyboard.
+//! Nothing that arrives over Telegram or over the socket can add a project, mint a token, flip
+//! `enabled`, or let a person speak. Inbound content selects from what the machine already knows;
+//! it never names something new. The only way in is `herdr-tg enroll <repo>`, run by a human at a
+//! keyboard — the only way off, or back on, is `herdr-tg disable <repo>` / `enable <repo>` at the
+//! same keyboard — and the only way a person is let into a project's conversations is
+//! `herdr-tg allow <repo> <user>` there too. `nothing_inbound_can_add_a_person.rs` pins that the
+//! bot and the hub do not so much as name the setter.
 //!
 //! # What is stored, and what is not
 //!
@@ -22,7 +25,7 @@
 //! project's own tree at `<repo>/.kickoff/hub.token`, mode 0600, where the bridge can read it and
 //! `.gitignore` keeps it out of a public remote.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -87,6 +90,20 @@ pub struct Project {
     /// `AskLedger::save`.
     #[serde(default)]
     pub lane_topics: BTreeMap<LaneId, i32>,
+    /// The people who may speak in THIS project's conversations — its own topic and every one of
+    /// its lanes' — and nowhere else. Telegram user ids.
+    ///
+    /// Beside the people who may speak anywhere (the bot's own list, which comes from the
+    /// configuration and is never in this file), this is how a room admits its own people: a
+    /// customer or a teammate who belongs in one project's conversations does not thereby belong
+    /// in every other project's. Set only by `herdr-tg allow <repo> <user>` at a terminal, and
+    /// read by the hub for every typed line and every tap.
+    ///
+    /// `#[serde(default)]` for the same reason `lane_topics` has it: the file on the operator's
+    /// box was written by a build that had never heard of this, and a registry that will not parse
+    /// refuses every project on the box.
+    #[serde(default)]
+    pub allowed_users: BTreeSet<i64>,
 }
 
 /// What a lane's topic is called, so the operator can pick it out of a list on a phone.
@@ -177,6 +194,12 @@ pub enum EnrolError {
     /// secret and writes it into a tree, and a command that quietly did that when it was only asked
     /// to flip a switch is a second door with no guard on it.
     NotEnrolled { repo: PathBuf },
+    /// Asked to let something speak that is not a person: a group's id, a zero, a chat.
+    ///
+    /// Refused rather than stored, because a number on this list that can never match a sender
+    /// is one the operator believes has let somebody in — and a group's id in particular reads as
+    /// "everyone in that group", which is precisely the grant this list exists to make impossible.
+    NotAPerson { given: i64 },
 }
 
 impl std::fmt::Display for EnrolError {
@@ -226,9 +249,14 @@ impl std::fmt::Display for EnrolError {
             ),
             Self::NotEnrolled { repo } => write!(
                 f,
-                "nothing is enrolled at {}, so there is nothing to switch. See what is enrolled \
+                "nothing is enrolled at {}, so there is nothing to change. See what is enrolled \
                  with:  herdr-tg projects",
                 repo.display()
+            ),
+            Self::NotAPerson { given } => write!(
+                f,
+                "{}",
+                crate::config::not_a_person("the user to allow", *given)
             ),
         }
     }
@@ -443,6 +471,45 @@ impl Registry {
         Ok(project)
     }
 
+    /// Let a person speak in this project's conversations, or stop them. Terminal-only, like the
+    /// switch: no message, no tap and no frame reaches this, and `nothing_inbound_can_add_a_person`
+    /// fails the build if the bot or the hub ever names it.
+    ///
+    /// The same read-modify-write as `set_enabled`, found by the same path rule, and live for the
+    /// running hub within about a second — it watches this file and re-reads it on change, and it
+    /// answers "may this person speak here" from the copy it holds. No restart.
+    ///
+    /// Only a person: a group's id is refused with the reason. See `EnrolError::NotAPerson`.
+    pub fn set_may_speak(
+        &mut self,
+        repo: &Path,
+        user: i64,
+        may: bool,
+    ) -> Result<Project, EnrolError> {
+        if !crate::config::is_a_persons_id(user) {
+            return Err(EnrolError::NotAPerson { given: user });
+        }
+        let _held = self.hold()?;
+        self.reread().map_err(|e| EnrolError::Unreadable {
+            path: self.path.clone(),
+            why: e.to_string(),
+        })?;
+        let wanted = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+        let Some(p) = self.projects.values_mut().find(|p| p.repo == wanted) else {
+            return Err(EnrolError::NotEnrolled {
+                repo: repo.to_path_buf(),
+            });
+        };
+        if may {
+            p.allowed_users.insert(user);
+        } else {
+            p.allowed_users.remove(&user);
+        }
+        let project = p.clone();
+        self.save()?;
+        Ok(project)
+    }
+
     /// Where this registry lives, for the one reader that has to notice it changing.
     pub fn path(&self) -> &Path {
         &self.path
@@ -516,6 +583,16 @@ impl Registry {
         // project he had turned off back on, and nothing in the output said so.
         let enabled = self.projects.get(&id).is_none_or(|p| p.enabled);
 
+        // A re-enrolment keeps the project's people, for the reason it keeps the switch: each of
+        // them was let in by a decision at a keyboard, and rotating a secret is not a decision
+        // about who may speak. Dropped here, a rotation would silently shut a room's own people
+        // out — and nothing in the output would say so.
+        let allowed_users = self
+            .projects
+            .get(&id)
+            .map(|p| p.allowed_users.clone())
+            .unwrap_or_default();
+
         let project = Project {
             id: id.clone(),
             title,
@@ -525,6 +602,7 @@ impl Registry {
             topic_id,
             icon_color,
             lane_topics,
+            allowed_users,
         };
         // The SECRET GOES DOWN FIRST, and the list of projects second. The other order took a
         // project off the air whenever the second step failed: the registry already held the hash
@@ -1071,5 +1149,120 @@ mod tests {
                 "jargon reached the operator: {said}"
             );
         }
+    }
+
+    #[test]
+    fn re_enrolling_keeps_a_projects_allowed_people() {
+        // Re-running `enroll` is the documented answer to a leaked secret, and it carries the
+        // switch and the topics forward for exactly this reason: each was a decision made at a
+        // keyboard, and rotating a secret is not a decision about them. A room's people are the
+        // same kind of decision. Dropped on rotation, every customer and teammate let into the
+        // room would be shut out in silence, and nothing in the output would say so.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "herdr-tg");
+        r.enrol(&repo).expect("enrols");
+        const GUEST: i64 = 555_001;
+        let with = r.set_may_speak(&repo, GUEST, true).expect("lets in");
+        assert!(
+            with.allowed_users.contains(&GUEST),
+            "the setter did not let the guest in"
+        );
+
+        let (rotated, _) = r.enrol(&repo).expect("re-enrols");
+        assert!(
+            rotated.allowed_users.contains(&GUEST),
+            "rotating the secret shut the project's own people out"
+        );
+        // And on disk, which is what the hub reads.
+        let after = Registry::load(d.path().join("projects.json"));
+        assert!(
+            after
+                .get(&rotated.id)
+                .expect("still enrolled")
+                .allowed_users
+                .contains(&GUEST),
+            "the file says the guest is gone"
+        );
+
+        // Shutting someone out is its own deliberate act, and it holds too.
+        let without = r.set_may_speak(&repo, GUEST, false).expect("shuts out");
+        assert!(!without.allowed_users.contains(&GUEST));
+        let (rotated, _) = r.enrol(&repo).expect("re-enrols");
+        assert!(
+            rotated.allowed_users.is_empty(),
+            "a rotation let a shut-out guest back in"
+        );
+    }
+
+    #[test]
+    fn a_registry_written_before_people_existed_still_loads_every_project() {
+        // The same upgrade property `lane_topics` has, for the same file on the same box: a
+        // registry that will not parse refuses every project, and an ordinary upgrade must not
+        // look like a corrupt file.
+        let d = tempfile::tempdir().expect("tmp");
+        let path = d.path().join("projects.json");
+        let secret = {
+            let mut r = Registry::load(&path);
+            let (_, s) = r.enrol(&repo(&d, "herdr-tg")).expect("enrols");
+            s
+        };
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("readable")).expect("json");
+        for (_, project) in doc.as_object_mut().expect("an object").iter_mut() {
+            project
+                .as_object_mut()
+                .expect("a project")
+                .remove("allowed_users")
+                .expect("this build wrote the key this test is here to remove");
+        }
+        let older = serde_json::to_string_pretty(&doc).expect("json");
+        fs::write(&path, &older).expect("write");
+
+        let r = Registry::load(&path);
+        assert_eq!(r.all().count(), 1, "an upgrade un-enrolled every project");
+        let p = r.resolve(&secret).expect("the project still resolves");
+        assert!(
+            p.allowed_users.is_empty(),
+            "a project from before people existed has people"
+        );
+    }
+
+    #[test]
+    fn only_a_person_can_be_let_into_a_project_never_a_group() {
+        // A group's id on the list reads as "everyone in that group", which is the one grant this
+        // list exists to make impossible — and it could never match a sender anyway, so the
+        // operator would believe he had let people in and nobody would be. Refused with the
+        // reason, in plain words, and nothing is written.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let here = repo(&d, "herdr-tg");
+        r.enrol(&here).expect("enrols");
+        for not_a_person in [0i64, -1009] {
+            let said = r
+                .set_may_speak(&here, not_a_person, true)
+                .expect_err("a group was let in")
+                .to_string();
+            assert!(said.contains("not a person"), "{said}");
+            for jargon in ["Err", "NotAPerson", "i64", "Option", "None"] {
+                assert!(
+                    !said.contains(jargon),
+                    "jargon reached the operator: {said}"
+                );
+            }
+        }
+        let on_disk = Registry::load(d.path().join("projects.json"));
+        assert!(
+            on_disk.all().all(|p| p.allowed_users.is_empty()),
+            "a refusal still wrote something"
+        );
+
+        // And a project nobody enrolled is a refusal in plain words, never an enrolment.
+        let said = r
+            .set_may_speak(&repo(&d, "never-enrolled"), 7, true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert_eq!(r.all().count(), 1, "letting someone in enrolled something");
     }
 }

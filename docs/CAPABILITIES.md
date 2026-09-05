@@ -1,4 +1,10 @@
-<!-- SURFACE, v7, 5 September 2026. v7 is v6 attacked. Offer 8 gains an eighth field,
+<!-- SURFACE, v8, 5 September 2026. v8 adds the second gate, WHO may speak, beside WHERE the bot
+     listens: REQUIRES 5 is new, REFUSES 3 names it, and offer 8 gains a ninth field,
+     `allowed_users` — the people a project has let into its own conversations at the terminal,
+     never the people who may speak anywhere. Until v8 the only gate was the chat allowlist, so
+     anyone who could post in the allowed forum was relayed into an agent's turn and anyone who
+     could see a keyboard could tap it; that was safe while the forum held one person.
+     v7 is v6 attacked. Offer 8 gains an eighth field,
      `connected_lanes`: `connected` is the project's OWN voice, and a project whose sessions are all
      dispatched into worktrees never has one — so it read `false` while its agent was live, and the
      document had no field that could carry the difference. The switch's bound is said honestly:
@@ -80,7 +86,7 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | 5 | **Retirement.** Buttons come off a question that has stopped being open, whoever closed it — which no screen-reading design can do. | `ask_resolved{how}`. |
 | 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
 | 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
-| 8 | **Read-only inventory.** `herdr-tg projects --json`: one object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes:{address:topic_id}, connected_lanes:[address]}`, in that order, sorted by title. `topic_id` is `null` before a bridge has ever been live. `connected` is whether the project's OWN voice has a bridge on the socket now — a project reached only through its worktrees never does, and `connected_lanes` is which of its addresses are live. Both come from the running hub's own record of its claims and are `null` whenever no running hub can vouch for them — unknown said as unknown, never a `false` nobody could prove. A registry that is there and cannot be read is refused, never reported as empty. No chat id, no path but the repo's. | Run it at the keyboard; `docs/ATTACHING.md` §7 offer 8 has the shape. |
+| 8 | **Read-only inventory.** `herdr-tg projects --json`: one object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes:{address:topic_id}, connected_lanes:[address], allowed_users:[user_id]}`, in that order, sorted by title. `topic_id` is `null` before a bridge has ever been live. `connected` is whether the project's OWN voice has a bridge on the socket now — a project reached only through its worktrees never does, and `connected_lanes` is which of its addresses are live. Both come from the running hub's own record of its claims and are `null` whenever no running hub can vouch for them — unknown said as unknown, never a `false` nobody could prove. `allowed_users` is the people let into THAT project's conversations with `herdr-tg allow` (REQUIRES 5), sorted; it is never the people who may speak anywhere, who are not in the file this reads. A registry that is there and cannot be read is refused, never reported as empty. No chat id, no path but the repo's, and no person but the project's own. | Run it at the keyboard; `docs/ATTACHING.md` §7 offer 8 has the shape. |
 
 ## REQUIRES — what you must bring
 
@@ -100,6 +106,24 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 4. **One connection per address.** If two producers must speak for one conversation, join them on
    your side. `adapters/kickoff-hub-attach/` is our implementation — it holds the claim and opens a
    local door that speaks hub-proto unchanged, so a producer needs no second wire contract.
+5. **Who may speak, said at a terminal.** The chat allowlist says WHERE the bot listens and
+   nothing about WHO. Two lists say who, and no message, tap or command can change either. The
+   people who may speak ANYWHERE the bot listens — type at any agent, tap any button, run
+   `/projects` — are named in the configuration: `HERDR_TG_ALLOWED_USER_IDS` (or
+   `allowed_user_ids`), plus one person per private chat on the chat allowlist, because in the Bot
+   API a private chat's id IS its person's id — so an operator whose allowlist already holds his
+   own chat sets nothing, and the startup log says which people it found. Read that the other way
+   too: a private chat on the CHAT allowlist is a grant of everything, so a teammate's chat added
+   there so `/projects` works for him in private may type at every agent and tap every button. The
+   startup log says so once per private chat, naming the number and the narrower verb; if that
+   person should reach one project, take the chat off the chat allowlist and use `allow`. A
+   project's OWN people —
+   a customer, a teammate in one room — are let in with `herdr-tg allow <repo> <user>` and heard
+   within about a second, no restart: in that project's topic and in its lanes' topics, and
+   nowhere else — not another project's, not General, and not the bot's commands, which answer
+   with every project's name and state. Everyone else gets silence and one line in the hub's
+   audit naming the sender; a reply would confirm something is listening. `disallow` takes it
+   back, re-enrolling keeps the list, and a channel post, a bot and an anonymous admin are nobody.
 
 ## REFUSES — settled, and not reconsidered by mail
 
@@ -110,8 +134,9 @@ Each is a line, not an omission. Several were paid for.
 2. **Writing into an org repo.** The hub writes to its own state directory and nowhere else. Hub
    state in a git working tree is state an adopter's coordinator commits and pushes.
 3. **Treating inbound content as instruction.** What arrives from Telegram SELECTS from what the
-   machine already knows; it never NAMES something new. No message can enrol a project, edit an
-   allowlist, or touch a credential.
+   machine already knows; it never NAMES something new. No message, tap or command can enrol a
+   project, edit an allowlist, let a person speak, or touch a credential — and a test fails the
+   build if the bot or the hub so much as names the setter that lets a person speak.
 4. **Typing into a terminal.** The path that read panes and sent keystrokes was deleted, not
    gated, and a guard now forbids naming a write RPC anywhere in the tree.
 5. **Choosing a model, an engine, or a repository.** Those belong to whoever dispatches.

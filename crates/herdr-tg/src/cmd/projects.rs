@@ -12,6 +12,11 @@
 //! the running hub holds the live claims map. They come from the snapshot the hub writes
 //! (`presence.rs`), and they are `null` whenever no running hub stands behind that snapshot —
 //! unknown, said as unknown, rather than a `false` nobody could prove.
+//!
+//! `allowed_users` is the one list of people either surface shows, and it is a PROJECT's own: the
+//! people let into its conversations at the terminal. The people who may speak anywhere — the
+//! operator among them — live in the configuration and not in the file this reads, so no field
+//! here can carry them. The phone's `/projects` shows no people at all; it is read in a group.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -41,6 +46,12 @@ pub(crate) struct Row<'a> {
     /// The addresses of it that have a bridge on the socket right now, or `null` when no running
     /// hub can say.
     pub connected_lanes: Option<Vec<LaneId>>,
+    /// The people let into THIS project's conversations with `herdr-tg allow`, as Telegram user
+    /// ids, sorted. Only ever the project's own people: the people who may speak anywhere — the
+    /// operator among them — are the configuration's and are not in the registry this reads, so
+    /// they cannot reach this surface. A room's dispatcher needs to know who its room admits;
+    /// nobody needs to know who runs the box.
+    pub allowed_users: &'a BTreeSet<i64>,
 }
 
 /// `herdr-tg projects`, either shape.
@@ -91,11 +102,12 @@ fn projects_in(
         // longest realistic value and a column that overruns takes the repo paths out of line.
         writeln!(
             out,
-            "{:<24} {:<34} {}{}",
+            "{:<24} {:<34} {}{}{}",
             p.title,
             where_it_talks(p),
             p.repo.display(),
-            state
+            state,
+            who_may_also_speak(p)
         )?;
     }
     if !any {
@@ -145,8 +157,19 @@ pub(crate) fn inventory<'a>(registry: &'a Registry, state_dir: &Path) -> Vec<Row
                     .filter_map(|a| a.lane.clone())
                     .collect()
             }),
+            allowed_users: &p.allowed_users,
         })
         .collect()
+}
+
+/// The project's own people, for the terminal listing — and nothing when there are none, so the
+/// ordinary row of a project with no guests is exactly what it was.
+fn who_may_also_speak(p: &Project) -> String {
+    if p.allowed_users.is_empty() {
+        return String::new();
+    }
+    let people: Vec<String> = p.allowed_users.iter().map(i64::to_string).collect();
+    format!("  may also speak: {}", people.join(", "))
 }
 
 /// Which topics a project has, for the terminal listing.
@@ -175,6 +198,9 @@ fn where_it_talks(p: &Project) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// The one person these tests let speak anywhere.
+    const OPERATOR: i64 = 7;
 
     /// Enrol a folder of this name into the registry at `dir/projects.json`.
     fn enrol(dir: &Path, name: &str) -> Project {
@@ -239,6 +265,7 @@ mod tests {
             crate::hub::AskLedger::load(dir.join("asks.json")),
             crate::hub::HubAudit::new(dir.join("hub.audit.log")),
             vec![-1001],
+            vec![OPERATOR],
             -1001,
         ))
     }
@@ -433,6 +460,7 @@ mod tests {
             "connected",
             "lanes",
             "connected_lanes",
+            "allowed_users",
         ];
         for pair in order.windows(2) {
             assert!(
@@ -576,6 +604,43 @@ mod tests {
                 "jargon in the listing: {}",
                 said(&r)
             );
+        }
+    }
+
+    #[test]
+    fn the_terminal_and_the_inventory_list_a_projects_own_people_and_only_those() {
+        // A room's dispatcher needs to know who its room admits, and the operator at the keyboard
+        // needs to see who he has let in — so both list the project's people. Neither can list
+        // the people who may speak anywhere, because those live in the configuration and not in
+        // the file this reads; that is structural, and this pins that nothing here started
+        // inventing them.
+        let d = tempfile::tempdir().expect("tmp");
+        let p = enrol(d.path(), "a-room");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let json = as_json(&inventory(&r, d.path()));
+        assert!(
+            json.contains("\"allowed_users\":[]"),
+            "a project with no guests does not say so: {json}"
+        );
+
+        r.set_may_speak(&p.repo, 555_002, true).expect("lets in");
+        r.set_may_speak(&p.repo, 555_001, true).expect("lets in");
+        let json = as_json(&inventory(&r, d.path()));
+        assert!(
+            json.contains("\"allowed_users\":[555001,555002]"),
+            "the project's people are not listed, sorted: {json}"
+        );
+        assert!(!json.contains("\"7\"") && !json.contains(":7,"), "{json}");
+
+        let mut out = Vec::new();
+        projects_in(&d.path().join("projects.json"), d.path(), false, &mut out).expect("lists");
+        let table = String::from_utf8(out).expect("utf8");
+        assert!(
+            table.contains("555001, 555002"),
+            "the table does not show who may speak: {table}"
+        );
+        for jargon in ["allowed_users", "BTreeSet", "Some", "None"] {
+            assert!(!table.contains(jargon), "jargon in the listing: {table}");
         }
     }
 

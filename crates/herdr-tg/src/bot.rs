@@ -1,16 +1,28 @@
 //! The Telegram front door: one bot, one forum, one topic per project.
 //!
-//! # The gate comes first
+//! # The gate comes first, and it asks two questions
 //!
 //! Every update passes [`Gate::admit`] before anything else looks at it — before command parsing,
 //! before any state is touched. That ordering is the whole security model, and it is why the check
 //! is a separate type with its own tests rather than an `if` inside a handler: a handler that grows
 //! a second branch is a handler that grows a way around the gate.
 //!
-//! A rejected chat gets **silence**, not a refusal. A refusal confirms the bot is alive and tells a
-//! stranger what it is for. The rejection is logged at `warn` with the chat id, so the operator can
-//! read his own id out of `journalctl` when he has mistyped it — which is the realistic failure
-//! here, not an attacker.
+//! The chat is the first question: is this somewhere the bot listens. The person is the second,
+//! and it is asked before the text is so much as read: may this person speak HERE. "Here" is the
+//! conversation the update belongs to — the project's topic or a lane's — and the answer comes
+//! from two lists, neither of which a message can change: the people who may speak anywhere
+//! (the configuration) and the people a project has let into its own conversations (the registry,
+//! written only by `herdr-tg allow` at a keyboard). A command is answered with facts about every
+//! project, so it takes the wider standing. Until this existed, anyone who could post in the
+//! allowed forum was relayed into an agent's turn and anyone who could see a keyboard could tap
+//! it — safe for as long as the forum held one person, and not a moment longer.
+//!
+//! A rejected chat gets **silence**, not a refusal, and so does a rejected person. A refusal
+//! confirms the bot is alive and tells a stranger what it is for. The rejection is logged at
+//! `warn` with the id, so the operator can read his own id out of `journalctl` when he has
+//! mistyped it — which is the realistic failure here, not an attacker — and a rejected person is
+//! also one line in the hub's audit, because that file is the only place he can learn that
+//! somebody in his forum is typing at his agents, and who.
 //!
 //! # This binary cannot type into a terminal
 //!
@@ -46,14 +58,23 @@ const TELEGRAM_MAX_CHARS: usize = 4096;
 const BODY_BUDGET: usize = TELEGRAM_MAX_CHARS - 256;
 
 /// The identity gate. Fails closed by construction.
+///
+/// Two questions, asked in this order on every update: is this a chat the bot listens in, and is
+/// this a person who may speak in it. The second used to be nobody's question — anyone who could
+/// post in the allowed forum was relayed into an agent's turn, and anyone who could see a keyboard
+/// could tap it — which was safe only while the forum held one person.
 #[derive(Debug, Clone)]
 pub struct Gate {
     allowed: BTreeSet<i64>,
+    /// The people who may speak anywhere this bot listens. A project's own people are the hub's to
+    /// know, from the registry; this is the list that needs no hub, so a command can be answered on
+    /// a box with no forum and refused on one for the same person either way.
+    people: BTreeSet<i64>,
 }
 
 impl Gate {
-    pub fn new(allowed: BTreeSet<i64>) -> Self {
-        Self { allowed }
+    pub fn new(allowed: BTreeSet<i64>, people: BTreeSet<i64>) -> Self {
+        Self { allowed, people }
     }
 
     /// Is this chat permitted? An empty allowlist admits nobody.
@@ -61,8 +82,117 @@ impl Gate {
         self.allowed.contains(&chat_id)
     }
 
+    /// May this person speak anywhere the bot listens? `None` — no person the update could vouch
+    /// for — is never anyone, and an empty list knows nobody.
+    pub fn knows(&self, user: Option<i64>) -> bool {
+        user.is_some_and(|u| crate::config::is_a_persons_id(u) && self.people.contains(&u))
+    }
+
     pub fn is_deaf(&self) -> bool {
         self.allowed.is_empty()
+    }
+
+    /// Nobody at all may speak anywhere: no person listed, and no private chat on the chat
+    /// allowlist to name one. Only a project's own people could still be heard.
+    pub fn nobody_may_speak(&self) -> bool {
+        self.people.is_empty()
+    }
+}
+
+/// The person who typed a message, when there is one the bot can vouch for.
+///
+/// `None` in three shapes, and every one of them is a stranger: a channel post carries no sender
+/// at all; a bot is not a person; and an admin posting anonymously arrives as Telegram's shared
+/// "anonymous admin" service account with `sender_chat` set to the group — so allowing that id
+/// would allow every anonymous admin in every group, and the group's id as a sender is refused
+/// outright rather than matched against anything.
+fn who_sent(msg: &Message) -> Option<i64> {
+    if msg.sender_chat.is_some() {
+        return None;
+    }
+    let from = msg.from.as_ref()?;
+    if from.is_bot {
+        return None;
+    }
+    i64::try_from(from.id.0).ok()
+}
+
+/// The person who tapped a button. Always someone on a callback query — Telegram sends none from a
+/// channel or a chat — but a bot is still not a person.
+fn who_tapped(q: &CallbackQuery) -> Option<i64> {
+    if q.from.is_bot {
+        return None;
+    }
+    i64::try_from(q.from.id.0).ok()
+}
+
+/// May a person of this standing do what he typed?
+///
+/// A command is answered with facts about every project — `/projects` is their names and states,
+/// and "I do not have that command" is an answer too — so it takes the wider standing. Words for
+/// the agent in this conversation take standing here. A command aimed at another bot is nobody's
+/// to act on whatever the standing, and is decided before this is asked.
+fn may_act(standing: crate::hub::Standing, typed: &Typed) -> bool {
+    match typed {
+        Typed::Command(_) | Typed::NotOneOfMine => standing.may_command(),
+        Typed::Steering => standing.may_speak_here(),
+        Typed::ForAnotherBot => false,
+    }
+}
+
+/// What kind of thing arrived, for the audit line about the person who was not allowed to send it.
+fn what_arrived(text: Option<&str>) -> &'static str {
+    match text {
+        None => "something that was not text",
+        Some(t) if t.starts_with('/') => "a command",
+        Some(_) => "words",
+    }
+}
+
+/// May this person speak here — asked of the hub when there is one, of the gate alone when not.
+///
+/// No hub means no registry to hold a project's people, so only the bot-wide list can answer. It
+/// must answer rather than refuse outright, because a command is still answered on a box where
+/// the forum has never been set up — that is how the operator finds out it has not.
+async fn standing_of(
+    ctx: &Ctx,
+    user: Option<i64>,
+    at: Option<&crate::hub::Addr>,
+) -> crate::hub::Standing {
+    match &ctx.hub {
+        Some(hub) => hub.standing_of(user, at).await,
+        None if ctx.gate.knows(user) => crate::hub::Standing::Anywhere,
+        None => crate::hub::Standing::Stranger,
+    }
+}
+
+/// A person who may not speak where he did: nothing relayed, nothing answered, one line written.
+///
+/// Silence on the phone is the point — a reply confirms something is listening — so the journal
+/// and the hub's audit are the only places this shows, and both carry the id: the operator is
+/// going to want either to let this person in or to find out who it was, and both start with the
+/// number. On a box with no forum there is no audit file, and the journal line is all there is.
+async fn refused_sender(
+    ctx: &Ctx,
+    user: Option<i64>,
+    chat_id: i64,
+    at: Option<&crate::hub::Addr>,
+    what: &str,
+) {
+    // `sender=<number>` or `sender=unknown`, the same as the audit line, and never the `Option`
+    // as the compiler prints it: this is the line he copies the id out of.
+    tracing::warn!(
+        sender = %crate::hub::name_the_sender(user),
+        chat_id,
+        what,
+        "from a person NOT allowed to speak here — ignored. To let this person into one \
+         project's conversations: herdr-tg allow <repo> <user id>. To let them speak anywhere \
+         this bot listens: add the id to HERDR_TG_ALLOWED_USER_IDS."
+    );
+    if let Some(hub) = &ctx.hub
+        && let Err(e) = hub.audit.stranger(user, chat_id, at, what)
+    {
+        tracing::error!(error = %e, "could not write down a refused sender");
     }
 }
 
@@ -156,7 +286,8 @@ struct Ctx {
 
 /// Run the bot until the process is asked to stop.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let gate = Gate::new(config.allowed_chat_ids.clone());
+    let people = config.people();
+    let gate = Gate::new(config.allowed_chat_ids.clone(), people.clone());
     if gate.is_deaf() {
         tracing::warn!(
             "the chat allowlist is EMPTY — this bot will answer nobody. Set \
@@ -166,6 +297,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!(chats = ?config.allowed_chat_ids, "allowlist active");
     }
+    announce_who_may_speak(&config.allowed_chat_ids, &config.allowed_user_ids, &gate);
 
     let bot = Bot::new(config.token());
     let me = bot.get_me().await?;
@@ -203,6 +335,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                 crate::hub::AskLedger::load(crate::hub::AskLedger::default_path()),
                 crate::hub::HubAudit::new(crate::hub::HubAudit::default_path()),
                 config.allowed_chat_ids.iter().copied().collect(),
+                people.iter().copied().collect(),
                 forum,
             ));
             let sock = crate::hub::socket_path();
@@ -309,6 +442,61 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Say at startup who may speak anywhere this bot listens, and where each of them came from.
+///
+/// Said in the same breath as the chats, and said loudly when it is nobody, because this is the
+/// line that stops a restart into this build from silently answering no one. The default — a
+/// private chat on the chat allowlist names its one person — is what keeps a configuration written
+/// before people existed working unchanged, so the line says which people came from where rather
+/// than only how many. Split from `serve` so a test can read the lines back without a bot token.
+/// The gate answers "is it nobody", not this function: one fail-closed answer, in one place.
+fn announce_who_may_speak(chats: &BTreeSet<i64>, listed: &BTreeSet<i64>, gate: &Gate) {
+    let from_private_chats = crate::config::people_from_private_chats(chats);
+    if gate.nobody_may_speak() {
+        tracing::warn!(
+            "NOBODY may speak to this bot: no private chat is on the chat allowlist to name a \
+             person, and HERDR_TG_ALLOWED_USER_IDS (or `allowed_user_ids` in herdr-tg.toml) is \
+             not set. Every typed line and every tap will be dropped, and only a person let into \
+             one project with `herdr-tg allow <repo> <user>` can be heard there. Add your own \
+             private chat to HERDR_TG_ALLOWED_CHAT_IDS, or list your user id."
+        );
+    } else {
+        tracing::info!(
+            people = ?gate.people,
+            listed = listed.len(),
+            from_private_chats = from_private_chats.len(),
+            "these people may speak anywhere this bot listens — the listed ones, and one per \
+             private chat on the chat allowlist, because a private chat's id is its person's id"
+        );
+    }
+    // One line PER private chat, because the count above is easy to read past and what it hides
+    // is a grant: a private chat on the CHAT allowlist used to mean "may DM the bot", and it now
+    // also means "may type at every agent and tap every button". The operator's own chat is the
+    // shape this default exists for, and is said at info. Two or more is the exact case where
+    // somebody was let in for a narrower reason — a teammate's chat, added so `/projects` works
+    // for him in private — and that is said at warn, naming the narrower verb, so the wider grant
+    // is a thing he read rather than a thing that happened.
+    for id in &from_private_chats {
+        if from_private_chats.len() > 1 {
+            tracing::warn!(
+                chat = id,
+                "is a private chat on the chat allowlist, so this person may type at EVERY agent \
+                 and tap EVERY button anywhere this bot listens. If they should only reach one \
+                 project, take the chat off HERDR_TG_ALLOWED_CHAT_IDS and run: herdr-tg allow \
+                 <repo> {id}"
+            );
+        } else {
+            tracing::info!(
+                chat = id,
+                "is a private chat on the chat allowlist, so this person may type at EVERY agent \
+                 and tap EVERY button anywhere this bot listens. If they should only reach one \
+                 project, take the chat off HERDR_TG_ALLOWED_CHAT_IDS and run: herdr-tg allow \
+                 <repo> {id}"
+            );
+        }
+    }
+}
+
 /// A tap on one of the hub's buttons.
 async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()> {
     let chat_id = q.message.as_ref().map(|m| m.chat().id.0).unwrap_or(0);
@@ -317,6 +505,25 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
             chat_id,
             "callback from a chat NOT on the allowlist — ignored"
         );
+        return Ok(());
+    }
+    // The person, second — and before the button is so much as read. The conversation the button
+    // belongs to comes from the ledger, so a project's own people can answer their project's
+    // questions; a button nothing was written down beside has none, and for that only the
+    // bot-wide list can answer. A stranger must not learn from a reply whether the button was
+    // real, so this is decided ahead of every branch below that says anything back.
+    let user = who_tapped(&q);
+    let at = match (&ctx.hub, q.message.as_ref()) {
+        (Some(hub), Some(m)) => hub
+            .ledger
+            .lock()
+            .await
+            .get(chat_id, &hub_proto::MsgId::new(m.id().0.to_string()))
+            .map(|r| r.addr()),
+        _ => None,
+    };
+    if !standing_of(&ctx, user, at.as_ref()).await.may_speak_here() {
+        refused_sender(&ctx, user, chat_id, at.as_ref(), "a tap").await;
         return Ok(());
     }
     let Some(data) = q.data.clone() else {
@@ -358,7 +565,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                         {
                             reply_thread = Some(topic);
                         }
-                        match hub.resolve_tap(chat_id, &msg_id, &option_id).await {
+                        match hub.resolve_tap(chat_id, user, &msg_id, &option_id).await {
                             // A chat this bot does not answer gets silence, not a refusal.
                             Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
                             Err(why) => escape_html(why.say()),
@@ -453,14 +660,40 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+
+    // The person, second — and before the text is looked at, so a stranger's photo is refused and
+    // written down the same as his words would be. The conversation the message belongs to is
+    // resolved ONCE here, for the standing and for the relay both: a message belongs to the topic
+    // it was typed in and to no other, and that lookup is the whole of routing.
+    let user = who_sent(&msg);
+    let thread = msg.thread_id.map(|t| t.0.0);
+    let at = match (&ctx.hub, thread) {
+        (Some(hub), Some(t)) => hub.addr_for_topic(t).await,
+        _ => None,
+    };
+    let standing = standing_of(&ctx, user, at.as_ref()).await;
+    if !standing.may_speak_here() {
+        refused_sender(&ctx, user, chat_id, at.as_ref(), what_arrived(msg.text())).await;
+        return Ok(());
+    }
     let Some(text) = msg.text() else {
         return Ok(());
     };
 
-    let cmd = match what_he_typed(text, &ctx.username) {
+    let typed = what_he_typed(text, &ctx.username);
+    // Somebody else's, by name. Nothing is relayed, nothing is said back, nothing is written
+    // down: Telegram hands every group bot every command, and this one was not for us.
+    if typed == Typed::ForAnotherBot {
+        return Ok(());
+    }
+    // Standing here, but not for this: a person let into one project asked for every project's
+    // name and state. Silence, and the same line — a reply would say what the command does.
+    if !may_act(standing, &typed) {
+        refused_sender(&ctx, user, chat_id, at.as_ref(), "a command").await;
+        return Ok(());
+    }
+    let cmd = match typed {
         Typed::Command(cmd) => cmd,
-        // Somebody else's, by name. Nothing is relayed, nothing is said back, nothing is written
-        // down: Telegram hands every group bot every command, and this one was not for us.
         Typed::ForAnotherBot => return Ok(()),
         // Aimed at us by name, and not one we have. Answered where he typed it, and never handed
         // to an agent as if it were steering.
@@ -480,58 +713,54 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
             // Not a command: it is something the operator typed at a project. A message belongs to the
             // topic it was typed in and to no other — that is the whole of routing, and every other
             // rule this bridge used to have is deleted rather than tested against.
-            let thread = msg.thread_id.map(|t| t.0.0);
-            let body = match (&ctx.hub, thread) {
-                (Some(hub), Some(thread)) => match hub.addr_for_topic(thread).await {
-                    Some(who) => {
-                        let mid = hub_proto::MsgId::new(msg.id.0.to_string());
-                        let user = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-                        // The message he swiped to reply to, if he did. A reply under one of the
-                        // agent's questions is the one time he says which question — and which
-                        // session — he means, and the hub decides what that is worth (`relay`). In a
-                        // forum topic every message carries the topic's root as its reply, so this
-                        // is usually a message nothing was written down beside, which counts as no
-                        // reply at all.
-                        let under = msg
-                            .reply_to_message()
-                            .map(|m| hub_proto::MsgId::new(m.id.0.to_string()));
-                        if hub
-                            .relay(&who, chat_id, user, &mid, text, under.as_ref())
-                            .await
-                        {
-                            tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
-                            // Nothing is said back. A confirmation under every line the operator types
-                            // turns a conversation into a receipt printer; the agent's own answer is
-                            // the acknowledgement, and it is the one he is waiting for.
-                            return Ok(());
-                        }
-                        // Dropped, visibly, where he typed it — never queued. A message held for a
-                        // worker that may never come back is a message he believes was sent.
-                        // The topic and not "that project": a lane has its own topic, and the project
-                        // it belongs to can be connected and busy while this worktree is not.
-                        //
-                        // Off before "not connected". A project he switched off at the terminal has
-                        // had its connection dropped, so "not connected" would be true and would
-                        // send him to restart a bridge the hub is going to refuse.
-                        if hub.is_switched_off(&who).await {
-                            escape_html(
-                                "This project is switched off, so nothing was sent. It will not be \
-                                 delivered later. Switch it back on at a terminal with:  herdr-tg \
-                                 enable <its folder>",
-                            )
-                        } else {
-                            escape_html(
-                                "Nothing is connected in this topic right now, so nothing was sent. \
-                                 It will not be delivered later.",
-                            )
-                        }
+            let body = match (&ctx.hub, thread, &at) {
+                (Some(hub), Some(_), Some(who)) => {
+                    let mid = hub_proto::MsgId::new(msg.id.0.to_string());
+                    // The message he swiped to reply to, if he did. A reply under one of the
+                    // agent's questions is the one time he says which question — and which
+                    // session — he means, and the hub decides what that is worth (`relay`). In a
+                    // forum topic every message carries the topic's root as its reply, so this
+                    // is usually a message nothing was written down beside, which counts as no
+                    // reply at all.
+                    let under = msg
+                        .reply_to_message()
+                        .map(|m| hub_proto::MsgId::new(m.id.0.to_string()));
+                    if hub
+                        .relay(who, chat_id, user, &mid, text, under.as_ref())
+                        .await
+                    {
+                        tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
+                        // Nothing is said back. A confirmation under every line the operator types
+                        // turns a conversation into a receipt printer; the agent's own answer is
+                        // the acknowledgement, and it is the one he is waiting for.
+                        return Ok(());
                     }
-                    // Never a fall back to the project when a lane's topic is unknown: that would put
-                    // what he typed at one worktree into the turn of an agent working on another.
-                    None => escape_html(
-                        "I do not know which project this topic belongs to, so I have not sent anything.",
-                    ),
-                },
+                    // Dropped, visibly, where he typed it — never queued. A message held for a
+                    // worker that may never come back is a message he believes was sent.
+                    // The topic and not "that project": a lane has its own topic, and the project
+                    // it belongs to can be connected and busy while this worktree is not.
+                    //
+                    // Off before "not connected". A project he switched off at the terminal has
+                    // had its connection dropped, so "not connected" would be true and would
+                    // send him to restart a bridge the hub is going to refuse.
+                    if hub.is_switched_off(who).await {
+                        escape_html(
+                            "This project is switched off, so nothing was sent. It will not be \
+                             delivered later. Switch it back on at a terminal with:  herdr-tg \
+                             enable <its folder>",
+                        )
+                    } else {
+                        escape_html(
+                            "Nothing is connected in this topic right now, so nothing was sent. \
+                             It will not be delivered later.",
+                        )
+                    }
+                }
+                // Never a fall back to the project when a lane's topic is unknown: that would put
+                // what he typed at one worktree into the turn of an agent working on another.
+                (Some(_), Some(_), None) => escape_html(
+                    "I do not know which project this topic belongs to, so I have not sent anything.",
+                ),
                 _ => escape_html(
                     "Type inside a project's topic and I will pass it on. Here in General I do not know \
                  who you mean.",
@@ -811,7 +1040,7 @@ mod tests {
     #[test]
     fn an_empty_allowlist_answers_nobody() {
         // The opposite convention would turn a misconfiguration into an open bot.
-        let g = Gate::new(BTreeSet::new());
+        let g = Gate::new(BTreeSet::new(), BTreeSet::new());
         assert!(g.is_deaf());
         assert!(!g.admit(1));
         assert!(!g.admit(0));
@@ -820,7 +1049,7 @@ mod tests {
 
     #[test]
     fn only_the_listed_chats_are_admitted() {
-        let g = Gate::new([7i64, -1001].into_iter().collect());
+        let g = Gate::new([7i64, -1001].into_iter().collect(), BTreeSet::new());
         assert!(g.admit(7) && g.admit(-1001));
         assert!(!g.admit(8) && !g.admit(0));
     }
@@ -894,9 +1123,13 @@ mod tests {
             crate::hub::AskLedger::load(dir.join("asks.json")),
             crate::hub::HubAudit::new(dir.join("hub.audit.log")),
             vec![forum, also],
+            vec![OPERATOR],
             forum,
         ))
     }
+
+    /// The one person these tests let speak anywhere.
+    const OPERATOR: i64 = 7;
 
     #[tokio::test]
     async fn a_flood_wait_on_a_message_the_hub_could_not_refuse_shuts_the_chat_for_the_agents_too()
@@ -988,6 +1221,7 @@ mod tests {
             crate::hub::AskLedger::load(dir.path().join("asks.json")),
             crate::hub::HubAudit::new(dir.path().join("hub.audit.log")),
             vec![-1001],
+            vec![OPERATOR],
             -1001,
         );
 
@@ -1212,5 +1446,588 @@ mod tests {
         for gone in ["/target", "/panes", "pane", "keystroke"] {
             assert!(!d.contains(gone), "the command set mentions {gone}: {d}");
         }
+    }
+
+    // ── who may speak ─────────────────────────────────────────────────────────────────────────
+
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const THE_FORUM: i64 = -1001;
+    /// The project's own topic, and one worktree's, as the hub would have bound them.
+    const TOPIC: i32 = 42;
+    const LANE_TOPIC: i32 = 43;
+    /// Somebody in the forum who is on no list at all.
+    const A_STRANGER: i64 = 999_001;
+    /// Somebody let into the one project, and nothing wider.
+    const GUEST: i64 = 555_001;
+
+    /// A Telegram that only counts. Every API call the bot makes is one TCP connection here, and
+    /// each is closed unanswered so the call fails at once. Nothing about a request is read: the
+    /// property under test is whether the bot spoke to Telegram at all, and a stranger must
+    /// produce no call — not a reply, not a toast, not a reaction.
+    async fn a_telegram_that_only_counts() -> (Bot, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = reqwest::Url::parse(&format!("http://{}/", listener.local_addr().expect("addr")))
+            .expect("url");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        (Bot::new("1:not-a-token").set_api_url(url), calls)
+    }
+
+    fn a_person(id: i64) -> serde_json::Value {
+        serde_json::json!({"id": id, "is_bot": false, "first_name": "someone"})
+    }
+
+    fn a_bot(id: i64) -> serde_json::Value {
+        serde_json::json!({"id": id, "is_bot": true, "first_name": "a bot"})
+    }
+
+    /// A message as Telegram delivers it, with the sender the test chooses (`Null` for none).
+    fn message_json(
+        chat: i64,
+        thread: Option<i32>,
+        from: serde_json::Value,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut m = serde_json::json!({
+            "message_id": 5,
+            "date": 1_700_000_000,
+            "chat": {"id": chat, "type": "supergroup", "title": "forum", "is_forum": true},
+        });
+        for (k, v) in body.as_object().expect("a body").iter() {
+            m[k] = v.clone();
+        }
+        if let Some(t) = thread {
+            m["message_thread_id"] = t.into();
+            m["is_topic_message"] = true.into();
+        }
+        if !from.is_null() {
+            m["from"] = from;
+        }
+        m
+    }
+
+    fn typed(chat: i64, thread: Option<i32>, from: serde_json::Value, text: &str) -> Message {
+        serde_json::from_value(message_json(
+            chat,
+            thread,
+            from,
+            serde_json::json!({"text": text}),
+        ))
+        .expect("a message Telegram would send")
+    }
+
+    fn a_photo(chat: i64, thread: Option<i32>, from: serde_json::Value) -> Message {
+        serde_json::from_value(message_json(
+            chat,
+            thread,
+            from,
+            serde_json::json!({"photo": [
+                {"file_id": "f", "file_unique_id": "u", "file_size": 1, "width": 1, "height": 1}
+            ]}),
+        ))
+        .expect("a photo Telegram would send")
+    }
+
+    /// A tap on a button under a message in the forum, by whoever the test says.
+    fn tapped(
+        chat: i64,
+        thread: Option<i32>,
+        from: serde_json::Value,
+        data: &str,
+    ) -> CallbackQuery {
+        serde_json::from_value(serde_json::json!({
+            "id": "q1",
+            "from": from,
+            "chat_instance": "ci",
+            "data": data,
+            "message": message_json(
+                chat,
+                thread,
+                a_bot(1),
+                serde_json::json!({"text": "Overwrite it?"}),
+            ),
+        }))
+        .expect("a tap Telegram would send")
+    }
+
+    /// A forum this bot listens in, with one project bound to [`TOPIC`] and one worktree of it to
+    /// [`LANE_TOPIC`], over the REAL Telegram surface aimed at the bot that only counts — so a
+    /// send through the hub is a counted call exactly as a reply from the handler is. The operator
+    /// is the one person who may speak anywhere.
+    async fn a_forum_with_one_project(
+        dir: &Path,
+        bot: &Bot,
+    ) -> (Ctx, PathBuf, Arc<crate::hub::Hub<crate::surface::Telegram>>) {
+        let repo = dir.join("herdr-tg");
+        std::fs::create_dir_all(&repo).expect("dir");
+        let mut registry = crate::registry::Registry::load(dir.join("projects.json"));
+        let (p, _) = registry.enrol(&repo).expect("enrols");
+        registry
+            .bind_topic(&crate::hub::Addr::project_itself(p.id.clone()), TOPIC)
+            .expect("binds");
+        registry
+            .bind_topic(
+                &crate::hub::Addr::lane_of(
+                    p.id.clone(),
+                    hub_proto::LaneId::new("lane-0905-120000-1"),
+                ),
+                LANE_TOPIC,
+            )
+            .expect("binds");
+        let hub = Arc::new(crate::hub::Hub::new(
+            Arc::new(crate::surface::Telegram::new(
+                bot.clone(),
+                ChatId(THE_FORUM),
+            )),
+            registry,
+            crate::hub::AskLedger::load(dir.join("asks.json")),
+            crate::hub::HubAudit::new(dir.join("hub.audit.log")),
+            vec![THE_FORUM],
+            vec![OPERATOR],
+            THE_FORUM,
+        ));
+        let ctx = Ctx {
+            hub: Some(Arc::clone(&hub)),
+            gate: Arc::new(Gate::new(
+                [THE_FORUM].into_iter().collect(),
+                [OPERATOR].into_iter().collect(),
+            )),
+            username: Arc::from("herd_bot"),
+        };
+        (ctx, repo, hub)
+    }
+
+    /// Every audit line about somebody who was not allowed to speak.
+    fn refused_senders(hub: &crate::hub::Hub<crate::surface::Telegram>) -> Vec<String> {
+        std::fs::read_to_string(hub.audit.path())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("sender="))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_command_from_a_person_not_on_the_list_is_ignored() {
+        // `/projects` answers with every project's name and state. A stranger in the forum was
+        // answered, and so would a person let into ONE project be — a command has no project, so
+        // only the bot-wide list may open it. Silence to both, because a reply confirms something
+        // is listening; and the operator's own command is still answered, so this is a gate and
+        // not a wall.
+        let (bot, calls) = a_telegram_that_only_counts().await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+
+        on_message(
+            bot.clone(),
+            typed(THE_FORUM, Some(TOPIC), a_person(A_STRANGER), "/projects"),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a stranger's /projects was answered"
+        );
+
+        hub.registry
+            .lock()
+            .await
+            .set_may_speak(&repo, GUEST, true)
+            .expect("lets the guest into the one project");
+        on_message(
+            bot.clone(),
+            typed(
+                THE_FORUM,
+                Some(TOPIC),
+                a_person(GUEST),
+                "/projects@herd_bot",
+            ),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a person let into one project read every project's name and state"
+        );
+        on_message(
+            bot.clone(),
+            typed(THE_FORUM, Some(TOPIC), a_person(GUEST), "/compact@herd_bot"),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a person let into one project was told which commands this bot has"
+        );
+
+        on_message(
+            bot.clone(),
+            typed(THE_FORUM, Some(TOPIC), a_person(OPERATOR), "/help"),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the operator's own command went unanswered"
+        );
+
+        let lines = refused_senders(&hub);
+        assert_eq!(lines.len(), 3, "one audit line each:\n{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("what=a command") && l.contains("not allowed to speak here")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains(&format!("sender={A_STRANGER}")),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(&format!("sender={GUEST}")),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_sender_leaves_one_audit_line_and_no_trace_on_the_phone() {
+        // Every way in, from somebody on no list: words in a project's topic, in a worktree's, in
+        // General, in a topic the hub cannot place; something that is not text; a tap; a command.
+        // Each leaves exactly one line in the audit — the only place the operator can learn that
+        // a stranger is typing at his agents, and who — and not one call to Telegram: no reply,
+        // no toast, no reaction. Silence is correct; a reply confirms something is listening.
+        let (bot, calls) = a_telegram_that_only_counts().await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, _repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+        let stranger = || a_person(A_STRANGER);
+
+        for (thread, words) in [
+            (Some(TOPIC), "hello agent"),
+            (Some(LANE_TOPIC), "hello worktree"),
+            (None, "hello general"),
+            (Some(99), "hello nowhere"),
+        ] {
+            on_message(
+                bot.clone(),
+                typed(THE_FORUM, thread, stranger(), words),
+                ctx.clone(),
+            )
+            .await
+            .expect("handled");
+        }
+        on_message(
+            bot.clone(),
+            a_photo(THE_FORUM, Some(TOPIC), stranger()),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+        on_callback(
+            bot.clone(),
+            tapped(
+                THE_FORUM,
+                Some(TOPIC),
+                stranger(),
+                &format!("{}|y", crate::surface::CALLBACK_PREFIX),
+            ),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+        on_message(
+            bot.clone(),
+            typed(THE_FORUM, Some(TOPIC), stranger(), "/projects"),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a stranger left a trace on the phone"
+        );
+        let audit = std::fs::read_to_string(hub.audit.path()).unwrap_or_default();
+        let lines: Vec<&str> = audit.lines().collect();
+        assert_eq!(
+            lines.len(),
+            7,
+            "one line for each of the seven, and nothing else:\n{audit}"
+        );
+        for l in &lines {
+            assert!(
+                l.contains(&format!("sender={A_STRANGER}"))
+                    && l.contains("not allowed to speak here"),
+                "a line that does not say who, or why: {l}"
+            );
+            assert!(
+                !l.contains("delivered") && !l.starts_with("sent"),
+                "something of the stranger's was sent: {l}"
+            );
+        }
+        assert!(
+            lines[0].contains("what=words") && lines[0].contains("project=p-"),
+            "words in a project's topic are not placed: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("lane="),
+            "words in a worktree's topic do not name the worktree: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("project=-"),
+            "a line in General names a project: {}",
+            lines[2]
+        );
+        assert!(lines[5].contains("what=a tap"), "{}", lines[5]);
+        assert!(lines[6].contains("what=a command"), "{}", lines[6]);
+    }
+
+    #[tokio::test]
+    async fn a_person_let_into_a_project_is_heard_there_and_the_operator_everywhere() {
+        // The other half of the gate: it opens. A guest's words in the project's topic and in its
+        // worktree's reach the relay — nothing is connected here, so the honest answer goes back
+        // to the topic, which is a call to Telegram — while the same guest in General and in a
+        // topic the hub cannot place is a stranger. The operator is heard in all four.
+        let (bot, calls) = a_telegram_that_only_counts().await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+        hub.registry
+            .lock()
+            .await
+            .set_may_speak(&repo, GUEST, true)
+            .expect("lets the guest in");
+
+        let mut expected = 0;
+        for (who, thread, heard) in [
+            (GUEST, Some(TOPIC), true),
+            (GUEST, Some(LANE_TOPIC), true),
+            (GUEST, None, false),
+            (GUEST, Some(99), false),
+            (OPERATOR, Some(TOPIC), true),
+            (OPERATOR, None, true),
+        ] {
+            let before = calls.load(Ordering::SeqCst);
+            on_message(
+                bot.clone(),
+                typed(THE_FORUM, thread, a_person(who), "hello"),
+                ctx.clone(),
+            )
+            .await
+            .expect("handled");
+            let spoke = calls.load(Ordering::SeqCst) > before;
+            assert_eq!(
+                spoke, heard,
+                "person {who} in topic {thread:?}: heard={heard}, but the bot spoke={spoke}"
+            );
+            if !heard {
+                expected += 1;
+            }
+        }
+        assert_eq!(refused_senders(&hub).len(), expected);
+    }
+
+    #[tokio::test]
+    async fn the_phone_list_names_no_person() {
+        // The terminal and `--json` list a project's own people. The phone's `/projects` is read
+        // in a group: a list of who may speak must not be posted where they, and everybody else
+        // in the forum, can read it.
+        let d = tempfile::tempdir().expect("tmp");
+        let (bot, _calls) = a_telegram_that_only_counts().await;
+        let (_ctx, repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+        hub.registry
+            .lock()
+            .await
+            .set_may_speak(&repo, 555_777, true)
+            .expect("lets in");
+        let said = digest_of(hub.as_ref()).await;
+        assert!(
+            !said.contains("555777") && !said.contains("555_777"),
+            "a person's id reached the phone: {said}"
+        );
+    }
+
+    #[test]
+    fn a_channel_post_a_bot_and_an_anonymous_admin_are_nobody() {
+        // Three shapes Telegram delivers with no person the bot can vouch for. The third is the
+        // trap: an admin posting anonymously arrives as Telegram's shared anonymous-admin service
+        // account — the same one in every group — with the group as `sender_chat`, so allowing
+        // that id would allow every anonymous admin everywhere.
+        assert_eq!(
+            who_sent(&typed(THE_FORUM, None, a_person(OPERATOR), "hi")),
+            Some(OPERATOR)
+        );
+        assert_eq!(
+            who_sent(&typed(THE_FORUM, None, serde_json::Value::Null, "hi")),
+            None,
+            "a post with no sender is somebody"
+        );
+        assert_eq!(
+            who_sent(&typed(THE_FORUM, None, a_bot(4242), "hi")),
+            None,
+            "a bot is a person"
+        );
+        let mut anonymous = message_json(
+            THE_FORUM,
+            None,
+            a_bot(4242),
+            serde_json::json!({"text": "hi"}),
+        );
+        anonymous["sender_chat"] =
+            serde_json::json!({"id": THE_FORUM, "type": "supergroup", "title": "forum"});
+        let anonymous: Message = serde_json::from_value(anonymous).expect("a message");
+        assert_eq!(who_sent(&anonymous), None, "an anonymous admin is somebody");
+
+        assert_eq!(
+            who_tapped(&tapped(THE_FORUM, None, a_person(OPERATOR), "h|y")),
+            Some(OPERATOR)
+        );
+        assert_eq!(
+            who_tapped(&tapped(THE_FORUM, None, a_bot(4242), "h|y")),
+            None,
+            "a bot's tap is a person's"
+        );
+    }
+
+    /// Everything `tracing` wrote while the guard lived, as the journal shows it — no colour, one
+    /// line per event — so a test can read the line the operator is told to read.
+    struct Journal(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the journal is not poisoned")
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn a_journal() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Journal(Arc::clone(&sink)))
+            .finish();
+        (tracing::subscriber::set_default(sub), buf)
+    }
+
+    fn read(journal: &Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(journal.lock().expect("not poisoned").clone()).expect("utf-8")
+    }
+
+    #[tokio::test]
+    async fn the_journal_names_a_refused_sender_by_the_number_or_as_unknown() {
+        // The journal line is the one the operator is told to copy an id out of, into
+        // `herdr-tg allow <repo> <id>`. It printed `user=Some(999001)` and `user=None` — not a
+        // number anyone can paste, and the exact word the bar forbids — while the audit line
+        // beside it already said `sender=999001` / `sender=unknown`. The two must agree.
+        let (_guard, journal) = a_journal();
+        let ctx = Ctx {
+            hub: None,
+            gate: Arc::new(Gate::new(
+                [THE_FORUM].into_iter().collect(),
+                [OPERATOR].into_iter().collect(),
+            )),
+            username: Arc::from("herd_bot"),
+        };
+        refused_sender(&ctx, Some(A_STRANGER), THE_FORUM, None, "words").await;
+        refused_sender(&ctx, None, THE_FORUM, None, "a tap").await;
+        let said = read(&journal);
+        assert!(
+            said.contains(&format!("sender={A_STRANGER}")),
+            "the stranger's number is not on the line as a bare number:\n{said}"
+        );
+        assert!(
+            said.contains("sender=unknown"),
+            "a sender the bot cannot vouch for is not said as `unknown`:\n{said}"
+        );
+        assert!(
+            !said.contains("Some(") && !said.contains("None"),
+            "jargon on the line the operator copies an id from:\n{said}"
+        );
+    }
+
+    #[test]
+    fn every_private_chat_on_the_chat_allowlist_is_announced_as_a_person_who_may_speak_anywhere() {
+        // A private chat on the chat allowlist makes its person one who may speak ANYWHERE: type
+        // at every agent, tap every button, run every command. That is what keeps the operator's
+        // own configuration working with no new setting — and it is also what a teammate's private
+        // chat, added so `/projects` works for him in private, grants without anyone having run
+        // `allow`. So the startup log says it once per chat, naming the number and the narrower
+        // verb, rather than folding the person into a count that is easy to read past.
+        let (_guard, journal) = a_journal();
+        let chats: BTreeSet<i64> = [THE_FORUM, OPERATOR, GUEST].into_iter().collect();
+        let listed = BTreeSet::new();
+        let gate = Gate::new(chats.clone(), [OPERATOR, GUEST].into_iter().collect());
+        announce_who_may_speak(&chats, &listed, &gate);
+        let said = read(&journal);
+        for id in [OPERATOR, GUEST] {
+            let line = said
+                .lines()
+                .find(|l| l.contains("EVERY agent") && l.contains(&format!("chat={id}")))
+                .unwrap_or_else(|| {
+                    panic!("no line says that private chat {id} may type at EVERY agent:\n{said}")
+                });
+            assert!(
+                line.contains(&format!("herdr-tg allow <repo> {id}")),
+                "the line does not say the narrower way to let this one person in: {line}"
+            );
+            assert!(
+                line.contains("HERDR_TG_ALLOWED_CHAT_IDS"),
+                "the line does not name the setting the chat came from: {line}"
+            );
+        }
+        assert_eq!(
+            said.matches("EVERY agent").count(),
+            2,
+            "one line per private chat, and none for the forum:\n{said}"
+        );
+        assert!(
+            said.lines()
+                .any(|l| l.contains("WARN") && l.contains("EVERY agent")),
+            "two private chats is the shape where somebody was let in for a narrower reason, and \
+             it is said at warn, not folded into info:\n{said}"
+        );
+
+        // The operator's own shape — one private chat, his — is not a warning: it is the
+        // configuration this default exists for.
+        let (_guard, journal) = a_journal();
+        let chats: BTreeSet<i64> = [THE_FORUM, OPERATOR].into_iter().collect();
+        let gate = Gate::new(chats.clone(), [OPERATOR].into_iter().collect());
+        announce_who_may_speak(&chats, &listed, &gate);
+        let said = read(&journal);
+        assert_eq!(said.matches("EVERY agent").count(), 1, "{said}");
+        assert!(
+            !said.lines().any(|l| l.contains("WARN")),
+            "one private chat is the expected shape and must not warn:\n{said}"
+        );
     }
 }

@@ -45,6 +45,21 @@ esac
 if ! grep -q '^HERDR_TG_ALLOWED_CHAT_IDS=' "$ENV_FILE"; then
   say "  ⚠ no HERDR_TG_ALLOWED_CHAT_IDS — the bot will start but answer NOBODY."
   say "    That is the fail-closed default, not a bug. Re-run setup-token.sh to add your chat id."
+else
+  # A private chat's id is its person's id, so every POSITIVE id on the chat allowlist is a person
+  # who may type at every agent and tap every button — the operator's own chat is the one this is
+  # for. Said here, once per chat, because a teammate's chat added so /projects works for him in
+  # private is the same grant, and nothing else at install time would say so. Only the chat-id
+  # line is read; the token line is never touched.
+  private_chats=$(sed -n 's/^HERDR_TG_ALLOWED_CHAT_IDS=//p' "$ENV_FILE" | tr -d "\"'" | tr -d '[:space:]' | tr ',' '\n' | grep '^[0-9]' || true)
+  for id in $private_chats; do
+    say "  ℹ chat $id is a private chat, so that person may type at EVERY agent and tap EVERY button."
+    say "    For one project only: take it off HERDR_TG_ALLOWED_CHAT_IDS and run  herdr-tg allow <repo> $id"
+  done
+  if ! grep -q '^HERDR_TG_ALLOWED_USER_IDS=' "$ENV_FILE" && [ -z "$private_chats" ]; then
+    say "  ⚠ no private chat on HERDR_TG_ALLOWED_CHAT_IDS and no HERDR_TG_ALLOWED_USER_IDS — NOBODY may speak."
+    say "    Add your own private chat to the chat allowlist, or list your user id in HERDR_TG_ALLOWED_USER_IDS."
+  fi
 fi
 
 # `Linger` is what lets a --user service run without an active login session. Without it the bridge

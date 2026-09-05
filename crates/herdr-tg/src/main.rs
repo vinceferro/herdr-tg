@@ -149,12 +149,6 @@ enum Cmd {
         timeout_ms: u64,
     },
 
-    /// Run the Telegram bridge: long-poll the Bot API and answer the allowlisted chat.
-    ///
-    /// Still read-only (slice 2): `/status`, `/doctor`, `/help`. The bridge binds nothing — it
-    /// dials out to api.telegram.org and to the local herdr socket, so the box needs no ingress
-    /// (D7). The token comes from `$HERDR_TG_TOKEN`, never from the config file; the chat-id
-    /// allowlist is the identity gate and fails closed, so an empty allowlist answers nobody.
     /// Enrol a project so its bridge may connect, or rotate the secret of one already enrolled.
     ///
     /// **The only door.** Nothing arriving over Telegram or over the hub's socket can add a
@@ -187,11 +181,13 @@ enum Cmd {
     ///
     /// `--json` is the read-only inventory another org's dispatcher reads topic ids from: one
     /// object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes,
-    /// connected_lanes}`, in that order, sorted by title. `topic_id` is `null` until a bridge has
-    /// been live once; `connected` is the project's own voice and `connected_lanes` its addresses
-    /// live now, both `null` whenever no running hub can vouch for the answer — unknown is said
-    /// as unknown. A registry that cannot be read is refused, never printed as empty. No chat id,
-    /// no path but the repo's.
+    /// connected_lanes, allowed_users}`, in that order, sorted by title. `topic_id` is `null`
+    /// until a bridge has been live once; `connected` is the project's own voice and
+    /// `connected_lanes` its addresses live now, both `null` whenever no running hub can vouch
+    /// for the answer — unknown is said as unknown. `allowed_users` is the people let into that
+    /// project's conversations with `allow`, and never the people who may speak anywhere. A
+    /// registry that cannot be read is refused, never printed as empty. No chat id, no path but
+    /// the repo's.
     Projects {
         /// Emit the inventory as JSON instead of the table.
         #[arg(long)]
@@ -215,6 +211,43 @@ enum Cmd {
         repo: PathBuf,
     },
 
+    /// Let a person speak in one project's conversations: its topic, and its worktrees' topics.
+    ///
+    /// Terminal-only, like enrolment: no message, no tap and no command can do this. The person
+    /// is heard within about a second, with no restart. He may type at that project's agents and
+    /// tap that project's buttons, and nothing else — not another project, not General, and not
+    /// the bot's own commands, which answer with every project's name and state. The people who
+    /// may do everything are named in the configuration (`HERDR_TG_ALLOWED_USER_IDS`), and every
+    /// private chat on the chat allowlist names its one person there already.
+    Allow {
+        /// The project's own directory, as it was enrolled.
+        repo: PathBuf,
+        /// The person's Telegram user id — the number the hub's audit writes down as `sender=`
+        /// when it ignores them. A positive number; a group's id is negative and is refused.
+        #[arg(allow_negative_numbers = true)]
+        user: i64,
+    },
+
+    /// Stop a person speaking in one project's conversations. From now on; what was already
+    /// relayed stays relayed.
+    Disallow {
+        /// The project's own directory, as it was enrolled.
+        repo: PathBuf,
+        /// The person's Telegram user id.
+        #[arg(allow_negative_numbers = true)]
+        user: i64,
+    },
+
+    /// Run the Telegram bridge: long-poll the Bot API and answer the allowlisted chats.
+    ///
+    /// The bridge binds nothing — it dials out to api.telegram.org and opens the hub's Unix
+    /// socket for the projects' bridges, so the box needs no ingress. The token comes from
+    /// `$HERDR_TG_TOKEN`, never from the config file. Two gates, both failing closed: the chat
+    /// allowlist says WHERE the bot listens, and an empty one answers nobody; who may SPEAK there
+    /// is `$HERDR_TG_ALLOWED_USER_IDS` plus one person per private chat on the chat allowlist —
+    /// a private chat's id is its person's id — and, per project, whoever `allow` let in. It
+    /// answers `/projects` and `/help`; anything else typed in a project's topic goes to that
+    /// project's agent as a message in its own turn.
     Serve {
         /// Structure only — workspace, allowlist, socket. Never the token.
         #[arg(long, value_name = "PATH")]
@@ -279,6 +312,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Projects { json } => cmd::projects::projects(json),
         Cmd::Disable { repo } => cmd::enroll::switch(&repo, false),
         Cmd::Enable { repo } => cmd::enroll::switch(&repo, true),
+        Cmd::Allow { repo, user } => cmd::enroll::let_speak(&repo, user, true),
+        Cmd::Disallow { repo, user } => cmd::enroll::let_speak(&repo, user, false),
         Cmd::Serve { config } => {
             // FIRST, before the config is even read, and long before a `Bot` exists.
             //

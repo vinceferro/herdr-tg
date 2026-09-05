@@ -1,5 +1,12 @@
-<!-- INTERFACE, v11, 5 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v12, 5 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v12 changes nothing on the wire and one field in offer 8: `allowed_users`, a ninth field —
+     the people a project has let into its own conversations at the terminal with
+     `herdr-tg allow <repo> <user>`, as `docs/CAPABILITIES.md` REQUIRES 5 describes. Behind the
+     wire the hub now asks WHO typed or tapped, not only WHERE: a `message` you receive carries in
+     `from.user_id` a person who has passed that check, and a tap you receive as `choice` was
+     made by one. Nothing an adapter sends can let a person in.
 
      v11 is v10 attacked. Offer 8 gains an eighth field, `connected_lanes`, because `connected` is
      the project's own voice and a project reached only through its worktrees never has one. §6's
@@ -760,8 +767,11 @@ that simply stops. If your agent going silent needs to be noticed, that is your 
 
 **8 · Read-only inventory.** `herdr-tg projects --json`, at a terminal, built 5 September. One JSON
 array, one object per project, sorted by title, fields in this order and no others:
-`{project_id, title, repo, enabled, topic_id, connected, lanes, connected_lanes}`. `topic_id` is
-`null` until a bridge of that project has been live once — a topic does not exist at enrolment.
+`{project_id, title, repo, enabled, topic_id, connected, lanes, connected_lanes, allowed_users}`.
+`topic_id` is `null` until a bridge of that project has been live once — a topic does not exist at
+enrolment. `allowed_users` is `[<user_id>]`, sorted: the people let into THAT project's
+conversations with `herdr-tg allow`, and never the people who may speak anywhere, who are not in
+the file this reads.
 `lanes` is every address of the project that has ever been given a topic, `{<address>: <topic_id>}`.
 `connected` is whether the project's OWN voice has a bridge on the socket right now — a project
 whose sessions are all dispatched into worktrees never has one, so it is `false` for such a project
@@ -770,7 +780,8 @@ while its agent is live — and `connected_lanes` is which of its addresses are 
 which the hub writes down for this command on every arrival and departure — so both are `null`
 whenever no running hub can vouch for the answer: unknown, said as unknown, never a `false` nobody
 could prove. A registry that is there and cannot be read is refused with a non-zero exit and
-nothing on stdout, never reported as an empty inventory. No chat id, no path but the repo's.
+nothing on stdout, never reported as an empty inventory. No chat id, no path but the repo's, and no
+person but the project's own.
 **There is still no invocation over the wire** — an adapter cannot ask the hub anything; the
 inventory is read by whoever dispatches you, at the keyboard, and the join key is the repo path.
 *And the safety gap stays:* the address echo (§4) catches a wrong conversation, and nothing catches
