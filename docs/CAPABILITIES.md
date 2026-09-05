@@ -1,4 +1,16 @@
-<!-- SURFACE, v2, 4 September 2026. v2 adds the one thing this file promised and nothing could do:
+<!-- SURFACE, v5, 5 September 2026. v5 is v3 and v4 attacked: the pre-pong hold is 65 frames
+     (the queue plus the one frame an adapter puts back on close), the hub sets
+     `in_reply_to_ask` from the message he replied to, the refusal line is threaded under the
+     line it refuses, and an engine that cannot read typed words refuses them on the wire.
+     v4, 5 September 2026, makes offer 3 true across a refused connection: the hub
+     holds 64 frames or 4 MiB before the pong (what a conforming adapter may carry into a
+     reconnect; it was 256 KiB), and a connection refused before it is live has every frame the
+     hub read acked `no` first. Nothing is destroyed unanswered any more.
+     v3, 5 September 2026, closes offer 6's gap: an adapter that cannot hand the
+     operator's typed words on answers `ack{status: refused, reason}`, and the hub now READS that
+     status and says so in the topic he typed in. Nothing on the wire changed; the hub ignored
+     the status of every ack before.
+     v2, 4 September 2026, added the one thing this file promised and nothing could do:
      a dispatcher-supplied address, `KICKOFF_HUB_ADDRESS`, defined in docs/ATTACHING.md.
      v1, 3 September 2026. What another org may rely on, what it must bring, and what will
      never be built here. Written to be mirrored: kickoff publishes the same three sections in its
@@ -49,10 +61,10 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | --- | --- | --- |
 | 1 | **A conversation of its own.** A forum topic per address, created on first LIVE connection and greeted so it appears in the list. | Connect with a secret and an address. |
 | 2 | **Exclusivity.** One live connection per address. A second is refused with a reason it can branch on; a dead one is evicted, a live one is never displaced. | `refused{reason}` on the wire. |
-| 3 | **Delivery you can trust.** Every frame after `hello` acked exactly once, with three values — `yes`, `no`, `unseen`. `unseen` means it went out and could not be confirmed, and it is never retried. `hello` is answered by `welcome` or `refused` instead, and is the one frame no ack is coming for. | `ack{ref, delivered, why}`. |
+| 3 | **Delivery you can trust.** Every frame after `hello` acked exactly once, with three values — `yes`, `no`, `unseen`. `unseen` means it went out and could not be confirmed, and it is never retried. `hello` is answered by `welcome` or `refused` instead, and is the one frame no ack is coming for. A connection refused before it is live — too much said before the pong, a frame over the ceiling, no pong at all — has every frame the hub read acked `no` before the socket closes; the hub holds 65 frames before the pong — the 64 a conforming adapter may have queued plus the one it puts back at the head of its queue on close — which is what one carries into a reconnect. | `ack{ref, delivered, why}`. |
 | 4 | **A question with buttons.** Options you mint; a tap resolves against a written record, and a question answered once can never be answered twice. | `ask` up, `choice` down. |
 | 5 | **Retirement.** Buttons come off a question that has stopped being open, whoever closed it — which no screen-reading design can do. | `ask_resolved{how}`. |
-| 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. | `message{text, from}` down. |
+| 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
 | 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
 | 8 | **Read-only inventory.** *Proposed, not built* — `herdr-tg projects --json` emitting `{project_id, title, repo, topic_id, connected, lanes:{name:topic_id}}`, honest about `null` before a bridge has ever connected. Say the word and it is a small slice. | Ask for it. |
 

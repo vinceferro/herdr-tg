@@ -57,6 +57,17 @@ const hub = claimingHub(hubSock)
 const relay = startAttach(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
 await until('the relay to say hello to the hub', () => hub.got.some(f => f.t === 'hello'))
 
+// Nothing is attached yet. The operator's typed words used to be dropped here in silence — no
+// producer to hand them to, no note, and no ack — so the hub went on believing they were read.
+// The wire has always had `ack{status: refused, reason}` for exactly this; the door answers with
+// it, and the hub's own half (the line in his topic) is `crates/herdr-tg/src/hub/tests.rs`.
+hub.to({ v: 1, id: 'h-m0', t: 'message', msg_id: 'm0', text: 'anyone home?', from: { chat_id: -1, user_id: 1 } })
+await until('the refusal', () => hub.got.some(f => f.t === 'ack' && f.ref === 'h-m0')).catch(() => {})
+const nobody = hub.got.find(f => f.t === 'ack' && f.ref === 'h-m0')
+check('typed_words_arriving_while_nothing_is_attached_are_refused_out_loud_rather_than_dropped',
+  nobody?.status === 'refused' && /nothing.*attached|attached.*nothing/i.test(String(nobody?.reason)),
+  JSON.stringify(nobody ?? null))
+
 const viaRelay = { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir, KICKOFF_HUB_RELAY: '1' }
 
 // Producer A is started the way CLAUDE CODE starts one: cwd is somewhere else entirely and the
@@ -124,16 +135,23 @@ check('an_ack_names_the_frame_the_producer_sent_not_the_one_the_relay_sent',
   /never got/.test(notice) && notice.includes(mine(doomed.text)), notice)
 hub.ack = 'yes'
 
-// The operator does not know there are two producers, and the hub has no way to address one.
+// The operator does not know there are two producers, and the hub has no way to address one. The
+// door hands his words to every producer and each answers for itself: a Claude session's tool
+// server hands them to its agent; an opencode session's cannot — nothing on that engine reads a
+// channel message — and it used to write them into that void anyway, with a line on stderr and
+// nothing on the wire, so the hub went on believing they were read.
 const beforeMsgA = channelMessages(A).length
 const beforeMsgB = channelMessages(B).length
 hub.to({ v: 1, id: 'h-m', t: 'message', msg_id: 'm9', text: 'try it with --dry-run first',
   from: { chat_id: -1, user_id: 1 } })
-await until('the typed words to reach both',
-  () => channelMessages(A).length > beforeMsgA && channelMessages(B).length > beforeMsgB)
-check('the_operators_typed_words_reach_every_producer',
-  channelMessages(A).at(-1)!.params.content === 'try it with --dry-run first' &&
-    channelMessages(B).at(-1)!.params.content === 'try it with --dry-run first')
+await until('the typed words to reach the producer whose engine can read them',
+  () => channelMessages(A).length > beforeMsgA)
+check('the_operators_typed_words_reach_the_producer_whose_engine_can_read_them',
+  channelMessages(A).at(-1)!.params.content === 'try it with --dry-run first')
+await Bun.sleep(300)
+check('and are not written into a channel the other engine cannot read',
+  channelMessages(B).length === beforeMsgB,
+  JSON.stringify(channelMessages(B).slice(beforeMsgB).map(l => l.params?.content)))
 
 // Liveness is what keeps the claim. A producer that has wedged must not be able to cost the lane
 // its place on the phone, so the ping is answered by the relay itself and never handed on.
@@ -230,16 +248,32 @@ const projHub = claimingHub(projSock)
 // `/event` stream — `properties`, not `data` — because a fixture invented here would only prove
 // this file agrees with itself, which is the exact way that field was got wrong once already.
 let pushEvent: ((o: unknown) => void) | null = null
+/** What `GET /session` lists — `{}`, an answer the watcher cannot read, until a test lists one. */
+let ocSessions: Record<string, unknown>[] | null = null
+/** Every prompt the fake opencode was handed, as the session it went to and the words. */
+const ocPrompts: { path: string; text: string }[] = []
 const oc = Bun.serve({
   port: 0,
-  fetch(req) {
-    if (new URL(req.url).pathname !== '/event') return new Response('{}', { status: 200 })
-    return new Response(new ReadableStream({
-      start(c) {
-        const enc = new TextEncoder()
-        pushEvent = (o: unknown) => c.enqueue(enc.encode(`data: ${JSON.stringify(o)}\n\n`))
-      },
-    }), { headers: { 'content-type': 'text/event-stream' } })
+  async fetch(req) {
+    const u = new URL(req.url)
+    if (u.pathname === '/event') {
+      return new Response(new ReadableStream({
+        start(c) {
+          const enc = new TextEncoder()
+          pushEvent = (o: unknown) => c.enqueue(enc.encode(`data: ${JSON.stringify(o)}\n\n`))
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } })
+    }
+    if (u.pathname === '/session' && req.method === 'GET') {
+      return ocSessions ? Response.json(ocSessions) : new Response('{}', { status: 200 })
+    }
+    if (u.pathname.endsWith('/prompt_async') && req.method === 'POST') {
+      const body = await req.json()
+      ocPrompts.push({ path: u.pathname, text: String(body?.parts?.[0]?.text) })
+      // The captured answer: 204, no body.
+      return new Response(null, { status: 204 })
+    }
+    return new Response('{}', { status: 200 })
   },
 })
 
@@ -277,6 +311,31 @@ check('the_event_voice_and_the_chosen_voice_share_one_claim_inside_one_process',
     projHub.got.some(f => f.t === 'ask' && /rm -rf build/.test(String(f.text))) &&
     new Set(ids).size === ids.length,
   `${projHub.got.filter(f => f.t === 'hello').length} hellos, ${projHub.refusals.length} refusals, ids ${JSON.stringify(ids)}`)
+
+// His typed words, at a door with TWO voices behind it, get ONE answer at the hub — the hub keeps
+// the first ack it hears for a message and no other. The tool server on opencode refuses them
+// (nothing on that engine reads a channel message); the watcher carries them, or refuses with the
+// reason that matters. Forwarded as they came, the tool server's "this engine cannot" arrived first
+// every time, being no more than a lookup, and the operator read the wrong reason on the days the
+// watcher could have said why — and "accepted" was never the first when both spoke.
+const typedAt = (id: string, text: string) =>
+  projHub.to({ v: 1, id, t: 'message', msg_id: `m-${id}`, text, from: { chat_id: -1, user_id: 1 } })
+typedAt('h-t1', 'anyone there?')
+await until('an answer', () => projHub.got.some(f => f.t === 'ack' && f.ref === 'h-t1'), 8000).catch(() => {})
+await Bun.sleep(600)
+const answers = projHub.got.filter(f => f.t === 'ack' && f.ref === 'h-t1')
+check('typed_words_at_a_door_with_two_voices_get_one_answer_and_it_is_the_carriers',
+  answers.length === 1 && answers[0].status === 'refused' &&
+    /worker's server|session/.test(String(answers[0].reason)) && !/engine/.test(String(answers[0].reason)),
+  JSON.stringify(answers))
+ocSessions = [{ id: 'ses_000000000000000000theOne', directory: repo, time: { created: 1, updated: 2 } }]
+typedAt('h-t2', 'try the staging one first')
+await until('the words to be taken', () => projHub.got.some(f => f.t === 'ack' && f.ref === 'h-t2'), 8000).catch(() => {})
+await Bun.sleep(600)
+const takenAt = projHub.got.filter(f => f.t === 'ack' && f.ref === 'h-t2')
+check("and when the carrier takes them the hub hears accepted, once, never the other voice's refusal",
+  takenAt.length === 1 && takenAt[0].status === 'accepted' && ocPrompts.some(p => p.text === 'try the staging one first'),
+  `${JSON.stringify(takenAt)} prompts=${JSON.stringify(ocPrompts)}`)
 
 // THE STRANGER'S TEST, and it is the one that matters most. `docs/examples/attach-from-the-document.ts`
 // was written from `docs/ATTACHING.md` alone and imports nothing from this repository — not the
@@ -370,6 +429,77 @@ check('a_second_attach_for_one_conversation_refuses_to_start_rather_than_racing_
 check('and the hub still sees exactly one connection for the lane',
   hub.got.filter(f => f.t === 'hello').length === 1,
   String(hub.got.filter(f => f.t === 'hello').length))
+
+// The hub takes a frame and the connection ends before it answers for it — a hub restart with
+// something in flight, or the hub before this slice destroying what a bridge said before its pong.
+// An ack names a per-connection id, so no answer is ever coming on the next connection; and the
+// relay is the only thing that knows WHOSE frame it was. Its own link used to keep the frame on the
+// books in silence, and the producer's agent went on believing "said".
+hub.ack = null
+const taken = await call(A, 'reply', { text: 'taken and never answered for' })
+check('a frame the hub took is reported as said, because it was', taken.text === 'said', taken.text)
+await until('the hub to have it', () => hub.got.some(f => f.t === 'say' && f.text === 'taken and never answered for'))
+const hellosBefore = hub.got.filter(f => f.t === 'hello').length
+hub.drop()
+await until('the producer to be told that nobody knows what became of it',
+  () => noticesTo(A).some(n => /could not confirm/.test(String(n.params?.content ?? ''))), 8000).catch(() => {})
+const unknown = noticesTo(A).map(n => String(n.params?.content ?? '')).find(t => /could not confirm/.test(t)) ?? ''
+check('a_producer_learns_which_of_its_frames_the_hub_took_and_never_answered_for', unknown !== '',
+  JSON.stringify(noticesTo(A).map(n => n.params?.content)))
+check('and it is told the fate is unknown, never that he did not get it',
+  /may have arrived and it may not/.test(unknown) && !/never got/.test(unknown), unknown)
+hub.ack = 'yes'
+await until('the relay to come back', () => hub.got.filter(f => f.t === 'hello').length > hellosBefore, 8000).catch(() => {})
+await Bun.sleep(300)
+check('and the frame is not sent again, because it may already be on his phone',
+  hub.got.filter(f => f.t === 'say' && f.text === 'taken and never answered for').length === 1,
+  String(hub.got.filter(f => f.t === 'say' && f.text === 'taken and never answered for').length))
+
+// The door's OWN line is not the hub's. When the hub connection ends, the frames still waiting in
+// it never went anywhere — and the door then ends its producers' sockets, so each producer's own
+// close-time report counted everything it had handed over and not heard back on, those included:
+// its agent was told they had gone out with their fate unknown, and not to expect them again, and
+// the door then sent them on the next connection. Each one is answered `no` BEFORE the socket
+// ends, so "never got it" is the truth and nothing the agent was told to forget is sent later.
+//
+// The twelve are queued in the PRODUCER while the hub is away — "not said yet", certain to go out
+// — so they are all inside it before the hub comes back. The hub then stops reading inside the
+// first chunk they arrive in (its one thread sleeps, which is what a hub that wedged looks like
+// from the door) so the door's writes fill the kernel and the rest sit in its own line; then the
+// hub closes on it. Twelve frames of sixty thousand bytes is more than two socket buffers hold.
+hub.drop()
+await until('the hub connection to be gone', () => hub.live === 0)
+await Bun.sleep(400)
+const noticesBefore = noticesTo(A).length
+const hellosNow = hub.got.filter(f => f.t === 'hello').length
+const queued: number[] = []
+for (let i = 0; i < 12; i++) {
+  const id = 300 + i
+  queued.push(id)
+  A.to({ jsonrpc: '2.0', id, method: 'tools/call',
+    params: { name: 'reply', arguments: { text: `held at the door ${i} ${'x'.repeat(60_000)}` } } })
+}
+await until('every reply to be answered', () => queued.every(id => A.out.some(l => l.id === id)), 15000)
+const told = queued.map(id => String(A.out.find(l => l.id === id)!.result?.content?.[0]?.text ?? ''))
+check('with the hub away the twelve are honestly reported as waiting', told.every(t => /^not said yet/.test(t)), JSON.stringify(told.map(t => t.slice(0, 40))))
+hub.freezeThenDrop(1500)
+await until('the relay to come back', () => hub.got.filter(f => f.t === 'hello').length > hellosNow, 10000).catch(() => {})
+await until('every frame to be answered for', () => {
+  const n = noticesTo(A).slice(noticesBefore).map(x => String(x.params?.content ?? ''))
+  return n.filter(t => /never got/.test(t)).length + n.filter(t => /could not confirm/.test(t)).length >= 12
+}, 10000).catch(() => {})
+await until('the relay to come back once more', () => hub.got.filter(f => f.t === 'hello').length > hellosNow + 1, 10000).catch(() => {})
+await Bun.sleep(1500)
+const notices = noticesTo(A).slice(noticesBefore).map(x => String(x.params?.content ?? ''))
+const neverGot = notices.filter(t => /never got/.test(t)).length
+const unconfirmed = notices.filter(t => /could not confirm/.test(t)).length
+const closeTime = notices.filter(t => /connection ended before the hub said/.test(t))
+check('a_frame_still_waiting_at_the_door_when_the_hub_goes_is_answered_no_before_the_producer_is_ended',
+  neverGot >= 1 && neverGot + unconfirmed === 12 && closeTime.length === 0,
+  `never got ${neverGot}, unconfirmed ${unconfirmed}, close-time reports ${closeTime.length} ${JSON.stringify(closeTime.map(t => t.slice(0, 140)))}`)
+check('and nothing the agent was told to forget is sent on the next connection',
+  hub.got.filter(f => f.t === 'say' && /^held at the door/.test(String(f.text))).length === 0,
+  String(hub.got.filter(f => f.t === 'say' && /^held at the door/.test(String(f.text))).length))
 
 A.child.kill()
 relay.kill()

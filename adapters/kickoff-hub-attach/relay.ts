@@ -46,7 +46,7 @@ import { mkdirSync, statSync, unlinkSync } from 'fs'
 import { dirname } from 'path'
 
 import type { Facts, Project } from '../../plugins/kickoff-channel/where.ts'
-import { HubLink, MAX_FRAME_BYTES, PROTOCOL_VERSION, type Outbound } from '../../plugins/kickoff-channel/hub-link.ts'
+import { HubLink, MAX_FRAME_BYTES, PROTOCOL_VERSION, type Outbound, type Unanswered } from '../../plugins/kickoff-channel/hub-link.ts'
 import { Ledger } from './ledger.ts'
 
 /** Everything the door needs, worked out once by `main.ts` from the namespace it read. */
@@ -63,6 +63,13 @@ export type RelayConfig = {
   hubSocket: string
   /** How long a departed producer has to come home before its questions come off the phone. */
   graceMs: number
+  /**
+   * The `instance` of the one producer that carries the operator's typed words — the watcher
+   * `--opencode` starts — or null when there is none. Named so that when every producer refuses
+   * his words, the reason forwarded is the carrier's: a tool server's "this engine cannot" is
+   * true and useless beside "the worker has no session open".
+   */
+  carrier: string | null
   /**
    * The enrolled project, resolved AFRESH on every attempt — never once, because the operator may
    * `herdr-tg enroll` while this is running and that is the documented recovery from unknown_project.
@@ -210,6 +217,24 @@ export function createRelay(cfg: RelayConfig): Relay {
   const ourOwn = new Set<string>()
 
   /**
+   * His typed words, handed to several producers, and who has yet to answer for them — keyed by
+   * the hub's own id for the `message`, which is what a producer's `ack` names.
+   *
+   * The hub keeps the FIRST answer it hears for a message and no other, so the door cannot forward
+   * every producer's answer as it comes. On opencode the tool server refuses at once — nothing on
+   * that engine reads a channel message, and saying so is no more than a lookup — while the
+   * watcher goes to the server and back, so forwarded as they came the operator read "this engine
+   * cannot" on the days the watcher could have said why, and "accepted" was never the first when
+   * both spoke. So: one `accepted` from anybody goes up the moment it arrives, and a `refused`
+   * goes up only once every producer the words were handed to has refused or gone — carrying the
+   * carrier's reason when the carrier is among them (`cfg.carrier`). Bounded, oldest first out,
+   * because a producer that never answers must not turn this into a leak.
+   */
+  type TypedWords = { waiting: Set<string>; refusals: { key: string; reason: string }[] }
+  const typedWords = new Map<string, TypedWords>()
+  const TYPED_WORDS_KEPT = 64
+
+  /**
    * Who the producers are and what they are waiting on — including across a restart of this process.
    *
    * `sendUp` is a closure rather than the link itself because the ledger has no business knowing
@@ -223,15 +248,30 @@ export function createRelay(cfg: RelayConfig): Relay {
     sendUp: (payload, _what, owner) => {
       const d = link.send(payload, _what, undefined, owner)
       if (d.delivered || !d.permanent) {
-        ourOwn.add(d.id)
-        // Bounded for the same reason every other map here is: a hub that stopped acking must not
-        // turn a set nobody reads any more into a slow leak.
-        while (ourOwn.size > 256) ourOwn.delete(ourOwn.values().next().value!)
+        rememberOurOwn(d.id)
         return { ok: true }
       }
       return { ok: false, why: d.why }
     },
   })
+
+  /**
+   * A frame this door sent for itself is one whose `ack` nobody upstairs is waiting on.
+   *
+   * Bounded for the same reason every other map here is: a hub that stopped acking must not turn
+   * a set nobody reads any more into a slow leak.
+   */
+  function rememberOurOwn(id: string): void {
+    ourOwn.add(id)
+    while (ourOwn.size > 256) ourOwn.delete(ourOwn.values().next().value!)
+  }
+
+  /** Say something to the hub on this door's OWN behalf — an answer for a frame it received. */
+  function answerHub(payload: Record<string, unknown>, what: string): void {
+    const d = link.send(payload, what)
+    if (d.delivered || !d.permanent) rememberOurOwn(d.id)
+    else note(`the hub link would not take ${what}: ${d.why}`)
+  }
 
   /** The one place a producer's ask id becomes the hub's, so the two can never drift apart. */
   const namespaced = (p: Producer, askId: string) => `${p.n}~${askId}`
@@ -338,6 +378,21 @@ export function createRelay(cfg: RelayConfig): Relay {
       for (const p of producers) {
         if (!p.greeted) continue
         p.greeted = false
+        // What it handed this door that never left. The door's own line is not the hub's: a
+        // frame still waiting in it when the hub connection ended went nowhere, and the socket
+        // about to be ended is the one its producer's close-time report runs on — which counts
+        // everything handed over and not heard back on, these included. The agent was told they
+        // had gone out with their fate unknown and would not be sent again, and this door then
+        // sent them on the next connection. Off the line and answered `no` BEFORE the socket
+        // ends, "never got it" is the truth and nothing the agent was told to forget is sent.
+        // The routing for a question that never went is dead weight, as it is for one the hub
+        // said no to.
+        for (const o of link.dropQueuedFor(p.key)) {
+          const m = byHubFrame.get(o.id)
+          byHubFrame.delete(o.id)
+          if (m?.askUp) ledger.closed(m.askUp)
+          refuseFrame(p, m?.ref ?? o.id)
+        }
         p.down.endAfterFlush()
       }
     },
@@ -356,6 +411,32 @@ export function createRelay(cfg: RelayConfig): Relay {
           continue
         }
         refuseFrame(p, m.ref)
+      }
+    },
+    /**
+     * Frames the hub took and the connection ended before it answered for them.
+     *
+     * The door keeps the wire's promise to its producers the way the hub keeps it to the door: one
+     * ack per frame, and never a socket ended with frames unanswered. `unseen` is the truth here —
+     * the hub may have delivered them and lost the ack with the socket, or destroyed them, and from
+     * this side the two are one — and a producer already knows what to do with it: say so to its
+     * agent, and never send the frame again. Written BEFORE the link is marked down, because marking
+     * it down ends every greeted producer's socket, and an ack written after that is written into a
+     * socket that is closing. The ask's routing record is kept: a question that DID land has live
+     * buttons, and this relay's instance survives the reconnect, so his tap can still arrive.
+     */
+    onUnanswered(gone: Unanswered[], why: string) {
+      note(`the hub connection ended with ${gone.length} frame(s) unanswered for: ${why}`)
+      for (const o of gone) {
+        const m = byHubFrame.get(o.id)
+        if (!m) continue
+        byHubFrame.delete(o.id)
+        const p = attached.get(m.key)
+        if (!p) {
+          note(`nobody knows what became of a frame whose producer is no longer here: ${o.what}`)
+          continue
+        }
+        p.down.write({ t: 'ack', ref: m.ref, delivered: 'unseen' })
       }
     },
   })
@@ -478,17 +559,49 @@ export function createRelay(cfg: RelayConfig): Relay {
         p.down.relay({ ...f, ask_id: a.askId })
         break
       }
-      case 'message':
+      case 'message': {
         // The operator's typed words are not addressed to a particular producer — the hub has no
         // idea there is more than one — so every attached producer gets them and each decides what
-        // it can do. The tool server hands them to its agent; the event watcher says it cannot pass
-        // them on.
+        // it can do. The tool server hands them to its agent; the watcher hands them to the session
+        // as a prompt, and answers the hub with an `ack` saying whether it could.
         //
         // Over the ATTACHED producers, not every open socket: a producer that has reconnected has an
         // older socket still draining its last frame, and his words would go into the one that is
         // about to close rather than the one its agent is reading.
-        for (const p of attached.values()) if (p.greeted) p.down.relay(f)
+        //
+        // `in_reply_to_ask` names the ask id the HUB knows, which is this door's namespaced one.
+        // The producer that asked gets its own id back; every other producer gets no field at
+        // all, because an id from another producer's namespace names nothing it ever minted.
+        const asked = f.in_reply_to_ask === undefined || f.in_reply_to_ask === null ? undefined : ledger.who(String(f.in_reply_to_ask))
+        const { in_reply_to_ask: _theirs, ...plain } = f
+        const handedTo = new Set<string>()
+        for (const p of attached.values()) {
+          if (!p.greeted) continue
+          handedTo.add(p.key)
+          p.down.relay(asked && asked.key === p.key ? { ...plain, in_reply_to_ask: asked.askId } : plain)
+        }
+        if (!handedTo.size) {
+          // Refused out loud, never dropped in silence. Dropped, the hub goes on believing his
+          // words were read; answered `refused`, it puts a line in the topic he typed in. The wire
+          // has always had this ack, and until now nothing ever sent it. This is the door's own
+          // answer because there is nobody else to give one: an engine's tool server that has not
+          // attached yet, or a worker whose engine has gone.
+          note('the operator typed something and nothing is attached to take it; the hub was told')
+          answerHub(
+            { t: 'ack', ref: String(f.id), status: 'refused', reason: 'nothing is attached to the worker yet that can take typed words' },
+            'an answer about typed words',
+          )
+          break
+        }
+        // Everyone it was handed to has to answer, or go, before the hub hears a refusal.
+        typedWords.set(String(f.id), { waiting: handedTo, refusals: [] })
+        while (typedWords.size > TYPED_WORDS_KEPT) {
+          const oldest = typedWords.keys().next()
+          if (oldest.done) break
+          typedWords.delete(oldest.value)
+        }
         break
+      }
       default:
         break
     }
@@ -590,12 +703,22 @@ export function createRelay(cfg: RelayConfig): Relay {
         detach(p)
         p.down.endAfterFlush()
         return
+      case 'ack': {
+        // An answer about his typed words is folded into the one answer the hub will hear; any
+        // other ack goes up as the frame it is.
+        const about = typedWords.get(String(f.ref))
+        if (about) {
+          answerForTypedWords(String(f.ref), about, p, f)
+          return
+        }
+        relayUp(p, f)
+        return
+      }
       case 'say':
       case 'ask':
       case 'done':
       case 'ask_resolved':
       case 'beat':
-      case 'ack':
         relayUp(p, f)
         return
       default:
@@ -654,11 +777,38 @@ export function createRelay(cfg: RelayConfig): Relay {
     else ledger.closed(askUp)
   }
 
+  /** One producer's answer about his typed words, folded into the one the hub will hear. */
+  function answerForTypedWords(ref: string, about: TypedWords, p: Producer, f: Record<string, any>): void {
+    // A second answer from one producer, or one from a producer the words were never handed to,
+    // says nothing the first did not.
+    if (!about.waiting.delete(p.key)) return
+    if (f.status === 'accepted') {
+      typedWords.delete(ref)
+      answerHub({ t: 'ack', ref, status: 'accepted' }, 'an answer about typed words')
+      return
+    }
+    about.refusals.push({ key: p.key, reason: typeof f.reason === 'string' ? f.reason : '' })
+    settleTypedWords(ref, about)
+  }
+
+  /** Nobody left to answer: one refusal goes up, with the reason that matters most. */
+  function settleTypedWords(ref: string, about: TypedWords): void {
+    if (about.waiting.size) return
+    typedWords.delete(ref)
+    const said = about.refusals.find(r => r.key === cfg.carrier) ?? about.refusals[0]
+    const reason = said?.reason || 'everything attached to the worker went away before taking it'
+    answerHub({ t: 'ack', ref, status: 'refused', reason }, 'an answer about typed words')
+  }
+
   function detach(p: Producer): void {
     if (!producers.delete(p)) return
     note(`a producer went away; ${producers.size} left`)
     if (!p.checked || attached.get(p.key) !== p) return
     attached.delete(p.key)
+    // Whatever of his typed words it had not answered for, it never will now.
+    for (const [ref, about] of typedWords) {
+      if (about.waiting.delete(p.key)) settleTypedWords(ref, about)
+    }
     ledger.rememberNow()
     // The other half of the same proof the hub makes: its socket is gone, and if nothing comes back
     // under its name, the questions it left cannot be answered by anybody and their buttons come off.

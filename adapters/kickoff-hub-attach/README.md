@@ -23,7 +23,7 @@ flag: it is `KICKOFF_HUB_PROJECT_DIR`, and `.` means "the directory I was starte
 | flag | what it does |
 | --- | --- |
 | *(none)* | Hold the claim and open the door. This alone is what `adapters/fanin/` used to be. |
-| `--opencode <url>` | Also watch the opencode server at `<url>` — its questions and permission prompts go to the phone as `ask`, a tap goes back to its own reply endpoint. This is what `adapters/opencode-bridge/` used to be, minus its process. |
+| `--opencode <url>` | Also watch the opencode server at `<url>` — its questions and permission prompts go to the phone as `ask`, a tap goes back to its own reply endpoint, and what the operator types in the topic goes to the session as a prompt, verbatim (the session the server lists for the project directory; a reply under a question goes to the session that asked it). When there is no session to hand the words to, the hub is told and puts one line in his topic. Without this flag an opencode worker is half a phone — no questions, no prompts, and typed words refused out loud rather than carried — and the start and `--check` both say so. This is what `adapters/opencode-bridge/` used to be, minus its process, plus the half of the phone it never had. |
 | `--run <command...>` | Start `<command...>` as this process's child, in the project directory, with the namespace pinned so any adapter descending from it finds the door. When the child exits, say `bye`, close the door, and exit with the child's status. Everything after `--run` is the command. |
 | `--check` | Prove this environment can reach the hub — one plain line per fact, then exit 0 if all hold, 1 otherwise. Sends `hello` and `bye` and nothing else; **creates no topic**. |
 

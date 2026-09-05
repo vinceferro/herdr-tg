@@ -3,7 +3,9 @@
  *
  * It watches an opencode server's `/event` stream and turns the two things opencode already knows
  * how to say — "I am asking this, and here are the options" and "I need permission to do this" —
- * into the hub's `ask`, then posts the operator's tap back as a reply.
+ * into the hub's `ask`, then posts the operator's tap back as a reply. And it carries the other
+ * half of a phone: what the operator TYPES at the conversation goes to the session as a prompt,
+ * verbatim, the way a Claude session gets it in its own turn (`carry`, below).
  *
  * # It is a PRODUCER at attach's own door, in the same process
  *
@@ -21,7 +23,10 @@
  * Every button this watcher mints comes from a list opencode published. A tap comes back as an
  * `option_id` this watcher wrote down, and it is looked up in that record — never used to address
  * anything. The operator picks one of the answers the machine already offered; he cannot name a
- * tool, a file or a command.
+ * tool, a file or a command. His typed words are the same rule from the other side: they travel
+ * only as the text of a prompt, and WHICH session gets them is the server's answer to a question
+ * this watcher asks about the project directory — nothing in the text can pick a session, a path
+ * or a URL.
  *
  * # The wire is not written here
  *
@@ -31,7 +36,7 @@
  */
 
 import type { Project } from '../../plugins/kickoff-channel/where.ts'
-import { HubLink, MAX_FRAME_BYTES, type Delivery, type Outbound } from '../../plugins/kickoff-channel/hub-link.ts'
+import { HubLink, MAX_FRAME_BYTES, type Delivery, type Outbound, type Unanswered } from '../../plugins/kickoff-channel/hub-link.ts'
 
 /** What the watcher needs, worked out by `main.ts` from the namespace and the door it opened. */
 export type WatcherConfig = {
@@ -39,6 +44,12 @@ export type WatcherConfig = {
   door: string
   /** The conversation attach holds, echoed in `hello` and checked in `welcome`. */
   address: string | null
+  /**
+   * This run of the watcher, as its `hello` names it. Minted by `main.ts` rather than here because
+   * the door has to know it: of the producers behind the door this is the one that carries the
+   * operator's typed words, and the door forwards its answer about them over a tool server's.
+   */
+  instance: string
   /** The opencode server to watch. Seam ②, and deliberately outside the namespace. */
   opencodeUrl: string
   /**
@@ -75,9 +86,43 @@ export function startWatcher(cfg: WatcherConfig): void {
   const ADDRESS = cfg.address
 
   /** This run. A new instance invalidates every question the last one left open. */
-  const INSTANCE = `${process.pid}-w-${Date.now()}`
+  const INSTANCE = cfg.instance
+
+  /**
+   * How long one request to the server may take before it is given up on.
+   *
+   * Bun's `fetch` waits for ever by default, and typed lines are carried one after another so
+   * their order is kept — so one request the server accepted and never answered parked that line
+   * AND every line typed after it, none of them acked: the hub went on believing each was read,
+   * and the operator went on typing at a wall that took none of it. Measured: two messages,
+   * twelve seconds, no ack for either. The measured round trip is 4–24 ms; a server that has not
+   * answered in ten seconds is not going to.
+   */
+  const OPENCODE_ANSWERS_WITHIN_MS = 10_000
 
   const open = new Map<string, Open>()
+
+  /**
+   * Sessions his typed words were handed to and that have not finished a turn since.
+   *
+   * 204 from `prompt_async` means opencode wrote the words down; the agent has not run. When it
+   * then cannot — the gateway down, a provider key expired, the context overflowed — opencode says
+   * so as `session.error`, and until this existed nothing here listened: the hub had posted
+   * nothing, and the only record was a stack trace in a stream nobody watches. Cleared by the
+   * session's next `session.idle`, which is a turn that ran. Bounded, oldest first, for a server
+   * that never goes idle.
+   */
+  const prompted = new Map<string, number>()
+  const MAX_PROMPTED = 100
+  function rememberPrompted(sessionID: string): void {
+    prompted.delete(sessionID)
+    prompted.set(sessionID, Date.now())
+    while (prompted.size > MAX_PROMPTED) {
+      const oldest = prompted.keys().next()
+      if (oldest.done) break
+      prompted.delete(oldest.value)
+    }
+  }
 
   /**
    * Bounded, because a server that never resolves its questions would otherwise make this a leak.
@@ -143,6 +188,7 @@ export function startWatcher(cfg: WatcherConfig): void {
     },
     onFrame: fromHub,
     onLost,
+    onUnanswered,
   })
 
   /**
@@ -153,6 +199,18 @@ export function startWatcher(cfg: WatcherConfig): void {
   function onLost(lost: Outbound[], why: string): void {
     for (const o of lost) if (o.askId) giveUpOn(o.askId, why)
     note(`${lost.length} frame(s) will never go out: ${why}`)
+  }
+
+  /**
+   * Frames the door took and the connection ended before it answered for them.
+   *
+   * The same fact the hub's own `unseen` carries, learned one hop earlier, and handled the same way:
+   * a question nobody can confirm was asked is given up on here, never asked again — a second copy
+   * would leave two live keyboards for one answer.
+   */
+  function onUnanswered(gone: Unanswered[], why: string): void {
+    for (const o of gone) if (o.askId) giveUpOn(o.askId, why)
+    note(`${gone.length} frame(s) went out and nobody knows what became of them: ${why}`)
   }
 
   /** Send, and act on what actually happened to it. */
@@ -230,14 +288,157 @@ export function startWatcher(cfg: WatcherConfig): void {
         void answer(String(f.ask_id), String(f.option_id))
         return
       case 'message':
-        // The operator typed at this project. opencode's own prompt endpoint is the place for this,
-        // and it is deliberately not wired yet: steering a session by text is a second decision.
-        note('the operator typed something; passing typed steering to opencode is not built yet')
+        // The operator typed at this conversation. Carried one at a time, in the order the lines
+        // arrived: two lines typed a second apart are one thought, and two lookups racing could
+        // put the second in front of the agent before the first.
+        carrying = carrying
+          .then(() => carry(f))
+          .catch(e => {
+            // The line must never be poisoned: a rejected promise here would skip every later
+            // `carry`, and every line typed after it would be neither posted nor acked — the
+            // silence this whole path exists to end. `carry` catches its own failures; this is
+            // for the one it cannot foresee, and the hub is still answered.
+            note(`could not carry the operator's words: ${(e as Error)?.message ?? e}`)
+            answerFor(String(f.id), 'the worker could not take it')
+          })
         return
       default:
         // Unknown kind ignored, so something shipped after this cannot kill the link by being newer.
         // `ping` never arrives here — `hub-link.ts` answers it — so liveness never waits on this switch.
         return
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────────────────────
+  // Typed steering.
+
+  /** The line of typed messages, carried one after another — see `case 'message'`. */
+  let carrying: Promise<void> = Promise.resolve()
+
+  /**
+   * The operator typed at this conversation, and his words become a PROMPT to the session —
+   * verbatim, the way a Claude session gets them in its own turn. Nothing is put in front of them
+   * and nothing in them is read: the session is the machine's answer (`sessionForTypedWords`), the
+   * URL is built from that answer and the `--opencode` flag, and the words travel only as the text
+   * of the body. `from` is not shown to the agent, exactly as the Claude adapter does not show it.
+   *
+   * The endpoint and the body were captured from opencode 1.18.25 on 5 September, not guessed —
+   * the last time this adapter guessed an opencode shape every test agreed with the guess.
+   * `POST /session/{id}/prompt_async` with `{parts: [{type: 'text', text}]}` answers 204 at once
+   * and runs the agent with the session's own model and agent. The v2 `/api/session/{id}/prompt`,
+   * the one a reader of the spec reaches for first, admitted the prompt, emitted two events, and
+   * ran nothing. A prompt to a session blocked on its own question is taken (204), written down,
+   * and run once the question is answered.
+   *
+   * Every `message` is answered on the wire with `ack{ref, status, reason?}`. `refused` carries a
+   * reason in the operator's own register, because the hub puts it in the topic he typed in — the
+   * one place he can learn that a line he wrote reached nobody. Until this existed his words
+   * reached a line on stderr saying it was not built, and nothing at all reached him.
+   */
+  async function carry(f: Record<string, any>): Promise<void> {
+    const ref = String(f.id)
+    if (typeof f.text !== 'string') {
+      answerFor(ref, 'the message arrived without any words in it')
+      return
+    }
+    const replyTo = f.in_reply_to_ask === undefined || f.in_reply_to_ask === null ? null : String(f.in_reply_to_ask)
+    const target = await sessionForTypedWords(replyTo)
+    if ('refused' in target) {
+      note(`the operator's words were not handed on: ${target.refused}`)
+      answerFor(ref, target.refused)
+      return
+    }
+    const sid = encodeURIComponent(target.sessionID)
+    try {
+      const r = await fetch(`${OPENCODE}/session/${sid}/prompt_async`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ parts: [{ type: 'text', text: f.text }] }),
+        signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
+      })
+      if (!r.ok) {
+        // The status is for a developer, here. The reason goes verbatim into his topic, where a
+        // number is jargon; and it is "it", because the hub's sentence is about "what you typed".
+        note(`opencode would not take the operator's words (${r.status})`)
+        answerFor(ref, "the worker's server would not take it")
+        return
+      }
+      note(`the operator's words went to ${target.how} as a prompt`)
+      rememberPrompted(target.sessionID)
+      answerFor(ref)
+    } catch (e) {
+      note(`could not reach opencode with the operator's words: ${(e as Error)?.message ?? e}`)
+      answerFor(ref, unreached(e))
+    }
+  }
+
+  /** What he is told when a request to the server ended without an answer. */
+  function unreached(e: unknown): string {
+    return (e as Error)?.name === 'TimeoutError'
+      ? "the worker's server did not answer in time"
+      : "the worker's server could not be reached"
+  }
+
+  /** Tell the hub what became of one `message`, on the wire. The hub acks this like any frame. */
+  function answerFor(ref: string, refused?: string): void {
+    say(
+      refused ? { t: 'ack', ref, status: 'refused', reason: refused } : { t: 'ack', ref, status: 'accepted' },
+      'an answer about typed words',
+    )
+  }
+
+  /**
+   * Which session his words go to. The MACHINE's answer, in this order, and never the text's:
+   *
+   *   1. Typed under a question this watcher asked and still holds open: the session that asked
+   *      it. It is the one time the operator has said which session he means. The words are
+   *      still a prompt and not an answer to the question — its answers are the buttons opencode
+   *      published, and a permission takes three words and no others — so the question stays open
+   *      for his tap, and opencode runs the words once it is answered (measured, 5 September).
+   *   2. Otherwise the session this wall's server is running for the project directory attach
+   *      speaks for: `GET /session?directory=<it>&roots=true`, which the server answers most
+   *      recently updated first. The operator's decision is one server per wall, so this is
+   *      usually one; when it is several, the one that moved last is the one whose words he is
+   *      reading. Root sessions only, because a subagent's session is not the conversation on his
+   *      phone; and nothing archived. Measured: the directory match takes a trailing slash and a
+   *      symlink, and excludes a subfolder.
+   *   3. None: refused, with a reason the hub can put in front of him. Never a guess — a guess is
+   *      his words in a session he was not talking to.
+   *
+   * `GET /api/session/active` was measured and is NOT used: it sees only the v2 drains, and stayed
+   * empty for the whole of a session driven through the v1 endpoint this watcher uses.
+   */
+  async function sessionForTypedWords(
+    inReplyTo: string | null,
+  ): Promise<{ sessionID: string; how: string } | { refused: string }> {
+    if (inReplyTo) {
+      const asked = open.get(inReplyTo)
+      if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}` }
+    }
+    let list: unknown
+    try {
+      const r = await fetch(`${OPENCODE}/session?directory=${encodeURIComponent(cfg.projectDir)}&roots=true`, {
+        signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
+      })
+      if (!r.ok) {
+        note(`opencode would not say which session is open (${r.status})`)
+        return { refused: "the worker's server would not say which session is open" }
+      }
+      list = await r.json()
+    } catch (e) {
+      note(`could not ask opencode which session is open: ${(e as Error)?.message ?? e}`)
+      return { refused: unreached(e) }
+    }
+    if (!Array.isArray(list)) return { refused: "the worker's server gave an answer that could not be read" }
+    const candidates = list
+      .filter((s: any) => s && typeof s.id === 'string' && s.id.startsWith('ses') && !s.parentID && !s.time?.archived)
+      .sort((a: any, b: any) => Number(b.time?.updated ?? 0) - Number(a.time?.updated ?? 0))
+    if (!candidates.length) {
+      return { refused: 'the worker has no session open, so there was nothing to hand it to' }
+    }
+    return {
+      sessionID: String(candidates[0].id),
+      how: candidates.length === 1 ? 'the one session open' : `the most recently active of ${candidates.length} sessions`,
     }
   }
 
@@ -280,6 +481,9 @@ export function startWatcher(cfg: WatcherConfig): void {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
+        // Not carried one after another as typed words are, so one stuck tap takes no other with
+        // it — but a request that never answers is still a promise this process holds for ever.
+        signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
       })
       if (!r.ok) {
         note(`opencode refused the answer to ${askId} (${r.status})`)
@@ -384,12 +588,45 @@ export function startWatcher(cfg: WatcherConfig): void {
         )
         return
       }
-      case 'session.idle':
+      case 'session.error': {
+        // The agent could not run on what he typed. opencode says so twice for one failure — the
+        // second carrying a stack trace — and then `session.idle`; the first is answered, once,
+        // and the session is forgotten so the second says nothing. Only for a session his words
+        // went to and that has not finished a turn since: an error in a session nobody typed at
+        // is the agent's own business, in its own terminal. The `ack` for his words was spent
+        // when opencode wrote them down, so this is a line in the topic, in his words. The first
+        // line of the message, control characters out: opencode's second event is a stack.
+        const sid = String(data.sessionID ?? '')
+        if (!sid || !prompted.delete(sid)) return
+        const err = data.error ?? {}
+        const said = firstLine(err?.data?.message) || firstLine(err?.name) || 'it did not say why'
+        say(
+          { t: 'say', text: `The agent could not act on what you typed: ${said}`, hint: 'prose' },
+          'a word about typed words the agent could not act on',
+        )
+        return
+      }
+      case 'session.idle': {
+        // A turn ended. Whatever he typed at this session has been read, so a later error in it
+        // is not about his words.
+        const sid = String(data.sessionID ?? '')
+        if (sid) prompted.delete(sid)
         say({ t: 'beat', state: 'idle' }, 'a heartbeat')
         return
+      }
       default:
         return
     }
+  }
+
+  /** The first line of a message, fit to put on a phone: no control characters, and not a stack. */
+  function firstLine(s: unknown): string {
+    if (typeof s !== 'string') return ''
+    return s
+      .split(/\r?\n/)[0]
+      .replace(/[\u0000-\u001f\u007f]/g, ' ')
+      .trim()
+      .slice(0, 300)
   }
 
   /**

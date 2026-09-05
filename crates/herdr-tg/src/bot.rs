@@ -398,7 +398,19 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
                 Some(who) => {
                     let mid = hub_proto::MsgId::new(msg.id.0.to_string());
                     let user = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-                    if hub.relay(&who, chat_id, user, &mid, text).await {
+                    // The message he swiped to reply to, if he did. A reply under one of the
+                    // agent's questions is the one time he says which question — and which
+                    // session — he means, and the hub decides what that is worth (`relay`). In a
+                    // forum topic every message carries the topic's root as its reply, so this
+                    // is usually a message nothing was written down beside, which counts as no
+                    // reply at all.
+                    let under = msg
+                        .reply_to_message()
+                        .map(|m| hub_proto::MsgId::new(m.id.0.to_string()));
+                    if hub
+                        .relay(&who, chat_id, user, &mid, text, under.as_ref())
+                        .await
+                    {
                         tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
                         // Nothing is said back. A confirmation under every line the operator types
                         // turns a conversation into a receipt printer; the agent's own answer is
@@ -737,6 +749,7 @@ mod tests {
             _topic_id: i32,
             _text: &str,
             _buttons: &[hub_proto::AskOption],
+            _reply_to: Option<&hub_proto::MsgId>,
         ) -> crate::hub::SendOutcome {
             unreachable!("the project list sends nothing")
         }

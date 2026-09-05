@@ -58,7 +58,7 @@
 //! process died mid-write and nothing else. It deliberately mirrors `audit.rs` rather than
 //! extending it: that file's subject is a pane and a keystroke, and the hub has neither.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -67,8 +67,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hub_proto::{
-    AskId, AskOption, BridgeFrame, Delivered, Envelope, FrameId, HubFrame, LaneId, Limits, MsgId,
-    OptionId, ProjectId, RefusedReason, VERSION,
+    AckStatus, AckWhy, AskId, AskOption, BridgeFrame, Delivered, Envelope, FrameId, HubFrame,
+    LaneId, Limits, MsgId, OptionId, ProjectId, RefusedReason, VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
@@ -78,6 +78,30 @@ use crate::registry::Registry;
 
 /// How long after `hello` the hub waits for a `pong` before calling a project live.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
+
+/// How much a bridge may say between `welcome` and its pong before the hub stops holding it.
+///
+/// Exactly what a conforming bridge can be carrying when it dials, and that is one more than its
+/// queue. `hub-link.ts` queues at most sixty-four frames, each at most
+/// [`hub_proto::MAX_FRAME_BYTES`] — and the frame the kernel had taken only part of when the last
+/// connection ended is put back at the HEAD of that queue on close, outside the bound `send`
+/// keeps. The queue is full precisely when a socket has stopped taking bytes, which is when a
+/// half-written frame is the ordinary state, so a bridge that outlived a hub that wedged and was
+/// restarted redials with sixty-five. A hold of exactly sixty-four refused the whole of that legal
+/// backlog on the sixty-fifth frame. So: the queue, plus the one put back, and only a bridge
+/// breaking its own rules ever trips this.
+///
+/// The byte bound used to be 256 KiB — sixteen times less than the bridge is allowed to hold — so
+/// a bridge that outlived a hub restart with an ordinary day's backlog hit it on every redial.
+/// Measured with the real bridge: sixty-four messages destroyed across three refused connections,
+/// not one of them acked, nothing on the phone.
+pub const PRE_PONG_FRAMES: usize = 64 + 1;
+pub const PRE_PONG_BYTES: usize = PRE_PONG_FRAMES * hub_proto::MAX_FRAME_BYTES;
+
+/// How long a connection that is being refused is given to take its acks before it is closed
+/// on it. A bridge reads these in a millisecond; a peer that has stopped reading is the one this
+/// bounds, so that a refusal can never hold a task open for ever.
+pub const GOODBYE_SHELF_LIFE: Duration = Duration::from_secs(2);
 
 /// How long a line of an agent's prose is worth holding before it is given up on.
 ///
@@ -267,11 +291,18 @@ pub trait Surface: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<i32, Refused>> + Send;
 
     /// Put a message in a topic, with buttons if there are any.
+    ///
+    /// `reply_to` threads it under one of the OPERATOR's messages, when it is about one. The line
+    /// saying his typed words reached nobody used to be a bare post in the topic, and with two
+    /// lines typed a second apart and one of them refused, it named neither. It must still go out
+    /// when the message it points at is gone — he may have deleted it — as a bare post rather
+    /// than not at all.
     fn send(
         &self,
         topic_id: i32,
         text: &str,
         buttons: &[AskOption],
+        reply_to: Option<&MsgId>,
     ) -> impl std::future::Future<Output = SendOutcome> + Send;
 
     /// Say one line in the forum itself, outside every project's topic.
@@ -1004,6 +1035,19 @@ struct Claim {
     tx: mpsc::Sender<Envelope<HubFrame>>,
 }
 
+/// One of his typed messages on its way to a bridge: the envelope id it went down under — the id
+/// the bridge's `ack` for it names — and which of his messages, in which conversation, it was.
+#[derive(Debug)]
+struct WordsDown {
+    frame: FrameId,
+    addr: Addr,
+    msg_id: MsgId,
+}
+
+/// How many of his messages the hub keeps waiting for an answer about, before the oldest is
+/// forgotten. A bridge that never answers must not turn a record nobody will read into a leak.
+const WORDS_DOWN_KEPT: usize = 256;
+
 /// The longest lane name the hub will address a conversation by.
 ///
 /// Well past anything kickoff mints — `lane-0902-201212-2783563` is twenty-four characters — and
@@ -1174,12 +1218,22 @@ pub struct Hub<S: Surface> {
     ///
     /// One call site, agent to operator, never the reverse.
     gist: Option<Arc<crate::summarize::Summarizer>>,
+    /// His typed words that went down to a bridge and may still be answered for.
+    ///
+    /// The wire lets a bridge answer a `message` with `ack{status, reason}`, and until this
+    /// existed the hub read the status of no ack at all — so an adapter with nothing to hand the
+    /// words to could say so, honestly, on the wire, and he was told nothing. Bounded at
+    /// [`WORDS_DOWN_KEPT`], oldest first out.
+    words_down: Arc<Mutex<VecDeque<WordsDown>>>,
     /// Which chats this bot answers. Checked first, before any state is touched.
     allowed_chats: Arc<Vec<i64>>,
     /// The one forum every topic lives in. Routing is a single rule — topic, inside this chat —
     /// and every other rule this bridge used to have is deleted rather than tested against.
     forum_chat: i64,
     settle: Duration,
+    /// How many frames, and how many bytes of them, are held for a bridge before its pong. The
+    /// constants, except under a test that has to watch a real bridge trip the bound.
+    pre_pong: (usize, usize),
 }
 
 impl<S: Surface> Hub<S> {
@@ -1202,9 +1256,11 @@ impl<S: Surface> Hub<S> {
             throttle: Arc::new(Mutex::new(Throttle::default())),
             topic_refused: Arc::new(Mutex::new(BTreeMap::new())),
             gist: crate::summarize::Summarizer::from_env().map(Arc::new),
+            words_down: Arc::new(Mutex::new(VecDeque::new())),
             allowed_chats: Arc::new(allowed_chats),
             forum_chat,
             settle: DEFAULT_SETTLE,
+            pre_pong: (PRE_PONG_FRAMES, PRE_PONG_BYTES),
         }
     }
 
@@ -1214,6 +1270,16 @@ impl<S: Surface> Hub<S> {
     #[cfg(test)]
     pub fn with_settle(mut self, settle: Duration) -> Self {
         self.settle = settle;
+        self
+    }
+
+    /// Hold less before the pong than [`PRE_PONG_FRAMES`] and [`PRE_PONG_BYTES`] say. Test-only:
+    /// the bound is exactly what a conforming bridge may be holding, so the only way to watch a
+    /// REAL bridge trip it is to lower it — and a knob for that in production is a knob someone
+    /// turns down to make a flood go away, which turns an honest refusal into a routine one.
+    #[cfg(test)]
+    pub fn with_pre_pong_hold(mut self, frames: usize, bytes: usize) -> Self {
+        self.pre_pong = (frames, bytes);
         self
     }
 
@@ -1387,6 +1453,18 @@ impl<S: Surface> Hub<S> {
     /// means that bridge is not keeping up, and the honest answer is "not delivered" now rather
     /// than an await that might never finish.
     pub async fn deliver(&self, addr: &Addr, frame: HubFrame) -> bool {
+        self.deliver_under(addr, Self::mint_frame_id(), frame).await
+    }
+
+    /// The envelope id the next frame down goes under — the id a bridge's `ack` for it will name.
+    /// Minted apart from the send so the one caller that waits to hear what became of a frame can
+    /// write the id down BEFORE the frame is on the wire.
+    fn mint_frame_id() -> FrameId {
+        FrameId::new(format!("h{}", next_frame_seq()))
+    }
+
+    /// Send one frame down under an id the caller already holds.
+    async fn deliver_under(&self, addr: &Addr, id: FrameId, frame: HubFrame) -> bool {
         let tx = {
             let claims = self.claims.lock().await;
             match claims.get(addr) {
@@ -1394,8 +1472,7 @@ impl<S: Surface> Hub<S> {
                 Some(claim) => claim.tx.clone(),
             }
         };
-        let env = Envelope::new(FrameId::new(format!("h{}", next_frame_seq())), frame);
-        match tx.try_send(env) {
+        match tx.try_send(Envelope::new(id, frame)) {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
@@ -1618,6 +1695,12 @@ impl<S: Surface> Hub<S> {
     /// Returns whether it was delivered, so the caller can say so rather than guess. A project that
     /// is not connected is told to the operator visibly, in the topic, and never queued: a message
     /// held for a worker that may never return is a message he believes was sent.
+    ///
+    /// `replied_to` is the message he swiped to reply to, if any. When it is one of the questions
+    /// this conversation's live session asked, the bridge is told which — `in_reply_to_ask` — and
+    /// that is the one time he says which question, and so which session, his words are for. The
+    /// adapter side decides what to do with it; this side hardcoded the field to nothing for a
+    /// slice, while three documents described the reply path as built.
     pub async fn relay(
         &self,
         addr: &Addr,
@@ -1625,27 +1708,76 @@ impl<S: Surface> Hub<S> {
         user_id: i64,
         msg_id: &MsgId,
         text: &str,
+        replied_to: Option<&MsgId>,
     ) -> bool {
         if !self.chat_is_allowed(chat_id) {
             return false;
         }
+        let in_reply_to_ask = match replied_to {
+            Some(under) => self.ask_replied_to(addr, chat_id, under).await,
+            None => None,
+        };
+        // Written down BEFORE the frame is on the wire, so the bridge's `ack` — which can arrive
+        // the moment it is — always finds the record it names. Taken back if the send fails, so a
+        // record never waits for an answer to a frame nothing received.
+        let frame = Self::mint_frame_id();
+        {
+            let mut down = self.words_down.lock().await;
+            down.push_back(WordsDown {
+                frame: frame.clone(),
+                addr: addr.clone(),
+                msg_id: msg_id.clone(),
+            });
+            while down.len() > WORDS_DOWN_KEPT {
+                down.pop_front();
+            }
+        }
         let delivered = self
-            .deliver(
+            .deliver_under(
                 addr,
+                frame.clone(),
                 HubFrame::Message {
                     msg_id: msg_id.clone(),
                     text: text.to_owned(),
                     from: hub_proto::From { chat_id, user_id },
-                    in_reply_to_ask: None,
+                    in_reply_to_ask,
                 },
             )
             .await;
+        if !delivered {
+            self.words_down.lock().await.retain(|w| w.frame != frame);
+        }
         let _ = if delivered {
             self.audit.outcome(addr, &SendOutcome::Sent(msg_id.clone()))
         } else {
             self.audit.refused(addr, "the project was not connected")
         };
         delivered
+    }
+
+    /// The question one of his replies is under, when it is one THIS conversation's live session
+    /// asked — else nothing, and his words are a line like any other.
+    ///
+    /// Looked up by the message he replied to, in this chat, in the ledger every keyboard is written
+    /// down in. Two things have to hold before the bridge is told, and both fail closed:
+    ///
+    /// * The record is this conversation's. A project and a lane of it are two agents, and a reply
+    ///   under one's question must not reach the other as a reply to something it asked.
+    /// * The record was written by the run that is connected NOW. A bridge mints its ask ids from
+    ///   a counter that starts over with the process, so `a1` from a session that has since
+    ///   restarted names a different question in the one running — and a reply under the old
+    ///   question would be handed to the new session as a reply to whatever it called `a1`.
+    ///
+    /// Every message in a forum topic carries the topic's root as its reply, so most of the time
+    /// this is asked about a message nothing was written down beside, and answers nothing.
+    async fn ask_replied_to(&self, addr: &Addr, chat_id: i64, under: &MsgId) -> Option<AskId> {
+        let record = self.ledger.lock().await.get(chat_id, under).cloned()?;
+        if !record.addr_is(addr) {
+            return None;
+        }
+        let claims = self.claims.lock().await;
+        let claim = claims.get(addr)?;
+        (claim.instance == record.instance).then(|| record.ask_id.clone())
     }
 
     /// The topic a conversation's messages go in, created and greeted on first use.
@@ -1791,7 +1923,7 @@ impl<S: Surface> Hub<S> {
         // The greeting's outcome is READ, not discarded. A topic that was made, written down, and
         // never greeted is a conversation he cannot find at all: Telegram does not list an empty
         // one. Without this the hub could not tell that state from a healthy topic.
-        match self.send_into(addr, id, &greeting, &[], until).await {
+        match self.send_into(addr, id, &greeting, &[], None, until).await {
             SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {}
             outcome => tracing::error!(
                 project = %addr.project, lane = addr.lane_field(), topic = id, title = %title,
@@ -1838,6 +1970,7 @@ impl<S: Surface> Hub<S> {
         topic_id: i32,
         text: &str,
         buttons: &[AskOption],
+        reply_to: Option<&MsgId>,
         until: std::time::Instant,
     ) -> SendOutcome {
         // Clipped here rather than by the surface, because whether anything was lost is a fact the
@@ -1855,7 +1988,7 @@ impl<S: Surface> Hub<S> {
                 return too_fast;
             }
             let _ = self.audit.sent(addr, topic_id, text.len());
-            let mut outcome = self.surface.send(topic_id, &text, buttons).await;
+            let mut outcome = self.surface.send(topic_id, &text, buttons, reply_to).await;
             if clamped && let SendOutcome::Sent(id) = outcome {
                 outcome = SendOutcome::Clamped(id);
             }
@@ -1998,6 +2131,17 @@ impl<S: Surface> Hub<S> {
             .await
     }
 
+    /// One line about one of HIS messages, threaded under it.
+    ///
+    /// For the one thing the hub says that is about a message he typed rather than something an
+    /// agent said: that his words reached nobody. Two lines typed a second apart, one of them
+    /// refused, and a bare post names neither; under the line it is about, it cannot be read as
+    /// being about the other.
+    pub async fn say_under(&self, addr: &Addr, text: &str, reply_to: &MsgId) -> SendOutcome {
+        self.say_as_under(addr, text, &[], Perishable::of(&[]), Some(reply_to))
+            .await
+    }
+
     /// The same, for a caller that knows what kind of thing it is saying.
     ///
     /// There is exactly one: an `ask` whose agent minted no options is still a QUESTION — the
@@ -2009,11 +2153,23 @@ impl<S: Surface> Hub<S> {
         buttons: &[AskOption],
         kind: Perishable,
     ) -> SendOutcome {
+        self.say_as_under(addr, text, buttons, kind, None).await
+    }
+
+    /// Everything a send is, with the one thing only [`Self::say_under`] supplies.
+    async fn say_as_under(
+        &self,
+        addr: &Addr,
+        text: &str,
+        buttons: &[AskOption],
+        kind: Perishable,
+        reply_to: Option<&MsgId>,
+    ) -> SendOutcome {
         // Minted ONCE, here, and shared by every turn this message has to take. A brand-new
         // conversation queues three times before its first word — the topic, the greeting, then the
         // message — and each of those used to start a deadline of its own.
         let until = std::time::Instant::now() + kind.shelf_life();
-        let outcome = self.try_to_say(addr, text, buttons, until).await;
+        let outcome = self.try_to_say(addr, text, buttons, reply_to, until).await;
         // THE ONE PLACE A LOST MESSAGE IS COUNTED. One call to this function is one thing somebody
         // wanted to say, however many turns it took, so counting here is what makes the number he
         // reads the number of messages he missed. Every give-up below funnels into exactly one
@@ -2032,6 +2188,7 @@ impl<S: Surface> Hub<S> {
         addr: &Addr,
         text: &str,
         buttons: &[AskOption],
+        reply_to: Option<&MsgId>,
         until: std::time::Instant,
     ) -> SendOutcome {
         let topic_id = match self.topic_for(addr, until).await {
@@ -2048,7 +2205,9 @@ impl<S: Surface> Hub<S> {
                 return SendOutcome::Refused(e.to_string());
             }
         };
-        let outcome = self.send_into(addr, topic_id, text, buttons, until).await;
+        let outcome = self
+            .send_into(addr, topic_id, text, buttons, reply_to, until)
+            .await;
 
         if outcome == SendOutcome::TopicGone {
             // Exactly once, and never as a retry: Telegram gives no service message when a topic is
@@ -2063,7 +2222,10 @@ impl<S: Surface> Hub<S> {
             // message again — and giving them a fresh shelf life would let one message spend two of
             // them, which is the doubling this deadline was moved out of `take_a_turn` to stop.
             return match self.topic_for(addr, until).await {
-                Ok(fresh) => self.send_into(addr, fresh, text, buttons, until).await,
+                Ok(fresh) => {
+                    self.send_into(addr, fresh, text, buttons, reply_to, until)
+                        .await
+                }
                 // The ceiling refusing the rebinding is a busy chat, not a missing topic, and
                 // saying "there is nowhere in his chat to put it" about it tells the agent to give
                 // up on a thing that mends itself inside a minute.
@@ -2474,7 +2636,7 @@ impl<S: Surface> Hub<S> {
         // The writer is a task of its own so that a slow Telegram send can never block reading the
         // socket. A bridge that cannot be read is a bridge whose `bye` is missed.
         let (tx, mut outbox) = mpsc::channel::<Envelope<HubFrame>>(64);
-        let writer = tokio::spawn(async move {
+        let mut writer = tokio::spawn(async move {
             while let Some(frame) = outbox.recv().await {
                 if hub_proto::write_frame(&mut tx_half, &frame).await.is_err() {
                     break;
@@ -2527,28 +2689,34 @@ impl<S: Surface> Hub<S> {
         // have it read, discarded, and never acked. No message, no record, no reply, and the agent
         // sitting blocked on an answer that could never come. Buffered here and replayed the
         // moment the project is live.
+        //
+        // BOUNDED, by count and by bytes, at exactly what a conforming bridge may be holding when
+        // it dials (`PRE_PONG_FRAMES`, `PRE_PONG_BYTES`). An unbounded Vec here let one connection
+        // hand the hub as much as it could write in the settling window — measured at 18 MB in
+        // 450 ms — before it had proved it was even there. A bound of 256 KiB, sixteen times under
+        // what the bridge may legally hold, refused every bridge that carried an ordinary backlog
+        // into a reconnect. The count matches the outbox's own 64.
+        let (hold_frames, hold_bytes) = self.pre_pong;
         let mut waiting: Vec<Envelope<BridgeFrame>> = Vec::new();
         let mut waiting_bytes = 0usize;
-        let mut overflowed = false;
-        let live = tokio::time::timeout(self.settle, async {
+        let settled = tokio::time::timeout(self.settle, async {
             loop {
                 match reader.next::<BridgeFrame>().await {
                     Ok(Some(frame)) => {
                         if let BridgeFrame::Pong { r#ref } = &frame.payload
                             && r#ref == &ping_id
                         {
-                            return true;
+                            return Settled::Live;
                         }
-                        // BOUNDED, by count and by bytes. An unbounded Vec here let one connection
-                        // hand the hub as much as it could write in the settling window — measured
-                        // at 18 MB in 450 ms — before it had proved it was even there. The count
-                        // matches the outbox's own 64.
                         waiting_bytes += frame_cost(&frame.payload);
-                        if waiting.len() >= 64 || waiting_bytes > 4 * hub_proto::MAX_FRAME_BYTES {
-                            overflowed = true;
-                            return false;
-                        }
+                        // The frame that trips the bound is kept WITH the others, not dropped on
+                        // the way out: it was read and it has an id, so it is owed an answer like
+                        // the rest of them.
+                        let over = waiting.len() >= hold_frames || waiting_bytes > hold_bytes;
                         waiting.push(frame);
+                        if over {
+                            return Settled::Overflowed;
+                        }
                     }
                     // A line this build cannot DECODE is one bad frame, not a dead peer — and it is
                     // exactly what a bridge one version ahead sends. The post-pong loop survives it;
@@ -2558,29 +2726,80 @@ impl<S: Surface> Hub<S> {
                         tracing::warn!(len, error = %source, "a frame this build cannot read, before the pong; ignoring it");
                         continue;
                     }
-                    _ => return false,
+                    // Over the ceiling before the pong. This used to fall into "never answered",
+                    // which is not what happened, and the bridge got a closed socket instead of the
+                    // `frame_too_large` the document promises it.
+                    Err(hub_proto::ProtoError::Oversize { .. }) => return Settled::Oversize,
+                    _ => return Settled::Gone,
                 }
             }
         })
         .await
-        .unwrap_or(false);
+        .unwrap_or(Settled::Gone);
 
-        if !live {
-            // Two different failures, said differently. A bridge that filled the buffer is talking
+        if settled != Settled::Live {
+            // Three different failures, said differently. A bridge that filled the buffer is talking
             // too much before it has proved it is there; one that said nothing is probably a channel
             // plugin that is not allowlisted, which boots and exits in about a tenth of a second.
             // Reporting the first as the second sends the operator looking in the wrong place.
-            let why = if overflowed {
-                "sent more before answering than the hub will hold for it"
-            } else {
-                "connected but never answered; it is probably not allowed to talk to me"
+            let why = match settled {
+                Settled::Overflowed => "sent more before answering than the hub will hold for it",
+                Settled::Oversize => "a frame was over the size ceiling",
+                Settled::Gone | Settled::Live => {
+                    "connected but never answered; it is probably not allowed to talk to me"
+                }
             };
             tracing::warn!(
                 project = %addr.project, lane = addr.lane_field(), why,
                 "a bridge did not become live"
             );
             let _ = self.audit.refused(&addr, why);
+            // Released FIRST, as the oversize path below does: what follows is writing, and a
+            // bridge that redials in a second must not find its own dead connection still holding
+            // the address.
             self.release(&addr, pid).await;
+            // Every frame it said is answered for BEFORE the socket goes. Each was read and has an
+            // id, and each is about to be destroyed; the wire's rule is one ack per frame, and a
+            // bridge keys "which of mine reached him" by exactly these ids. `writer.abort()` used
+            // to come straight after the release, and the whole buffer went down with the socket:
+            // sixty-four messages, measured, the agent told of none of them, the bridge reconnecting
+            // to do it again. `too-fast` for the overflow, because that is what it was; no reason
+            // for the rest, because the closed set has none for "the connection never became live"
+            // and a wrong one sends the agent the wrong way.
+            let ack_why = match settled {
+                Settled::Overflowed => Some(AckWhy::TooFast),
+                _ => None,
+            };
+            let goodbye = async {
+                for frame in std::mem::take(&mut waiting) {
+                    let env = Envelope::new(
+                        FrameId::new(format!("h{}", next_frame_seq())),
+                        HubFrame::Ack {
+                            r#ref: frame.id,
+                            delivered: Delivered::No,
+                            why: ack_why,
+                        },
+                    );
+                    if tx.send(env).await.is_err() {
+                        break;
+                    }
+                }
+                if settled == Settled::Oversize {
+                    let _ = tx
+                        .send(Envelope::new(
+                            FrameId::new(format!("h{}", next_frame_seq())),
+                            HubFrame::Refused {
+                                reason: RefusedReason::FrameTooLarge,
+                            },
+                        ))
+                        .await;
+                }
+            };
+            // Bounded, twice: a peer that has stopped reading must not hold this task open for
+            // ever, and the writer is ended rather than left to find that out on its own.
+            let _ = tokio::time::timeout(GOODBYE_SHELF_LIFE, goodbye).await;
+            drop(tx);
+            let _ = tokio::time::timeout(GOODBYE_SHELF_LIFE, &mut writer).await;
             writer.abort();
             return Ok(());
         }
@@ -2919,11 +3138,21 @@ impl<S: Surface> Hub<S> {
                     .await;
                 (Delivered::Yes, None)
             }
-            // Liveness and bookkeeping. Acked so that "every frame gets exactly one" stays true
-            // without exception, which is what makes a missing ack mean something.
-            BridgeFrame::Beat { .. } | BridgeFrame::Ack { .. } | BridgeFrame::Pong { .. } => {
+            // The bridge saying what became of a frame the hub sent it. The only frames anybody
+            // is waiting on an answer for are his typed words; everything else about it is
+            // bookkeeping. Acked like any frame, so "every frame gets exactly one" stays true.
+            BridgeFrame::Ack {
+                r#ref,
+                status,
+                reason,
+            } => {
+                self.what_became_of_his_words(addr, &r#ref, status, reason.as_deref())
+                    .await;
                 (Delivered::Yes, None)
             }
+            // Liveness and bookkeeping. Acked so that "every frame gets exactly one" stays true
+            // without exception, which is what makes a missing ack mean something.
+            BridgeFrame::Beat { .. } | BridgeFrame::Pong { .. } => (Delivered::Yes, None),
             BridgeFrame::Bye { .. } => (Delivered::Yes, None),
             BridgeFrame::Hello { .. } => {
                 // A second hello on a live connection. Not a takeover and not an error worth
@@ -2931,6 +3160,74 @@ impl<S: Surface> Hub<S> {
                 (Delivered::No, Some(hub_proto::AckWhy::TelegramRefused))
             }
             BridgeFrame::Unknown => (Delivered::Yes, None),
+        }
+    }
+
+    /// A bridge has said what became of a frame the hub handed it.
+    ///
+    /// `accepted` is the end of it: the agent's own answer is the acknowledgement, and a line under
+    /// everything he types would turn the conversation into a receipt printer. `refused` is said
+    /// in the topic he typed in, with the adapter's reason, and says the words will not be
+    /// delivered later — the sentence he already gets when nothing is connected there. It is the
+    /// only place he can learn that a line he wrote reached nobody: an opencode worker with no
+    /// session open used to say so on the wire and he went on looking at a line he believed was
+    /// read.
+    ///
+    /// Only for a frame this hub handed THIS conversation as his words. A refusal naming an id the
+    /// bridge made up, or a frame of any other kind, writes nothing — a bridge cannot put text in
+    /// his topic under the hub's name by refusing things it was never sent. And the FIRST answer
+    /// for a message is the one that counts: the record goes with it, so a second cannot write a
+    /// second line. Behind attach's door several producers may answer one message, and the door
+    /// folds them into one before this hub hears it; a Claude tool server, which can hand the
+    /// words to its agent, answers nothing at all.
+    async fn what_became_of_his_words(
+        &self,
+        addr: &Addr,
+        frame: &FrameId,
+        status: AckStatus,
+        reason: Option<&str>,
+    ) {
+        let his = {
+            let mut down = self.words_down.lock().await;
+            let Some(at) = down
+                .iter()
+                .position(|w| &w.frame == frame && &w.addr == addr)
+            else {
+                return;
+            };
+            down.remove(at)
+        };
+        let Some(his) = his else { return };
+        if status == AckStatus::Accepted {
+            return;
+        }
+        let why = plain_reason(reason);
+        let _ = self.audit.refused(
+            addr,
+            &format!(
+                "what he typed (message {}) was not handed on: {why}",
+                his.msg_id
+            ),
+        );
+        // Only into a topic that is already bound. It always is — the words came from a message
+        // he typed in it — and a refusal must never be the reason a topic gets made.
+        if self.registry.lock().await.topic_of(addr).is_none() {
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(),
+                "an adapter refused his words for a conversation with no topic; nowhere to say so"
+            );
+            return;
+        }
+        let text = format!(
+            "What you typed did not reach the agent — {why}. It will not be delivered later."
+        );
+        // Under the line it is about, so two lines typed a second apart cannot be confused.
+        let outcome = self.say_under(addr, &text, &his.msg_id).await;
+        if !matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(), outcome = ?outcome,
+                "could not tell him his words were refused"
+            );
         }
     }
 
@@ -3128,13 +3425,53 @@ impl<S: Surface> Hub<S> {
 /// The text is the whole of it in practice; the rest is a fixed handful of bytes. Exact accounting
 /// would mean encoding a frame this side is about to hand straight to `handle`, which is a cost
 /// paid on every frame to make a bound slightly tighter.
+/// How the settling window ended: the one way in, and the three ways a connection is refused
+/// without ever having been live. Each of the three is said differently, and each answers for
+/// whatever was buffered before the socket goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settled {
+    /// The pong named the ping. The topic is made after this, and nothing before it.
+    Live,
+    /// More than [`PRE_PONG_FRAMES`] or [`PRE_PONG_BYTES`] before the pong.
+    Overflowed,
+    /// A frame over [`hub_proto::MAX_FRAME_BYTES`] before the pong.
+    Oversize,
+    /// The window passed, or the socket ended, with no pong.
+    Gone,
+}
+
+/// What a frame costs against the pre-pong hold: its text plus an allowance for the envelope, and
+/// never more than one frame can be on the wire. The codec refuses anything past
+/// [`hub_proto::MAX_FRAME_BYTES`] before it gets here, so [`PRE_PONG_FRAMES`] of the largest frames
+/// possible cost at most [`PRE_PONG_BYTES`] — the count and the byte bound say the same thing,
+/// rather than the bytes tripping a frame early on the last of a legal backlog.
 fn frame_cost(frame: &BridgeFrame) -> usize {
-    match frame {
+    let cost = match frame {
         BridgeFrame::Say { text, .. }
         | BridgeFrame::Done { text }
         | BridgeFrame::Ask { text, .. } => text.len() + 64,
         _ => 64,
+    };
+    cost.min(hub_proto::MAX_FRAME_BYTES)
+}
+
+/// An adapter's reason for refusing his words, made fit to put in front of him.
+///
+/// It is the adapter's own text and it lands in his topic, so it gets what a lane name gets: no
+/// control character survives (a newline here would forge a line in the audit file, which is one
+/// tab-separated record per line), it is one line's worth and no more, and it is never empty —
+/// "did not reach the agent — ." is a sentence with a hole in it.
+fn plain_reason(reason: Option<&str>) -> String {
+    const MOST: usize = 200;
+    let cleaned: Vec<&str> = reason
+        .unwrap_or("")
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        return "the worker did not say why".to_owned();
     }
+    crate::queue::fit(&cleaned.join(" "), MOST).0
 }
 
 /// Per-process frame counter. Opaque and monotonic is all the protocol asks for.

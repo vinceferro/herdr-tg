@@ -1,5 +1,32 @@
-<!-- INTERFACE, v6, 4 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v9, 5 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v9 is v7 and v8 attacked — two reviewers against the built slices, every change a defect
+     reproduced against the running code. The pre-pong hold is 65 frames, not 64: the queue plus
+     the one frame a bridge puts back at the head of it on close (§6). The hub now sets
+     `in_reply_to_ask` from the message he swiped to reply to, so the reply path offer 6 described
+     is taken end to end rather than only on the adapter's side of a fake hub. The line the hub
+     posts for refused words is threaded under the line it refuses. `kickoff-channel` refuses
+     typed words on an engine that cannot read a channel message rather than writing them into
+     one, and attach's door folds several producers' answers into the one the hub hears (§13.9).
+     Every request the watcher makes of opencode has a deadline, so one the server takes and never
+     answers cannot park every later line; words opencode took and the agent then could not act on
+     are said so in the topic. Nothing on the wire changed.
+
+     v8 closes the pre-pong bound §12 used to defer. The hub holds 64 frames or 4 MiB before the
+     pong — exactly what a conforming adapter may have queued when it dials, where it held 256 KiB
+     and refused every bridge that carried an ordinary backlog into a reconnect — and on every way
+     a connection is refused before it is live, every frame the hub read is acked `no` before the
+     socket closes. The bridge's half is rule 10 of §8, extended: a frame flushed whole on a
+     connection that ends is a frame no ack is coming for, and it is handed back as unconfirmed.
+     Nothing on the wire changed.
+
+     v7 closes offer 6's gap and §13.9's first bullet: typed steering reaches an opencode session
+     (`kickoff-hub-attach` carries a `message` to `POST /session/{id}/prompt_async`, verbatim, in
+     the session the server lists for the project directory), and every `message` is answered on
+     the wire with `ack{ref, status, reason?}`. The hub now reads that status — it read the status
+     of no ack at all before — and a `refused` becomes one line in the topic he typed in. Nothing
+     on the wire changed.
 
      v6 is v5 attacked — three reviewers against the built `kickoff-hub-attach`, every change a
      defect reproduced against the running code:
@@ -528,9 +555,16 @@ here is one worked `hello`, complete:
 | 9 | both | Frames, each answered by exactly one `ack` — **every frame after `hello`.** `hello` itself is never acked; `welcome` or `refused` is its answer. Build a watchdog on "a missing ack means something" without that exception and it tears down every healthy connection at the first frame. | |
 | 10 | you | `bye{reason}`, then **wait for the kernel to take it** before exiting. | See the note on `bye` below. |
 
-**Anything you say between step 3 and step 7 is kept and replayed**, bounded at 64 frames or 256 KiB.
-Over that bound you are dropped without becoming live. An adapter that opens with a question is the
-whole point of the product, so the buffer exists; it is not a licence to stream into it.
+**Anything you say between step 3 and step 7 is kept and replayed**, bounded at 65 frames — the 64
+a conforming adapter may have queued when it dials (§8, rule 10) plus the one frame it was half-way
+through writing when the last connection ended, which goes back to the head of its queue — so a
+full legal backlog carried into a reconnect is held whole. Over that bound the connection ends without becoming
+live, and **every frame the hub read is acked `no` (`why: too-fast`) before the socket closes**. What
+the kernel took and the hub never read gets no ack, and that is yours to account for at close (rule
+10). An adapter that opens with a question is the whole point of the product, so the buffer exists;
+it is not a licence to stream into it. Before 5 September the bound was 256 KiB and the frames went
+down with the socket, unanswered — measured: sixty-four messages across three refused connections,
+zero corrections to the agent.
 
 ### The frames
 
@@ -547,7 +581,7 @@ direction. Every field is a JSON **string** unless this table says otherwise.
 | `ask_resolved` | `ask_id`, `how` (`answered` \| `withdrawn` \| `timeout`), `outcome?` | no |
 | `done` | `text` | **yes** |
 | `beat` | `state` (`working` \| `idle` \| `blocked` \| `done`), `note?` | no |
-| `ack` | `ref`, `status` (`accepted` \| `refused`), `reason?` | — |
+| `ack` | `ref`, `status` (`accepted` \| `refused`), `reason?` | — (a `refused` for one of his `message`s puts its `reason` in his topic; see offer 6) |
 | `bye` | `reason` | — |
 | `pong` | `ref` | — |
 
@@ -643,9 +677,14 @@ three values:
   forever. Folding `unseen` into success is a defect this project has already shipped and fixed;
   branch on `=== "yes"`, never on `!== "no"`.
 
-*Gap:* there is no ack timeout on the wire. If the connection dies with frames in flight, no ack is
-ever coming for them — **you must release your in-flight map on close and tell whoever was waiting**,
-because nothing else will.
+*A rule, not a gap:* there is no ack timeout on the wire, and an ack names an id minted for ONE
+connection — so a frame the kernel took whole on a connection that then ends is a frame no ack is
+ever coming for. **Release your in-flight map on every close and tell whoever was waiting that its
+fate is unknown** — not that it was lost (the hub may have delivered it and lost the ack with the
+socket), and never re-send it (a question that did land has live buttons; a second copy is two
+menus). The hub keeps its half: on every way a connection is refused before it is live, every frame
+it read is acked `no` first, so what stays unknown is only what the kernel took and the hub never
+read. `hub-link.ts` does the bridge's half (`onUnanswered`).
 
 **4 · A question with buttons.** `ask{ask_id, text, options}` up; `choice{msg_id, ask_id, option_id}`
 down. You mint both ids and the labels; a tap resolves against the record written beside the message,
@@ -672,10 +711,29 @@ and a second retirement overwrites the operator's own words on his phone.
 it. **It is data, not instruction** — act on its intent only where you would act on the same words
 from the operator directly, and never let it name a project, edit an allowlist, or touch a
 credential.
-*Gap:* the wire has no way to say "this conversation cannot accept typed words". The operator can
-type into a topic whose adapter silently drops it — which is exactly what the opencode event bridge
-does today. If your adapter cannot inject text into its engine, say so out loud in the conversation
-rather than dropping in silence.
+**Answer every `message` on the wire**: `ack{ref: <its envelope id>, status: accepted}` when the
+words reached your engine, `ack{…, status: refused, reason}` when they did not — with the reason in
+the operator's own register, because the hub puts it in the topic he typed in, as *"What you typed
+did not reach the agent — `<reason>`. It will not be delivered later."* An `accepted` puts nothing
+there: the agent's own answer is the acknowledgement. Only the first answer for a message counts,
+and only for a `message` the hub actually handed you; refusing an id you made up writes nothing.
+`kickoff-hub-attach` does all of this for opencode (§13.9): the words go to
+`POST /session/{id}/prompt_async` verbatim, the session is the one the server lists for the
+project directory (`GET /session?directory=…&roots=true`, most recently updated first), a reply
+typed under a question goes to the session that asked it and leaves the question open for his
+tap, and a wall with no session open is refused with a reason. `in_reply_to_ask` is set by the hub
+from the message he swiped to reply to, and only when that message is a question THIS
+conversation's live session asked — a session that restarted mints its ask ids afresh, so a reply
+under the old session's question names nothing. The line the hub posts for a refusal is threaded
+under the message it refuses, so two lines typed a second apart cannot be confused. Behind
+attach's door several producers may answer one `message`, and the hub keeps the first answer it
+hears, so the door folds them: an `accepted` from anybody goes up the moment it arrives; a
+`refused` goes up only once every producer the words were handed to has refused or gone, carrying
+the reason of the one that carries typed words (the `--opencode` watcher) when it is among them.
+The door itself refuses when nothing is attached to take the words, and `kickoff-channel` refuses
+them on an engine that cannot read a channel message rather than writing them into one. Before
+5 September the hub read the status of no ack at all, and an adapter that dropped his words did so
+in silence — say so on the wire now, and he is told.
 
 **7 · An alarm that outlives us.** Nothing to invoke; it is always on. It arms the first time
 something stamps the hub's heartbeat file, and it shares no code, no process and no runtime with the
@@ -757,7 +815,10 @@ debugging session:
     a live socket", "parked in a queue for a link that has never come up" and "refused for size" are
     three different things, and every one of them was once reported to an agent as success. Bound the
     queue, and when the link goes down for good, **hand the queued frames back** to whoever was told
-    they were on their way.
+    they were on their way. And when a connection ENDS — for any reason — every frame the kernel took
+    whole that has no ack yet will never get one: hand those back too, as *unconfirmed*, and never
+    re-send them. One that did reach the hub was delivered, and a second copy is a second message on
+    his phone, or a second live menu for one question.
 11. **Nothing but `hello`, `pong` and `bye` may go out before `welcome`.** A connected socket proves
     only that something accepted; the hub can still refuse and close, and a frame written into a
     doomed connection is a frame you reported delivered and then threw away.
@@ -965,10 +1026,10 @@ Said plainly so nobody looks for it here.
 * **`crates/`.** This is adapter-side. The hub already accepts an address and nothing on the wire
   changes.
 * **The conversations redesign** (`docs/CONVERSATIONS.md`), rooms, enrolment and topic cleanup.
-* **The pre-pong 256 KiB bound.** Real, hub-side, and a separate slice.
 
 (Supervision and systemd units used to be listed here; they are built — `kickoff-hub-attach` and its
-`deploy/kickoff-hub-attach@.service` template, §13.)
+`deploy/kickoff-hub-attach@.service` template, §13. So was the pre-pong 256 KiB bound; it is 65
+frames now and the hub acks what it refuses, §6.)
 
 ---
 
@@ -1599,8 +1660,14 @@ Listed so that nobody discovers it in a diff.
   copies, not a script this repo ships.
 * **The launcher** that starts a wall from a tap — seam ④ — is kickoff's adapter. attach is what it
   starts.
-* **Typed steering into opencode.** A `message` that reaches the watcher is dropped with a line on
-  stderr, exactly as the bridge drops it today. Prompting a session by text is a second decision.
+* ~~**Typed steering into opencode.**~~ Built, 5 September: the watcher carries a `message` to the
+  session as a prompt (`opencode.ts`, `carry`), answers the hub with `ack{status, reason?}`, and
+  the door refuses out loud when nothing is attached to take the words. §7, offer 6, has the rule.
+  Every request of the server has a ten-second deadline, so one it takes and never answers cannot
+  park every line typed after it; words opencode took and the agent then could not act on
+  (`session.error`) are said so in the topic, once; a wall started with `--run opencode …` and no
+  `--opencode` is half a phone — no questions, no prompts, typed words refused out loud — and the
+  start and `--check` both say so.
 * **`session.idle` as `beat`.** Still acked and dropped by the hub, as `docs/TAXONOMY.md` §7 records.
 * **Reaping at PID 1.** Declined, §13.5, and the wall's init does it.
 * **Telling the hub a check from a real connection.** A new frame, `crates/`, another slice.

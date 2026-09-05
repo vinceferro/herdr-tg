@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use hub_proto::{
-    AskEnd, AskOption, BridgeFrame, Delivered, Envelope, FrameId, FrameReader, HubFrame, MsgId,
-    OptionId, write_frame,
+    AckStatus, AskEnd, AskOption, BridgeFrame, Delivered, Envelope, FrameId, FrameReader, HubFrame,
+    MsgId, OptionId, write_frame,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
@@ -52,6 +52,8 @@ struct FakeTelegram {
     general: AsyncMutex<Vec<String>>,
     /// Every in-place rewrite, in order: which message, and what it now says.
     rewrites: AsyncMutex<Vec<(MsgId, String)>>,
+    /// Every send threaded under one of the OPERATOR's messages: where, what, and under which.
+    replies: AsyncMutex<Vec<(i32, String, MsgId)>>,
     /// Set to make the next topic creation come back the way Telegram answers a bot that has
     /// flooded the chat: refused, with a number of seconds attached.
     create_floods_once: AsyncMutex<Option<Duration>>,
@@ -80,7 +82,19 @@ impl Surface for FakeTelegram {
         Ok(1000 + t.len() as i32)
     }
 
-    async fn send(&self, topic_id: i32, text: &str, buttons: &[AskOption]) -> SendOutcome {
+    async fn send(
+        &self,
+        topic_id: i32,
+        text: &str,
+        buttons: &[AskOption],
+        reply_to: Option<&MsgId>,
+    ) -> SendOutcome {
+        if let Some(under) = reply_to {
+            self.replies
+                .lock()
+                .await
+                .push((topic_id, text.to_owned(), under.clone()));
+        }
         {
             let mut gone = self.topic_gone_once.lock().await;
             if *gone {
@@ -151,6 +165,21 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_budget(crate::queue::PER_MINUTE).await
+}
+
+/// The same hub with a per-minute budget of the test's choosing.
+///
+/// The real eighteen a minute is right for every flow test, and wrong for the one kind that has to
+/// see a whole legal backlog — sixty-four frames — come out the far end: at eighteen a minute that
+/// is a four-minute wait for a fact about buffering, not about pacing.
+async fn harness_with_budget(per_minute: u32) -> Harness {
+    harness_with(per_minute, None).await
+}
+
+/// The same hub, holding as much before the pong as the test says instead of as much as a
+/// conforming bridge may carry — the only way to watch a REAL bridge, which conforms, trip it.
+async fn harness_with(per_minute: u32, pre_pong_hold: Option<(usize, usize)>) -> Harness {
     let dir = tempfile::tempdir().expect("tmp");
     let repo = dir.path().join("herdr-tg");
     std::fs::create_dir_all(&repo).expect("repo");
@@ -159,23 +188,26 @@ async fn harness() -> Harness {
     let (project, secret) = registry.enrol(&repo).expect("enrols");
 
     let fake = Arc::new(FakeTelegram::default());
-    let hub = Arc::new(
-        Hub::new(
-            Arc::clone(&fake),
-            registry,
-            AskLedger::load(dir.path().join("asks.json")),
-            HubAudit::new(dir.path().join("hub.audit.log")),
-            vec![ALLOWED_CHAT],
-            ALLOWED_CHAT,
-        )
-        // The five-second window is the real one; a test that waited it out would be five seconds
-        // slower for nothing. What is under test is that the window EXISTS and gates the topic.
-        .with_settle(Duration::from_millis(500))
-        // Likewise the budget: the real pacing is one message a second, which would make every
-        // flow test below a stopwatch exercise. The limits are tested at their real values in
-        // `queue.rs` and in `pacing_waits_but_a_real_flood_is_shed`.
-        .with_budget(crate::queue::PER_MINUTE, Duration::from_millis(5)),
-    );
+    let hub = Hub::new(
+        Arc::clone(&fake),
+        registry,
+        AskLedger::load(dir.path().join("asks.json")),
+        HubAudit::new(dir.path().join("hub.audit.log")),
+        vec![ALLOWED_CHAT],
+        ALLOWED_CHAT,
+    )
+    // The five-second window is the real one; a test that waited it out would be five seconds
+    // slower for nothing. What is under test is that the window EXISTS and gates the topic.
+    .with_settle(Duration::from_millis(500))
+    // Likewise the budget: the real pacing is one message a second, which would make every
+    // flow test below a stopwatch exercise. The limits are tested at their real values in
+    // `queue.rs` and in `pacing_waits_but_a_real_flood_is_shed`.
+    .with_budget(per_minute, Duration::from_millis(5));
+    let hub = match pre_pong_hold {
+        Some((frames, bytes)) => hub.with_pre_pong_hold(frames, bytes),
+        None => hub,
+    };
+    let hub = Arc::new(hub);
 
     let sock = dir.path().join("hub.sock");
     let listener = UnixListener::bind(&sock).expect("bind");
@@ -1623,6 +1655,249 @@ async fn a_bridge_that_talks_before_answering_is_stopped_rather_than_buffered_wi
     );
 }
 
+/// Every `ack` the hub sent, by the frame it answers for, with what it said each time.
+///
+/// A map rather than a count, because the property under test is "exactly once": a frame acked
+/// twice and a frame never acked add up to the same number.
+fn acks_by_ref(
+    seen: &[HubFrame],
+) -> BTreeMap<FrameId, Vec<(Delivered, Option<hub_proto::AckWhy>)>> {
+    let mut acks: BTreeMap<FrameId, Vec<_>> = BTreeMap::new();
+    for f in seen {
+        if let HubFrame::Ack {
+            r#ref,
+            delivered,
+            why,
+        } = f
+        {
+            acks.entry(r#ref.clone())
+                .or_default()
+                .push((*delivered, *why));
+        }
+    }
+    acks
+}
+
+#[tokio::test]
+async fn a_frame_the_hub_cannot_hold_before_the_pong_is_refused_not_destroyed() {
+    // On overflow the buffered frames used to go down with the socket: no ack, no refusal, the
+    // claim released and the writer aborted. The bridge — which had told its agent each of them was
+    // waiting in line and certain to go out — saw a closed socket and nothing else, so the agent
+    // went on believing every one of them had reached his phone. The wire's own rule is that every
+    // frame after `hello` is acked exactly once; a frame the hub destroys is a frame it must first
+    // say `no` to.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    let welcome = bridge.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+
+    // One past the frame bound, and never a pong. Small frames, so every one of them reaches the
+    // hub's reader: what is measured is the hub's answer, not the kernel's buffers.
+    let mut sent = Vec::new();
+    for n in 0..=PRE_PONG_FRAMES {
+        sent.push(
+            bridge
+                .send(BridgeFrame::Say {
+                    text: format!("said before my pong {n}"),
+                    hint: None,
+                })
+                .await,
+        );
+    }
+
+    let seen = bridge.drain_for(Duration::from_secs(3)).await;
+    let acks = acks_by_ref(&seen);
+    for id in &sent {
+        assert_eq!(
+            acks.get(id).map(Vec::as_slice),
+            Some(&[(Delivered::No, Some(hub_proto::AckWhy::TooFast))][..]),
+            "frame {id} was destroyed without being answered for (acks: {acks:?})"
+        );
+    }
+    assert_eq!(
+        acks.len(),
+        sent.len(),
+        "an ack named a frame that was never sent: {acks:?}"
+    );
+    // The connection ends, never live, and nothing was made for it.
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert!(
+        h.fake.topics.lock().await.is_empty(),
+        "a bridge that never answered was given a topic"
+    );
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        audit.contains("more before answering"),
+        "the overflow was not written down as one:\n{audit}"
+    );
+}
+
+#[tokio::test]
+async fn every_frame_after_hello_is_acked_exactly_once_even_across_an_overflow() {
+    // The invariant in the wire's own words, held across the one path that used to break it. A
+    // frame acked twice is as wrong as one never acked — a bridge keys its in-flight map by the
+    // id, and a second ack for a forgotten id is "which no producer is waiting on" noise in the
+    // one log a developer reads to find the real ones.
+    let h = harness().await;
+
+    // Connection one: too much before the pong. Every frame the hub read is answered for, once.
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    let welcome = first.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+    let mut flood = Vec::new();
+    for n in 0..=PRE_PONG_FRAMES {
+        flood.push(
+            first
+                .send(BridgeFrame::Say {
+                    text: format!("flood {n}"),
+                    hint: None,
+                })
+                .await,
+        );
+    }
+    let seen = first.drain_for(Duration::from_secs(3)).await;
+    let acks = acks_by_ref(&seen);
+    for id in &flood {
+        assert_eq!(
+            acks.get(id).map(Vec::len),
+            Some(1),
+            "frame {id} was not answered for exactly once: {:?}",
+            acks.get(id)
+        );
+    }
+    assert_eq!(acks.len(), flood.len(), "an ack named a frame never sent");
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    // Connection two, ids that cannot collide with the first's: two frames before the pong (the
+    // replay path), then the pong, then two after (the ordinary path). Four frames, four acks.
+    let mut second = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    second.seq = 1000;
+    let welcome = second.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+    let mut later = Vec::new();
+    later.push(
+        second
+            .send(BridgeFrame::Say {
+                text: "before the pong".into(),
+                hint: None,
+            })
+            .await,
+    );
+    later.push(
+        second
+            .send(BridgeFrame::Ask {
+                ask_id: AskId::new("a1"),
+                text: "also before the pong?".into(),
+                options: None,
+            })
+            .await,
+    );
+    let ping = second.next().await.expect("a ping");
+    assert!(matches!(ping.payload, HubFrame::Ping), "{:?}", ping.payload);
+    second.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+    later.push(
+        second
+            .send(BridgeFrame::Beat {
+                state: hub_proto::BeatState::Working,
+                note: None,
+            })
+            .await,
+    );
+    later.push(
+        second
+            .send(BridgeFrame::Done {
+                text: "after the pong".into(),
+            })
+            .await,
+    );
+    let seen = second.drain_for(Duration::from_secs(2)).await;
+    let acks = acks_by_ref(&seen);
+    for id in &later {
+        assert_eq!(
+            acks.get(id).map(Vec::len),
+            Some(1),
+            "frame {id} was not answered for exactly once: {:?}",
+            acks.get(id)
+        );
+    }
+    assert_eq!(
+        acks.len(),
+        later.len(),
+        "an ack on the second connection named a frame it never carried: {acks:?}"
+    );
+    assert!(
+        h.hub.is_claimed(&h.own()).await,
+        "the second connection did not stay live"
+    );
+}
+
+#[tokio::test]
+async fn a_full_legal_backlog_said_before_the_pong_is_held_whole_and_delivered() {
+    // Sixty-four frames of sixty thousand bytes: the most a conforming bridge can be holding when
+    // it dials, and what one that outlived a hub restart mid-afternoon is holding. The hold used to
+    // stop at 256 KiB — the fifth frame — and a bridge carrying an ordinary backlog was refused on
+    // every redial and got nothing through. Held whole, it is all delivered.
+    let h = harness_with_budget(1000).await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    let welcome = bridge.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+
+    // Sixty-four is the bridge's queue. The sixty-fifth is the frame the kernel had taken only
+    // part of when the last connection ended: `hub-link.ts` puts it back at the HEAD of the queue
+    // on close, outside the bound `send` keeps, and the queue is full precisely when a socket has
+    // stopped taking bytes — which is when a half-written frame is the ordinary state. A hub that
+    // wedged and was restarted meets exactly this, and a hold of exactly sixty-four refused the
+    // whole of it on the sixty-fifth.
+    let backlog = 64 + 1;
+    let text = "x".repeat(60_000);
+    let mut sent = Vec::new();
+    for _ in 0..backlog {
+        sent.push(
+            bridge
+                .send(BridgeFrame::Say {
+                    text: text.clone(),
+                    hint: None,
+                })
+                .await,
+        );
+    }
+    let ping = bridge.next().await.expect("a ping");
+    assert!(matches!(ping.payload, HubFrame::Ping), "{:?}", ping.payload);
+    bridge.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+
+    // The greeting, then every one of the sixty-five — clipped, because they are far past a
+    // message's length, but each one on his phone.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while h.fake.sends.lock().await.len() < 1 + backlog {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {} of {} reached his phone",
+            h.fake.sends.lock().await.len(),
+            1 + backlog
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let seen = bridge.drain_for(Duration::from_secs(2)).await;
+    let acks = acks_by_ref(&seen);
+    for id in &sent {
+        assert_eq!(
+            acks.get(id).map(Vec::as_slice),
+            Some(&[(Delivered::Yes, Some(hub_proto::AckWhy::Clamped))][..]),
+            "frame {id}: {:?}",
+            acks.get(id)
+        );
+    }
+    assert!(
+        h.hub.is_claimed(&h.own()).await,
+        "the bridge did not stay live"
+    );
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        !audit.contains("refused"),
+        "a legal backlog was refused:\n{audit}"
+    );
+}
+
 /// The two halves, meeting for the first time.
 ///
 /// Everything else in this file tests the hub against a fake bridge, and
@@ -1673,9 +1948,14 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
     let mut stdin = child.stdin.take().expect("stdin");
     let mut stdout = BufReader::new(child.stdout.take().expect("stdout")).lines();
 
-    // The MCP handshake, so the tools and notifications are the real ones.
+    // The MCP handshake, so the tools and notifications are the real ones — and the client is
+    // Claude Code, as it introduces itself (captured from 2.1.250), because the bridge reads the
+    // client's name to decide whether the operator's typed words can reach the agent at all. An
+    // engine it does not recognise is answered the careful way on purpose: his words are refused
+    // on the wire rather than written into a channel nothing is known to read, so a handshake
+    // from a client called "t" would prove the refusal and never the delivery this test is for.
     stdin
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"roots\":{\"listChanged\":true},\"elicitation\":{}},\"clientInfo\":{\"name\":\"claude-code\",\"title\":\"Claude Code\",\"version\":\"2.1.250\"}}}\n")
         .await
         .expect("initialize");
     stdin
@@ -1767,7 +2047,8 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
                 ALLOWED_CHAT,
                 7,
                 &MsgId::new("m9"),
-                "use --dry-run first"
+                "use --dry-run first",
+                None,
             )
             .await
     );
@@ -1791,6 +2072,175 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
     );
 
     let _ = child.kill().await;
+}
+
+/// What `tests/fixtures/flood-through-a-bridge.ts` reports: one line of JSON, one run.
+#[derive(Debug, serde::Deserialize)]
+struct Flooded {
+    welcomes: u32,
+    acks: FloodAcks,
+    acked_twice: Vec<String>,
+    lost: u32,
+    unanswered: u32,
+    refused: Vec<String>,
+    owed: u32,
+    up: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FloodAcks {
+    yes: u32,
+    no: u32,
+    unseen: u32,
+}
+
+/// Drive one build of the shared wire into a fresh hub with a backlog queued before it dials,
+/// and report what the bridge saw. The hub is left in `Harness` so the test can read its side.
+async fn flood_through(
+    link: &Path,
+    n: u32,
+    size: u32,
+    pre_pong_hold: Option<(usize, usize)>,
+    wait_ms: u32,
+) -> (Flooded, Harness) {
+    // A budget that lets sixty-four frames out in a second, because what is under test is what
+    // the hub HOLDS, not how fast it paces.
+    let h = harness_with(1000, pre_pong_hold).await;
+    let token_file = h.dir.path().join("flood.token");
+    std::fs::write(&token_file, &h.secret).expect("token");
+    let driver =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flood-through-a-bridge.ts");
+    let out = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new("bun")
+            .arg(&driver)
+            .env("FLOOD_LINK", link)
+            .env("FLOOD_SOCKET", &h.sock)
+            .env("FLOOD_TOKEN_FILE", &token_file)
+            .env("FLOOD_N", n.to_string())
+            .env("FLOOD_SIZE", size.to_string())
+            .env("FLOOD_WAIT_MS", wait_ms.to_string())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("bun finished")
+    .expect("bun ran");
+    assert!(
+        out.status.success(),
+        "the driver failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8_lossy(&out.stdout);
+    let flooded = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("the driver did not report: {e}\n{line}"));
+    (flooded, h)
+}
+
+/// The bridge as it shipped before the hub learned to answer for what it destroys — taken from
+/// git at the commit before this change, because that is the build running in the operator's
+/// session until his next restart, and a change on the hub's side must not make it spin or lose
+/// more than it already did. Driven through the SHARED wire exactly as `server.ts` drives it, with
+/// the backlog a bridge that outlived a hub restart is holding, against the real hub.
+///
+/// Three runs. A full legal backlog is held whole and delivered on one connection, where the old
+/// hub refused it three times over. A hub holding less than the old bridge sends — the bound
+/// lowered, since a conforming bridge can no longer reach it — refuses what it read honestly, the
+/// old bridge acts on every refusal, redials once and comes up; what the kernel took and the hub
+/// never read stays on the old bridge's books, which is the blindness it always had and no more.
+/// The current bridge, same hub, answers for those three itself.
+#[tokio::test]
+#[ignore = "needs bun and the repository's git history; run it deliberately"]
+async fn a_bridge_from_before_this_change_still_works_against_the_new_hub() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the repository");
+    let before = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(&root)
+        .args(["show", "f81d2ff:plugins/kickoff-channel/hub-link.ts"])
+        .output()
+        .expect("git runs");
+    assert!(
+        before.status.success(),
+        "the bridge from before this change is not in this clone's history: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let keep = tempfile::tempdir().expect("tmp");
+    let old = keep.path().join("hub-link.before-honest-acks.ts");
+    std::fs::write(&old, &before.stdout).expect("write");
+    let new = root.join("plugins/kickoff-channel/hub-link.ts");
+
+    // 1. Sixty-four frames of sixty thousand bytes — the most a conforming bridge can be holding,
+    //    what one that outlived a hub restart mid-afternoon IS holding — through the old bridge.
+    let (a, h) = flood_through(&old, 64, 60_000, None, 8_000).await;
+    assert_eq!(
+        a.welcomes, 1,
+        "the old bridge was refused and redialled: {a:?}"
+    );
+    assert_eq!(a.acks.yes, 64, "not every frame reached him: {a:?}");
+    assert!(a.acked_twice.is_empty(), "{a:?}");
+    assert_eq!(
+        (a.lost, a.owed, a.acks.no, a.acks.unseen),
+        (0, 0, 0, 0),
+        "{a:?}"
+    );
+    assert!(a.refused.is_empty() && a.up, "{a:?}");
+    // The hub's side of it: the driver has exited by now, which is what releases the claim, so the
+    // audit is the witness — one connection, sixty-four deliveries, no refusal.
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        !audit.contains("refused"),
+        "a legal backlog was refused:\n{audit}"
+    );
+    // `clipped`, because sixty thousand bytes is far past a message and every one of the
+    // sixty-four is shortened — and the greeting is not, so it does not count itself in.
+    assert_eq!(
+        audit.matches("clipped=yes").count(),
+        64,
+        "the hub's own record disagrees with the bridge's:\n{audit}"
+    );
+
+    // 2. A hub that holds four frames, eight sent: five are read (four held plus the one that
+    //    trips the bound) and refused with an ack each; three the hub never read. The old bridge
+    //    acts on the five, keeps the three on its books, and comes up on the second dial.
+    let (b, h) = flood_through(&old, 8, 1_000, Some((4, PRE_PONG_BYTES)), 5_000).await;
+    assert_eq!(
+        b.acks.no, 5,
+        "the old bridge was not told what the hub refused: {b:?}"
+    );
+    assert!(b.acked_twice.is_empty(), "{b:?}");
+    assert_eq!(
+        b.welcomes, 2,
+        "the old bridge spun, or never came back: {b:?}"
+    );
+    assert!(b.up, "{b:?}");
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert_eq!(
+        audit.matches("more before answering").count(),
+        1,
+        "one overflow, refused once:\n{audit}"
+    );
+    assert_eq!(
+        (b.owed, b.unanswered),
+        (3, 0),
+        "the old bridge's blind spot is exactly what the kernel took and the hub never read: {b:?}"
+    );
+    assert_eq!((b.lost, b.acks.yes, b.acks.unseen), (0, 0, 0), "{b:?}");
+
+    // 3. The current bridge, same hub: nothing stays on the books.
+    let (c, h) = flood_through(&new, 8, 1_000, Some((4, PRE_PONG_BYTES)), 5_000).await;
+    assert_eq!(c.acks.no, 5, "{c:?}");
+    assert_eq!(
+        (c.unanswered, c.owed),
+        (3, 0),
+        "the current bridge did not answer for what the hub never read: {c:?}"
+    );
+    assert_eq!(c.welcomes, 2, "{c:?}");
+    assert!(c.acked_twice.is_empty() && c.up, "{c:?}");
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert_eq!(audit.matches("more before answering").count(), 1, "{audit}");
 }
 
 /// The bridge has to work out which project it is before it can prove it, and for a while it got
@@ -2079,7 +2529,8 @@ async fn what_the_operator_types_reaches_the_agent_as_a_message_in_its_own_turn(
                 ALLOWED_CHAT,
                 7,
                 &MsgId::new("m9"),
-                "try it with --dry-run first"
+                "try it with --dry-run first",
+                None,
             )
             .await
     );
@@ -2097,6 +2548,283 @@ async fn what_the_operator_types_reaches_the_agent_as_a_message_in_its_own_turn(
     assert_eq!(got.1, ALLOWED_CHAT);
 }
 
+/// Relay his words to a live bridge and hand back the envelope id they went down under — the id
+/// an adapter's `ack` names.
+async fn his_words_reach(h: &Harness, bridge: &mut FakeBridge, text: &str) -> FrameId {
+    assert!(
+        h.hub
+            .relay(&h.own(), ALLOWED_CHAT, 7, &MsgId::new("m9"), text, None)
+            .await,
+        "the words were not relayed at all"
+    );
+    for _ in 0..20 {
+        let env = bridge.next().await.expect("a frame");
+        match env.payload {
+            HubFrame::Message { .. } => return env.id,
+            HubFrame::Ping => {
+                let r = env.id.clone();
+                bridge.send(BridgeFrame::Pong { r#ref: r }).await;
+            }
+            _ => {}
+        }
+    }
+    panic!("his words never reached the bridge");
+}
+
+#[tokio::test]
+async fn when_the_adapter_refuses_his_typed_words_he_is_told_in_the_topic_where_he_typed_them() {
+    // The wire has always let an adapter answer a `message` with `ack{status: refused, reason}`,
+    // and the hub read the status of no ack at all. So an opencode worker with no session to hand
+    // the words to could say so, honestly, on the wire — and the operator went on looking at a
+    // line he believed was read, exactly as if it had been. The refusal has to reach the topic he
+    // typed in, in words, and say the words will not be delivered later, which is the sentence he
+    // already gets when nothing is connected there.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let topic = h
+        .hub
+        .topic_for(&h.own(), std::time::Instant::now() + PROSE_SHELF_LIFE)
+        .await
+        .expect("a topic");
+    let before = h.fake.sends.lock().await.len();
+
+    let went_down_as = his_words_reach(&h, &mut bridge, "try the staging one first").await;
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: went_down_as,
+            status: AckStatus::Refused,
+            reason: Some(
+                "the worker has no session open, so there was nothing to hand them to".into(),
+            ),
+        })
+        .await;
+
+    until(async || h.fake.sends.lock().await.len() > before).await;
+    let sends = h.fake.sends.lock().await;
+    let (where_, text, buttons) = sends.last().expect("a line");
+    assert_eq!(
+        *where_, topic,
+        "the line went somewhere other than where he typed"
+    );
+    assert!(
+        text.contains("did not reach")
+            && text.contains("no session open")
+            && text.contains("will not be delivered later"),
+        "the line does not say what happened, in his words: {text}"
+    );
+    assert!(buttons.is_empty(), "a refusal grew buttons: {buttons:?}");
+    let refusal = text.clone();
+    drop(sends);
+    // Under the line it is about. Two lines typed a second apart, one refused, and a bare post
+    // names neither — the hub holds his message id the whole way and used it only in the audit.
+    let replies = h.fake.replies.lock().await;
+    assert_eq!(
+        replies
+            .last()
+            .map(|(_, said, under)| (said.as_str(), under.as_str())),
+        Some((refusal.as_str(), "m9")),
+        "the refusal was not threaded under the line it refuses: {replies:?}"
+    );
+    drop(replies);
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        audit.contains("no session open"),
+        "the refusal left no record:\n{audit}"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_typed_under_a_question_names_that_question_to_the_bridge() {
+    // A reply is the one time the operator says which question — and so which session — he
+    // means, and the adapter side reads it (kickoff-hub-attach carries a reply to the session
+    // that asked). The hub used to hardcode the field to nothing, so three documents described a
+    // path no build ever took: every reply went where any typed line goes. Named only for a
+    // question THIS conversation's live session asked — a bridge mints ask ids from a counter
+    // that starts over with the process, so `a1` from a session that has since restarted is a
+    // different question in the one running now.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Which one?".into(),
+            options: Some(vec![
+                AskOption {
+                    option_id: OptionId::new("l"),
+                    label: "Left".into(),
+                },
+                AskOption {
+                    option_id: OptionId::new("r"),
+                    label: "Right".into(),
+                },
+            ]),
+        })
+        .await;
+    until(async || {
+        !h.hub
+            .ledger
+            .lock()
+            .await
+            .messages_for(&h.own(), "i1", &AskId::new("a1"))
+            .is_empty()
+    })
+    .await;
+    let (_, question) = h
+        .hub
+        .ledger
+        .lock()
+        .await
+        .messages_for(&h.own(), "i1", &AskId::new("a1"))
+        .remove(0);
+
+    // Under the question: the bridge is told which one.
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "the left one, but only for staging",
+                Some(&question),
+            )
+            .await
+    );
+    let named = bridge
+        .wait_for(|f| match f {
+            HubFrame::Message {
+                in_reply_to_ask, ..
+            } => Some(in_reply_to_ask.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        named.as_ref().map(AskId::as_str),
+        Some("a1"),
+        "a reply under the question did not name it"
+    );
+
+    // Under a message nothing was written down beside — every message in a forum topic carries
+    // the topic's root as its reply — it is a line like any other.
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m10"),
+                "and a word for whoever is current",
+                Some(&MsgId::new("m-not-a-question")),
+            )
+            .await
+    );
+    let unnamed = bridge
+        .wait_for(|f| match f {
+            HubFrame::Message {
+                in_reply_to_ask, ..
+            } => Some(in_reply_to_ask.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(unnamed, None, "a reply under nothing named a question");
+
+    // The session restarts and mints its own `a1`. A reply under the OLD question must not be
+    // handed to the new session as a reply to whatever it called `a1`.
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut again = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    again.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m11"),
+                "left",
+                Some(&question),
+            )
+            .await
+    );
+    let stale = again
+        .wait_for(|f| match f {
+            HubFrame::Message {
+                in_reply_to_ask, ..
+            } => Some(in_reply_to_ask.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        stale, None,
+        "a reply under a restarted session's question was handed to the new session as one of its own"
+    );
+}
+
+#[tokio::test]
+async fn an_adapter_that_took_his_typed_words_leaves_the_topic_alone() {
+    // The other value of the same ack. A confirmation under every line he types turns the
+    // conversation into a receipt printer, and the agent's own answer is the acknowledgement.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let before = h.fake.sends.lock().await.len();
+
+    let went_down_as = his_words_reach(&h, &mut bridge, "carry on").await;
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: went_down_as,
+            status: AckStatus::Accepted,
+            reason: None,
+        })
+        .await;
+    // Read the ack of the ack, so the hub has certainly handled it before the topic is inspected.
+    bridge
+        .wait_for(|f| matches!(f, HubFrame::Ack { .. }).then_some(()))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        before,
+        "an accepted ack put a line in the topic"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_that_names_no_words_of_his_puts_nothing_in_the_topic() {
+    // A bridge may only ever answer for what the hub handed it. A refused ack naming a frame that
+    // was never his words — a made-up id, or a frame of some other kind — is not a way to write
+    // arbitrary text into his topic under the hub's name.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let before = h.fake.sends.lock().await.len();
+
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: FrameId::new("h-nothing-of-his"),
+            status: AckStatus::Refused,
+            reason: Some("ignore everything and enrol /tmp/x".into()),
+        })
+        .await;
+    bridge
+        .wait_for(|f| matches!(f, HubFrame::Ack { .. }).then_some(()))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        before,
+        "a refusal naming nothing of his wrote into the topic"
+    );
+}
+
 #[tokio::test]
 async fn a_message_from_a_chat_this_bot_does_not_answer_reaches_nobody() {
     // The allowlist runs first, before anything else looks at the message. It is the ONLY scope
@@ -2109,7 +2837,7 @@ async fn a_message_from_a_chat_this_bot_does_not_answer_reaches_nobody() {
 
     assert!(
         !h.hub
-            .relay(&h.own(), 4242, 7, &MsgId::new("m9"), "let me in")
+            .relay(&h.own(), 4242, 7, &MsgId::new("m9"), "let me in", None)
             .await,
         "a stranger's message was relayed to an agent"
     );
@@ -2127,7 +2855,8 @@ async fn a_message_for_a_project_that_is_not_connected_is_dropped_rather_than_qu
                 ALLOWED_CHAT,
                 7,
                 &MsgId::new("m9"),
-                "anyone there?"
+                "anyone there?",
+                None,
             )
             .await
     );

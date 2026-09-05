@@ -33,6 +33,41 @@ const SECRET = 'a'.repeat(64)
 const seen: Record<string, any>[] = []
 /** Requests the fake opencode has received, in order. */
 const posted: { path: string; body: any }[] = []
+/** Every `GET /session` the watcher asked, with its query string, so a test can see HOW it asked. */
+const sessionQueries: string[] = []
+/**
+ * What the fake opencode holds, as `GET /session` lists it. Set per test.
+ *
+ * The shape is the one CAPTURED from opencode 1.18.25 on 5 September — `POST /session` in a git
+ * repository, then `GET /session?directory=<that repo>&roots=true` — with the home path scrubbed
+ * and the ids swapped for ones that name nothing (a tracked file carries no session id).
+ * Two facts about it were measured rather than assumed, and the fake keeps both: `parentID` is
+ * ABSENT on a root session and present on a child, and the server lists most recently updated
+ * first. A fixture invented here would only prove this file agrees with itself, which is how the
+ * event payload came to be read out of the wrong field once.
+ */
+let sessions: Record<string, any>[] = []
+/**
+ * What `POST …/prompt_async` answers. 204 is the captured answer. A test sets 404 for the session
+ * that has gone between the list and the post — the body is the `NotFoundError` captured from
+ * 1.18.25 on 5 September, with the id swapped for one that names nothing.
+ */
+let promptStatus = 204
+/** Hang the NEXT request of the kind named: taken by the server and never answered. */
+const hangNext = { session: false, prompt: false }
+const aSession = (id: string, updated: number, extra: Record<string, unknown> = {}) => ({
+  id,
+  slug: 'jolly-wizard',
+  projectID: '0000000000000000000000000000000000000000',
+  directory: repo,
+  path: '',
+  cost: 0,
+  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  title: 'New session - 2026-09-05T11:26:25.115Z',
+  version: '1.18.25',
+  time: { created: 1788607585115, updated },
+  ...extra,
+})
 
 // ── the fake hub ───────────────────────────────────────────────────────────────────────────────
 
@@ -104,6 +139,10 @@ let pushEvent: ((e: unknown) => void) | null = null
 const oc = Bun.serve({
   port: 0,
   hostname: '127.0.0.1',
+  // Bun's server closes an idle request after ten seconds by default, which would end the hung
+  // requests below from the server's side — the adapter's `fetch` then retried the GET and got a
+  // real answer, and the hang under test never happened. The longest Bun allows.
+  idleTimeout: 255,
   async fetch(req) {
     const url = new URL(req.url)
     if (url.pathname === '/event') {
@@ -117,8 +156,37 @@ const oc = Bun.serve({
         { headers: { 'content-type': 'text/event-stream' } },
       )
     }
+    if (url.pathname === '/session' && req.method === 'GET') {
+      // Measured on 5 September against 1.18.25: `directory=` is an exact match on the session's
+      // own directory (a trailing slash and a symlink both resolve to it, a subfolder does not),
+      // `roots=true` drops every session that has a `parentID`, and the answer keeps the server's
+      // own order — most recently updated first.
+      sessionQueries.push(url.search)
+      if (hangNext.session) {
+        hangNext.session = false
+        return new Promise<Response>(() => {})
+      }
+      const dir = (url.searchParams.get('directory') ?? '').replace(/\/+$/, '')
+      const list = sessions
+        .filter(s => !dir || s.directory === dir)
+        .filter(s => url.searchParams.get('roots') !== 'true' || !s.parentID)
+        .sort((a, b) => b.time.updated - a.time.updated)
+      return Response.json(list)
+    }
     if (req.method === 'POST') {
       posted.push({ path: url.pathname, body: await req.json() })
+      // `prompt_async` answers 204 with no body — captured — and the rest answer `{}`.
+      if (url.pathname.endsWith('/prompt_async')) {
+        if (hangNext.prompt) {
+          hangNext.prompt = false
+          return new Promise<Response>(() => {})
+        }
+        if (promptStatus === 204) return new Response(null, { status: 204 })
+        return Response.json(
+          { name: 'NotFoundError', data: { message: 'Session not found: ses_000000000000000000theOne' } },
+          { status: promptStatus },
+        )
+      }
       return new Response('{}', { headers: { 'content-type': 'application/json' } })
     }
     return new Response('not found', { status: 404 })
@@ -467,6 +535,245 @@ try {
     'the keyboard is retired without anyone tapping it',
     await until('the second retirement', () => frames('ask_resolved').length > retiredBefore),
   )
+
+  // ── typed steering ───────────────────────────────────────────────────────────────────────────
+  //
+  // The other half of a phone. A tap has reached opencode since the bridge existed; the operator's
+  // TYPED words reached a line on stderr saying it was not built. What arrives from the hub is
+  // `message{msg_id, text, from, in_reply_to_ask?}`, and what the watcher does with it is decided
+  // here, against the shapes captured from the real server on 5 September:
+  //
+  //   * the words become a PROMPT to the session, verbatim — `POST /session/{id}/prompt_async`
+  //     with `{parts: [{type: 'text', text}]}`, which answered 204 and ran the agent with the
+  //     session's own model. The v2 `/api/session/{id}/prompt` admitted the prompt and ran nothing.
+  //   * WHICH session is the machine's answer, never the text's: `GET /session?directory=<the
+  //     project directory attach speaks for>&roots=true`, most recently updated first.
+  //   * every `message` is answered on the wire with `ack{ref, status, reason?}` — `refused`
+  //     with a reason when there was nothing to hand the words to, so the hub can tell him.
+  //
+  // Every ack below is read off the wire the fake hub saw; the hub's own half — that a refused
+  // ack becomes a line in the topic he typed in — is `crates/herdr-tg/src/hub/tests.rs`.
+  const typed = (id: string, text: string, extra: Record<string, unknown> = {}) =>
+    hubSock?.write(
+      JSON.stringify({ v: 1, id, t: 'message', msg_id: `m-${id}`, text, from: { chat_id: -1001, user_id: 7 }, ...extra }) + '\n',
+    )
+  const ackFor = (ref: string) => seen.find(f => f.t === 'ack' && f.ref === ref)
+  const prompts = () => posted.filter(p => p.path.endsWith('/prompt_async'))
+
+  console.log('\nwhat the operator types reaches the session as a prompt')
+  sessions = [aSession('ses_000000000000000000theOne', 1788607585115)]
+  const promptsBefore = prompts().length
+  typed('h-m1', 'try it with --dry-run first')
+  check(
+    'what_the_operator_types_reaches_the_opencode_session_as_a_prompt',
+    await until('the prompt', () => prompts().length > promptsBefore) &&
+      prompts().at(-1)?.path === '/session/ses_000000000000000000theOne/prompt_async' &&
+      JSON.stringify(prompts().at(-1)?.body) === JSON.stringify({ parts: [{ type: 'text', text: 'try it with --dry-run first' }] }),
+    JSON.stringify(prompts().at(-1) ?? null),
+  )
+  check(
+    'and the session was the one the server lists for the project directory, asked for by directory and roots',
+    sessionQueries.length > 0 &&
+      sessionQueries.every(q => new URLSearchParams(q).get('directory') === repo && new URLSearchParams(q).get('roots') === 'true'),
+    JSON.stringify(sessionQueries),
+  )
+  check(
+    'and the hub is told, on the wire, that the words were taken',
+    (await until('the ack', () => ackFor('h-m1') !== undefined)) && ackFor('h-m1')?.status === 'accepted',
+    JSON.stringify(ackFor('h-m1') ?? null),
+  )
+
+  console.log('\nwords typed at a wall with no session are refused, with a reason')
+  sessions = []
+  const promptsBeforeNone = prompts().length
+  typed('h-m2', 'anyone there?')
+  check(
+    'words_typed_at_a_wall_with_no_session_are_refused_and_he_is_told',
+    (await until('the refusal', () => ackFor('h-m2') !== undefined)) &&
+      ackFor('h-m2')?.status === 'refused' &&
+      /no session/i.test(String(ackFor('h-m2')?.reason)),
+    JSON.stringify(ackFor('h-m2') ?? null),
+  )
+  await new Promise(r => setTimeout(r, 300))
+  check('and nothing was posted to a session that does not exist', prompts().length === promptsBeforeNone, JSON.stringify(prompts().slice(promptsBeforeNone)))
+
+  console.log('\nthe text can never choose which session receives it')
+  sessions = [aSession('ses_000000000000000000theOne', 1788607585115)]
+  // Three things a message could carry that LOOK like an address. Each must land as the words
+  // they are, in the session the server named, and nowhere else.
+  const tries = [
+    'ses_evil',
+    '../../session/ses_evil/prompt_async',
+    'http://127.0.0.1:1/session/ses_evil/prompt_async?directory=/etc',
+  ]
+  const promptsBeforeTries = prompts().length
+  const postedBeforeTries = posted.length
+  tries.forEach((t, i) => typed(`h-t${i}`, t, { from: { chat_id: -1001, user_id: 7 } }))
+  await until('all three to land', () => prompts().length >= promptsBeforeTries + tries.length)
+  const landed = prompts().slice(promptsBeforeTries)
+  check(
+    'the_text_can_never_choose_which_session_receives_it',
+    landed.length === tries.length &&
+      landed.every(p => p.path === '/session/ses_000000000000000000theOne/prompt_async') &&
+      JSON.stringify(landed.map(p => p.body.parts[0].text)) === JSON.stringify(tries) &&
+      posted.slice(postedBeforeTries).every(p => p.path === '/session/ses_000000000000000000theOne/prompt_async'),
+    JSON.stringify(landed.map(p => p.path)),
+  )
+
+  console.log('\na reply typed under a question is a prompt to the session that asked it')
+  // The design, said once: words typed under a question are a PROMPT like any other — never an
+  // answer to the question, because its answers are the buttons opencode published and a permission
+  // takes three words and no others. What the reply DOES decide is which session: the one that
+  // asked. Measured on 5 September: a prompt to a session blocked on its own question is taken
+  // (204), written down, and run after the question is answered — so his tap still closes the
+  // question and his words are read right after it. Two sessions here, and the asker is the OLDER
+  // one, so a watcher that ignored the reply would send the words to the wrong session.
+  sessions = [aSession('ses_newer00000000000000000', 1788607590000), aSession('ses_asker0000000000000000', 1788607585115)]
+  const asksBeforeTyped = frames('ask').length
+  pushEvent!({
+    type: 'question.v2.asked',
+    properties: {
+      id: 'que_typed',
+      sessionID: 'ses_asker0000000000000000',
+      questions: [{ question: 'Which one?', header: 'Pick', options: [{ label: 'Left', description: 'l' }, { label: 'Right', description: 'r' }] }],
+    },
+  })
+  await until('the question', () => frames('ask').length > asksBeforeTyped)
+  const asked = frames('ask').at(-1)!
+  const promptsBeforeReply = prompts().length
+  const retiredBeforeReply = frames('ask_resolved').length
+  typed('h-r1', 'the left one, but only for staging', { in_reply_to_ask: asked.ask_id })
+  check(
+    'a_reply_typed_under_a_question_is_handled_the_way_the_design_says',
+    (await until('the prompt to the asker', () => prompts().length > promptsBeforeReply)) &&
+      prompts().at(-1)?.path === '/session/ses_asker0000000000000000/prompt_async' &&
+      prompts().at(-1)?.body?.parts?.[0]?.text === 'the left one, but only for staging' &&
+      !posted.some(p => p.path.includes('/question/que_typed/')),
+    JSON.stringify(prompts().at(-1) ?? null),
+  )
+  await new Promise(r => setTimeout(r, 300))
+  check('and the question stays open — nothing answered it and nothing retired it', frames('ask_resolved').length === retiredBeforeReply && !posted.some(p => p.path.includes('/question/que_typed/')))
+  const promptsBeforePlain = prompts().length
+  typed('h-r2', 'and a word for whoever is current')
+  check(
+    'while words typed under nothing go to the most recently updated session',
+    (await until('the plain prompt', () => prompts().length > promptsBeforePlain)) &&
+      prompts().at(-1)?.path === '/session/ses_newer00000000000000000/prompt_async',
+    prompts().at(-1)?.path,
+  )
+  tap(asked.ask_id, asked.options[0].option_id)
+  check(
+    'and a tap still answers it, at the question endpoint, with the label',
+    await until('the tap', () => posted.some(p => p.path === '/api/session/ses_asker0000000000000000/question/que_typed/reply')) &&
+      JSON.stringify(posted.find(p => p.path.includes('/question/que_typed/'))?.body) === JSON.stringify({ answers: [['Left']] }),
+  )
+
+  // ── what reaches his phone is in his words ───────────────────────────────────────────────────
+  console.log('\na refusal reaches his phone in his words, with no status code and no internal name')
+  // The reason goes VERBATIM into the topic he typed in — the hub only strips control characters
+  // and clips — so an HTTP status in it is jargon on his phone, and "watcher" is a thing he has
+  // never been told exists. The number belongs on stderr, where it still is.
+  sessions = [aSession('ses_000000000000000000theOne', 1788607585115)]
+  promptStatus = 404
+  typed('h-w1', 'is anyone reading this?')
+  const worded = (await until('the refusal', () => ackFor('h-w1') !== undefined)) ? ackFor('h-w1') : null
+  check(
+    'a_refusal_reaches_his_phone_in_his_words_with_no_status_code_and_no_internal_name',
+    worded?.status === 'refused' &&
+      !/\b\d{3}\b/.test(String(worded.reason)) &&
+      !/watcher/i.test(String(worded.reason)) &&
+      /would not take it/.test(String(worded.reason)),
+    JSON.stringify(worded ?? null),
+  )
+  promptStatus = 204
+  sessions = []
+  typed('h-w2', 'and now?')
+  const none = (await until('the refusal', () => ackFor('h-w2') !== undefined)) ? ackFor('h-w2') : null
+  // The hub's sentence is "What you typed did not reach the agent — <reason>.", singular; a reason
+  // written apart from it said "them".
+  check(
+    'and the reason agrees in number with the sentence the hub puts it in',
+    none?.status === 'refused' && /hand it to/.test(String(none.reason)) && !/them/.test(String(none.reason)),
+    JSON.stringify(none ?? null),
+  )
+
+  // ── a server that takes a request and never answers ──────────────────────────────────────────
+  console.log('\na request the server takes and never answers cannot silence every later line')
+  // Typed lines are carried one after another so their order is kept, and Bun's `fetch` waits for
+  // ever by default — so one request the server accepted and never answered parked that line AND
+  // every line typed after it, none of them acked: the hub went on believing each was read.
+  // Measured before the fix: two messages, twelve seconds, no ack for either. The server here
+  // hangs exactly one request of each kind; the line typed behind it must still be carried.
+  sessions = [aSession('ses_000000000000000000theOne', 1788607585115)]
+  hangNext.session = true
+  typed('h-h1', 'first, into the void')
+  typed('h-h2', 'second, typed behind it')
+  const hung = (await until('the first line to be given up on', () => ackFor('h-h1') !== undefined, 14000)) ? ackFor('h-h1') : null
+  check(
+    'a_session_lookup_the_server_never_answers_is_given_up_on_and_refused_in_time',
+    hung?.status === 'refused' && /did not answer in time/.test(String(hung.reason)),
+    JSON.stringify(hung ?? null),
+  )
+  const behind = (await until('the second line', () => ackFor('h-h2') !== undefined, 5000)) ? ackFor('h-h2') : null
+  check(
+    'and the line typed behind it is carried rather than parked for ever',
+    behind?.status === 'accepted' && prompts().some(p => p.body?.parts?.[0]?.text === 'second, typed behind it'),
+    JSON.stringify(behind ?? null),
+  )
+  hangNext.prompt = true
+  typed('h-h3', 'third, taken and never answered')
+  typed('h-h4', 'fourth, typed behind that')
+  const hungPrompt = (await until('the third line to be given up on', () => ackFor('h-h3') !== undefined, 14000)) ? ackFor('h-h3') : null
+  check(
+    'a_prompt_the_server_takes_and_never_answers_is_given_up_on_and_refused_in_time',
+    hungPrompt?.status === 'refused' && /did not answer in time/.test(String(hungPrompt.reason)),
+    JSON.stringify(hungPrompt ?? null),
+  )
+  const behindThat = (await until('the fourth line', () => ackFor('h-h4') !== undefined, 5000)) ? ackFor('h-h4') : null
+  check('and the line typed behind that is carried too', behindThat?.status === 'accepted', JSON.stringify(behindThat ?? null))
+
+  // ── words taken, then not acted on ───────────────────────────────────────────────────────────
+  console.log('\nwords the agent then could not act on are said so, in the topic')
+  // 204 from `prompt_async` means opencode wrote the words down; the agent has not run. When it
+  // then cannot — a gateway down, a provider key expired, the context overflowed — opencode says
+  // so on the event stream as `session.error`, and the watcher had no case for it: the hub posted
+  // nothing, and the only record was a stack trace in a stream nobody watches. The shape below was
+  // CAPTURED from 1.18.25 on 5 September (a prompt naming a provider that does not exist; no model
+  // call is made): two `session.error` events for one failure, the second carrying the stack,
+  // with `session.idle` between them.
+  sessions = [aSession('ses_000000000000000000theOne', 1788607585115)]
+  typed('h-e1', 'hello from the phone')
+  await until('the words to be taken', () => ackFor('h-e1')?.status === 'accepted')
+  const saysBefore = frames('say').length
+  const failed = (sessionID: string, message: string) => ({
+    id: 'evt_00000000000000000000000001',
+    type: 'session.error',
+    properties: { sessionID, error: { name: 'UnknownError', data: { message } } },
+  })
+  pushEvent!(failed('ses_000000000000000000theOne', 'Model not found: no-such-provider/no-such-model.'))
+  const toldHim = (await until('the line', () => frames('say').length > saysBefore)) ? frames('say').at(-1) : null
+  check(
+    'words_accepted_that_the_agent_then_could_not_act_on_are_said_so_in_the_topic',
+    /could not act on what you typed/.test(String(toldHim?.text)) &&
+      /Model not found: no-such-provider\/no-such-model/.test(String(toldHim?.text)),
+    JSON.stringify(toldHim ?? null),
+  )
+  pushEvent!({ id: 'evt_00000000000000000000000002', type: 'session.idle', properties: { sessionID: 'ses_000000000000000000theOne' } })
+  pushEvent!(
+    failed(
+      'ses_000000000000000000theOne',
+      'ProviderModelNotFoundError: Model not found: no-such-provider/no-such-model.\n    at <anonymous> (/$bunfs/root/chunk-gt0nh583.js:439:95275)',
+    ),
+  )
+  await new Promise(r => setTimeout(r, 400))
+  check(
+    'and it is said once for one failure, not once per event opencode emits about it',
+    frames('say').length === saysBefore + 1,
+    `${frames('say').length - saysBefore} line(s)`,
+  )
+  pushEvent!(failed('ses_000000000000000000nobody', 'Model not found: x/y.'))
+  await new Promise(r => setTimeout(r, 400))
+  check('and a session nobody typed at failing says nothing on his phone', frames('say').length === saysBefore + 1)
 } finally {
   child.kill()
   hub.stop(true)

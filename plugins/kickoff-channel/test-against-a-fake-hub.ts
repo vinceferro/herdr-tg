@@ -332,8 +332,11 @@ hub.stop()
 // ── Part 3: promises the bridge makes about frames it is holding ──────────────────────────────
 console.log('\nabout what is waiting in line:')
 
-/** A fake hub that records what reaches it, and answers `hello` however the test asks. */
-function fakeHub(path: string, answer: (hello: any, s: any) => void) {
+/**
+ * A fake hub that records what reaches it, and answers `hello` however the test asks — and every
+ * later frame however `then` asks, for a test about what a hub does AFTER the welcome.
+ */
+function fakeHub(path: string, answer: (hello: any, s: any) => void, then?: (frame: any, s: any) => void) {
   const got: Record<string, any>[] = []
   let acc = ''
   const server = Bun.listen({
@@ -351,6 +354,7 @@ function fakeHub(path: string, answer: (hello: any, s: any) => void) {
           const f = JSON.parse(line)
           got.push(f)
           if (f.t === 'hello') answer(f, s)
+          else then?.(f, s)
         }
       },
       close() {}, error() {},
@@ -432,6 +436,53 @@ check('whole, and in the order they were said',
   arrived.map(f => f.text.slice(0, 3)).join(''))
 backlog.child.kill()
 backlogHub.stop()
+
+// A frame the kernel took whole is off the queue the moment it is written, and the hub answers for
+// it only on THIS connection: an ack names a frame by an id the next connection's hub has never
+// seen. So a connection that ends with frames flushed and unanswered ends with frames nobody will
+// ever answer for — and the bridge used to keep them on its books, in silence, for ever. The agent
+// had been told "said"; no correction ever came. Measured against the real hub: fourteen frames
+// flushed whole into two refused connections, zero corrections, nothing on the phone.
+//
+// The hub below does to the last two frames exactly what the shipped hub did to everything a
+// bridge said before its pong — reads them, closes, answers for nothing — and to the first two
+// what it does now, which is say `no` before closing. The agent has to learn of all four, and in
+// two different registers, because "he never got it" and "nobody knows" are not the same fact.
+const thrownSock = join(dir, 'thrown.sock')
+const thrown = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: thrownSock })
+await handshake(thrown)
+await call(thrown, 200, 'reply', { text: 'first' })
+await call(thrown, 201, 'reply', { text: 'second' })
+await call(thrown, 202, 'ask', { text: 'third: proceed?', options: [{ id: 'y', label: 'Yes' }] })
+await call(thrown, 203, 'reply', { text: 'fourth' })
+let read = 0
+const thrownHub = fakeHub(thrownSock, (_h, s) => welcome(s), (f, s) => {
+  if (f.t !== 'say' && f.t !== 'ask') return
+  read++
+  if (read <= 2) s.write(JSON.stringify({ v: 1, id: `h-a${read}`, t: 'ack', ref: f.id, delivered: 'no', why: 'too-fast' }) + '\n')
+  if (read === 4) s.end()
+})
+await until('the agent to be told what became of the frames the hub never answered for',
+  () => noticesTo(thrown).some(n => /before the hub said/.test(String(n.params?.content ?? ''))), 8000)
+  .catch(() => {})
+const unanswered = noticesTo(thrown).map(n => String(n.params?.content ?? '')).find(t => /before the hub said/.test(t)) ?? ''
+const neverGot = noticesTo(thrown).map(n => String(n.params?.content ?? '')).filter(t => /He never got/.test(t))
+check('a_bridge_learns_which_flushed_frames_the_hub_threw_away', unanswered !== '',
+  JSON.stringify(noticesTo(thrown).map(n => n.params?.content)))
+check('it says they may or may not have reached him, never that they did or that they did not',
+  /may have arrived and it may not/.test(unanswered) && !/never got/.test(unanswered), unanswered)
+check('it names what each of them was', /a message for him/.test(unanswered) && /a question \(a\d+\)/.test(unanswered), unanswered)
+check('and tells the agent not to ask that question again, because its buttons may be live',
+  /do not ask it again/i.test(unanswered), unanswered)
+check('the two the hub refused before closing are reported as refused, separately',
+  neverGot.length === 2, `${neverGot.length}: ${JSON.stringify(neverGot)}`)
+await until('the bridge to come back', () => thrownHub.got.filter(f => f.t === 'hello').length >= 2, 6000).catch(() => {})
+await Bun.sleep(300)
+check('and none of the four is sent again, because a second copy of a question is two live menus',
+  thrownHub.got.filter(f => f.t === 'say' || f.t === 'ask').length === 4,
+  JSON.stringify(thrownHub.got.map(f => f.t)))
+thrown.child.kill()
+thrownHub.stop()
 
 // ── Part 4: lanes ──────────────────────────────────────────────────────────────────────────────
 //
@@ -723,6 +774,31 @@ check('and it is still told, in the same first words, whether his phone actually
 check('while a claude session is told his answer is coming, in the sentence it always was',
   askedHere.text === `asked (${askedHere.text.match(/\((a\d+)\)/)![1]}) — his answer will arrive as a channel message, do not wait here`,
   askedHere.text)
+
+// His typed words, on the engine that cannot read them. They arrive as `message`, and the bridge
+// used to write them into a channel notification nothing on opencode consumes — a line on stderr
+// saying so, and nothing on the wire — so the hub went on believing they were read, and the
+// operator went on looking at a line that had reached nobody. The wire has always had
+// `ack{status: refused, reason}` for exactly this.
+const typedSock = join(dir, 'typed.sock')
+let typedConn: any = null
+const typedHub = fakeHub(typedSock, (_h, s) => { welcome(s); typedConn = s })
+const typedThere = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: typedSock })
+await handshake(typedThere, OPENCODE)
+await until('the bridge to be welcomed', () => typedConn !== null)
+await Bun.sleep(200)
+typedConn.write(JSON.stringify({ v: 1, id: 'h-m1', t: 'message', msg_id: 'm1',
+  text: 'try the staging one first', from: { chat_id: -1, user_id: 1 } }) + '\n')
+await until('the refusal', () => typedHub.got.some(f => f.t === 'ack' && f.ref === 'h-m1'), 5000).catch(() => {})
+const refusedThere = typedHub.got.find(f => f.t === 'ack' && f.ref === 'h-m1')
+check('typed_words_on_an_engine_that_cannot_read_them_are_refused_on_the_wire_not_dropped',
+  refusedThere?.status === 'refused' && /typed words/.test(String(refusedThere?.reason)) && /--opencode/.test(String(refusedThere?.reason)),
+  JSON.stringify(refusedThere ?? null))
+check('and they are not written into a channel nothing on this engine reads',
+  !typedThere.out.some(l => l.method === 'notifications/claude/channel' && l.params?.content === 'try the staging one first'),
+  JSON.stringify(typedThere.out.filter(l => l.method === 'notifications/claude/channel').map(l => l.params?.content)))
+typedThere.child.kill()
+typedHub.stop()
 
 // The other three tools' SUCCESS sentences are a pair, not a copy, and calling them a copy is what
 // hid a defect for a whole slice. "Said" is honest on Claude Code because the hub can still

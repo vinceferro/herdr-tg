@@ -65,7 +65,7 @@ overrides `rust-toolchain.toml`. `TMPDIR` because an agent session inherits it a
 The same applies to `git commit`: the pre-commit hook runs six gates in your environment, so prefix
 the commit too, or it is refused with seven red tests you did not break.
 
-Two tests are `#[ignore]`d because they need bun. `scripts/install-channel-plugin.sh` runs them, and
+Seven tests are `#[ignore]`d — five need bun, one is a proxy-driven child, one runs the pre-change bridge against the new hub. `scripts/install-channel-plugin.sh` runs them, and
 refuses to install a bridge that disagrees with the hub:
 
 ```
@@ -108,6 +108,24 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   proves reachability and makes no topic. `adapters/fanin/` and `adapters/opencode-bridge/` are
   **gone** — a stranger opening `adapters/` finds one thing to run. Every check the two suites held
   survives, moved to attach; the systemd template is `deploy/kickoff-hub-attach@.service`.
+- **Typed steering reaches an opencode worker** (5 September). The watcher carries a `message` to
+  `POST /session/{id}/prompt_async` verbatim, in the session the server lists for the project
+  directory; a reply typed under a question — the hub sets `in_reply_to_ask` from the message he
+  swiped to reply to, for a question this conversation's live session asked — goes to the session
+  that asked and leaves the question open for the tap. Every `message` is answered
+  `ack{status, reason?}`, and **the hub now reads it**: a `refused` becomes one line in the topic he
+  typed in, under the line it refuses. It read the status of no ack before. On an engine that cannot
+  read a channel message the tool server refuses typed words on the wire, and attach's door folds
+  several producers' answers into the one the hub hears. Every request the watcher makes of opencode
+  has a deadline; words opencode took and the agent then could not act on are said so in the topic.
+- **Nothing a bridge says before its pong is destroyed unanswered** (5 September). The hub holds
+  65 frames before the pong — the 64 `hub-link.ts` may have queued plus the one it puts back at the
+  head of its queue on close, which is what it carries into a reconnect; it
+  was 256 KiB, and a bridge with an afternoon's backlog was refused on every redial — and on every
+  way a connection is refused before it is live, each frame the hub read is acked `no` first. The
+  bridge's half: a frame flushed whole on a connection that ends is handed back as unconfirmed
+  (`onUnanswered`), never kept in silence and never re-sent. The bridge from before this change is
+  run against the new hub by `a_bridge_from_before_this_change_still_works_against_the_new_hub`.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.

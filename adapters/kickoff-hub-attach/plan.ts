@@ -11,7 +11,7 @@
  */
 
 import { existsSync } from 'fs'
-import { isAbsolute, join } from 'path'
+import { basename, isAbsolute, join } from 'path'
 
 import { doorDerivedFromGit, type Attachment } from '../../plugins/kickoff-channel/attach.ts'
 
@@ -79,6 +79,26 @@ export function opencodeUrlProblem(url: string): string | null {
     return `--opencode ${url} names no port; the watcher would dial the wrong server. Give it the port opencode serve was given, e.g. --opencode http://127.0.0.1:9711`
   }
   return null
+}
+
+/**
+ * Whether the operator's phone reaches this engine both ways, or why only one.
+ *
+ * On opencode everything the agent did NOT choose to say — its questions, its permission prompts —
+ * and everything the operator types back travel through the watcher `--opencode` starts; the tool
+ * server the engine spawns carries only what the agent chose to say. A wall started with
+ * `--run opencode …` and no `--opencode` is therefore half a phone, and it looked whole: every line
+ * of the check was green. A warning rather than a refusal, because the wall works for what it does
+ * carry, and typed words are refused out loud on it rather than dropped — nothing is silent, only
+ * less. Null when there is nothing to say.
+ */
+export function typedWordsFact(run: string[] | null, opencodeUrl: string | null): { ok: boolean; text: string; warn: boolean } | null {
+  if (!run || opencodeUrl !== null || basename(run[0] ?? '') !== 'opencode') return null
+  return {
+    ok: true,
+    warn: true,
+    text: 'the engine is opencode and no --opencode <url> was given, so its questions, its permission prompts and what the operator types on his phone all reach nothing; add --opencode http://127.0.0.1:<the port opencode serve was given>',
+  }
 }
 
 /**

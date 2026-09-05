@@ -51,7 +51,7 @@ import {
 import { readFileSync } from 'fs'
 
 import { readConfig, secretFor, type Attachment } from './attach.ts'
-import { HubLink, type Delivery, type Identity, type Outbound } from './hub-link.ts'
+import { HubLink, type Delivery, type Identity, type Outbound, type Unanswered } from './hub-link.ts'
 import { type Project } from './where.ts'
 
 /**
@@ -129,6 +129,15 @@ const LINK_DROPPED = VIA_FANIN
 
 /** This run of this worker. A new one invalidates every question drawn for the last. */
 const INSTANCE = `${process.pid}-${Date.now()}`
+
+/**
+ * Why his typed words are refused on an engine that cannot hand them to the agent. It lands in the
+ * topic he typed in, so it has to be true whichever way the wall was started: the tool the agent
+ * has here cannot take them, and the watcher a worker gets from `--opencode` can — behind attach's
+ * door that watcher answers for the same words, and the door forwards its answer over this one.
+ */
+const CANNOT_TAKE_TYPED_WORDS =
+  'nothing on this engine can take typed words from the phone by itself; a worker started with --opencode carries them'
 
 /**
  * Whether the client on the other end of this stdio can hand the agent something this bridge did
@@ -415,6 +424,7 @@ const link = new HubLink({
   identify,
   onFrame,
   onLost,
+  onUnanswered,
   note,
   whenUnreachable: NOTHING_LISTENING,
   whenDropped: LINK_DROPPED,
@@ -561,6 +571,35 @@ function onLost(lost: Outbound[], why: string): void {
   )
 }
 
+/**
+ * Frames the hub took and the connection ended before it answered for them.
+ *
+ * Each was reported as said or asked, and each is now in the one state this vocabulary is most
+ * careful about: nobody knows. The hub may have destroyed them before the bridge had proved it was
+ * there, or delivered them and lost the ack with the socket, and from here the two are identical.
+ * So the agent is told exactly that — not "never got" (a question that DID land has live buttons,
+ * and his tap will still reach this session), and not to send them again (a second copy of a
+ * question is two menus for one answer).
+ */
+function onUnanswered(gone: Unanswered[], why: string): void {
+  const asks = gone.flatMap(o => (o.askId ? [o.askId] : []))
+  const one = gone.length === 1
+  deliver(
+    `${one ? 'One thing' : `${gone.length} things`} you were told ${one ? 'was' : 'were'} said went out, and the ` +
+      `connection ended before the hub said whether ${one ? 'it' : 'any of them'} reached him: ` +
+      `${gone.map(o => o.what).join(', ')}. ${why} ${one ? 'It' : 'Each'} may have arrived and it may not have, ` +
+      `and there is no way to find out — so ${one ? 'it' : 'they'} will not be sent again, because sending ` +
+      `${one ? 'it' : 'them'} twice would leave two on his phone. Do not tell him you reached him.` +
+      (asks.length
+        ? ` The question ${asks.join(' or ')} may still be answered — if it did arrive, its buttons are live and his ` +
+          'tap will reach you — so do NOT ask it again, or he will have two menus for one question. But do not ' +
+          'wait on it either: if it never arrived, no answer is ever coming. If you must have an answer, say what ' +
+          'you need in a plain message and let him type it back.'
+        : ''),
+    { about: 'he may never have got this', user: 'the channel itself' },
+  )
+}
+
 /** Why the hub says a frame never reached his phone, in words the agent can pass on. */
 const ackReasons = new Map<string, string>([
   ['too-fast', 'too much was sent to his phone at once, so this one was shed'],
@@ -677,6 +716,19 @@ function onFrame(frame: Record<string, any>): void {
       break
     }
     case 'message':
+      if (!canCarryAChannelMessage()) {
+        // Refused on the wire, never dropped into a notification nothing here reads. His words
+        // used to go out as `notifications/claude/channel` on this engine too — into the void,
+        // with a line on stderr and no ack — so the hub went on believing they were read and the
+        // operator went on looking at a line that had reached nobody. The wire has always had
+        // this ack; the hub puts its reason in the topic he typed in.
+        note(`this engine cannot take typed words from the phone; the hub was told: ${frame.text}`)
+        link.send(
+          { t: 'ack', ref: String(frame.id), status: 'refused', reason: CANNOT_TAKE_TYPED_WORDS },
+          'an answer about typed words',
+        )
+        break
+      }
       deliver(frame.text, {
         message_id: frame.msg_id,
         ...(frame.in_reply_to_ask ? { in_reply_to_ask: frame.in_reply_to_ask } : {}),

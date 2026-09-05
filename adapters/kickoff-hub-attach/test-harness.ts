@@ -69,6 +69,12 @@ export function claimingHub(path: string) {
   /** What to answer every relayed frame with. `null` means answer nothing, like a hub gone quiet. */
   let ackAs: 'yes' | 'no' | null = 'yes'
   let claiming = true
+  /**
+   * Stop reading for this long inside the next chunk, then close on the sender. The test process
+   * is the hub's one thread, so sleeping in it is what a hub that has stopped taking bytes looks
+   * like from the door: the kernel fills, and the door's own line starts holding frames.
+   */
+  let freeze: number | null = null
 
   const write = (s: any, o: Record<string, unknown>) => s.write(JSON.stringify(o) + '\n')
 
@@ -77,6 +83,15 @@ export function claimingHub(path: string) {
     socket: {
       open(s: any) { conns.set(s, { s, acc: '' }) },
       data(s: any, chunk: any) {
+        // Not on the hello: the door has to be welcomed and greet its producers before there is
+        // anything for it to hold. The first chunk of what they say is the one the hub stalls in.
+        if (freeze !== null && !chunk.toString().includes('"t":"hello"')) {
+          const ms = freeze
+          freeze = null
+          Bun.sleepSync(ms)
+          s.end()
+          return
+        }
         const c = conns.get(s)!
         c.acc += chunk.toString()
         for (;;) {
@@ -127,6 +142,10 @@ export function claimingHub(path: string) {
     get live() { return conns.size },
     set ack(v: 'yes' | 'no' | null) { ackAs = v },
     set enforcing(v: boolean) { claiming = v },
+    /** End every connection the relay is holding, which is what a hub restart looks like from here. */
+    drop: () => { for (const s of [...conns.keys()]) s.end() },
+    /** Stop reading inside the next chunk for `ms`, then close on the sender — a hub that wedged and was restarted. */
+    freezeThenDrop: (ms: number) => { freeze = ms },
     stop: () => server.stop(true),
   }
 }

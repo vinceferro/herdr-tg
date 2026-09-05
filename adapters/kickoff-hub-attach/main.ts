@@ -31,7 +31,7 @@ import { createRelay } from './relay.ts'
 import { runCheck } from './check.ts'
 import { runChild } from './run.ts'
 import { startWatcher } from './opencode.ts'
-import { PRIVATE_DOOR_PREFIX, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact } from './plan.ts'
+import { PRIVATE_DOOR_PREFIX, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
 
 /** Say something in this process's own transcript, prefixed so a journal tells it from the child's. */
 function note(msg: string): void {
@@ -158,7 +158,18 @@ note(`the door is ${door}`)
 {
   const fact = toolServerFact(CONFIG, door, ARGS.run !== null)
   if (fact?.warn) note(fact.text)
+  // Half a phone, said at the start as well as by `--check`, from the same sentence.
+  const half = typedWordsFact(ARGS.run, ARGS.opencode)
+  if (half?.warn) note(half.text)
 }
+
+/**
+ * This run of the watcher, named HERE rather than inside it, because the door needs to know it:
+ * of the producers behind the door the watcher is the one that carries his typed words, and when
+ * every producer refuses them the door forwards the watcher's reason over a tool server's. Null
+ * without `--opencode`, and then there is no carrier to prefer.
+ */
+const WATCHER_INSTANCE = ARGS.opencode ? `${process.pid}-w-${Date.now()}` : null
 
 const relay = createRelay({
   projectDir: CONFIG.projectDir,
@@ -167,6 +178,7 @@ const relay = createRelay({
   listen: door,
   hubSocket: CONFIG.hubSocket,
   graceMs: CONFIG.relayGraceMs,
+  carrier: WATCHER_INSTANCE,
   // Resolved AFRESH on every attempt: the operator may `herdr-tg enroll` while this runs.
   secretOf: () => secretFor(CONFIG),
   note,
@@ -240,6 +252,7 @@ function watcherConfig(url: string) {
   return {
     door,
     address: CONFIG.address,
+    instance: WATCHER_INSTANCE!,
     opencodeUrl: url,
     secretOf: () => secretFor(CONFIG),
     projectDir: CONFIG.projectDir,

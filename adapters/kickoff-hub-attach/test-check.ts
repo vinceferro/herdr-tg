@@ -394,6 +394,28 @@ console.log('\nwhen --opencode names no port:')
   hub.stop()
 }
 
+// ── L2. an opencode engine with no --opencode is half a phone, and the check says so ─────────
+//
+// Without `--opencode`, an opencode worker's questions, its permission prompts and what the operator
+// types on his phone all reach nothing: the watcher is what carries every one of them, and the tool
+// server the engine spawns can only say what the agent chose to say. The start warns too, from the
+// same sentence, so the check and the worker cannot disagree.
+console.log('\nwhen the engine is opencode and no --opencode was given:')
+{
+  const hubSock = join(dir, 'l2-hub.sock')
+  const hub = recordingHub(hubSock)
+  const env = { KICKOFF_HUB_PROJECT_DIR: laneDir, KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: relayDir }
+  const r = await runCheck(env, ['--run', 'opencode', 'serve', '--port', '9711'])
+  check('the_check_warns_that_an_opencode_engine_started_without_opencode_reaches_half_a_phone',
+    r.out.some(l => /^warn\s+.*--opencode/.test(l)),
+    JSON.stringify(r.out))
+  const ok = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--run', 'opencode', 'serve', '--port', '9711'])
+  check('and says nothing of the kind when --opencode is there',
+    !ok.out.some(l => /^warn\s+.*--opencode/.test(l)),
+    JSON.stringify(ok.out.filter(l => /^warn/.test(l))))
+  hub.stop()
+}
+
 // ── M. the hub's directory is 0700, and this is not the hub's user ────────────────────────────
 //
 // The real directory is `drwx------`, so a foreign uid cannot even stat the socket inside it. The

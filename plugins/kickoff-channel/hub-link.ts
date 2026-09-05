@@ -76,6 +76,15 @@ export type Outbound = {
 /** A frame the kernel has taken only the first `sent` bytes of. */
 type Started = Outbound & { sent: number }
 
+/**
+ * A frame the kernel took whole that nobody will ever answer for, and what it was.
+ *
+ * Not an `Outbound`: its bytes are gone and must stay gone. Re-sending it is the one thing a caller
+ * must not do with it — if it DID reach the hub, a second copy is a second message on his phone,
+ * and for a question a second live menu.
+ */
+export type Unanswered = { id: string; what: string; askId?: string }
+
 /** Where to dial and what to say on arrival — or why neither can be worked out yet. */
 export type Identity =
   | { socket: string; hello: Record<string, unknown> }
@@ -106,6 +115,21 @@ export type HubLinkOptions = {
    * wearing a different coat.
    */
   onLost?: (lost: Outbound[], why: string) => void
+  /**
+   * Frames the kernel took whole on a connection that then ended before the hub answered for them.
+   *
+   * An `ack` names a frame by an id minted for ONE connection, and the next connection's hub has
+   * never seen it — so at the moment a connection closes, every flushed frame without an ack is a
+   * frame no ack is ever coming for. They used to stay on the books in silence: the agent had been
+   * told "said", the hub had destroyed them (or delivered them and lost the ack with the socket),
+   * and no correction ever came. Measured against the real hub: fourteen frames flushed whole into
+   * two refused connections, zero corrections to the agent, nothing on the phone.
+   *
+   * Their fate is UNKNOWN, and that is what a caller must say — not "lost" (`onLost` is for frames
+   * that never went) and never "reached him". Nothing here re-sends them: if one did land, a second
+   * copy is a duplicate on his phone, and for a question a second live menu.
+   */
+  onUnanswered?: (frames: Unanswered[], why: string) => void
   /** Say something in this process's own transcript. The operator cannot see it; a developer can. */
   note: (msg: string) => void
   /**
@@ -348,6 +372,25 @@ export class HubLink {
     return n
   }
 
+  /**
+   * Take every frame one caller still has waiting here off the queue, and hand them back.
+   *
+   * For a relay whose hub connection has just ended and is about to end its producers' sockets.
+   * A producer's own close-time report then counts everything it handed over and heard nothing
+   * back on — and frames still waiting HERE are among them: it told its agent they had gone out
+   * with their fate unknown and would not be sent again, and this queue then sent them on the
+   * next connection. They never went. Off the queue, and answered `no` by the caller before the
+   * socket ends, "never got it" is the truth and nothing the agent was told to forget goes out
+   * later. What the kernel took whole is not here; that is `onUnanswered`'s.
+   */
+  dropQueuedFor(owner: string): Outbound[] {
+    const mine = this.pending.filter(o => o.owner === owner)
+    if (!mine.length) return []
+    this.pending = this.pending.filter(o => o.owner !== owner)
+    for (const o of mine) this.inFlight.delete(o.id)
+    return mine
+  }
+
   private remember(id: string, what: string, askId?: string): void {
     this.inFlight.set(id, askId ? { what, askId } : { what })
     while (this.inFlight.size > this.maxPending * 2) {
@@ -400,6 +443,23 @@ export class HubLink {
    * The backoff resets here too: it used to reset on every connect, which meant a hub that accepted
    * and then refused was dialled again a second later, forever, instead of being left alone.
    */
+  /**
+   * Hand back every frame this connection took whole and never heard an answer for.
+   *
+   * Called once per close, BEFORE the link is marked down: a relay standing in for the hub ends
+   * its producers' sockets on the way down, and what is said after that is said into a socket
+   * that is closing. What is still queued is not touched — it goes out on the next connection, and
+   * that is what its caller was told.
+   */
+  private answerForTheFlushed(why: string): void {
+    const queued = new Set(this.pending.map(o => o.id))
+    const gone: Unanswered[] = []
+    for (const [id, f] of this.inFlight) if (!queued.has(id)) gone.push({ id, ...f })
+    if (!gone.length) return
+    for (const g of gone) this.inFlight.delete(g.id)
+    this.o.onUnanswered?.(gone, why)
+  }
+
   markUp(): void {
     this.state = { up: true }
     this.reachedWelcome = true
@@ -481,9 +541,14 @@ export class HubLink {
           }
           this.unsent = null
           this.control = []
+          // Everything the kernel took whole on this connection and the hub never answered for is
+          // answered for by nobody now. Said before the link is marked down, for the reason on
+          // `answerForTheFlushed`; said with the reason already recorded when there is one.
+          const dropped = this.o.whenDropped ?? 'The link to his phone dropped and is being rebuilt.'
+          this.answerForTheFlushed(wasUp ? dropped : this.state.why)
           // A reason already recorded — a refusal, say — outlives the close it caused, because it
           // explains the silence far better than "the link dropped" does.
-          if (wasUp) this.markDown(false, this.o.whenDropped ?? 'The link to his phone dropped and is being rebuilt.')
+          if (wasUp) this.markDown(false, dropped)
           // A socket that opened and then closed before `welcome` is the silent close: a uid the
           // hub reads as another user, or a `hello` it could not decode, look identical from here.
           // Reported so a caller proving reachability can say so; not reported when it closed after

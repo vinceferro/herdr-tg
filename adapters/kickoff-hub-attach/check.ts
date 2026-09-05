@@ -35,7 +35,7 @@ import { join } from 'path'
 
 import { readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
 import { HubLink } from '../../plugins/kickoff-channel/hub-link.ts'
-import { opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact } from './plan.ts'
+import { opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
 
 export type CheckOptions = {
   /** The opencode URL, if `--opencode` was on the line — checked for a port, as the start does. */
@@ -52,6 +52,9 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
     console.log(`NOT  ${s}`)
     fails++
   }
+  // True and worth fixing, but a worker here can still reach him: not counted against the check,
+  // because a wrapper that is refused a wall that works learns not to run the check.
+  const warn = (s: string) => console.log(`warn ${s}`)
 
   // ── the configuration ───────────────────────────────────────────────────────────────────────
   // One reader for the whole namespace, so what the check proves is what the worker would do. When
@@ -264,6 +267,10 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
     } else {
       ok('not PID 1')
     }
+
+    // Half a phone, said here and at the start from the same sentence.
+    const half = typedWordsFact(opts.run, opts.opencodeUrl)
+    if (half?.warn) warn(half.text)
   }
 
   return done()

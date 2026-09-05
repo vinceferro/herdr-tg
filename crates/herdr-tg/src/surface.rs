@@ -20,7 +20,8 @@
 use hub_proto::{AskOption, MsgId};
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, Rgb, ThreadId,
+    InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReplyParameters, Rgb,
+    ThreadId,
 };
 
 use crate::hub::{Refused, SendOutcome, Surface};
@@ -190,12 +191,31 @@ impl Surface for Telegram {
         }
     }
 
-    async fn send(&self, topic_id: i32, text: &str, buttons: &[AskOption]) -> SendOutcome {
+    async fn send(
+        &self,
+        topic_id: i32,
+        text: &str,
+        buttons: &[AskOption],
+        reply_to: Option<&MsgId>,
+    ) -> SendOutcome {
         let mut req = self
             .bot
             .send_message(self.forum, escape_html(text))
             .parse_mode(ParseMode::Html)
             .message_thread_id(ThreadId(MessageId(topic_id)));
+
+        // Threaded under HIS message when the line is about one. `allow_sending_without_reply`
+        // is the fallback the operator would want: he may have deleted the line he typed, and a
+        // refusal that then failed to send would be a second silence about the same words. An
+        // id this bot cannot read as a Telegram message id is not one of his; the line goes out
+        // bare rather than not at all.
+        if let Some(under) = reply_to
+            && let Ok(raw) = under.as_str().parse::<i32>()
+        {
+            req = req.reply_parameters(
+                ReplyParameters::new(MessageId(raw)).allow_sending_without_reply(),
+            );
+        }
 
         if !buttons.is_empty() {
             // `callback_data` is 64 bytes and carries an OPAQUE id, never a decision. What the id
