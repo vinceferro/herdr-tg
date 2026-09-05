@@ -397,6 +397,53 @@ console.log('\nwhen another connection holds the claim and never lets go:')
   await Bun.sleep(300)
 }
 
+// ── H. the project is switched off under a live door ──────────────────────────────────────────
+//
+// Since 5 September a `refused` can arrive on a LIVE connection: `not_enabled`, then a close, is
+// what the hub sends a connected bridge when its project is switched off at a terminal. The door's
+// refusal branch was written when a refusal only ever answered a `hello`, and said so — "no greeted
+// producer is ended by this" — so it marked the link down FIRST, which ends every greeted producer,
+// and wrote the reason afterwards into sockets that had already said goodbye. A tool server behind
+// the door then saw only a dropped link, and its agent read "the hub went away" for a project the
+// operator had deliberately turned off.
+//
+// RED, before the fix:
+//   FAIL a_producer_greeted_by_the_door_is_told_its_project_is_off_before_its_socket_ends producer saw ["welcome"]
+//   FAIL and_the_frame_the_hub_never_answered_is_not_left_hanging producer saw ["welcome"]
+console.log('\nwhen the project is switched off under a live door:')
+
+{
+  const s = scenario('off', repo)
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const sock = await s.sockOf()
+  const P = rawProducer(sock)
+  await P.ready
+  P.send(hello({ instance: 'the-one-switched-off' }))
+  await until('the producer to be greeted', () => P.got.some(f => f.t === 'welcome'), 10000)
+  // One frame the hub took and never answered, so the door is holding something for this producer
+  // at the moment the switch is thrown — the ordinary state, not an empty one.
+  s.hub!.ack = null
+  P.send({ v: 1, id: 'p-say', t: 'say', text: 'still here?' })
+  await until('the frame at the hub', () => s.hub!.got.some(f => f.t === 'say'), 10000)
+
+  // What `hub.rs` does on the kick: the reason, then the close.
+  s.hub!.to({ v: 1, id: 'h-off', t: 'refused', reason: 'not_enabled' })
+  await Bun.sleep(150)
+  s.hub!.drop()
+
+  await until('the door to end the producer', () => !P.connected, 10000).catch(() => {})
+  const heard = P.got.map(f => `${f.t}${f.reason ? `(${f.reason})` : ''}${f.delivered ? `(${f.delivered} ref=${f.ref})` : ''}`)
+  check('a_producer_greeted_by_the_door_is_told_its_project_is_off_before_its_socket_ends',
+    !P.connected && P.got.some(f => f.t === 'refused' && f.reason === 'not_enabled'),
+    `producer saw ${JSON.stringify(heard)}`)
+  check('and_the_frame_the_hub_never_answered_is_not_left_hanging',
+    P.got.some(f => f.t === 'ack' && f.ref === 'p-say'),
+    `producer saw ${JSON.stringify(heard)}`)
+
+  s.relay.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
 rmSync(dir, { recursive: true, force: true })
 const n = failed()
 console.log(`\n${n === 0 ? 'all checks passed' : `${n} FAILED`}`)

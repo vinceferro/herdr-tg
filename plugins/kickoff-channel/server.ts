@@ -600,6 +600,19 @@ function onUnanswered(gone: Unanswered[], why: string): void {
   )
 }
 
+/**
+ * Why the hub closed a LIVE link, while that is the reason behind what follows.
+ *
+ * A project switched off at a terminal reaches a connected bridge as `refused{not_enabled}`, then
+ * `no` for every frame the hub had read and not sent, then the close. The closed set of ack
+ * reasons has none for the switch, so those acks carry no reason — and the fallback below rendered
+ * each of them as "his phone did not take it", once per frame, while the refusal itself was said on
+ * stderr and nowhere the agent reads. The agent read that his phone had rejected four messages and
+ * was never told the operator had switched the project off. Held from the refusal to the next
+ * `welcome`, so the acks that follow a live refusal name it.
+ */
+let liveRefusalWhy: string | null = null
+
 /** Why the hub says a frame never reached his phone, in words the agent can pass on. */
 const ackReasons = new Map<string, string>([
   ['too-fast', 'too much was sent to his phone at once, so this one was shed'],
@@ -631,6 +644,7 @@ function onFrame(frame: Record<string, any>): void {
         break
       }
       heldByAnother = 0
+      liveRefusalWhy = null
       note(`connected as "${frame.project}"`)
       link.markUp()
       break
@@ -708,11 +722,24 @@ function onFrame(frame: Record<string, any>): void {
       // An unknown reason is treated as temporary on purpose: a hub shipped after this build may
       // refuse for something recoverable, and telling the agent to give up on a guess is worse than
       // telling it to wait.
+      const said = why ?? `The hub would not take this connection, and gave a reason this bridge does not know (${reason}).`
+      // A refusal on a LIVE link is the hub ending a connection it had welcomed — the project
+      // switched off at a terminal — and it is said into the agent's turn, once, before anything
+      // that follows from it: a tool result says it too, but only if the agent happens to call
+      // one, and what arrives next are acks with no reason of their own. Remembered so that those
+      // acks are rendered with this rather than with a guess about his phone.
+      if (link.isUp) {
+        liveRefusalWhy = said
+        deliver(`The hub has closed this session's link to his phone: ${said}`, {
+          about: 'the link to his phone was closed',
+          user: 'the channel itself',
+        })
+      }
       // Permanent when a relay is proven to be holding this conversation: waiting cannot mend a
       // setting, and telling the agent its message "goes out when the link comes back" is a promise
       // about a link that is never coming back on this configuration.
-      link.markDown(stuck || joinTheRelay || reason in forGood, why ?? `The hub would not take this connection, and gave a reason this bridge does not know (${reason}).`)
-      note(why ?? `refused: ${reason}`)
+      link.markDown(stuck || joinTheRelay || reason in forGood, said)
+      note(said)
       break
     }
     case 'message':
@@ -733,6 +760,11 @@ function onFrame(frame: Record<string, any>): void {
         message_id: frame.msg_id,
         ...(frame.in_reply_to_ask ? { in_reply_to_ask: frame.in_reply_to_ask } : {}),
       })
+      // Said the moment the words are in the agent's turn, at the same honesty as the opencode
+      // watcher's "handed to the engine": the hub turns it into the thumb on his own message, the
+      // second stage of the receipt on his phone. Nothing on this engine sent it before, so on the
+      // engine the round trip was proven on every line he typed kept the eyes for ever.
+      link.send({ t: 'ack', ref: String(frame.id), status: 'accepted' }, 'an answer about typed words')
       break
     case 'choice':
       // The answer to a question this session asked. It arrives as a message in the agent's own
@@ -791,7 +823,12 @@ function onFrame(frame: Record<string, any>): void {
         )
         break
       }
-      const why = ackReasons.get(String(frame.why)) ?? 'his phone did not take it'
+      // No reason on the ack, after a live refusal, means the refusal IS the reason: the hub has
+      // none in its closed set for a frame refused because the project was switched off.
+      const why =
+        frame.why == null && liveRefusalWhy
+          ? liveRefusalWhy
+          : (ackReasons.get(String(frame.why)) ?? 'his phone did not take it')
       note(`the hub did not deliver a frame (${frame.why ?? 'no reason given'})`)
       if (!was) break
       deliver(

@@ -92,6 +92,13 @@ pub enum Spender {
     TheHub,
 }
 
+/// Reactions have a ceiling of their own, measured 5 September (`docs/RATE-PROBE.md` §3): twenty
+/// `setMessageReaction` calls in a trailing minute, counted apart from sends — the twenty-first was
+/// refused with a `retry_after` that counted down the rest of the minute, while a send still went
+/// through. Under it by the same two as [`PER_MINUTE`], for the same reason: the window is
+/// Telegram's clock, not ours.
+pub const REACTIONS_PER_MINUTE: u32 = 18;
+
 /// The longest message body the hub will put in one Telegram message.
 ///
 /// The API's own limit is 4096 characters. The gap is room for the wrapper the renderer adds — a
@@ -366,6 +373,42 @@ impl Default for Budgets {
 /// a body that is not valid UTF-8, which the API rejects — turning a message that was merely long
 /// into one that does not arrive at all.
 ///
+/// What the hub may spend on reactions.
+///
+/// Its own ledger and not a [`ChatBudget`], because it shares nothing with sends: no gap (twenty
+/// went out in two seconds), no reserve for the hub (a reaction is never the only way to say
+/// something — the line in the topic is), and no flood wait (a reaction Telegram refuses is a mark
+/// that does not appear, never a reason to hold the agents' sends). A mark past the ceiling is
+/// refused HERE, so the hub stops asking rather than walking into a minute of `429`s — and an
+/// attempt is what is counted, whether or not Telegram took it, because a refused call is the one
+/// thing the measurement could not tell apart from an accepted one on Telegram's side.
+///
+/// One window, not one per chat. Whether Telegram counts reactions per chat, as it does sends, or
+/// per bot is unmeasured; one forum is the only deployment there is, so the stricter reading costs
+/// nothing today and cannot be wrong.
+#[derive(Debug, Default)]
+pub struct ReactionBudget {
+    spent: VecDeque<Instant>,
+}
+
+impl ReactionBudget {
+    /// Take one reaction, or say no.
+    pub fn take(&mut self, now: Instant) -> bool {
+        while self
+            .spent
+            .front()
+            .is_some_and(|&t| now.duration_since(t) >= WINDOW)
+        {
+            self.spent.pop_front();
+        }
+        if self.spent.len() as u32 >= REACTIONS_PER_MINUTE {
+            return false;
+        }
+        self.spent.push_back(now);
+        true
+    }
+}
+
 /// The tail marker is part of the budget, not added after it. A clip that then overflows the limit
 /// by the length of its own marker is a bug that only shows up on exactly-sized input.
 pub fn fit(text: &str, max: usize) -> (String, bool) {
@@ -381,6 +424,45 @@ pub fn fit(text: &str, max: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reactions_are_counted_apart_from_sends_and_stop_at_their_own_ceiling() {
+        // The measurement: twenty reactions in a minute, the twenty-first refused, and a send still
+        // going through afterwards. So the reactions' ledger is full at its own ceiling while the
+        // send budget has not moved — and it opens again as the oldest reaction ages out of the
+        // window, the way the probe saw reactions accepted again after the wall.
+        let mut reactions = ReactionBudget::default();
+        let mut sends = Budgets::default();
+        let start = Instant::now();
+        let chat = -1001;
+
+        for n in 0..REACTIONS_PER_MINUTE {
+            assert!(
+                reactions.take(start + Duration::from_millis(u64::from(n) * 100)),
+                "reaction {n} was refused under the ceiling"
+            );
+        }
+        let at_the_wall = start + Duration::from_secs(2);
+        assert!(
+            !reactions.take(at_the_wall),
+            "the reaction past the ceiling was taken"
+        );
+        assert!(
+            sends.take(chat, at_the_wall, Spender::AnAgent).is_ok(),
+            "a minute of reactions shut the chat for sends"
+        );
+
+        // One window on, the first reaction has aged out and exactly one more fits.
+        let a_minute_on = start + WINDOW;
+        assert!(
+            reactions.take(a_minute_on),
+            "nothing aged out of the window"
+        );
+        assert!(
+            !reactions.take(a_minute_on),
+            "more than the aged-out one was taken back"
+        );
+    }
 
     #[test]
     fn a_burst_never_exceeds_the_chat_budget() {

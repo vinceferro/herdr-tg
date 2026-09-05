@@ -12,7 +12,8 @@
 //!
 //! Nothing that arrives over Telegram or over the socket can add a project, mint a token, or flip
 //! `enabled`. Inbound content selects from what the machine already knows; it never names something
-//! new. The only way in is `herdr-tg enroll <repo>`, run by a human at a keyboard.
+//! new. The only way in is `herdr-tg enroll <repo>`, run by a human at a keyboard — and the only
+//! way off, or back on, is `herdr-tg disable <repo>` / `enable <repo>` at the same keyboard.
 //!
 //! # What is stored, and what is not
 //!
@@ -170,6 +171,12 @@ pub enum EnrolError {
     /// Its own variant because silence here is the worst outcome there is: nothing else on the box
     /// would ever explain why a project that worked yesterday is turned away.
     HalfWritten { repo: PathBuf, why: String },
+    /// Asked to switch a project on or off, and nothing is enrolled at that path.
+    ///
+    /// Refused rather than enrolled on the spot: switching on is not a way in. Enrolment mints a
+    /// secret and writes it into a tree, and a command that quietly did that when it was only asked
+    /// to flip a switch is a second door with no guard on it.
+    NotEnrolled { repo: PathBuf },
 }
 
 impl std::fmt::Display for EnrolError {
@@ -216,6 +223,12 @@ impl std::fmt::Display for EnrolError {
                 path.display(),
                 path.display(),
                 path.display()
+            ),
+            Self::NotEnrolled { repo } => write!(
+                f,
+                "nothing is enrolled at {}, so there is nothing to switch. See what is enrolled \
+                 with:  herdr-tg projects",
+                repo.display()
             ),
         }
     }
@@ -283,18 +296,38 @@ impl Registry {
     /// re-enrolling. Neither is good, and the loud line is what stops the bad one being silent.
     pub fn load(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let projects = match read_projects(&path) {
-            Ok(p) => p,
+        match Self::try_load(&path) {
+            Ok(registry) => registry,
             Err(e) => {
                 tracing::error!(
                     error = %e, path = %path.display(),
                     "the project registry could not be read, so NO project can connect until it is \
                      re-enrolled. The file has been left exactly as it is."
                 );
-                BTreeMap::new()
+                Self {
+                    path,
+                    projects: BTreeMap::new(),
+                }
             }
-        };
-        Self { path, projects }
+        }
+    }
+
+    /// Read the registry, or say why it cannot be read.
+    ///
+    /// For a reader that must not guess. `load`'s start-empty is right for the hub's boot and wrong
+    /// for the inventory another org's dispatcher reads: there, a corrupt or unreadable file came
+    /// out as `[]` with a clean exit, which a machine capturing stdout reads as "no project exists
+    /// and no topic exists". A file that is not there is still an empty registry — nothing has been
+    /// enrolled yet — because that is what it means.
+    pub fn try_load(path: impl Into<PathBuf>) -> Result<Self, EnrolError> {
+        let path = path.into();
+        match read_projects(&path) {
+            Ok(projects) => Ok(Self { path, projects }),
+            Err(source) => Err(EnrolError::Unreadable {
+                why: source.to_string(),
+                path,
+            }),
+        }
     }
 
     /// Resolve a secret to the project it belongs to.
@@ -380,6 +413,41 @@ impl Registry {
         self.save()
     }
 
+    /// Switch a project off, or back on. Terminal-only, like everything else that changes who may
+    /// connect: no message and no frame reaches this.
+    ///
+    /// The project is found by its repo path, canonicalised when the folder still exists and taken
+    /// as written when it does not — a project whose tree has been deleted is exactly the one worth
+    /// switching off, and refusing because the folder is gone would leave it the only project on
+    /// the box that cannot be.
+    ///
+    /// Writing the flag is only half of what "off" means. The hub reads `enabled` at `hello`, so
+    /// this alone turns away the NEXT connection and does nothing to one already on the socket. The
+    /// other half — dropping a live connection — is the hub's, which watches this file for exactly
+    /// that. See `Hub::drop_connections_of_switched_off_projects`.
+    pub fn set_enabled(&mut self, repo: &Path, enabled: bool) -> Result<Project, EnrolError> {
+        let _held = self.hold()?;
+        self.reread().map_err(|e| EnrolError::Unreadable {
+            path: self.path.clone(),
+            why: e.to_string(),
+        })?;
+        let wanted = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+        let Some(p) = self.projects.values_mut().find(|p| p.repo == wanted) else {
+            return Err(EnrolError::NotEnrolled {
+                repo: repo.to_path_buf(),
+            });
+        };
+        p.enabled = enabled;
+        let project = p.clone();
+        self.save()?;
+        Ok(project)
+    }
+
+    /// Where this registry lives, for the one reader that has to notice it changing.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Enrol a repo, or rotate an already-enrolled one's secret.
     ///
     /// Terminal-only. Returns the secret exactly once, because it is never stored anywhere this
@@ -443,12 +511,17 @@ impl Registry {
             .map(|p| p.lane_topics.clone())
             .unwrap_or_default();
 
+        // A re-enrolment keeps the switch where the operator left it. This was `true` outright, so
+        // rotating a leaked secret — the documented reason to re-run `enroll` — silently switched a
+        // project he had turned off back on, and nothing in the output said so.
+        let enabled = self.projects.get(&id).is_none_or(|p| p.enabled);
+
         let project = Project {
             id: id.clone(),
             title,
             repo: repo.clone(),
             token_sha256: sha256_hex(secret.as_bytes()),
-            enabled: true,
+            enabled,
             topic_id,
             icon_color,
             lane_topics,
@@ -750,6 +823,72 @@ mod tests {
             Some(77),
             "the topic and its history must survive"
         );
+    }
+
+    #[test]
+    fn re_enrolling_a_switched_off_project_does_not_switch_it_back_on() {
+        // Re-running `enroll` is the documented answer to a leaked secret, and `enabled: true` was
+        // hardcoded on that path — so rotating the secret of a project the operator had switched
+        // off silently switched it back on, with nothing in the output saying so. Off is a decision
+        // he made at a keyboard, and a rotation must carry it forward the way it carries the topic.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "herdr-tg");
+        r.enrol(&repo).expect("enrols");
+        let off = r.set_enabled(&repo, false).expect("switches off");
+        assert!(!off.enabled, "the setter did not switch it off");
+
+        let (rotated, _) = r.enrol(&repo).expect("re-enrols");
+        assert!(
+            !rotated.enabled,
+            "rotating the secret switched a switched-off project back on"
+        );
+        // And on disk, which is what the hub reads at the next hello.
+        let after = Registry::load(d.path().join("projects.json"));
+        assert!(
+            !after.get(&rotated.id).expect("still enrolled").enabled,
+            "the file says it is on again"
+        );
+
+        // Switching it back on is its own deliberate act, and it holds too.
+        let on = r.set_enabled(&repo, true).expect("switches on");
+        assert!(on.enabled);
+    }
+
+    #[test]
+    fn switching_a_project_nobody_enrolled_is_refused_in_plain_words_rather_than_enrolling_it() {
+        // Switching on is not a way in. A command that quietly enrolled when asked to flip a switch
+        // would be a second door beside the one that has the guard on it.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let said = r
+            .set_enabled(&repo(&d, "never-enrolled"), true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert!(said.contains("herdr-tg projects"), "{said}");
+        for jargon in ["Err", "NotEnrolled", "canonical", "None", "Option"] {
+            assert!(
+                !said.contains(jargon),
+                "jargon reached the operator: {said}"
+            );
+        }
+        assert_eq!(r.all().count(), 0, "a switch enrolled something");
+    }
+
+    #[test]
+    fn a_project_whose_folder_is_gone_can_still_be_switched_off() {
+        // The project whose tree was deleted is exactly the one worth switching off, and it is the
+        // one a path check would refuse: its folder no longer canonicalises.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "gone-soon");
+        let (p, _) = r.enrol(&repo).expect("enrols");
+        fs::remove_dir_all(&repo).expect("delete the tree");
+        let off = r
+            .set_enabled(&p.repo, false)
+            .expect("a deleted folder can still be switched off");
+        assert!(!off.enabled);
     }
 
     #[test]

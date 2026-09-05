@@ -131,6 +131,29 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
 - **The watchdog is live** and shares no code or process with the hub. It arms the first time
   something stamps `~/.local/state/herdr-tg/hub.heartbeat`.
+- **A project has an off switch, at the terminal only.** `herdr-tg disable <repo>` writes the flag;
+  the hub watches the registry file and, within a second, drops a LIVE connection's claim and ends
+  it — `refused{not_enabled}` first, then `no` for every frame it had queued, the one waiting for
+  its turn included, then the close; only a message already mid-send is finished — and it does so
+  even when the loud bridge's backlog has the read loop parked on a full queue. `/projects` on the
+  phone says "switched off". `enable` is the way back, and re-enrolling keeps the switch where it
+  was. No Telegram command can do this; the command set is pinned as a closed list of two.
+- **`herdr-tg projects --json` is built.** `connected` (the project's own voice) and
+  `connected_lanes` (its addresses live now) come from `hub.connected.json`, which the hub rewrites
+  on every claim and release under its own pid — and unlinks when a rewrite fails — and the command
+  believes it only when the lock's holder is alive, is a herdr-tg, and wrote it — otherwise `null`.
+  A registry that cannot be read is refused, never printed as `[]`. See `presence.rs`.
+- **His typed line carries a reaction for the stage it reached**: 👀 when the hub handed it on,
+  👍 when the bridge acked it, 👎 (plus the line saying why) when the bridge refused it. The Claude
+  tool server acks `accepted` the moment the words are in the agent's turn, so the thumb lands on
+  that engine too. The eyes land in a task of their own; `relay` never waits on Telegram. Measured
+  5 September (`docs/RATE-PROBE.md` §3): reactions are not charged against the send ceiling, have a
+  twenty-a-minute ceiling of their own — the hub keeps a ledger for it and stops asking past
+  eighteen — and `✅`/`❌` do not exist as a bot's free reactions. A reaction Telegram refuses for
+  anything but the ceiling is said once at warn in the journal.
+- **A line that does not open with a slash is never a command.** The parser splits the first word
+  at `@` before it looks for a slash, so an `@mention`, an email or an ssh remote read as another
+  bot's command and were dropped in silence; `what_he_typed` guards on the slash first.
 - `fix/r5-parser` is **dead**: it improved the screen parser, and there is no screen parser.
 - The tracker shim `.kickoff/bin/mc` is **dead** in this repo. Report status in chat.
 

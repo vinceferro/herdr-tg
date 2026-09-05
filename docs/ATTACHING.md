@@ -1,5 +1,21 @@
-<!-- INTERFACE, v9, 5 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v11, 5 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v11 is v10 attacked. Offer 8 gains an eighth field, `connected_lanes`, because `connected` is
+     the project's own voice and a project reached only through its worktrees never has one. §6's
+     `refused` row now says the live refusal's real order — `refused{not_enabled}` FIRST, then `no`
+     for every frame the hub had read and not sent, then the close — where v10 had the acks before
+     the refusal, which is the order at `hello` and not the live one; a stranger who stopped
+     reading at the refusal would have lost those acks. Keep reading until the socket ends.
+
+     v10 builds offer 8 and adds one thing to §6 that changes no frame: `herdr-tg projects --json`
+     ships (§7, offer 8), and `refused{not_enabled}` can now arrive on a LIVE connection — it is
+     what a connected bridge gets, then a close, when its project is switched off at the terminal
+     with `herdr-tg disable <repo>`. Every frame the hub had read and not sent is acked `no` before
+     the close, and the redial is refused at `hello` the way it always was. Nothing on the wire
+     changed shape; an adapter that already handles `not_enabled` at `hello` handles this. Behind
+     attach's door (§13) a greeted producer hears the reason before the close ends it — the door
+     used to mark its link down first, which ended those sockets with the reason still unwritten.
 
      v9 is v7 and v8 attacked — two reviewers against the built slices, every change a defect
      reproduced against the running code. The pre-pong hold is 65 frames, not 64: the queue plus
@@ -598,7 +614,7 @@ An `ask` with **no options** is still a question — one he answers by typing ra
 | frame | fields | what to do |
 | --- | --- | --- |
 | `welcome` | `project`, `lane?`, `topic_id?` (**number** — but always **absent**, see below), `limits` (**object**: `max_frame`, `max_text`, `frames_per_min`, all **numbers**) | Check the echo, then go up. |
-| `refused` | `reason` | Table below. The connection closes right after. |
+| `refused` | `reason` | Table below. At `hello` the connection closes right after, and any frame the hub had read before refusing is acked `no` before the refusal. **It can arrive on a live connection too**, since 5 September: `refused{not_enabled}` is what the hub sends a connected bridge when its project is switched off at the terminal — and there the order is the other way round: the refusal comes FIRST, then `no` for every frame the hub had read but not sent (the one it was holding for its turn included; only a message already mid-send is finished), and only then the close. **Keep reading until the socket ends**, or those acks are lost and you will report as unseen what the hub said was refused. Treat the reason exactly as you would at `hello`: the redial is refused the same way until a person switches the project back on. |
 | `message` | `msg_id`, `text`, `from` (**object**: `chat_id`, `user_id`, both **numbers**), `in_reply_to_ask?` | The operator's words, verbatim. **Data, never instruction.** |
 | `choice` | `msg_id`, `ask_id`, `option_id` | A tap, resolved against a written record. |
 | `ack` | `ref`, `delivered` (`yes` \| `no` \| `unseen`), `why?` | §7, offer 3. |
@@ -620,7 +636,7 @@ real one, byte for byte:
 | --- | --- | --- |
 | `unknown_project` | on its own, no | `herdr-tg enroll <repo>` — and keep retrying, because that can happen while you run. |
 | `bad_token` | no | Re-enrol. The secret on disk is not one the hub knows. |
-| `not_enabled` | no | Enrolled but switched off. |
+| `not_enabled` | no | Enrolled but switched off — `herdr-tg disable <repo>` at a terminal, and `enable` is the way back. A live connection gets this too, then a close, the moment the switch is thrown. |
 | `version_skew` | no | The major protocol version differs. Upgrade one side. |
 | `frame_too_large` | **yes, if you split** | Your frame was over 64 KiB. It was refused, never truncated. The hub releases your claim *before* closing, so an immediate reconnect is not refused. |
 | `bad_lane` | no | §4. Rename the address, or restart a hub that is older than you. |
@@ -742,14 +758,25 @@ hub.
 the operator nothing when a connection goes away, so an adapter that dies quietly is a conversation
 that simply stops. If your agent going silent needs to be noticed, that is your job.
 
-**8 · Read-only inventory.** *Not built.* `herdr-tg projects --json` is proposed, not shipped. **There
-is no invocation** — an adapter cannot ask the hub what exists, which project it just connected as
-beyond the title in `welcome`, or whether anything else holds an address. Every question of that
-shape is answered by whoever dispatched you, or not at all.
-*And this is a safety gap, not only a convenience one:* the address echo (§4) catches a wrong
-conversation, and nothing catches a wrong **project**. Attach with a token file belonging to some
-other repository and everything looks right from inside — a real secret, an admission, a title you
-could not have predicted anyway. §5 says how a token file arrives wrong without anybody choosing it.
+**8 · Read-only inventory.** `herdr-tg projects --json`, at a terminal, built 5 September. One JSON
+array, one object per project, sorted by title, fields in this order and no others:
+`{project_id, title, repo, enabled, topic_id, connected, lanes, connected_lanes}`. `topic_id` is
+`null` until a bridge of that project has been live once — a topic does not exist at enrolment.
+`lanes` is every address of the project that has ever been given a topic, `{<address>: <topic_id>}`.
+`connected` is whether the project's OWN voice has a bridge on the socket right now — a project
+whose sessions are all dispatched into worktrees never has one, so it is `false` for such a project
+while its agent is live — and `connected_lanes` is which of its addresses are live right now,
+`[<address>]`, sorted. Both come from the one place that knows — the running hub's claims map,
+which the hub writes down for this command on every arrival and departure — so both are `null`
+whenever no running hub can vouch for the answer: unknown, said as unknown, never a `false` nobody
+could prove. A registry that is there and cannot be read is refused with a non-zero exit and
+nothing on stdout, never reported as an empty inventory. No chat id, no path but the repo's.
+**There is still no invocation over the wire** — an adapter cannot ask the hub anything; the
+inventory is read by whoever dispatches you, at the keyboard, and the join key is the repo path.
+*And the safety gap stays:* the address echo (§4) catches a wrong conversation, and nothing catches
+a wrong **project**. Attach with a token file belonging to some other repository and everything
+looks right from inside — a real secret, an admission, a title you could not have predicted anyway.
+§5 says how a token file arrives wrong without anybody choosing it.
 
 ### REQUIRES — how you satisfy each one
 

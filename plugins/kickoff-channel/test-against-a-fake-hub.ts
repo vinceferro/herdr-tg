@@ -258,6 +258,14 @@ await until('the typed message',
 const typed = outLines.filter(l => l.method === 'notifications/claude/channel')[1]
 check("the operator's words reach the agent verbatim",
   typed.params.content === 'try it with --dry-run first')
+// The receipt on his phone has two stages, and the second is this ack: the eyes say the hub handed
+// his words on, the thumb says the agent has them. Nothing on this engine ever sent it, so on the
+// engine the round trip was proven on every line he typed kept the eyes for ever.
+await until('the bridge to answer for his words', () => fromBridge.some(f => f.t === 'ack' && f.ref === 'h10'), 3000)
+  .catch(() => {})
+const forHisWords = fromBridge.find(f => f.t === 'ack' && f.ref === 'h10')
+check("and the hub is told the words reached the agent's turn",
+  forHisWords?.status === 'accepted', JSON.stringify(forHisWords ?? 'no ack at all'))
 
 check('every tool tells the agent to read what it returns',
   outLines.find(l => l.id === 2)!.result.tools.every((t: any) => /Read what it returns/.test(t.description)),
@@ -1129,6 +1137,50 @@ claudeWay.child.kill()
 namedWay.child.kill()
 cwdWay.child.kill()
 neutralHub.stop()
+
+// ── The project switched off under a LIVE link ─────────────────────────────────────────────────
+//
+// What `hub.rs` sends a connected bridge when its project is switched off at a terminal: the
+// refusal, then `no` for every frame it had read and not sent, then the close. The closed set of
+// ack reasons has none for the switch, so those acks carry no reason — and the fallback rendered
+// each as "his phone did not take it" while the refusal itself went to stderr and nowhere else.
+// The agent read that his phone had rejected its messages, and was never told the operator had
+// switched the project off; it learned the truth only if it happened to call a tool afterwards.
+const offSock = join(dir, 'off.sock')
+let offConn: any = null
+let offWelcomed = false
+const offHub = fakeHub(offSock, (_h, s) => {
+  // Live once; every redial after the switch is refused at hello, as the real hub does.
+  if (offWelcomed) { s.write(JSON.stringify({ v: 1, id: 'h-off-again', t: 'refused', reason: 'not_enabled' }) + '\n'); s.end(); return }
+  offWelcomed = true
+  offConn = s
+  welcome(s)
+})
+const off = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: offSock })
+await handshake(off)
+await until('the hub to welcome the bridge about to be switched off', () => offConn !== null)
+await call(off, 300, 'reply', { text: 'one' })
+await call(off, 301, 'reply', { text: 'two' })
+await until('both frames at the hub', () => offHub.got.filter(f => f.t === 'say').length >= 2)
+const offSays = offHub.got.filter(f => f.t === 'say')
+offConn.write(JSON.stringify({ v: 1, id: 'h-off', t: 'refused', reason: 'not_enabled' }) + '\n')
+for (const [i, f] of offSays.entries()) {
+  offConn.write(JSON.stringify({ v: 1, id: `h-off-a${i}`, t: 'ack', ref: f.id, delivered: 'no' }) + '\n')
+}
+await Bun.sleep(150)
+offConn.end()
+await until('the agent to hear about both frames',
+  () => noticesTo(off).filter(n => /He never got/.test(String(n.params?.content ?? ''))).length >= 2, 8000)
+  .catch(() => {})
+const offNotices = noticesTo(off).map(n => String(n.params?.content ?? ''))
+const neverGotOff = offNotices.filter(t => /He never got/.test(t))
+check('a_project_switched_off_under_a_live_link_is_said_into_the_agents_turn',
+  offNotices.some(t => /switched off/.test(t) && !/He never got/.test(t)), JSON.stringify(offNotices))
+check('and_the_frames_it_had_queued_are_blamed_on_the_switch_and_never_on_his_phone',
+  neverGotOff.length >= 2 && neverGotOff.every(t => /switched off/.test(t)) && !offNotices.some(t => /his phone did not take it/.test(t)),
+  JSON.stringify(offNotices))
+off.child.kill()
+offHub.stop()
 
 rmSync(dir, { recursive: true, force: true })
 console.log(`\n${failures === 0 ? 'all checks passed' : `${failures} FAILED`}`)

@@ -64,6 +64,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hub_proto::{
@@ -275,6 +276,29 @@ pub enum SendOutcome {
     Refused(String),
     /// It went out and could not be checked. Never retried when the message carried buttons.
     Unseen,
+    /// Its project was switched off at the terminal while it waited for its turn. Nothing was
+    /// spent on it and nothing landed; the bridge is told with no reason, the same answer every
+    /// frame queued behind it gets, because the closed set of reasons has none for this and the
+    /// `refused{not_enabled}` that precedes these acks already says why.
+    SwitchedOff,
+}
+
+/// Where one of HIS messages has got to, marked on the message itself.
+///
+/// The hub already knows three stages of a line he typed: it handed the words to the bridge, the
+/// bridge said the agent has them, or the bridge said it could not hand them on. A reaction on his
+/// own message says which, without spending a send and without adding a line — measured free
+/// against the send ceiling on 5 September (`docs/RATE-PROBE.md` §3). ONE reaction per message,
+/// replaced as the stage advances, never stacked; a refusal still gets the line in the topic too,
+/// because a reaction carries no reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// The hub took his words and handed them to the bridge. Nothing has answered yet.
+    HandedOn,
+    /// The bridge said the words reached the agent's turn.
+    Accepted,
+    /// The bridge said it could not hand them on. The line under his message says why.
+    Refused,
 }
 
 /// Telegram, behind a trait, so the hub's decisions can be tested without one.
@@ -338,6 +362,22 @@ pub trait Surface: Send + Sync + 'static {
         original: &str,
         note: &str,
     ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+
+    /// Put one reaction on one of HIS messages, replacing whatever was there.
+    ///
+    /// **Not charged against the send ceiling, and never retried.** Reactions were measured on
+    /// 5 September (`docs/RATE-PROBE.md` §3): twenty of them and a send still went through, so
+    /// they come out of no send budget. They have a ceiling of their own — twenty a minute — which
+    /// the hub keeps to before calling this, and a mark that ceiling or Telegram refuses simply
+    /// does not appear: the line in the topic carries the meaning, and nothing an agent is waiting
+    /// on is behind a reaction. A refusal is logged and forgotten by the caller — but it carries
+    /// [`Refused::flood_wait`], because the caller says a 429 quietly and anything else out loud.
+    fn mark(
+        &self,
+        chat_id: i64,
+        msg_id: &MsgId,
+        mark: Mark,
+    ) -> impl std::future::Future<Output = Result<(), Refused>> + Send;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -443,6 +483,8 @@ pub enum NoTopic {
     TooFast(Duration),
     /// Telegram, or the registry, would not give this conversation a topic.
     Failed(String),
+    /// The project was switched off while the topic waited for its turn.
+    SwitchedOff,
 }
 
 impl std::fmt::Display for NoTopic {
@@ -450,7 +492,125 @@ impl std::fmt::Display for NoTopic {
         match self {
             Self::TooFast(d) => write!(f, "the chat is at its limit for now; {}s", d.as_secs()),
             Self::Failed(why) => write!(f, "{why}"),
+            Self::SwitchedOff => write!(f, "the project was switched off"),
         }
+    }
+}
+
+/// The off switch, as seen from inside one connection's frames.
+///
+/// Thrown by the connection when its project is switched off at the terminal, and read in two
+/// places: the handler, before it starts on each queued frame, and [`take_a_turn`] inside the one
+/// frame the handler was already in. That second reader is why this exists. The switch used to
+/// finish the frame in flight, and the frame in flight on the loud project — the project the
+/// switch is for — is one holding the send permit while it sleeps out a spent minute: the socket
+/// stayed open, the claim was gone but the goodbye had not been said, and one more line landed
+/// in the topic up to ninety seconds after the operator had typed `disable`. A frame that is still
+/// WAITING has spent nothing, so it is refused like everything queued behind it; one already
+/// inside the send is finished, because cancelling a Telegram call mid-flight is how a message
+/// lands with an ack saying it did not.
+///
+/// Carried into the frame as a task-local rather than as a parameter, because the wait is six
+/// calls under `handle` and every caller of `say` between here and there — the bot's own sends,
+/// the tests — has no switch to pass.
+///
+/// [`take_a_turn`]: Hub::take_a_turn
+#[derive(Default)]
+pub(crate) struct ConnectionSwitch {
+    off: AtomicBool,
+    thrown: tokio::sync::Notify,
+}
+
+impl ConnectionSwitch {
+    /// Off from now on, and every wait inside this connection's current frame woken to see it.
+    fn throw(&self) {
+        self.off.store(true, Ordering::Release);
+        self.thrown.notify_waiters();
+    }
+
+    fn is_off(&self) -> bool {
+        self.off.load(Ordering::Acquire)
+    }
+}
+
+tokio::task_local! {
+    /// The switch of the connection whose frame is being handled, if a connection's frame is.
+    static SWITCH: Arc<ConnectionSwitch>;
+}
+
+/// Wait on `what`, unless the switch is thrown first — `None` when it was.
+///
+/// The wake-up is registered BEFORE the flag is read: `notify_waiters` wakes only what was already
+/// waiting, so reading first and registering second would miss a throw that landed between the
+/// two, and the frame would sleep out its minute as if nothing had happened.
+async fn unless_switched_off<T>(
+    switch: Option<&ConnectionSwitch>,
+    what: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let Some(switch) = switch else {
+        return Some(what.await);
+    };
+    let thrown = switch.thrown.notified();
+    tokio::pin!(thrown);
+    thrown.as_mut().enable();
+    if switch.is_off() {
+        return None;
+    }
+    tokio::pin!(what);
+    tokio::select! {
+        t = &mut what => Some(t),
+        _ = &mut thrown => {
+            if switch.is_off() {
+                None
+            } else {
+                Some(what.await)
+            }
+        }
+    }
+}
+
+/// Put one reaction on one of his messages, or not — see [`Hub::mark_his_message`] for the rules.
+///
+/// A free function rather than a method because the eyes land in a task of their own, after
+/// `relay` has returned, and a task cannot borrow the hub.
+async fn mark_his_message<S: Surface>(
+    surface: &S,
+    reactions: &Mutex<crate::queue::ReactionBudget>,
+    refusal_said: &AtomicBool,
+    chat_id: i64,
+    msg_id: &MsgId,
+    mark: Mark,
+) {
+    if !reactions.lock().await.take(std::time::Instant::now()) {
+        tracing::debug!(
+            message = %msg_id, ?mark,
+            "over the reactions' own ceiling this minute; the mark does not appear"
+        );
+        return;
+    }
+    let Err(refused) = surface.mark(chat_id, msg_id, mark).await else {
+        return;
+    };
+    // The ceiling is expected and costs nothing; anything else is the receipts silently gone —
+    // a forum whose settings allow no reactions, or a bot with no right to react — and it is said
+    // once, at a level the unit's journal shows.
+    if refused.flood_wait.is_some() {
+        tracing::debug!(
+            error = %refused, message = %msg_id, ?mark,
+            "Telegram refused a reaction for its own ceiling; the topic still says what happened"
+        );
+    } else if !refusal_said.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            error = %refused, message = %msg_id, ?mark,
+            "Telegram refuses this bot's reactions, so his messages will carry no marks; the \
+             topic still says what happened. Said once; the cause is the chat's settings or the \
+             bot's rights, not the line"
+        );
+    } else {
+        tracing::debug!(
+            error = %refused, message = %msg_id, ?mark,
+            "Telegram refused a reaction again; said at warn once already"
+        );
     }
 }
 
@@ -798,6 +958,7 @@ impl HubAudit {
             SendOutcome::TopicGone => "topic-gone".to_owned(),
             SendOutcome::Refused(why) => format!("refused\twhy={why}"),
             SendOutcome::Unseen => "unseen".to_owned(),
+            SendOutcome::SwitchedOff => "switched-off".to_owned(),
         };
         self.line(&format!("{word}\t{}", subject(addr)))
     }
@@ -1033,7 +1194,24 @@ struct Claim {
     pid: u32,
     instance: String,
     tx: mpsc::Sender<Envelope<HubFrame>>,
+    /// The one way to end this connection from OUTSIDE its own read loop, and why.
+    ///
+    /// A read loop is a bare `reader.next()`, so nothing but the socket ending could ever stop it —
+    /// and removing the map entry alone does not: the send path never consults this map, so a
+    /// connection whose claim was taken away kept posting into its topic and spending the chat's
+    /// budget until its bridge happened to hang up. Switching a project off has to end the
+    /// connection, not merely forget it.
+    kick: mpsc::Sender<RefusedReason>,
 }
+
+/// How often the hub looks at the registry file for a project switched off at the terminal.
+///
+/// A second, because "off" has to mean the flood stops NOW, and a poll is the only way a separate
+/// process's write reaches a connection this process is holding: the CLI does not hold the socket,
+/// and a signal would tie two processes together by pid for the one fact a file already carries. A
+/// stat a second on a file of a few kilobytes is nothing; the registry is re-read only when the stat
+/// says it changed.
+pub const REGISTRY_WATCH_EVERY: Duration = Duration::from_secs(1);
 
 /// One of his typed messages on its way to a bridge: the envelope id it went down under — the id
 /// the bridge's `ack` for it names — and which of his messages, in which conversation, it was.
@@ -1041,6 +1219,9 @@ struct Claim {
 struct WordsDown {
     frame: FrameId,
     addr: Addr,
+    /// The chat he typed in, so the mark on his message can find it. A message id is only half
+    /// an address on Telegram: every chat numbers its own.
+    chat_id: i64,
     msg_id: MsgId,
 }
 
@@ -1133,8 +1314,19 @@ fn lane_is_addressable(lane: &LaneId) -> bool {
 ///
 /// The evict-a-corpse rule depends on this being a fact rather than a hope. `/proc/<pid>` is the
 /// fact; a signal-0 probe would answer "yes" for a pid this user does not own.
-fn pid_is_alive(pid: u32) -> bool {
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// What the registry file looks like from outside, for noticing that it changed.
+///
+/// The inode is the load-bearing part: the registry is written by temp-and-rename, so every save is
+/// a new inode whatever the size and however coarse the clock. A file that is not there is a
+/// fingerprint of its own rather than an error, so a registry that appears later is noticed too.
+fn registry_fingerprint(path: &Path) -> Option<(u64, u64, Option<std::time::SystemTime>)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).ok()?;
+    Some((m.ino(), m.len(), m.modified().ok()))
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -1186,6 +1378,14 @@ pub struct Hub<S: Surface> {
     /// One live connection per ADDRESS, not per project. Two worktrees of one repo are two agents
     /// that can each block on a question of their own, and the second used to be turned away.
     claims: Arc<Mutex<BTreeMap<Addr, Claim>>>,
+    /// The claims map, written down for a process that is not this one.
+    ///
+    /// `herdr-tg projects --json` runs at a terminal and has to say who is connected from the one
+    /// place that knows, which is here. Rewritten whole every time the map changes, under the
+    /// claims lock so two changes cannot publish out of order; a claim or release happens a dozen
+    /// times a day, so the write is nowhere near a hot path. See `presence.rs` for why a file and
+    /// what a reader must check before believing it.
+    presence: crate::presence::Presence,
     /// One outbound budget per chat, because Telegram's ceiling is per chat and forum topics do
     /// not get one of their own. Six busy projects share it.
     budgets: Arc<Mutex<crate::queue::Budgets>>,
@@ -1225,6 +1425,31 @@ pub struct Hub<S: Surface> {
     /// words to could say so, honestly, on the wire, and he was told nothing. Bounded at
     /// [`WORDS_DOWN_KEPT`], oldest first out.
     words_down: Arc<Mutex<VecDeque<WordsDown>>>,
+    /// The order the marks on his messages land in.
+    ///
+    /// A tool server acks a `message` within a millisecond of reading it, while the eyes are an
+    /// HTTPS call of a hundred and fifty. Two reactions in flight on one message land in whichever
+    /// order Telegram takes them, and the eyes landing last leave him looking at "handed on" for a
+    /// line the agent already has — for good, since nothing marks it again. So `relay` takes this
+    /// before the frame goes down and hands it to the task that lands the eyes, which drops it
+    /// when they have; the ack's mark waits its turn. Marks are one per line he types, so a permit
+    /// costs nobody anything.
+    mark_permit: Arc<Mutex<()>>,
+    /// What may still be spent on reactions this minute — their own ledger, never the send budget.
+    ///
+    /// Measured 5 September (`docs/RATE-PROBE.md` §3): twenty reactions in a trailing minute, the
+    /// twenty-first refused for the rest of it, and a send still going through beside them. So a
+    /// reaction takes nothing from an agent, and past its own ceiling the hub stops asking rather
+    /// than walking every later mark into a `429`.
+    reactions: Arc<Mutex<crate::queue::ReactionBudget>>,
+    /// Whether the journal has been told that Telegram refuses this bot's reactions.
+    ///
+    /// A mark refused for the ceiling is expected and logged at debug; one refused for anything
+    /// else — a forum whose settings allow no reactions, or none of these three, or a bot with no
+    /// right to react — is the whole receipt silently absent, and at debug the journal said
+    /// nothing. Said once at warn, not once per line he types: the cause does not change between
+    /// lines, and a journal that repeats one sentence a hundred times is one nobody reads.
+    reaction_refusal_said: Arc<AtomicBool>,
     /// Which chats this bot answers. Checked first, before any state is touched.
     allowed_chats: Arc<Vec<i64>>,
     /// The one forum every topic lives in. Routing is a single rule — topic, inside this chat —
@@ -1245,18 +1470,36 @@ impl<S: Surface> Hub<S> {
         allowed_chats: Vec<i64>,
         forum_chat: i64,
     ) -> Self {
+        // Beside the audit log, because every state file of this hub lives in one directory and
+        // the audit's path is the one this constructor is already handed. Written EMPTY at once:
+        // a hub that has just started has nothing connected, and until it says so the file on disk
+        // is the last hub's, naming that hub's pid — which a reader rightly refuses to believe, and
+        // reports as unknown for as long as it is left there.
+        let presence =
+            crate::presence::Presence::new(audit.path().with_file_name(crate::presence::FILE));
+        if let Err(e) = presence.write(std::iter::empty()) {
+            tracing::error!(
+                error = %e, path = %presence.path().display(),
+                "could not write down that nothing is connected yet; `projects --json` will say \
+                 unknown until a bridge arrives or leaves"
+            );
+        }
         Self {
             surface,
             registry: Arc::new(Mutex::new(registry)),
             ledger: Arc::new(Mutex::new(ledger)),
             audit: Arc::new(audit),
             claims: Arc::new(Mutex::new(BTreeMap::new())),
+            presence,
             budgets: Arc::new(Mutex::new(crate::queue::Budgets::default())),
             send_permit: Arc::new(Mutex::new(())),
             throttle: Arc::new(Mutex::new(Throttle::default())),
             topic_refused: Arc::new(Mutex::new(BTreeMap::new())),
             gist: crate::summarize::Summarizer::from_env().map(Arc::new),
             words_down: Arc::new(Mutex::new(VecDeque::new())),
+            mark_permit: Arc::new(Mutex::new(())),
+            reactions: Arc::new(Mutex::new(crate::queue::ReactionBudget::default())),
+            reaction_refusal_said: Arc::new(AtomicBool::new(false)),
             allowed_chats: Arc::new(allowed_chats),
             forum_chat,
             settle: DEFAULT_SETTLE,
@@ -1497,13 +1740,17 @@ impl<S: Surface> Hub<S> {
     ///
     /// A dead incumbent is evicted rather than honoured: a worker that crashed must not lock its
     /// own project out until someone finds a keyboard.
+    ///
+    /// Returns the receiver the connection must listen on for a [`Claim::kick`]: the one way this
+    /// connection can be ended by something other than its own socket.
     pub async fn claim(
         &self,
         addr: Addr,
         pid: u32,
         instance: String,
         tx: mpsc::Sender<Envelope<HubFrame>>,
-    ) -> Result<(), RefusedReason> {
+    ) -> Result<mpsc::Receiver<RefusedReason>, RefusedReason> {
+        let (kick, kicked) = mpsc::channel(1);
         {
             let mut claims = self.claims.lock().await;
             // Exclusive per ADDRESS. Widening it to the project was the refusal that made a second
@@ -1523,9 +1770,126 @@ impl<S: Surface> Hub<S> {
                     "evicting a bridge that is no longer running"
                 );
             }
-            claims.insert(addr, Claim { pid, instance, tx });
+            claims.insert(
+                addr,
+                Claim {
+                    pid,
+                    instance,
+                    tx,
+                    kick,
+                },
+            );
+            self.note_who_is_connected(&claims);
         }
-        Ok(())
+        Ok(kicked)
+    }
+
+    /// Write the claims map down for `projects --json`, which runs in another process.
+    ///
+    /// Called with the claims lock HELD, deliberately: two changes racing to write would otherwise
+    /// publish whichever finished last, and a snapshot that says a bridge is connected after it
+    /// has gone is the one thing the reader's own checks cannot catch. A failed write is logged
+    /// and nothing else — the map in memory is the truth and delivery does not depend on this.
+    fn note_who_is_connected(&self, claims: &BTreeMap<Addr, Claim>) {
+        if let Err(e) = self.presence.write(claims.keys()) {
+            tracing::error!(
+                error = %e, path = %self.presence.path().display(),
+                "could not write down who is connected; `projects --json` will be stale"
+            );
+        }
+    }
+
+    /// End every live connection whose project has been switched off at the terminal.
+    ///
+    /// `enabled` is read at `hello`, so the flag on its own turns away the NEXT connection and does
+    /// nothing to one already on the socket — the thing the operator actually reached for the
+    /// switch to stop. This is the other half: the registry is re-read, and every claim under a
+    /// project that is now off is told why and ended, through the connection's own kick. The
+    /// bridge gets `refused{not_enabled}` and a close, exactly what it would get dialling fresh.
+    ///
+    /// Called by [`Self::watch_the_registry`] whenever the file changes, so the operator's write at
+    /// a terminal reaches a connection this process holds within about a second.
+    pub async fn drop_connections_of_switched_off_projects(&self) {
+        let off: BTreeSet<ProjectId> = {
+            let mut registry = self.registry.lock().await;
+            if let Err(e) = registry.reread() {
+                // The last good copy has nothing new to say, and a stale read must never switch
+                // anything off: refusing to act is the only safe answer to a file that cannot be
+                // read, and admission already treats it the same way.
+                tracing::error!(
+                    error = %e,
+                    "could not re-read the project registry; not switching anything off"
+                );
+                return;
+            }
+            registry
+                .all()
+                .filter(|p| !p.enabled)
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        if off.is_empty() {
+            return;
+        }
+        // Claims first, registry second, and never both at once — the same order every other
+        // reader keeps. The kicks are cloned out and the guard dropped before anything is awaited.
+        let kicked: Vec<Addr> = {
+            let mut claims = self.claims.lock().await;
+            let mut kicked = Vec::new();
+            claims.retain(|addr, claim| {
+                if !off.contains(&addr.project) {
+                    return true;
+                }
+                // The connection is told THROUGH its kick and removes its own claim on the way out.
+                // One that cannot be told — nothing listening on the far end of the kick — is
+                // forgotten here instead, so a switched-off project is never shown as connected
+                // and never handed his words; that shape is only ever a test's own claim.
+                match claim.kick.try_send(RefusedReason::NotEnabled) {
+                    Ok(()) => {
+                        kicked.push(addr.clone());
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            project = %addr.project, lane = addr.lane_field(),
+                            "a switched-off project's claim had nothing behind it to tell; forgotten"
+                        );
+                        false
+                    }
+                }
+            });
+            self.note_who_is_connected(&claims);
+            kicked
+        };
+        for addr in kicked {
+            tracing::info!(
+                project = %addr.project, lane = addr.lane_field(),
+                "its project was switched off at the terminal; ending its connection"
+            );
+        }
+    }
+
+    /// Watch the registry file and act on a project switched off at the terminal.
+    ///
+    /// A stat every `every`, and a re-read only when the stat says something changed: the file is
+    /// rewritten by temp-and-rename, so a change is a new inode, a new size, or a new mtime, and
+    /// this process's own writes (a topic binding) look the same and cost one harmless re-read.
+    /// Spawned once for the life of the hub; the handle is returned so a test can hold it.
+    pub fn watch_the_registry(self: Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let path = self.registry.lock().await.path().to_path_buf();
+            let mut seen = registry_fingerprint(&path);
+            loop {
+                tokio::time::sleep(every).await;
+                let now = registry_fingerprint(&path);
+                if now == seen {
+                    continue;
+                }
+                seen = now;
+                self.drop_connections_of_switched_off_projects().await;
+            }
+        })
     }
 
     /// Take the keyboard off every question a run of this CONVERSATION other than this one left
@@ -1606,6 +1970,7 @@ impl<S: Surface> Hub<S> {
         let mut claims = self.claims.lock().await;
         if claims.get(addr).is_some_and(|c| c.pid == pid) {
             claims.remove(addr);
+            self.note_who_is_connected(&claims);
         }
     }
 
@@ -1639,6 +2004,35 @@ impl<S: Surface> Hub<S> {
             .is_some()
     }
 
+    /// Is the chat shut for the agents' sends — at its per-minute ceiling, or under a flood wait?
+    /// The one-second gap between sends is deliberately not counted: a test asking this a moment
+    /// after a send wants to know whether the BUDGET moved, not whether a send just went.
+    #[cfg(test)]
+    pub async fn the_chat_is_shut_for_sends(&self, chat_id: i64) -> bool {
+        matches!(
+            self.budgets.lock().await.would_refuse(
+                chat_id,
+                std::time::Instant::now(),
+                crate::queue::Spender::AnAgent,
+            ),
+            Some(crate::queue::Refusal::Ceiling(_))
+        )
+    }
+
+    /// Has the journal been told that Telegram refuses this bot's reactions? Test-only: the only
+    /// way to see from outside that a refusal was told apart from the ceiling.
+    #[cfg(test)]
+    pub fn a_reaction_refusal_was_said(&self) -> bool {
+        self.reaction_refusal_said.load(Ordering::Acquire)
+    }
+
+    /// How many of his typed lines are still waiting for a bridge's answer. A fence for a test
+    /// that has to know every ack it sent has been handled, without sending anything to find out.
+    #[cfg(test)]
+    pub async fn words_awaiting_an_answer(&self) -> usize {
+        self.words_down.lock().await.len()
+    }
+
     /// Test-only, and it stays that way. The DELIVERY path must never ask this: it asks by trying
     /// to deliver, which is the question it actually has, and a "is it connected" read taken a
     /// moment earlier is a fact that can already be wrong by the time it is acted on.
@@ -1648,6 +2042,21 @@ impl<S: Surface> Hub<S> {
     #[cfg(test)]
     pub async fn is_claimed(&self, addr: &Addr) -> bool {
         self.claims.lock().await.contains_key(addr)
+    }
+
+    /// Is this conversation's project switched off?
+    ///
+    /// For the sentence `bot.rs` says back when his words reach nobody. Off is his own decision at
+    /// a terminal, and "not connected" — true, since the switch drops the connection — would send
+    /// him to restart a bridge the hub is going to refuse. Read from the copy the registry watcher
+    /// keeps fresh rather than from disk: a message is not the moment to re-read a file, and a
+    /// second's lag on a sentence costs nothing.
+    pub async fn is_switched_off(&self, addr: &Addr) -> bool {
+        self.registry
+            .lock()
+            .await
+            .get(&addr.project)
+            .is_some_and(|p| !p.enabled)
     }
 
     /// Which projects have a bridge on the socket right now, for a human reading a list.
@@ -1726,12 +2135,18 @@ impl<S: Surface> Hub<S> {
             down.push_back(WordsDown {
                 frame: frame.clone(),
                 addr: addr.clone(),
+                chat_id,
                 msg_id: msg_id.clone(),
             });
             while down.len() > WORDS_DOWN_KEPT {
                 down.pop_front();
             }
         }
+        // Taken BEFORE the frame goes down and held until the eyes have landed, so the bridge's
+        // ack — which can arrive within a millisecond of the frame — cannot put its thumb on the
+        // message ahead of the eyes and then have the eyes cover it. See `mark_permit`. Owned,
+        // because it travels into the task that lands the eyes and is dropped there.
+        let in_order = Arc::clone(&self.mark_permit).lock_owned().await;
         let delivered = self
             .deliver_under(
                 addr,
@@ -1752,7 +2167,60 @@ impl<S: Surface> Hub<S> {
         } else {
             self.audit.refused(addr, "the project was not connected")
         };
+        // The eyes: his words are on their way, and nothing has answered for them yet. Only when
+        // they actually went — a message nobody received gets its line in the topic, not a mark
+        // that reads as a receipt.
+        //
+        // In a task of their own, and `relay` returns the moment the frame is down. Awaited here
+        // they were one HTTPS round trip inside the update handler — which Telegram's dispatcher
+        // runs one at a time per chat, so his next line and every tap in the forum waited behind
+        // them, seventeen seconds of it when Telegram stalls — with the mark permit held the whole
+        // time, so every other bridge's ack waited too. Before the receipts existed a successful
+        // relay made no Telegram call at all. The permit goes with the eyes and is released when
+        // they have landed, which is what keeps the thumb behind them.
+        if delivered {
+            let surface = Arc::clone(&self.surface);
+            let reactions = Arc::clone(&self.reactions);
+            let said = Arc::clone(&self.reaction_refusal_said);
+            let msg_id = msg_id.clone();
+            tokio::spawn(async move {
+                mark_his_message(
+                    &*surface,
+                    &reactions,
+                    &said,
+                    chat_id,
+                    &msg_id,
+                    Mark::HandedOn,
+                )
+                .await;
+                drop(in_order);
+            });
+        } else {
+            drop(in_order);
+        }
         delivered
+    }
+
+    /// Put the stage a line of his has reached on the line itself.
+    ///
+    /// Through no SEND budget, by measurement: twenty reactions and a send still went through
+    /// (`docs/RATE-PROBE.md` §3), so a reaction spends nothing an agent could have had. Reactions
+    /// have a ceiling of their own, kept in [`Self::reactions`], and a mark past it — or one
+    /// Telegram refuses anyway — is simply a mark that does not appear: never retried, never
+    /// waited for, and never fed into the send budget as a flood wait. The measurement showed a
+    /// chat shut for reactions still taking sends, and holding every agent off for a refused
+    /// decoration would be a loss with nothing behind it. Nothing is said in the topic in its
+    /// place: the line an agent's refusal earns is posted whether or not the mark landed.
+    async fn mark_his_message(&self, chat_id: i64, msg_id: &MsgId, mark: Mark) {
+        mark_his_message(
+            &*self.surface,
+            &self.reactions,
+            &self.reaction_refusal_said,
+            chat_id,
+            msg_id,
+            mark,
+        )
+        .await;
     }
 
     /// The question one of his replies is under, when it is one THIS conversation's live session
@@ -1843,6 +2311,7 @@ impl<S: Surface> Hub<S> {
         if let Err(refused) = self.take_a_turn(addr, until).await {
             return Err(match refused {
                 SendOutcome::TooFast(wait) => NoTopic::TooFast(wait),
+                SendOutcome::SwitchedOff => NoTopic::SwitchedOff,
                 other => NoTopic::Failed(format!("{other:?}")),
             });
         }
@@ -1964,6 +2433,10 @@ impl<S: Surface> Hub<S> {
     /// * **`answerCallbackQuery`** is deliberately outside all of this. Whether it is charged at
     ///   all is unmeasured (`docs/RATE-PROBE.md`), it is one per tap and paced by a thumb, and
     ///   spending a send for something that may cost nothing takes it off an agent for no reason.
+    /// * **The reactions on his own messages** are not sends and are not metered here — measured
+    ///   5 September (`docs/RATE-PROBE.md` §3): twenty of them and a send still went through. They
+    ///   have a ceiling of their own and a ledger of their own, [`Self::reactions`], and a mark
+    ///   that ledger or Telegram refuses does not appear and costs nobody anything.
     async fn send_into(
         &self,
         addr: &Addr,
@@ -2022,6 +2495,14 @@ impl<S: Surface> Hub<S> {
         outcome
     }
 
+    /// A frame refused because its project was switched off while it waited. Written down, like
+    /// every other way a message does not go out.
+    fn switched_off_under(&self, addr: &Addr) -> SendOutcome {
+        let outcome = SendOutcome::SwitchedOff;
+        let _ = self.audit.outcome(addr, &outcome);
+        outcome
+    }
+
     /// Wait for this sender's turn in the queue and spend one of the chat's tokens, or shed.
     ///
     /// Lifted out of `send_into` so that MAKING A TOPIC can pay for one too. `create_forum_topic`
@@ -2063,9 +2544,20 @@ impl<S: Surface> Hub<S> {
         // it. The deadline still covers the QUEUE and not merely the sleep, because the queue is
         // most of the wait: bounding only the sleep let a bridge sit behind nine others for a minute
         // and then be told it was too fast.
-        let turn = match tokio::time::timeout_at(until.into(), self.send_permit.lock()).await {
-            Ok(t) => t,
-            Err(_) => {
+        //
+        // **Both waits below end early if the project is switched off** — see `ConnectionSwitch`.
+        // Nothing has been spent at either, so the frame is refused like the ones queued behind it
+        // rather than posted into a topic the operator has just turned off.
+        let switch = SWITCH.try_with(Arc::clone).ok();
+        let turn = match unless_switched_off(
+            switch.as_deref(),
+            tokio::time::timeout_at(until.into(), self.send_permit.lock()),
+        )
+        .await
+        {
+            None => return Err(self.switched_off_under(addr)),
+            Some(Ok(t)) => t,
+            Some(Err(_)) => {
                 // Told how long it actually waited, not a constant. `MAX_PACE_WAIT` went out here
                 // as the retry_after, which was a made-up number unrelated to the real wait.
                 let outcome = SendOutcome::TooFast(self.what_the_queue_costs().await);
@@ -2097,7 +2589,13 @@ impl<S: Surface> Hub<S> {
                 // while the chat's bucket is empty the waiters behind cannot send either, and when
                 // a token does arrive the head of the queue is exactly who should have it.
                 Err(refusal) if std::time::Instant::now() + refusal.wait() <= until => {
-                    tokio::time::sleep(refusal.wait()).await;
+                    if unless_switched_off(switch.as_deref(), tokio::time::sleep(refusal.wait()))
+                        .await
+                        .is_none()
+                    {
+                        drop(turn);
+                        return Err(self.switched_off_under(addr));
+                    }
                 }
                 // Past its shelf life. For prose that means a minute and a half of a chat that
                 // would not take it; for a question it means the answer would arrive too late to be
@@ -2200,6 +2698,9 @@ impl<S: Surface> Hub<S> {
                 let _ = self.audit.outcome(addr, &outcome);
                 return outcome;
             }
+            // Already written down by `take_a_turn`, and not Telegram's refusal: the ack must
+            // not blame Telegram for the operator's own switch.
+            Err(NoTopic::SwitchedOff) => return SendOutcome::SwitchedOff,
             Err(e) => {
                 let _ = self.audit.refused(addr, &e.to_string());
                 return SendOutcome::Refused(e.to_string());
@@ -2230,6 +2731,7 @@ impl<S: Surface> Hub<S> {
                 // saying "there is nowhere in his chat to put it" about it tells the agent to give
                 // up on a thing that mends itself inside a minute.
                 Err(NoTopic::TooFast(wait)) => SendOutcome::TooFast(wait),
+                Err(NoTopic::SwitchedOff) => SendOutcome::SwitchedOff,
                 Err(_) => outcome,
             };
         }
@@ -2644,21 +3146,25 @@ impl<S: Surface> Hub<S> {
             }
         });
 
-        if let Err(reason) = self
+        let mut kicked = match self
             .claim(addr.clone(), pid, instance.clone(), tx.clone())
             .await
         {
-            let env = Envelope::new(FrameId::new("h-refused"), HubFrame::Refused { reason });
-            let _ = tx.send(env).await;
-            // Give the writer a moment to put the refusal on the wire before the task is dropped;
-            // a refusal nobody receives is the same as the silent takeover this replaced.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            writer.abort();
-            let _ = self
-                .audit
-                .refused(&addr, "another bridge already holds this conversation");
-            return Ok(());
-        }
+            Ok(kicked) => kicked,
+            Err(reason) => {
+                let env = Envelope::new(FrameId::new("h-refused"), HubFrame::Refused { reason });
+                let _ = tx.send(env).await;
+                // Give the writer a moment to put the refusal on the wire before the task is
+                // dropped; a refusal nobody receives is the same as the silent takeover this
+                // replaced.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                writer.abort();
+                let _ = self
+                    .audit
+                    .refused(&addr, "another bridge already holds this conversation");
+                return Ok(());
+            }
+        };
 
         // Admitted, with no topic yet. See `HubFrame::Welcome` for why that is not an omission.
         let _ = tx
@@ -2701,7 +3207,21 @@ impl<S: Surface> Hub<S> {
         let mut waiting_bytes = 0usize;
         let settled = tokio::time::timeout(self.settle, async {
             loop {
-                match reader.next::<BridgeFrame>().await {
+                // The kick is listened for HERE too, not only once the connection is live. A project
+                // switched off inside the settling window used to go on to get a topic, a greeting
+                // and a minute of delivery before anything noticed.
+                let next = tokio::select! {
+                    next = reader.next::<BridgeFrame>() => next,
+                    kick = kicked.recv() => return match kick {
+                        Some(_) => Settled::SwitchedOff,
+                        // The claim was taken from under this connection: its process is gone
+                        // from /proc and a successor evicted it. Nobody is behind the socket to
+                        // tell, and "switched off" would be untrue — it went the way a dead
+                        // bridge goes.
+                        None => Settled::Gone,
+                    },
+                };
+                match next {
                     Ok(Some(frame)) => {
                         if let BridgeFrame::Pong { r#ref } = &frame.payload
                             && r#ref == &ping_id
@@ -2745,6 +3265,7 @@ impl<S: Surface> Hub<S> {
             let why = match settled {
                 Settled::Overflowed => "sent more before answering than the hub will hold for it",
                 Settled::Oversize => "a frame was over the size ceiling",
+                Settled::SwitchedOff => "its project was switched off at the terminal",
                 Settled::Gone | Settled::Live => {
                     "connected but never answered; it is probably not allowed to talk to me"
                 }
@@ -2784,13 +3305,18 @@ impl<S: Surface> Hub<S> {
                         break;
                     }
                 }
-                if settled == Settled::Oversize {
+                // The two refusals with a reason the bridge can branch on are told it. The
+                // closed set has none for "never answered", so that one stays a close.
+                let reason = match settled {
+                    Settled::Oversize => Some(RefusedReason::FrameTooLarge),
+                    Settled::SwitchedOff => Some(RefusedReason::NotEnabled),
+                    _ => None,
+                };
+                if let Some(reason) = reason {
                     let _ = tx
                         .send(Envelope::new(
                             FrameId::new(format!("h{}", next_frame_seq())),
-                            HubFrame::Refused {
-                                reason: RefusedReason::FrameTooLarge,
-                            },
+                            HubFrame::Refused { reason },
                         ))
                         .await;
                 }
@@ -2853,15 +3379,31 @@ impl<S: Surface> Hub<S> {
         // deeper than a bridge is allowed to hold still blocks the read loop, and that is correct —
         // it is the only backpressure there is.
         let (frames_tx, mut frames_rx) = mpsc::channel::<Envelope<BridgeFrame>>(64);
+        // Thrown when the project is switched off under this connection. What the handler still
+        // holds is then answered `no` without a send: draining sixty-four queued frames into the
+        // topic at one a second would be a minute of the flood the switch was thrown to stop. The
+        // frame already inside `handle` sees the switch too, at its pacer wait — see
+        // `ConnectionSwitch` for why that one matters most.
+        let switch = Arc::new(ConnectionSwitch::default());
         let mut handler = {
             let hub = Arc::clone(&self);
             let addr = addr.clone();
             let instance = instance.clone();
             let tx = tx.clone();
+            let switch = Arc::clone(&switch);
             tokio::spawn(async move {
                 while let Some(frame) = frames_rx.recv().await {
                     let ack_ref = frame.id.clone();
-                    let (delivered, why) = hub.handle(&addr, &instance, frame.payload).await;
+                    let (delivered, why) = if switch.is_off() {
+                        (Delivered::No, None)
+                    } else {
+                        SWITCH
+                            .scope(
+                                Arc::clone(&switch),
+                                hub.handle(&addr, &instance, frame.payload),
+                            )
+                            .await
+                    };
                     let _ = tx
                         .send(Envelope::new(
                             FrameId::new(format!("h{}", next_frame_seq())),
@@ -2876,9 +3418,37 @@ impl<S: Surface> Hub<S> {
             })
         };
 
-        for frame in waiting {
-            if frames_tx.send(frame).await.is_err() {
-                break;
+        // The kick is listened for while these are queued, as it is below: a reconnect carrying
+        // sixty-five frames into a full queue parks here exactly as the live loop does.
+        let mut waiting: VecDeque<Envelope<BridgeFrame>> = waiting.into();
+        while !waiting.is_empty() {
+            let kicked_with = tokio::select! {
+                slot = frames_tx.reserve() => match slot {
+                    Ok(slot) => {
+                        slot.send(waiting.pop_front().expect("checked non-empty"));
+                        None
+                    }
+                    Err(_) => break,
+                },
+                kick = kicked.recv() => match kick {
+                    None => break,
+                    Some(reason) => Some(reason),
+                },
+            };
+            if let Some(reason) = kicked_with {
+                self.end_switched_off(
+                    &addr,
+                    pid,
+                    reason,
+                    waiting.into(),
+                    &switch,
+                    tx,
+                    frames_tx,
+                    handler,
+                    writer,
+                )
+                .await;
+                return Ok(());
             }
         }
 
@@ -2892,7 +3462,33 @@ impl<S: Surface> Hub<S> {
         // claim nobody is behind: its worker restarts, is refused as already-claimed, and the
         // operator is left with a project that has gone quiet for no visible reason.
         loop {
-            match reader.next::<BridgeFrame>().await {
+            // Two things can end this loop from outside the bridge's own frames: the socket, and a
+            // kick. The kick is the operator switching the project off at the terminal, and it is
+            // the only way a connection is ever ended by this side.
+            let next = tokio::select! {
+                next = reader.next::<BridgeFrame>() => next,
+                kick = kicked.recv() => {
+                    // `None` is the claim taken from under this connection by a successor that
+                    // found its process dead. Nothing is behind the socket, and the successor
+                    // holds the address now, so this ends the way EOF does: the release below is
+                    // pid-guarded and leaves the successor's claim alone.
+                    let Some(reason) = kick else { break };
+                    self.end_switched_off(
+                        &addr,
+                        pid,
+                        reason,
+                        Vec::new(),
+                        &switch,
+                        tx,
+                        frames_tx,
+                        handler,
+                        writer,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            match next {
                 Ok(None) => break,
                 // A line that will not DECODE is one bad frame, not a dead peer — and this is
                 // exactly what a bridge one version ahead sends. Tearing the connection down for it
@@ -2948,8 +3544,39 @@ impl<S: Surface> Hub<S> {
                     break;
                 }
                 Ok(Some(frame)) => {
-                    if frames_tx.send(frame).await.is_err() {
-                        break;
+                    // The kick is listened for HERE too, not only between frames. With the queue
+                    // full — a loud bridge whose minute is spent, which is the bridge the switch
+                    // exists for — this send parks the loop for as long as the pacer holds the
+                    // frame at the head of the queue, and the switch waited behind it: measured
+                    // at fifty-seven seconds, claim held, his words still handed to it, one more
+                    // line posted. The frame in hand is answered `no` with the rest.
+                    let kicked_with = tokio::select! {
+                        slot = frames_tx.reserve() => match slot {
+                            Ok(slot) => {
+                                slot.send(frame);
+                                None
+                            }
+                            Err(_) => break,
+                        },
+                        kick = kicked.recv() => match kick {
+                            None => break,
+                            Some(reason) => Some((reason, frame)),
+                        },
+                    };
+                    if let Some((reason, frame)) = kicked_with {
+                        self.end_switched_off(
+                            &addr,
+                            pid,
+                            reason,
+                            vec![frame],
+                            &switch,
+                            tx,
+                            frames_tx,
+                            handler,
+                            writer,
+                        )
+                        .await;
+                        return Ok(());
                     }
                 }
             }
@@ -2972,6 +3599,79 @@ impl<S: Surface> Hub<S> {
         }
         writer.abort();
         Ok(())
+    }
+
+    /// End a live connection whose project was switched off at the terminal.
+    ///
+    /// Everything read from the bridge is answered for before the socket ends, in this order:
+    /// `refused{not_enabled}` first, so the bridge reads every `no` after it in that light and
+    /// stops promising its agent anything; then `no` for each frame in hand — read off the socket
+    /// and not yet queued; then, from the handler, `no` for everything queued behind the frame it
+    /// was inside, and for that frame too if it was still waiting for its turn (see
+    /// `ConnectionSwitch`). A frame already inside a send is finished, because cancelling a
+    /// Telegram call mid-flight lands a message whose ack says it did not land. Then the close,
+    /// bounded like every other goodbye.
+    #[allow(clippy::too_many_arguments)]
+    async fn end_switched_off(
+        &self,
+        addr: &Addr,
+        pid: u32,
+        reason: RefusedReason,
+        in_hand: Vec<Envelope<BridgeFrame>>,
+        switch: &ConnectionSwitch,
+        tx: mpsc::Sender<Envelope<HubFrame>>,
+        frames_tx: mpsc::Sender<Envelope<BridgeFrame>>,
+        mut handler: tokio::task::JoinHandle<()>,
+        mut writer: tokio::task::JoinHandle<()>,
+    ) {
+        tracing::info!(
+            project = %addr.project, lane = addr.lane_field(), ?reason,
+            "ending a live connection: its project was switched off at the terminal"
+        );
+        // Released FIRST, so `/projects` stops calling it connected and his typed words stop
+        // reaching it the instant the switch is thrown, before any goodbye.
+        self.release(addr, pid).await;
+        // Told why BEFORE the switch is thrown inside this connection, so the refusal is on the
+        // wire ahead of every `no` the switch causes. Bounded: a bridge that has stopped reading
+        // has a full outbox, and the handler is already parked on it — nothing more can post.
+        let _ = tokio::time::timeout(
+            GOODBYE_SHELF_LIFE,
+            tx.send(Envelope::new(
+                FrameId::new(format!("h{}", next_frame_seq())),
+                HubFrame::Refused { reason },
+            )),
+        )
+        .await;
+        switch.throw();
+        let _ = self
+            .audit
+            .refused(addr, "its project was switched off at the terminal");
+        for frame in in_hand {
+            let env = Envelope::new(
+                FrameId::new(format!("h{}", next_frame_seq())),
+                HubFrame::Ack {
+                    r#ref: frame.id,
+                    delivered: Delivered::No,
+                    why: None,
+                },
+            );
+            if tokio::time::timeout(GOODBYE_SHELF_LIFE, tx.send(env))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        drop(frames_tx);
+        if tokio::time::timeout(PROSE_SHELF_LIFE, &mut handler)
+            .await
+            .is_err()
+        {
+            handler.abort();
+        }
+        drop(tx);
+        let _ = tokio::time::timeout(GOODBYE_SHELF_LIFE, &mut writer).await;
+        writer.abort();
     }
 
     /// One frame from a bridge. Returns what to put in its ack.
@@ -3178,8 +3878,8 @@ impl<S: Surface> Hub<S> {
     /// his topic under the hub's name by refusing things it was never sent. And the FIRST answer
     /// for a message is the one that counts: the record goes with it, so a second cannot write a
     /// second line. Behind attach's door several producers may answer one message, and the door
-    /// folds them into one before this hub hears it; a Claude tool server, which can hand the
-    /// words to its agent, answers nothing at all.
+    /// folds them into one before this hub hears it; the Claude tool server answers `accepted`
+    /// the moment it has handed the words into the agent's turn.
     async fn what_became_of_his_words(
         &self,
         addr: &Addr,
@@ -3198,6 +3898,17 @@ impl<S: Surface> Hub<S> {
             down.remove(at)
         };
         let Some(his) = his else { return };
+        // The tick, or the cross, in place of the eyes. Marked BEFORE the line for a refusal, so
+        // the two arrive in the order he reads them: the glance, then the sentence.
+        let mark = match status {
+            AckStatus::Accepted => Mark::Accepted,
+            AckStatus::Refused => Mark::Refused,
+        };
+        {
+            // Behind the eyes, always: `relay` holds this until they have landed.
+            let _in_order = self.mark_permit.lock().await;
+            self.mark_his_message(his.chat_id, &his.msg_id, mark).await;
+        }
         if status == AckStatus::Accepted {
             return;
         }
@@ -3255,6 +3966,8 @@ impl<S: Surface> Hub<S> {
             SendOutcome::TopicGone => (Delivered::No, Some(hub_proto::AckWhy::NoTopic)),
             SendOutcome::Refused(_) => (Delivered::No, Some(hub_proto::AckWhy::TelegramRefused)),
             SendOutcome::Unseen => (Delivered::Unseen, None),
+            // The same answer every frame queued behind it gets, for the same reason.
+            SendOutcome::SwitchedOff => (Delivered::No, None),
         }
     }
 
@@ -3438,6 +4151,10 @@ enum Settled {
     Oversize,
     /// The window passed, or the socket ended, with no pong.
     Gone,
+    /// Its project was switched off at the terminal while it was still settling. Nothing is made
+    /// for it: a topic created and greeted for a project he had just turned off would be the switch
+    /// producing the one thing it exists to stop.
+    SwitchedOff,
 }
 
 /// What a frame costs against the pre-pong hold: its text plus an allowance for the envelope, and

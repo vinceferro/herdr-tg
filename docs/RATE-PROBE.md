@@ -1,5 +1,6 @@
-<!-- MEASUREMENT, 3 September 2026. The probe docs/HUB-DESIGN.md §12 specified and nobody ran, run
-     at last against the real Bot API and a real forum. Numbers here are observed, not quoted. -->
+<!-- MEASUREMENT, 3 September 2026; §3 added 5 September. The probe docs/HUB-DESIGN.md §12 specified
+     and nobody ran, run at last against the real Bot API and a real forum. Numbers here are
+     observed, not quoted. -->
 
 # What the Bot API actually charges
 
@@ -61,6 +62,53 @@ Two consequences:
   message costs one token; one that posts each update costs one per update. At the ceiling this is
   the difference between a status line that keeps up and one that is shed.
 
+## 3. `setMessageReaction` is NOT charged against it — and has a ceiling of its own
+
+Measured 5 September, in a throwaway topic. Five seeds to have messages to react to, then a check of
+which emoji the API takes at all, then thirty reactions round-robin over the seeds — each one
+*replacing* the last, which is how the hub will use them — then one send:
+
+```
+seeds: 5 sent in 0.6s
+emoji ✅: HTTP 400 Bad Request: REACTION_INVALID
+emoji ❌: HTTP 400 Bad Request: REACTION_INVALID
+emoji 👀: HTTP 200 ok
+emoji 👍: HTTP 200 ok
+emoji 👎: HTTP 200 ok
+  reaction 18: 429 retry_after=35
+  … (every one after it, retry_after counting down)
+reactions: accepted=17 refused429=13 other=0 seconds=24.9
+send afterwards: OK — reactions did not spend the send budget
+clear (empty list): HTTP 429 Too Many Requests: retry after 34
+```
+
+Three findings, and the third is the one nobody asked about:
+
+* **A reaction does not spend a send.** Five sends, twenty accepted reactions, and a send still went
+  through with the reaction bucket empty. Marking the operator's own message is free against the
+  ceiling that rations the agents.
+* **The tick and the cross do not exist.** `✅` and `❌` are refused outright: a bot's free reactions
+  are Telegram's fixed list, and neither is on it. `👀` is; `👍` and `👎` are the nearest honest pair
+  for "the agent has it" and "it did not reach the agent". The hub uses those three.
+* **Reactions have a ceiling of their own: twenty in a trailing minute, the same shape as sends,
+  counted separately.** Three accepted in the emoji check plus seventeen in the run is twenty, and
+  the twenty-first was refused with a `retry_after` that counted down the rest of the minute — and
+  clearing a reaction is a reaction call, so it was refused too. A first run of this probe, smeared
+  over three minutes by a slow HTTP client, hit the same wall after the same twenty and then had
+  reactions accepted again as the oldest aged out.
+
+What follows for the hub: a reaction goes through **no** send accounting, and it has a ledger of
+its own — eighteen of the measured twenty in a trailing minute, under the ceiling by the same two
+as sends and for the same reason — past which the hub stops asking rather than walking every later
+mark into a `429`. It is never retried and never waited for: a mark the ledger or Telegram refuses
+is a mark that does not appear, the line in the topic still carries the meaning, and nothing an
+agent is waiting on is behind it. One of his messages costs at most two reactions (the eyes, then
+the thumb up or down), so the wall is nine of his lines in one minute, which a thumb does not reach.
+
+Not measured here: a reaction on a message HE sent rather than one the bot sent. Reacting to other
+people's messages is the ordinary use of the call and there is no reason to expect a difference,
+but no message of his was in a throwaway topic to try it on.
+
 ## What is still not measured
 
 * Whether two *different bots* in one group have separate budgets. Every limit above is phrased as a
@@ -68,11 +116,14 @@ Two consequences:
   reading, and horizontal scaling would be built on it. It needs a second bot token to settle.
 * Whether `answerCallbackQuery` or `createForumTopic` are charged. Topic creation was routed through
   the budget on 2 September on the assumption that it is.
+* Whether the reaction ceiling is per chat, like the send ceiling, or per bot.
 * Anything about the paid broadcast tier.
 
 ## Running it again
 
-The two probes live in the session scratchpad rather than in the repo, because they need the live
-bot token and they put forty messages into a real forum. Re-derive them from this file if needed:
-forty sends across four topics for the first, five sends and thirty edits for the second. Aim both
-at throwaway topics — never at a project topic someone is reading.
+The three probes live in the session scratchpad rather than in the repo, because they need the live
+bot token and they put messages into a real forum. Re-derive them from this file if needed: forty
+sends across four topics for the first, five sends and thirty edits for the second, five sends and
+thirty reactions then one send for the third. Aim all of them at throwaway topics — never at a
+project topic someone is reading — and never call `getUpdates`, which the running hub holds. Use a
+client that answers in a fraction of a second, or the window slides under the run.

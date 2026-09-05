@@ -74,10 +74,73 @@ impl Gate {
     description = "herdr-tg — your herd, from your pocket."
 )]
 pub enum Command {
-    #[command(description = "which projects are enrolled, and which are connected.")]
+    #[command(
+        description = "which projects are enrolled, which are connected, and which are switched off."
+    )]
     Projects,
     #[command(description = "show this help.")]
     Help,
+}
+
+/// What a line typed at the bot is, decided before anything is done with it.
+///
+/// Telegram hands a group bot EVERY `/command` typed in the group, including ones aimed at some
+/// other bot by name, so the first question is not "which command" but "is this for us at all".
+#[derive(Debug, PartialEq)]
+enum Typed {
+    /// One of this bot's own commands, whether or not he typed the `@name` after it.
+    Command(Command),
+    /// Words for whatever is running in the topic. Relayed verbatim; never parsed.
+    Steering,
+    /// A command aimed, by name, at a different bot in the same group. Not ours to answer and
+    /// not his words for an agent either — the only right thing to do with it is nothing.
+    ForAnotherBot,
+    /// A command aimed at THIS bot by name, that it does not have.
+    NotOneOfMine,
+}
+
+/// Decide what he typed. Pure, so it can be tested without a bot token.
+///
+/// `bot_username` is the name Telegram gave this bot, read from `getMe` at startup — never a
+/// constant. This was `"herdr_tg"`, a name the bot has never had, so every `@`-suffixed command
+/// failed to parse as aimed at the wrong bot and fell through to the relay: `/projects@<the real
+/// bot>` went verbatim into a coding agent's turn and into the audit as words he meant to send.
+/// Only with the real name in hand is dropping a command aimed at another bot the right thing.
+fn what_he_typed(text: &str, bot_username: &str) -> Typed {
+    use teloxide::utils::command::ParseError;
+    // A command opens with a slash; nothing else is one. The parser is trusted only past that
+    // point, because it splits the FIRST WORD at `@` and checks the name before it has looked for
+    // a slash at all — so `@alice can you check`, `me@example.com` and `git@github.com:org/repo`
+    // all came back "aimed at another bot", and the branch that rightly drops those in silence
+    // dropped his words with them: no relay, no reply, nothing in the audit. A bare `@<this bot>`
+    // went the other way and was answered "I do not have that command".
+    if !text.starts_with('/') {
+        return Typed::Steering;
+    }
+    match Command::parse(text, bot_username) {
+        Ok(cmd) => Typed::Command(cmd),
+        // Aimed at somebody else, by name. The parser checks the name BEFORE it looks the command
+        // up, so this is exactly "not ours" and never "not a command we have".
+        Err(ParseError::WrongBotName(_)) => Typed::ForAnotherBot,
+        // A command we do not have. Whether it is his words for an agent or a miss aimed at us
+        // turns on whether he named us: agents have slash commands of their own, and a bare
+        // `/compact` in a topic is for the agent in it.
+        Err(ParseError::UnknownCommand(_)) if names_this_bot(text, bot_username) => {
+            Typed::NotOneOfMine
+        }
+        Err(_) => Typed::Steering,
+    }
+}
+
+/// Is the first word `/something@<this bot>`, whatever the something?
+///
+/// The same split the parser makes — first word, then `@` — so the two cannot disagree about which
+/// bot a line names. Case-insensitive because usernames are.
+fn names_this_bot(text: &str, bot_username: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .and_then(|word| word.split_once('@'))
+        .is_some_and(|(_, name)| name.eq_ignore_ascii_case(bot_username))
 }
 
 /// Everything a handler needs, cloned per update.
@@ -87,6 +150,8 @@ struct Ctx {
     /// real state on a box where the forum has not been set up yet and must not be a crash.
     hub: Option<Arc<crate::hub::Hub<crate::surface::Telegram>>>,
     gate: Arc<Gate>,
+    /// This bot's own username, as Telegram reports it. What a `/command@name` is checked against.
+    username: Arc<str>,
 }
 
 /// Run the bot until the process is asked to stop.
@@ -154,6 +219,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                         audit = %hub.audit.path().display(),
                         "the hub is listening"
                     );
+                    // The other half of `herdr-tg disable`: the flag alone turns away the NEXT
+                    // connection, and this is what ends one that is already on the socket.
+                    Arc::clone(&hub).watch_the_registry(crate::hub::REGISTRY_WATCH_EVERY);
                     let accept = Arc::clone(&hub);
                     tokio::spawn(async move {
                         // A per-connection error must not end the loop. Running out of file
@@ -194,6 +262,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let ctx = Ctx {
         hub,
         gate: Arc::new(gate),
+        username: Arc::from(me.username()),
     };
 
     // The other half of the watchdog contract. `deploy/herdr-tg-watchdog.sh` buzzes the operator's
@@ -388,64 +457,96 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let Ok(cmd) = Command::parse(text, "herdr_tg") else {
-        // Not a command: it is something the operator typed at a project. A message belongs to the
-        // topic it was typed in and to no other — that is the whole of routing, and every other
-        // rule this bridge used to have is deleted rather than tested against.
-        let thread = msg.thread_id.map(|t| t.0.0);
-        let body = match (&ctx.hub, thread) {
-            (Some(hub), Some(thread)) => match hub.addr_for_topic(thread).await {
-                Some(who) => {
-                    let mid = hub_proto::MsgId::new(msg.id.0.to_string());
-                    let user = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-                    // The message he swiped to reply to, if he did. A reply under one of the
-                    // agent's questions is the one time he says which question — and which
-                    // session — he means, and the hub decides what that is worth (`relay`). In a
-                    // forum topic every message carries the topic's root as its reply, so this
-                    // is usually a message nothing was written down beside, which counts as no
-                    // reply at all.
-                    let under = msg
-                        .reply_to_message()
-                        .map(|m| hub_proto::MsgId::new(m.id.0.to_string()));
-                    if hub
-                        .relay(&who, chat_id, user, &mid, text, under.as_ref())
-                        .await
-                    {
-                        tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
-                        // Nothing is said back. A confirmation under every line the operator types
-                        // turns a conversation into a receipt printer; the agent's own answer is
-                        // the acknowledgement, and it is the one he is waiting for.
-                        return Ok(());
-                    }
-                    // Dropped, visibly, where he typed it — never queued. A message held for a
-                    // worker that may never come back is a message he believes was sent.
-                    // The topic and not "that project": a lane has its own topic, and the project
-                    // it belongs to can be connected and busy while this worktree is not.
-                    escape_html(
-                        "Nothing is connected in this topic right now, so nothing was sent. It \
-                         will not be delivered later.",
-                    )
-                }
-                // Never a fall back to the project when a lane's topic is unknown: that would put
-                // what he typed at one worktree into the turn of an agent working on another.
-                None => escape_html(
-                    "I do not know which project this topic belongs to, so I have not sent anything.",
-                ),
-            },
-            _ => escape_html(
-                "Type inside a project's topic and I will pass it on. Here in General I do not know \
-                 who you mean.",
-            ),
-        };
-        told_the_operator(&ctx, chat_id).await;
-        let mut out = bot
-            .send_message(msg.chat.id, &body)
-            .parse_mode(ParseMode::Html);
-        if let Some(t) = thread {
-            out = out.message_thread_id(ThreadId(MessageId(t)));
+    let cmd = match what_he_typed(text, &ctx.username) {
+        Typed::Command(cmd) => cmd,
+        // Somebody else's, by name. Nothing is relayed, nothing is said back, nothing is written
+        // down: Telegram hands every group bot every command, and this one was not for us.
+        Typed::ForAnotherBot => return Ok(()),
+        // Aimed at us by name, and not one we have. Answered where he typed it, and never handed
+        // to an agent as if it were steering.
+        Typed::NotOneOfMine => {
+            told_the_operator(&ctx, chat_id).await;
+            reply(
+                &ctx,
+                &bot,
+                msg.chat.id,
+                msg.thread_id.map(|t| t.0.0),
+                &escape_html("I do not have that command. /help lists the ones I answer."),
+            )
+            .await;
+            return Ok(());
         }
-        what_telegram_said(&ctx, chat_id, out.await).await;
-        return Ok(());
+        Typed::Steering => {
+            // Not a command: it is something the operator typed at a project. A message belongs to the
+            // topic it was typed in and to no other — that is the whole of routing, and every other
+            // rule this bridge used to have is deleted rather than tested against.
+            let thread = msg.thread_id.map(|t| t.0.0);
+            let body = match (&ctx.hub, thread) {
+                (Some(hub), Some(thread)) => match hub.addr_for_topic(thread).await {
+                    Some(who) => {
+                        let mid = hub_proto::MsgId::new(msg.id.0.to_string());
+                        let user = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+                        // The message he swiped to reply to, if he did. A reply under one of the
+                        // agent's questions is the one time he says which question — and which
+                        // session — he means, and the hub decides what that is worth (`relay`). In a
+                        // forum topic every message carries the topic's root as its reply, so this
+                        // is usually a message nothing was written down beside, which counts as no
+                        // reply at all.
+                        let under = msg
+                            .reply_to_message()
+                            .map(|m| hub_proto::MsgId::new(m.id.0.to_string()));
+                        if hub
+                            .relay(&who, chat_id, user, &mid, text, under.as_ref())
+                            .await
+                        {
+                            tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
+                            // Nothing is said back. A confirmation under every line the operator types
+                            // turns a conversation into a receipt printer; the agent's own answer is
+                            // the acknowledgement, and it is the one he is waiting for.
+                            return Ok(());
+                        }
+                        // Dropped, visibly, where he typed it — never queued. A message held for a
+                        // worker that may never come back is a message he believes was sent.
+                        // The topic and not "that project": a lane has its own topic, and the project
+                        // it belongs to can be connected and busy while this worktree is not.
+                        //
+                        // Off before "not connected". A project he switched off at the terminal has
+                        // had its connection dropped, so "not connected" would be true and would
+                        // send him to restart a bridge the hub is going to refuse.
+                        if hub.is_switched_off(&who).await {
+                            escape_html(
+                                "This project is switched off, so nothing was sent. It will not be \
+                                 delivered later. Switch it back on at a terminal with:  herdr-tg \
+                                 enable <its folder>",
+                            )
+                        } else {
+                            escape_html(
+                                "Nothing is connected in this topic right now, so nothing was sent. \
+                                 It will not be delivered later.",
+                            )
+                        }
+                    }
+                    // Never a fall back to the project when a lane's topic is unknown: that would put
+                    // what he typed at one worktree into the turn of an agent working on another.
+                    None => escape_html(
+                        "I do not know which project this topic belongs to, so I have not sent anything.",
+                    ),
+                },
+                _ => escape_html(
+                    "Type inside a project's topic and I will pass it on. Here in General I do not know \
+                 who you mean.",
+                ),
+            };
+            told_the_operator(&ctx, chat_id).await;
+            let mut out = bot
+                .send_message(msg.chat.id, &body)
+                .parse_mode(ParseMode::Html);
+            if let Some(t) = thread {
+                out = out.message_thread_id(ThreadId(MessageId(t)));
+            }
+            what_telegram_said(&ctx, chat_id, out.await).await;
+            return Ok(());
+        }
     };
 
     let body = match cmd {
@@ -591,7 +692,14 @@ pub(crate) async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) 
                 // its own, so it would say "has never connected" directly above a row saying a
                 // worktree of it is connected — a pair that contradicts itself, and the ordinary
                 // row for such a repo rather than an edge case.
-                let where_it_is = if project_is_connected.contains(&p.id) {
+                //
+                // OFF comes first, before liveness. A switched-off project has had its claim
+                // dropped within a second of the switch, so "not connected" would be true and
+                // useless: it reads as a project between sessions and sends him to restart a
+                // bridge that the hub will refuse. Off is his own decision, so the list says so.
+                let where_it_is = if !p.enabled {
+                    "switched off"
+                } else if project_is_connected.contains(&p.id) {
                     "connected"
                 } else if lanes.contains_key(&p.id) {
                     "not connected itself — only its worktrees are"
@@ -767,6 +875,14 @@ mod tests {
             _note: &str,
         ) -> anyhow::Result<()> {
             unreachable!("the project list retires nothing")
+        }
+        async fn mark(
+            &self,
+            _chat_id: i64,
+            _msg_id: &hub_proto::MsgId,
+            _mark: crate::hub::Mark,
+        ) -> Result<(), crate::hub::Refused> {
+            unreachable!("the project list marks nothing")
         }
     }
 
@@ -982,6 +1098,110 @@ mod tests {
                 "a reply into a worktree's topic blames the project: {said}"
             );
         }
+    }
+
+    #[test]
+    fn a_command_aimed_at_this_bot_by_name_is_a_command_not_steering() {
+        // Group habit puts the bot's name after a command, and Telegram's own client inserts it
+        // when the command is picked from a menu. The parser was handed a username this bot has
+        // never had, so every suffixed command failed to parse, fell through to the relay branch,
+        // and `/projects@<the real bot>` was delivered verbatim into a coding agent's turn and
+        // written into the audit as words he meant to send.
+        assert_eq!(
+            what_he_typed("/projects@herd_bot", "herd_bot"),
+            Typed::Command(Command::Projects)
+        );
+        // Usernames are case-insensitive on Telegram, and a phone capitalises things.
+        assert_eq!(
+            what_he_typed("/help@Herd_Bot", "herd_bot"),
+            Typed::Command(Command::Help)
+        );
+        assert_eq!(
+            what_he_typed("/projects", "herd_bot"),
+            Typed::Command(Command::Projects)
+        );
+    }
+
+    #[test]
+    fn a_command_aimed_at_another_bot_is_ignored_rather_than_relayed() {
+        // Telegram hands a group bot every command typed in the group. One aimed at a different
+        // bot by name is neither ours to answer nor his words for an agent, and relaying it would
+        // put `/start@somebody_else_bot` into a coding agent's turn.
+        assert_eq!(
+            what_he_typed("/projects@somebody_else_bot", "herd_bot"),
+            Typed::ForAnotherBot
+        );
+        assert_eq!(
+            what_he_typed("/start@somebody_else_bot", "herd_bot"),
+            Typed::ForAnotherBot
+        );
+    }
+
+    #[test]
+    fn a_line_whose_first_word_carries_an_at_sign_is_his_words_not_another_bots_command() {
+        // The parser splits the FIRST WORD at `@` and checks the name before it has looked for a
+        // slash at all, so an `@mention` of a person, an email address or an ssh remote read as a
+        // command aimed at some other bot — and the fix for `/x@other_bot` then dropped them in
+        // silence: no relay, no reply, nothing written down. That is offer 6 broken by a fix for a
+        // neighbouring row: a line he wrote reaching nobody without a word. A line that does not
+        // open with a slash is never a command, whatever its first word contains.
+        for words in [
+            "@alice can you check the deploy",
+            "me@example.com is the address",
+            "git@github.com:org/repo.git is the remote",
+            // Tapping the bot's own name in a group inserts `@name ` into the composer, and the
+            // words after it were answered "I do not have that command".
+            "@herd_bot hello",
+            "@herd_bot",
+            "hello@herd_bot",
+        ] {
+            assert_eq!(
+                what_he_typed(words, "herd_bot"),
+                Typed::Steering,
+                "{words:?} was not relayed as his words"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slash_word_with_no_bot_named_is_steering_for_the_agent() {
+        // Agents have slash commands of their own, and a bare one typed in a topic is for the
+        // agent in it. Only a command this bot HAS is taken; the rest is his words, untouched.
+        assert_eq!(what_he_typed("/compact", "herd_bot"), Typed::Steering);
+        assert_eq!(
+            what_he_typed("/clear and start over", "herd_bot"),
+            Typed::Steering
+        );
+        assert_eq!(what_he_typed("plain words", "herd_bot"), Typed::Steering);
+    }
+
+    #[test]
+    fn a_command_this_bot_does_not_have_but_was_aimed_at_by_name_is_answered_rather_than_relayed() {
+        // He named this bot, so it is not the agent he was talking to. Relaying `/compact@herd_bot`
+        // into a turn would hand an agent an instruction addressed to somebody else.
+        assert_eq!(
+            what_he_typed("/compact@herd_bot", "herd_bot"),
+            Typed::NotOneOfMine
+        );
+    }
+
+    #[test]
+    fn no_message_can_switch_a_project_off_or_on() {
+        // Admission is terminal-only, and the switch is part of admission: a `/disable` here would
+        // let anyone the allowlist admits — or anyone who got hold of his phone — silence a project,
+        // and a `/enable` would be a way IN that no keyboard was needed for. The command set is
+        // pinned as a closed list, not as an absence of two names, so a third command of any name
+        // has to come past this test.
+        let names: Vec<String> = Command::bot_commands()
+            .into_iter()
+            .map(|c| c.command)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["/projects".to_owned(), "/help".to_owned()],
+            "the command set grew: {names:?}. Switching a project off or on is a decision made at \
+             a keyboard, never from a message."
+        );
     }
 
     #[test]

@@ -493,13 +493,28 @@ export function createRelay(cfg: RelayConfig): Relay {
         const why = stuck
           ? `Another connection has held this conversation across several attempts and is not letting go. If no worker for it is running, a stray process is squatting the claim (${reason}).`
           : `The hub would not take this relay (${reason}).`
-        if (permanent) {
+        if (permanent && link.isUp) {
+          // A refusal on a LIVE link: `not_enabled`, since 5 September, when the project is switched
+          // off at a terminal. The hub says the reason first, then finishes answering for what it
+          // had already read, and only then closes — so the door does the same. Greeted producers
+          // hear the reason NOW and stop promising their agents anything; every ack that still
+          // arrives is relayed; and the close the wire promises is what ends them, with whatever is
+          // then unanswered said to be `unseen` as at any close. Marking the link down here (the
+          // old order, written when a refusal only ever answered a `hello`) ended those sockets
+          // before the reason was written into them, so a tool server saw nothing but a dropped
+          // link, and its agent read "the hub went away" for a project the operator had turned off.
+          // A producer that has not said hello yet is turned away at once, as it would be after.
+          for (const p of producers) {
+            if (p.greeted) p.down.write({ t: 'refused', reason })
+            else refuse(p, reason)
+          }
+        } else if (permanent) {
           // Marked down FIRST. A permanent refusal lets go of every frame the link was holding, and
           // `onLost` answers each with an `ack` saying no — which has to reach a socket that is still
           // open. Ending the producers first (the old order) wrote that "no" into sockets already
           // closing, so the agent kept reading "waiting in line" for a frame nothing would ever
-          // carry. No greeted producer is ended by this: a refusal answers a `hello`, so the link
-          // was down before it dialled, and every greeted producer was already ended then.
+          // carry. No greeted producer is ended by this: the link is down, so every greeted
+          // producer was already ended when it went down.
           link.markDown(true, why)
           for (const p of producers) refuse(p, reason)
         } else {

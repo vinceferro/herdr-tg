@@ -57,6 +57,20 @@ struct FakeTelegram {
     /// Set to make the next topic creation come back the way Telegram answers a bot that has
     /// flooded the chat: refused, with a number of seconds attached.
     create_floods_once: AsyncMutex<Option<Duration>>,
+    /// How long one send takes. Zero everywhere except the test that needs a backlog to still be
+    /// queued behind a send in flight at the moment something happens to the connection.
+    send_takes: AsyncMutex<Duration>,
+    /// Every reaction put on one of HIS messages, in order: which chat, which message, what mark.
+    marks: AsyncMutex<Vec<(i64, MsgId, Mark)>>,
+    /// Set to make every reaction fail the way Telegram refuses one over its own ceiling.
+    mark_fails: AsyncMutex<bool>,
+    /// Set to make every reaction fail the way Telegram refuses one it will never take — a forum
+    /// whose settings allow none, or a bot with no right to react.
+    mark_refused_outright: AsyncMutex<bool>,
+    /// How long the EYES take to land, and only the eyes. A real reaction is an HTTPS round trip;
+    /// making one stage slow and the next instant is how a test forces the two into flight at
+    /// once and sees which order they land in.
+    slow_eyes: AsyncMutex<Duration>,
 }
 
 impl Surface for FakeTelegram {
@@ -108,6 +122,10 @@ impl Surface for FakeTelegram {
                 return SendOutcome::TooFast(wait);
             }
         }
+        let takes = *self.send_takes.lock().await;
+        if !takes.is_zero() {
+            tokio::time::sleep(takes).await;
+        }
         self.sends
             .lock()
             .await
@@ -150,6 +168,33 @@ impl Surface for FakeTelegram {
             .lock()
             .await
             .push((topic_id, msg_id.clone(), format!("{original} || {note}")));
+        Ok(())
+    }
+
+    async fn mark(&self, chat_id: i64, msg_id: &MsgId, mark: Mark) -> Result<(), Refused> {
+        if *self.mark_fails.lock().await {
+            return Err(Refused {
+                why: "Too Many Requests: retry after 35".to_owned(),
+                flood_wait: Some(Duration::from_secs(35)),
+            });
+        }
+        if *self.mark_refused_outright.lock().await {
+            return Err(Refused {
+                why: "Bad Request: REACTION_INVALID".to_owned(),
+                flood_wait: None,
+            });
+        }
+        if mark == Mark::HandedOn {
+            let takes = *self.slow_eyes.lock().await;
+            if !takes.is_zero() {
+                tokio::time::sleep(takes).await;
+            }
+        }
+        // Recorded when it LANDS, after the delay — the order Telegram would apply them in.
+        self.marks
+            .lock()
+            .await
+            .push((chat_id, msg_id.clone(), mark));
         Ok(())
     }
 }
@@ -222,6 +267,10 @@ async fn harness_with(per_minute: u32, pre_pong_hold: Option<(usize, usize)>) ->
             }
         });
     }
+    // The registry watcher, as `serve` spawns it — at a test's cadence rather than the real one, for
+    // the same reason the settling window is shortened: what is under test is that the watch EXISTS
+    // and reaches a live connection, not how many seconds it takes.
+    Arc::clone(&hub).watch_the_registry(Duration::from_millis(50));
 
     Harness {
         hub,
@@ -5370,4 +5419,756 @@ async fn a_bridge_that_goes_away_behind_a_held_frame_lets_go_of_its_conversation
         "the session that came back was refused by the connection it replaced: {:?}",
         came_back.payload
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The off switch. `enabled` was read at `hello` and nowhere else, and nothing could set it.
+
+#[tokio::test]
+async fn a_project_switched_off_at_the_terminal_loses_its_live_connection_now() {
+    // The registry's `enabled` was consulted at `hello` and never again, so a project switched off
+    // while its bridge was connected kept posting, kept being acked `yes`, and kept receiving his
+    // taps and typed words until the bridge happened to hang up. When one of fourteen is loud and
+    // all of them share twenty messages a minute, the switch exists to stop the loud one NOW — and
+    // the only lever there was, a JSON editor, did not reach a live connection at all.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    // The operator, at a terminal, in a process of his own: a second handle on the same file.
+    let repo = h.dir.path().join("herdr-tg");
+    let mut at_the_terminal = Registry::load(h.dir.path().join("projects.json"));
+    at_the_terminal
+        .set_enabled(&repo, false)
+        .expect("switches off");
+
+    // The bridge is told why — with the reason it already knows how to put into words — and then
+    // the socket ends, exactly as if it had dialled a switched-off project fresh.
+    let heard = bridge.drain_for(Duration::from_secs(3)).await;
+    assert!(
+        heard.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::NotEnabled
+            }
+        )),
+        "the bridge was never told its project is off: {heard:?}"
+    );
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    // His words no longer reach it, so he is told nothing was sent rather than believing it was.
+    assert!(
+        !h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "carry on",
+                None
+            )
+            .await,
+        "typed words were handed to a project that is switched off"
+    );
+    // And the sentence he gets back can say WHY, rather than "not connected" — which is true, and
+    // sends him to restart a bridge the hub is going to refuse.
+    assert!(
+        h.hub.is_switched_off(&h.own()).await,
+        "the hub does not know the project is off, so he would be told it is merely not connected"
+    );
+
+    // The only fleet view there is says so, in those words — not "not connected", which is what a
+    // project between sessions says, and which would send him to look for a bridge to restart.
+    let said = crate::bot::digest_of(h.hub.as_ref()).await;
+    assert!(
+        said.contains("switched off"),
+        "the project list does not say the project is switched off:\n{said}"
+    );
+
+    // Dialling again is refused at hello, as it always was.
+    let mut again = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    assert!(
+        matches!(
+            again.next().await.map(|e| e.payload),
+            Some(HubFrame::Refused {
+                reason: RefusedReason::NotEnabled
+            })
+        ),
+        "a switched-off project admitted a fresh bridge"
+    );
+
+    // Switched back on at the terminal, the next dial is admitted: off is a state, not a grave.
+    at_the_terminal
+        .set_enabled(&repo, true)
+        .expect("switches on");
+    let mut back = FakeBridge::connect(&h.sock, &h.secret, "i3", h.project.as_str()).await;
+    assert!(
+        matches!(
+            back.next().await.map(|e| e.payload),
+            Some(HubFrame::Welcome { .. })
+        ),
+        "a project switched back on was still refused"
+    );
+}
+
+#[tokio::test]
+async fn a_switched_off_project_stops_posting_at_once_rather_than_draining_its_backlog() {
+    // Ending the connection is not enough on its own: the frames the hub had already read and
+    // queued for that connection would still be handled, one send at a time, into the topic — a
+    // minute more of exactly the flood the switch was thrown to stop. What was queued is answered
+    // `no`, so the agent is told rather than left believing it was said, and nothing more lands.
+    let h = harness_with_budget(1000).await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+
+    // A backlog that is still queued when the switch is thrown: each send takes long enough that
+    // twenty of them are a few seconds of Telegram, and the switch lands after the first couple.
+    *h.fake.send_takes.lock().await = Duration::from_millis(150);
+    let mut sent_ids = Vec::new();
+    for n in 0..20 {
+        sent_ids.push(
+            bridge
+                .send(BridgeFrame::Say {
+                    text: format!("line {n}"),
+                    hint: None,
+                })
+                .await,
+        );
+    }
+    until(async || h.fake.sends.lock().await.len() >= 3).await;
+
+    let repo = h.dir.path().join("herdr-tg");
+    Registry::load(h.dir.path().join("projects.json"))
+        .set_enabled(&repo, false)
+        .expect("switches off");
+    let thrown_at = std::time::Instant::now();
+
+    // Everything the hub answered before the socket ended. It ends promptly, not after the backlog
+    // has trickled out.
+    let heard = bridge.drain_for(Duration::from_secs(8)).await;
+    let ended_after = thrown_at.elapsed();
+    let landed = h.fake.sends.lock().await.len();
+    assert!(
+        landed <= 1 + 4,
+        "{} of the twenty queued lines were posted into the topic after the project was switched \
+         off; the backlog was drained rather than refused",
+        landed - 1
+    );
+    let refused_no = heard
+        .iter()
+        .filter(|f| {
+            matches!(
+                f,
+                HubFrame::Ack {
+                    delivered: Delivered::No,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        refused_no >= 10,
+        "only {refused_no} of the queued lines were answered `no`; the rest were left with no \
+         answer at all, so the agent goes on believing they were said: {heard:?}"
+    );
+    assert!(
+        heard.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::NotEnabled
+            }
+        )),
+        "the bridge was never told why: {heard:?}"
+    );
+    assert!(
+        ended_after < Duration::from_secs(5),
+        "the connection stayed open {ended_after:?} after the switch was thrown"
+    );
+}
+
+/// The real bridge, told mid-session that its project has been switched off, and the words its
+/// agent then reads. Everything the hub does is real; the bridge is the one that runs in the
+/// operator's sessions, and what its `say` tool returns is the only place the agent learns why
+/// nothing reaches the phone any more.
+#[tokio::test]
+#[ignore = "needs bun on PATH; run it deliberately"]
+async fn a_bridge_told_its_project_is_off_relays_the_reason_in_plain_words_through_the_real_plugin()
+{
+    let h = harness().await;
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+    let repo = h.dir.path().join("herdr-tg");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&plugin)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        .env("CLAUDE_PROJECT_DIR", &repo)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"claude-code\",\"title\":\"Claude Code\",\"version\":\"2.1.250\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+
+    // Live, greeted, connected — the ordinary state the switch is thrown in.
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    // Frames queued behind a slow send when the switch lands: the loud project's ordinary state.
+    // Each is answered `no` with no reason — the closed set has none for the switch — and the
+    // bridge rendered every one as "his phone did not take it", into the agent's turn, while the
+    // refusal itself went to stderr: four false statements about the operator, and the truth only
+    // if the agent happened to call a tool afterwards.
+    *h.fake.send_takes.lock().await = Duration::from_millis(700);
+    for n in 0..6 {
+        stdin
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"tools/call\",\"params\":{{\"name\":\"reply\",\"arguments\":{{\"text\":\"line {n}\"}}}}}}\n",
+                    10 + n
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("reply");
+    }
+    until(async || h.fake.sends.lock().await.len() >= 3).await;
+
+    Registry::load(h.dir.path().join("projects.json"))
+        .set_enabled(&repo, false)
+        .expect("switches off");
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    // Everything the bridge tells the agent in the seconds after the switch.
+    let quiet_for = Duration::from_millis(1500);
+    let mut heard = Vec::new();
+    while let Ok(Ok(Some(line))) = tokio::time::timeout(quiet_for, stdout.next_line()).await {
+        heard.push(line);
+    }
+    let notices: Vec<&String> = heard
+        .iter()
+        .filter(|l| l.contains("notifications/claude/channel"))
+        .collect();
+    assert!(
+        !notices
+            .iter()
+            .any(|l| l.contains("his phone did not take it")),
+        "frames queued at the moment of the switch were blamed on his phone: {notices:#?}"
+    );
+    assert!(
+        notices.iter().any(|l| l.contains("switched off")),
+        "the agent was never told, in its own turn, that the project is switched off: {notices:#?}"
+    );
+    assert!(
+        notices
+            .iter()
+            .filter(|l| l.contains("He never got"))
+            .all(|l| l.contains("switched off")),
+        "a queued frame's fate was explained by something other than the switch: {notices:#?}"
+    );
+    *h.fake.send_takes.lock().await = Duration::ZERO;
+
+    // The agent speaks. What comes back is the whole of what it will ever be told.
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"reply\",\"arguments\":{\"text\":\"still here?\"}}}\n")
+        .await
+        .expect("reply");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut answer = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(2), stdout.next_line()).await {
+            Ok(Ok(Some(line))) => {
+                if line.contains("\"id\":2") {
+                    answer = Some(line);
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let answer = answer.expect("the reply tool never answered the agent");
+    assert!(
+        answer.contains("switched off"),
+        "the agent was not told its project is switched off: {answer}"
+    );
+    assert!(
+        !answer.contains("not_enabled"),
+        "the wire's own word reached the agent instead of a sentence: {answer}"
+    );
+    // And the topic got nothing more from a project that is off: the greeting, what was posted
+    // before the switch, and at most the one line that was already mid-send when it landed.
+    let posted = h.fake.sends.lock().await.len();
+    assert!(
+        posted <= 4,
+        "{} line(s) were posted for a switched-off project after the switch",
+        posted - 3
+    );
+    let _ = child.kill().await;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// What the hub writes down for a process that is not the hub.
+
+#[tokio::test]
+async fn the_hub_writes_down_who_is_connected_for_a_process_that_is_not_the_hub() {
+    // `projects --json` runs at a terminal, in its own process, and `connected` has to come from
+    // the live claims map — which only this process holds. The snapshot follows the map on every
+    // arrival and every departure, over a real socket, and names this hub as its writer so a
+    // reader can tell it from what a dead hub left behind.
+    let h = harness().await;
+    let presence = crate::presence::Presence::new(h.dir.path().join(crate::presence::FILE));
+    let before = presence.read().expect("written at construction, empty");
+    assert!(before.connected.is_empty(), "{before:?}");
+    assert_eq!(before.hub_pid, std::process::id());
+
+    let mut own = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    own.become_live().await;
+    let mut a =
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)).await;
+    a.become_live().await;
+    until(async || h.hub.connected_ids().await.len() == 2).await;
+
+    let live: Vec<Addr> = presence
+        .read()
+        .expect("readable")
+        .connected
+        .iter()
+        .map(|c| c.addr())
+        .collect();
+    assert_eq!(
+        live,
+        vec![h.own(), h.lane(LANE_A)],
+        "the snapshot does not match the claims map"
+    );
+
+    drop(a);
+    until(async || !h.hub.is_claimed(&h.lane(LANE_A)).await).await;
+    let live: Vec<Addr> = presence
+        .read()
+        .expect("readable")
+        .connected
+        .iter()
+        .map(|c| c.addr())
+        .collect();
+    assert_eq!(
+        live,
+        vec![h.own()],
+        "a bridge that went away is still written down as connected"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Reactions as delivery receipts: a mark on HIS message, where he typed it, for each stage the hub
+// already knows. Measured free against the send ceiling (`docs/RATE-PROBE.md` §3).
+
+#[tokio::test]
+async fn his_message_gets_eyes_when_handed_on_and_a_tick_when_the_agent_has_it() {
+    // "A double checkmark was message delivered successfully and an ack reaction as the eyes" —
+    // the previous bot did this and it is what made it nice to work with. The hub already knows
+    // both moments: the frame going down, and the bridge's ack coming back. A reaction says so on
+    // his own line, spends no send, and adds nothing to the topic.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let sends_before = h.fake.sends.lock().await.len();
+
+    let went_down_as = his_words_reach(&h, &mut bridge, "try the staging one first").await;
+    {
+        let marks = h.fake.marks.lock().await;
+        assert_eq!(
+            marks.as_slice(),
+            &[(ALLOWED_CHAT, MsgId::new("m9"), Mark::HandedOn)],
+            "his message did not get the eyes when the hub handed it on: {marks:?}"
+        );
+    }
+
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: went_down_as,
+            status: AckStatus::Accepted,
+            reason: None,
+        })
+        .await;
+    until(async || h.fake.marks.lock().await.len() == 2).await;
+    {
+        let marks = h.fake.marks.lock().await;
+        assert_eq!(
+            marks.last(),
+            Some(&(ALLOWED_CHAT, MsgId::new("m9"), Mark::Accepted)),
+            "the tick never replaced the eyes once the agent had his words: {marks:?}"
+        );
+        // One mark per stage on the same message — the surface replaces, and the hub never asks
+        // for the same stage twice.
+        assert_eq!(marks.len(), 2, "{marks:?}");
+    }
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        sends_before,
+        "an accepted line grew a message in the topic; the reaction is the whole receipt"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_message_gets_a_cross_and_still_gets_the_line_that_says_why() {
+    // A reaction carries no reason, so the cross is in ADDITION to the line under his message —
+    // never instead of it. He glances at the mark; he reads the line to learn what to do.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let sends_before = h.fake.sends.lock().await.len();
+
+    let went_down_as = his_words_reach(&h, &mut bridge, "use the other branch").await;
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: went_down_as,
+            status: AckStatus::Refused,
+            reason: Some("the worker has no session open".into()),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() > sends_before).await;
+    until(async || h.fake.marks.lock().await.len() == 2).await;
+
+    let marks = h.fake.marks.lock().await;
+    assert_eq!(
+        marks.last(),
+        Some(&(ALLOWED_CHAT, MsgId::new("m9"), Mark::Refused)),
+        "a refused line did not get the cross: {marks:?}"
+    );
+    drop(marks);
+    let replies = h.fake.replies.lock().await;
+    let (_, said, under) = replies.last().expect("the line that says why");
+    assert_eq!(under.as_str(), "m9", "the line is not under his message");
+    assert!(
+        said.contains("no session open") && said.contains("will not be delivered later"),
+        "the cross replaced the line instead of joining it: {said}"
+    );
+}
+
+#[tokio::test]
+async fn a_message_that_reached_nobody_gets_no_mark_at_all() {
+    // The eyes mean "the hub handed it on". Nothing was handed on here — he is told so in words,
+    // by the line `bot.rs` posts — and a mark on it would be a receipt for a delivery that never
+    // happened.
+    let h = harness().await;
+    assert!(
+        !h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "anyone?",
+                None
+            )
+            .await
+    );
+    // The mark lands from a spawned task, so an assertion made the instant `relay` returns sees an
+    // empty set whether or not a mark was wrongly queued. Wait long enough for a wrong one to land,
+    // or this test cannot fail on the property it is named for — it passed with the guard
+    // removed, three runs out of three.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(
+        h.fake.marks.lock().await.is_empty(),
+        "a message nobody received was marked as handed on"
+    );
+}
+
+#[tokio::test]
+async fn a_reaction_spends_from_the_budget_only_if_the_measurement_says_it_must() {
+    // Measured 5 September (`docs/RATE-PROBE.md` §3): twenty reactions and a send still went
+    // through, so a reaction is not charged against the send ceiling and must not be accounted as
+    // one — a mark that took a token off an agent for free decoration would be the one thing worse
+    // than no mark. The same measurement found a ceiling of the reactions' OWN, twenty in a
+    // trailing minute, the twenty-first refused for the rest of it; so they are accounted apart,
+    // and past that ceiling the hub stops asking rather than walking into a minute of refusals.
+    // And a reaction Telegram refuses anyway is a mark that does not appear, nothing more: it must
+    // never shut the chat for sends, which the measurement showed it does not.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // Telegram refusing a reaction is not Telegram shutting the chat. First, so that the surface
+    // is actually reached: the eyes and the thumb both go out and both come back refused.
+    *h.fake.mark_fails.lock().await = true;
+    let id = his_words_reach(&h, &mut bridge, "one over").await;
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: id,
+            status: AckStatus::Accepted,
+            reason: None,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    *h.fake.mark_fails.lock().await = false;
+
+    // Then far more marks than a minute has reactions in it: each line costs two.
+    for n in 0..crate::queue::REACTIONS_PER_MINUTE {
+        let id = his_words_reach(&h, &mut bridge, &format!("line {n}")).await;
+        bridge
+            .send(BridgeFrame::Ack {
+                r#ref: id,
+                status: AckStatus::Accepted,
+                reason: None,
+            })
+            .await;
+    }
+    // Every ack handled — each takes its line off the hub's record of words awaiting an answer —
+    // and so every mark that was going to be asked for has been. Not a fence frame: that would be
+    // a send, and this test is about what the sends have left.
+    until(async || h.hub.words_awaiting_an_answer().await == 0).await;
+
+    let landed = h.fake.marks.lock().await.len() as u32;
+    // The two refused ones count: an attempt is what Telegram counts, whether or not it took it.
+    assert_eq!(
+        landed + 2,
+        crate::queue::REACTIONS_PER_MINUTE,
+        "the hub asked for {} reactions inside one minute; the measured ceiling is {}, and past \
+         it every call is a refusal",
+        landed + 2,
+        crate::queue::REACTIONS_PER_MINUTE
+    );
+    // Thirty-eight marks asked for, two of them refused by Telegram, and the send budget has not
+    // moved: not at its ceiling, and not shut by a refused reaction fed in as a flood wait.
+    assert!(
+        !h.hub.the_chat_is_shut_for_sends(ALLOWED_CHAT).await,
+        "marking his messages spent the chat's send budget, which the measurement says it must not"
+    );
+}
+
+#[tokio::test]
+async fn the_thumb_never_loses_to_the_eyes_when_the_agent_answers_at_once() {
+    // The ordinary case, not a corner: attach's tool server acks a `message` within a millisecond
+    // of reading it — it writes the channel notification and answers — while the eyes are an
+    // HTTPS call of a hundred and fifty milliseconds. Two reactions in flight on one message land
+    // in whichever order Telegram takes them, and the eyes landing last leave him looking at
+    // "handed on" for a line the agent already has, for good: nothing ever marks it again.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    *h.fake.slow_eyes.lock().await = Duration::from_millis(150);
+
+    // A bridge that answers every message the instant it reads it, like the real one.
+    tokio::spawn(async move {
+        loop {
+            let Some(env) = bridge.next().await else {
+                break;
+            };
+            match env.payload {
+                HubFrame::Message { .. } => {
+                    bridge
+                        .send(BridgeFrame::Ack {
+                            r#ref: env.id,
+                            status: AckStatus::Accepted,
+                            reason: None,
+                        })
+                        .await;
+                }
+                HubFrame::Ping => {
+                    bridge.send(BridgeFrame::Pong { r#ref: env.id }).await;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "go ahead",
+                None
+            )
+            .await
+    );
+    until(async || h.fake.marks.lock().await.len() >= 2).await;
+    let marks: Vec<Mark> = h.fake.marks.lock().await.iter().map(|m| m.2).collect();
+    assert_eq!(
+        marks,
+        vec![Mark::HandedOn, Mark::Accepted],
+        "the marks landed out of order, so the eyes stand on a line the agent already has"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The switch under a backlog, and the eyes off the update handler's path.
+
+#[tokio::test]
+async fn the_switch_reaches_a_bridge_whose_backlog_has_filled_the_hubs_queue_at_once() {
+    // The kick was listened for only between frames. The loud bridge — the one the switch exists
+    // for — fills the handler's queue past the sixty-four it holds once its minute is spent, and
+    // the read loop is then parked on that queue for as long as the pacer holds the frame at its
+    // head: measured at fifty-seven seconds, with the claim still held, his words still handed
+    // to it, and one more line posted after the switch was thrown. The backlog here is deeper
+    // than the queue at the REAL budget, so the loop is parked when the switch lands; the frame
+    // the pacer is holding has spent nothing and is refused with the rest.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || h.fake.sends.lock().await.len() == 1).await;
+
+    for n in 0..90 {
+        bridge
+            .send(BridgeFrame::Say {
+                text: format!("line {n}"),
+                hint: None,
+            })
+            .await;
+    }
+    // The minute is spent, the handler is inside a frame waiting for it to roll, and everything
+    // behind that frame is queued or unread.
+    until(async || h.fake.sends.lock().await.len() >= 10).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let landed_before = h.fake.sends.lock().await.len();
+
+    let repo = h.dir.path().join("herdr-tg");
+    Registry::load(h.dir.path().join("projects.json"))
+        .set_enabled(&repo, false)
+        .expect("switches off");
+    let thrown_at = std::time::Instant::now();
+
+    let heard = bridge.drain_for(Duration::from_secs(6)).await;
+    let ended_after = thrown_at.elapsed();
+    assert!(
+        heard.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::NotEnabled
+            }
+        )),
+        "the switch waited behind the backlog: nothing was heard in {ended_after:?}, and the \
+         bridge is {} holding its claim: {heard:?}",
+        if h.hub.is_claimed(&h.own()).await {
+            "still"
+        } else {
+            "no longer"
+        }
+    );
+    assert!(
+        !h.hub.is_claimed(&h.own()).await,
+        "the claim is still held after the switch was thrown"
+    );
+    assert!(
+        ended_after < Duration::from_secs(5),
+        "the connection stayed open {ended_after:?} after the switch was thrown"
+    );
+    let landed = h.fake.sends.lock().await.len();
+    assert_eq!(
+        landed,
+        landed_before,
+        "{} line(s) were posted into the topic after the project was switched off",
+        landed - landed_before
+    );
+    let refused_no = heard
+        .iter()
+        .filter(|f| {
+            matches!(
+                f,
+                HubFrame::Ack {
+                    delivered: Delivered::No,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(
+        refused_no >= 64,
+        "only {refused_no} of the queued lines were answered `no`: {heard:?}"
+    );
+}
+
+#[tokio::test]
+async fn his_words_go_down_before_the_eyes_land_so_a_slow_telegram_holds_nothing_up() {
+    // The eyes were awaited inside `relay`, holding the hub-wide mark permit: every update in the
+    // forum — his next line, a tap on a button — waited behind one HTTPS round trip, seventeen
+    // seconds of it when Telegram stalls, and every other bridge's ack handler waited on the
+    // permit with it. Before the receipts a successful relay made no Telegram call at all, and it
+    // must not start waiting on one now: the frame goes down, `relay` returns, and the eyes land
+    // in their own time — still ahead of the thumb, because the permit travels with them.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    *h.fake.slow_eyes.lock().await = Duration::from_millis(600);
+
+    let started = std::time::Instant::now();
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                7,
+                &MsgId::new("m9"),
+                "go ahead",
+                None
+            )
+            .await
+    );
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_millis(300),
+        "relay held the update handler {took:?} waiting for the eyes to land"
+    );
+    until(async || !h.fake.marks.lock().await.is_empty()).await;
+    assert_eq!(
+        h.fake.marks.lock().await.last().map(|m| m.2),
+        Some(Mark::HandedOn),
+        "the eyes never landed"
+    );
+}
+
+#[tokio::test]
+async fn a_reaction_refused_for_a_reason_that_is_not_the_ceiling_is_said_in_the_journal_and_a_full_minute_is_not()
+ {
+    // Every refused reaction was logged at debug, one level under what the unit's journal shows —
+    // the level chosen for the expected `429`, which then swallowed the unexpected `400` with it.
+    // A forum whose settings allow no reactions, or none of these three, or a bot with no right
+    // to react, is the whole receipt silently absent with nothing anywhere saying so. The one
+    // measurement §3 admits is missing — a reaction on a message HE sent — is exactly the first
+    // production use, so its failure must be visible. Said once: the cause does not change
+    // between lines.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // The ceiling: expected, and not worth a line the operator reads.
+    *h.fake.mark_fails.lock().await = true;
+    his_words_reach(&h, &mut bridge, "over the ceiling").await;
+    until(async || h.hub.words_awaiting_an_answer().await == 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !h.hub.a_reaction_refusal_was_said(),
+        "a reaction refused for the ceiling was reported as Telegram refusing reactions"
+    );
+    *h.fake.mark_fails.lock().await = false;
+
+    // Anything else: said, so the journal explains the marks that never appear.
+    *h.fake.mark_refused_outright.lock().await = true;
+    his_words_reach(&h, &mut bridge, "never taken").await;
+    until(async || h.hub.a_reaction_refusal_was_said()).await;
 }

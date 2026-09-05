@@ -40,6 +40,7 @@ mod config;
 mod heartbeat;
 mod hub;
 mod lock;
+mod presence;
 mod queue;
 mod registry;
 mod render;
@@ -183,7 +184,36 @@ enum Cmd {
     },
 
     /// Every enrolled project, and whether it has a topic yet.
-    Projects,
+    ///
+    /// `--json` is the read-only inventory another org's dispatcher reads topic ids from: one
+    /// object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes,
+    /// connected_lanes}`, in that order, sorted by title. `topic_id` is `null` until a bridge has
+    /// been live once; `connected` is the project's own voice and `connected_lanes` its addresses
+    /// live now, both `null` whenever no running hub can vouch for the answer — unknown is said
+    /// as unknown. A registry that cannot be read is refused, never printed as empty. No chat id,
+    /// no path but the repo's.
+    Projects {
+        /// Emit the inventory as JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Switch an enrolled project off: its bridge is turned away, and one already connected is
+    /// dropped. Its topic and its history stay.
+    ///
+    /// Terminal-only, like enrolment: no message and no frame can do this. When one project of
+    /// fourteen is loud and all of them share one chat's twenty messages a minute, this is the
+    /// lever — and it stops a live bridge, not only the next one.
+    Disable {
+        /// The project's own directory, as it was enrolled.
+        repo: PathBuf,
+    },
+
+    /// Switch a project back on. Its bridge is admitted the next time it dials.
+    Enable {
+        /// The project's own directory, as it was enrolled.
+        repo: PathBuf,
+    },
 
     Serve {
         /// Structure only — workspace, allowlist, socket. Never the token.
@@ -246,7 +276,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             repo,
             even_if_git_would_commit_it,
         } => cmd::enroll::enrol(&repo, even_if_git_would_commit_it),
-        Cmd::Projects => cmd::enroll::projects(),
+        Cmd::Projects { json } => cmd::projects::projects(json),
+        Cmd::Disable { repo } => cmd::enroll::switch(&repo, false),
+        Cmd::Enable { repo } => cmd::enroll::switch(&repo, true),
         Cmd::Serve { config } => {
             // FIRST, before the config is even read, and long before a `Bot` exists.
             //

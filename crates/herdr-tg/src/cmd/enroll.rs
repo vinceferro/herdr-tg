@@ -1,9 +1,10 @@
-//! `herdr-tg enroll <repo>` and `herdr-tg projects` — the terminal-only door.
+//! `herdr-tg enroll <repo>`, `disable <repo>` and `enable <repo>` — the terminal-only door.
 //!
 //! Admission is the one thing no message can do. Nothing arriving over Telegram or over the hub's
-//! socket can add a project, mint a secret, or switch one on: inbound content selects from what the
-//! machine already knows, and it never names something new. That boundary is only real if the way
-//! in is argv, at a keyboard, which is what this file is.
+//! socket can add a project, mint a secret, or switch one on or off: inbound content selects from
+//! what the machine already knows, and it never names something new. That boundary is only real
+//! if the way in is argv, at a keyboard, which is what this file is. The listing that reads what
+//! this file wrote is `projects.rs`.
 
 use std::io::IsTerminal;
 use std::path::Path;
@@ -92,49 +93,46 @@ fn enrol_into(
     Ok(())
 }
 
-/// Every enrolled project, for a human at the keyboard.
-pub(crate) fn projects() -> anyhow::Result<()> {
-    let registry = Registry::load(Registry::default_path());
-    let mut any = false;
-    for p in registry.all() {
-        any = true;
-        let state = if p.enabled { "" } else { "  (switched off)" };
-        // The middle column is 34 wide because "no topic of its own yet, 12 worktrees" is 37 at its
-        // longest realistic value and a column that overruns takes the repo paths out of line.
+/// `herdr-tg disable <repo>` and `herdr-tg enable <repo>`: the switch, at the keyboard.
+///
+/// Off is written into the registry, which the running hub watches — so a bridge already on the
+/// socket loses its claim within about a second and is told why, and the next one to dial is
+/// turned away at `hello`. What it had queued is answered `no` unsent; only a message it was
+/// already in the middle of sending is finished, because a Telegram call cancelled mid-flight is
+/// a message that lands with an answer saying it did not.
+/// Nothing about the project is forgotten: its secret, its topic and its history all stay, and
+/// `enable` is the whole of the way back.
+pub(crate) fn switch(repo: &Path, on: bool) -> anyhow::Result<()> {
+    let project = switch_in(&Registry::default_path(), repo, on)?;
+    if on {
+        println!("switched on    {}", project.title);
         println!(
-            "{:<24} {:<34} {}{}",
-            p.title,
-            where_it_talks(p),
-            p.repo.display(),
-            state
+            "               Its bridge is admitted the next time it dials. One that was turned \
+             away tries again on its own, within a minute."
         );
-    }
-    if !any {
-        println!("Nothing is enrolled yet. Add a project with:  herdr-tg enroll <repo>");
+    } else {
+        println!("switched off   {}", project.title);
+        println!(
+            "               Its bridge is turned away from now on, and one already connected is \
+             dropped now — a message it was in the middle of sending may still land. Its topic \
+             and its history stay."
+        );
+        println!(
+            "               Switch it back on with:  herdr-tg enable {}",
+            project.repo.display()
+        );
     }
     Ok(())
 }
 
-/// Which topics a project has, for the terminal listing.
-///
-/// The worktree count is here because this is the only VISIBLE sign a lane ever ran: a worktree's
-/// topic outlives the worktree by design, and nothing else on the box names how many a project has
-/// collected. Not a size warning — the file itself is cheap, and the measured numbers are on
-/// `Project::lane_topics`.
-fn where_it_talks(p: &crate::registry::Project) -> String {
-    let topic = match p.topic_id {
-        Some(id) => format!("topic {id}"),
-        // Three states, not two. A repo whose sessions are all dispatched into worktrees never
-        // binds a topic of its own, so "not connected yet" beside a worktree count is a row that
-        // contradicts itself — and it is that repo's ORDINARY row, not an edge case.
-        None if p.lane_topics.is_empty() => "not connected yet".to_owned(),
-        None => "no topic of its own yet".to_owned(),
-    };
-    match p.lane_topics.len() {
-        0 => topic,
-        1 => format!("{topic}, 1 worktree"),
-        n => format!("{topic}, {n} worktrees"),
-    }
+/// The same, against a named registry, so it can be tested without touching the operator's own.
+fn switch_in(
+    registry_path: &Path,
+    repo: &Path,
+    on: bool,
+) -> anyhow::Result<crate::registry::Project> {
+    let mut registry = Registry::load(registry_path);
+    Ok(registry.set_enabled(repo, on)?)
 }
 
 /// What git says about whether this project's own secret would be committed.
@@ -303,66 +301,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_terminal_listing_says_how_many_worktrees_a_project_has_collected() {
-        // Every lane that ever went live keeps its topic for good, and the count lives in the file
-        // the hub re-reads on every admission. This is the only view where that is visible at all,
-        // and "twelve a day, never deleted" is a number the operator agreed to without ever being
-        // shown it.
+    fn the_switch_at_the_terminal_is_written_where_the_hub_reads_it_and_the_listing_says_so() {
+        // The switch is a registry write and nothing else, on purpose: the hub re-reads that file
+        // on every admission and watches it for a live connection to drop, so a write here is the
+        // whole of what "off" has to be. And the terminal listing has said "(switched off)" since
+        // before anything could set the flag — it is worth one assertion that it still does.
         let d = tempfile::tempdir().expect("tmp");
-        let mut r = crate::registry::Registry::load(d.path().join("projects.json"));
-        let dir = d.path().join("herdr-tg");
+        let registry = d.path().join("projects.json");
+        let dir = d.path().join("loud-one");
         std::fs::create_dir_all(&dir).expect("dir");
-        let (p, _) = r.enrol(&dir).expect("enrols");
-        let addr = crate::hub::Addr::project_itself(p.id.clone());
-        r.bind_topic(&addr, 1001).expect("binds");
+        crate::registry::Registry::load(&registry)
+            .enrol(&dir)
+            .expect("enrols");
 
-        let said =
-            |r: &crate::registry::Registry| where_it_talks(r.get(&p.id).expect("the project"));
-        assert_eq!(said(&r), "topic 1001", "{}", said(&r));
-
-        r.bind_topic(
-            &crate::hub::Addr::lane_of(p.id.clone(), hub_proto::LaneId::new("lane-0902-201212-1")),
-            1002,
-        )
-        .expect("binds");
-        assert_eq!(said(&r), "topic 1001, 1 worktree", "{}", said(&r));
-
-        r.bind_topic(
-            &crate::hub::Addr::lane_of(p.id.clone(), hub_proto::LaneId::new("lane-0902-204418-2")),
-            1003,
-        )
-        .expect("binds");
-        assert_eq!(said(&r), "topic 1001, 2 worktrees", "{}", said(&r));
-
-        for jargon in ["lane_topics", "Some", "None", "BTreeMap"] {
-            assert!(
-                !said(&r).contains(jargon),
-                "jargon in the listing: {}",
-                said(&r)
-            );
-        }
-    }
-
-    #[test]
-    fn a_project_reached_only_through_its_worktrees_is_not_listed_as_never_connected() {
-        // A repo whose sessions are all dispatched into worktrees never binds a topic of its own,
-        // so `topic_id` stays empty for ever. "not connected yet" beside a worktree count is a row
-        // that contradicts itself, and it is the ORDINARY row for such a repo, not an edge case.
-        let d = tempfile::tempdir().expect("tmp");
-        let mut r = crate::registry::Registry::load(d.path().join("projects.json"));
-        let dir = d.path().join("oc-dogfood");
-        std::fs::create_dir_all(&dir).expect("dir");
-        let (p, _) = r.enrol(&dir).expect("enrols");
-        r.bind_topic(
-            &crate::hub::Addr::lane_of(p.id.clone(), hub_proto::LaneId::new("lane-0902-231907-1")),
-            1002,
-        )
-        .expect("binds");
-
-        let said = where_it_talks(r.get(&p.id).expect("the project"));
+        let off = switch_in(&registry, &dir, false).expect("switches off");
+        assert!(!off.enabled);
+        let on_disk = crate::registry::Registry::load(&registry);
         assert!(
-            !said.contains("not connected yet"),
-            "a project with a worktree topic is listed as one that has never connected: {said}"
+            !on_disk.get(&off.id).expect("still enrolled").enabled,
+            "the switch was not written where the hub reads it"
+        );
+
+        let on = switch_in(&registry, &dir, true).expect("switches on");
+        assert!(on.enabled);
+        assert!(
+            crate::registry::Registry::load(&registry)
+                .get(&on.id)
+                .expect("still enrolled")
+                .enabled
+        );
+
+        // A path nobody enrolled is a refusal in plain words, never an enrolment.
+        let said = switch_in(&registry, &d.path().join("nobody"), true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert_eq!(
+            crate::registry::Registry::load(&registry).all().count(),
+            1,
+            "a switch enrolled something"
         );
     }
 

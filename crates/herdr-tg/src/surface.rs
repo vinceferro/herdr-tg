@@ -20,11 +20,11 @@
 use hub_proto::{AskOption, MsgId};
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReplyParameters, Rgb,
-    ThreadId,
+    InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReactionType,
+    ReplyParameters, Rgb, ThreadId,
 };
 
-use crate::hub::{Refused, SendOutcome, Surface};
+use crate::hub::{Mark, Refused, SendOutcome, Surface};
 use crate::render::escape_html;
 
 /// The six colours Telegram permits for a topic icon, in the order the design's `hash % 6` indexes.
@@ -311,6 +311,51 @@ impl Surface for Telegram {
         );
         Ok(())
     }
+
+    async fn mark(&self, chat_id: i64, msg_id: &MsgId, mark: Mark) -> Result<(), Refused> {
+        let Ok(raw) = msg_id.as_str().parse::<i32>() else {
+            return Err(Refused {
+                why: "that message id is not one Telegram gave".to_owned(),
+                flood_wait: None,
+            });
+        };
+        // The whole list is SET, not added to — that is what the API call does — and the list is
+        // exactly one long, so the eyes come off when the tick goes on. A reaction on his message
+        // lands in whichever topic he typed it in; the message id is the address, and no thread
+        // id is needed or taken.
+        //
+        // The seconds come out as a VALUE, as they do for a topic: the hub says nothing about a
+        // reaction refused for the ceiling and warns once about one refused for anything else,
+        // and it can only tell the two apart if this side does.
+        self.bot
+            .set_message_reaction(ChatId(chat_id), MessageId(raw))
+            .reaction(reaction_for(mark))
+            .await
+            .map_err(|e| Refused {
+                why: e.to_string(),
+                flood_wait: flood_wait(&e),
+            })?;
+        Ok(())
+    }
+}
+
+/// The one reaction a stage is shown as.
+///
+/// `✅` and `❌` — what the operator asked for — do not exist as a bot's free reactions: the API
+/// refuses them as `REACTION_INVALID` (`docs/RATE-PROBE.md` §3). The eyes are on the list; the
+/// thumbs are the nearest honest pair for "the agent has it" and "it did not reach the agent",
+/// and the cross's job of saying WHY is done by the line under his message, not by the mark.
+///
+/// Exactly one element, always. Two would stack, and a bot may set one reaction per message.
+fn reaction_for(mark: Mark) -> Vec<ReactionType> {
+    let emoji = match mark {
+        Mark::HandedOn => "👀",
+        Mark::Accepted => "👍",
+        Mark::Refused => "👎",
+    };
+    vec![ReactionType::Emoji {
+        emoji: emoji.to_owned(),
+    }]
 }
 
 #[cfg(test)]
@@ -351,6 +396,32 @@ mod tests {
         );
         assert!(body.contains("&lt;dir&gt;"), "{body}");
         assert!(body.contains("&amp;"), "{body}");
+    }
+
+    #[test]
+    fn a_reaction_replaces_the_last_one_rather_than_stacking() {
+        // `setMessageReaction` SETS the message's whole list of reactions. One element means the
+        // eyes come off when the thumb goes on; two would be a stack, and a bot may only set one.
+        // And every one of them is an emoji Telegram accepts from a bot — `✅` and `❌` are not,
+        // measured (`docs/RATE-PROBE.md` §3), which is why the tick is a thumb.
+        for mark in [Mark::HandedOn, Mark::Accepted, Mark::Refused] {
+            let list = reaction_for(mark);
+            assert_eq!(list.len(), 1, "{mark:?} would stack: {list:?}");
+            let emoji = list[0]
+                .emoji()
+                .expect("an emoji reaction, never a custom one");
+            assert!(
+                ["👀", "👍", "👎"].contains(&emoji.as_str()),
+                "{mark:?} uses {emoji}, which the API refused for a bot"
+            );
+        }
+        // Three stages, three different marks: a stage he cannot tell from the last is no stage.
+        let all: std::collections::BTreeSet<String> =
+            [Mark::HandedOn, Mark::Accepted, Mark::Refused]
+                .into_iter()
+                .map(|m| reaction_for(m)[0].emoji().cloned().unwrap_or_default())
+                .collect();
+        assert_eq!(all.len(), 3);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 
 pub(crate) mod doctor;
 pub(crate) mod enroll;
+pub(crate) mod projects;
 pub(crate) mod read;
 pub(crate) mod status;
 pub(crate) mod watch;

@@ -1,4 +1,18 @@
-<!-- SURFACE, v5, 5 September 2026. v5 is v3 and v4 attacked: the pre-pong hold is 65 frames
+<!-- SURFACE, v7, 5 September 2026. v7 is v6 attacked. Offer 8 gains an eighth field,
+     `connected_lanes`: `connected` is the project's OWN voice, and a project whose sessions are all
+     dispatched into worktrees never has one — so it read `false` while its agent was live, and the
+     document had no field that could carry the difference. The switch's bound is said honestly:
+     the claim drops within a second and everything queued is refused unsent, but a message already
+     mid-send is finished before the close. And §6 of `docs/ATTACHING.md` now gives the live
+     refusal's real order — `refused` first, then the `no` acks, then the close.
+     v6 builds offer 8: `herdr-tg projects --json` ships, with
+     `connected` read from the running hub's own record of its claims and `null` when no running
+     hub can vouch for it. Two more things in the same day, neither a new offer: a project can be
+     switched off at the terminal (`herdr-tg disable <repo>`) and a LIVE connection is then
+     refused `not_enabled` and closed, not only the next one; and the operator's own typed line
+     carries a reaction for the stage it has reached — measured free against the send ceiling in
+     docs/RATE-PROBE.md §3 — beside the line offer 6 already posts for a refusal.
+     v5 is v3 and v4 attacked: the pre-pong hold is 65 frames
      (the queue plus the one frame an adapter puts back on close), the hub sets
      `in_reply_to_ask` from the message he replied to, the refusal line is threaded under the
      line it refuses, and an engine that cannot read typed words refuses them on the wire.
@@ -66,13 +80,18 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | 5 | **Retirement.** Buttons come off a question that has stopped being open, whoever closed it — which no screen-reading design can do. | `ask_resolved{how}`. |
 | 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
 | 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
-| 8 | **Read-only inventory.** *Proposed, not built* — `herdr-tg projects --json` emitting `{project_id, title, repo, topic_id, connected, lanes:{name:topic_id}}`, honest about `null` before a bridge has ever connected. Say the word and it is a small slice. | Ask for it. |
+| 8 | **Read-only inventory.** `herdr-tg projects --json`: one object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes:{address:topic_id}, connected_lanes:[address]}`, in that order, sorted by title. `topic_id` is `null` before a bridge has ever been live. `connected` is whether the project's OWN voice has a bridge on the socket now — a project reached only through its worktrees never does, and `connected_lanes` is which of its addresses are live. Both come from the running hub's own record of its claims and are `null` whenever no running hub can vouch for them — unknown said as unknown, never a `false` nobody could prove. A registry that is there and cannot be read is refused, never reported as empty. No chat id, no path but the repo's. | Run it at the keyboard; `docs/ATTACHING.md` §7 offer 8 has the shape. |
 
 ## REQUIRES — what you must bring
 
 1. **Enrolment, at a terminal, per repo.** Admission is the one thing no message can do. `herdr-tg
    enroll <repo>` writes a 0600 secret to `<repo>/.kickoff/hub.token`. It refuses outright if git
-   would commit that file, because a secret in a public history cannot be untracked.
+   would commit that file, because a secret in a public history cannot be untracked. The switch is
+   part of admission: `herdr-tg disable <repo>` turns a project off — a connected bridge loses its
+   claim within a second and is refused `not_enabled`, everything it had queued is answered `no`
+   unsent, and the connection closes once the one message it may have been in the middle of
+   sending is finished; the next to dial is refused at `hello` — and `enable` is the only way
+   back. Re-enrolling keeps the switch where it was.
 2. **An address that is unique within its project.** See above. We will not de-duplicate for you.
 3. **A bridge that speaks hub-proto** — NDJSON over `AF_UNIX`, nine frames up, six down — and that
    answers a ping. A topic is minted only after `hello`, a settling window and one answered ping,
