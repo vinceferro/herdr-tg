@@ -48,6 +48,7 @@ mod registry;
 mod render;
 mod summarize;
 mod surface;
+mod transport;
 
 use std::io::{IsTerminal, Write};
 use std::num::NonZeroU32;

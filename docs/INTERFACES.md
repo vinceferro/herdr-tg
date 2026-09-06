@@ -12,7 +12,8 @@ document is naming the other three before anything is written against them.
     ┌─────┴──────┐
     │  the hub   │  identity · presence · delivery · resolution · alarm
     └─────┬──────┘
-          │  ① hub-proto over a Unix socket        ← BUILT
+          │  ① hub-proto — the frames             ← BUILT
+          │     over a transport: AF_UNIX, admitted on the peer's uid
     ┌─────┴──────┐
     │  adapter   │  one per engine
     └─────┬──────┘
@@ -39,8 +40,38 @@ second implementation.
 
 ## Seam ① — hub ↔ adapter. BUILT.
 
-`crates/hub-proto`. NDJSON over `AF_UNIX`, nine frames up, six down. Zero mentions of herdr,
+`crates/hub-proto`. NDJSON, nine frames up, six down, over `AF_UNIX`. Zero mentions of herdr,
 kickoff, claude, tmux or panes in `hub.rs`.
+
+### The transport is a seam inside seam ①, not a fifth seam
+
+Two things were being read as one. **The frames** say what a conversation is: say, ask, resolve, end,
+ack. **The transport** says who may open a connection at all, what the hub can prove about whoever
+did, and — because bytes cross by mount and never on the wire — which offers that connection can
+have. Naming the difference is what lets the next question be answered without reopening the first:
+a bridge somewhere else changes the transport and not one frame.
+
+There is one transport today and it is local: `AF_UNIX` at `/run/user/<uid>/kickoff/hub.sock`, a
+`0700` directory and a `0600` socket, admitted on the **peer's uid** taken off the socket by the
+kernel **and** the secret in `hello`, both. What the transport supplies beyond that is a pid, which
+is the fence for a bridge that dies without a `bye` (`/proc/<pid>`), and a shared filesystem, which
+is the whole of files — a path is worth nothing to a peer that cannot open it, so a connection that
+does not share the hub's filesystem is offered no outbox. `docs/CAPABILITIES.md` REQUIRES 3 is the
+sentence another org builds against; offer 9 is where files belong to the transport rather than to
+the wire.
+
+Numbering stays at four seams, deliberately: `docs/ATTACHING.md` §11 and `docs/CAPABILITIES.md`
+OPEN 1 both cite these numbers, and a transport is not a fourth party meeting the other three — it is
+the floor seam ① stands on. Where the hub keeps the difference is `transport.rs` beside `hub.rs`: one
+knows what a socket and a peer are and nothing about a claim, the other knows what a claim is and
+nothing about a socket.
+
+**A transport that is not this machine is OPEN, not refused** — `docs/CAPABILITIES.md` OPEN 4, with
+our proposed shape written down in advance: a gateway on the hub's box holding an ordinary local
+connection for a peer elsewhere, and a second kind of connection identity inside the hub beside
+today's local peer. Every frame would mean exactly what it means now; what a remote peer could not
+have is the uid, the `/proc` fence and the outbox. Nothing of it is built, and building it changes
+no frame.
 
 The contract, in one line each:
 

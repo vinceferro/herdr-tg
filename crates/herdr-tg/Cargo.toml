@@ -7,7 +7,14 @@ license.workspace = true
 
 [dependencies]
 herdr-client = { path = "../herdr-client" }
-tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
+# Every tokio feature this crate's own code uses is named HERE, and that is not tidiness: `net`,
+# `io-util`, `sync` and `process` were all reaching it only because `herdr-client`, `reqwest` and
+# `teloxide` happen to ask for them and cargo unifies features across the graph. `transport.rs`
+# binds the Unix socket and splits a boxed stream (`net`, `io-util`); `hub.rs` and `summarize.rs`
+# hold a `Mutex`, an `mpsc` and a `Semaphore` (`sync`); the plugin tests start `bun` (`process`).
+# The day one of those dependencies changes its TLS stack or stops needing a socket, this crate
+# would stop compiling for a reason nobody would look for in another crate's manifest.
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "sync", "process"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 anyhow     = { workspace = true }

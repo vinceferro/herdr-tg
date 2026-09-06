@@ -1,5 +1,18 @@
-<!-- INTERFACE, v19, 6 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v20, 6 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v20 says what the pid of §3 is FOR, which this document left to be inferred. It is a local fence
+     and nothing else: the hub evicts a dead claim by looking for `/proc/<pid>`, and it accepts a
+     release only from the number that took the claim. Nothing is routed by it, and the pid you put
+     in `hello` is compared with the socket's for one line in the journal and then ignored. Which RUN
+     you are is the `instance`, which you mint — and worth saying because our own two adapters mint
+     theirs as `<pid>-<milliseconds>`: a number that means something only to this kernel, travelling
+     inside the one string a fleet does read. The pid is also the one identifying thing that exists
+     only because both ends are on one machine, which is now written down where it belongs:
+     `docs/CAPABILITIES.md` v16 makes the transport a thing of its own — REQUIRES 3 names today's
+     one and the two facts it admits on, offer 9 says files are a capability OF that transport, and
+     OPEN 4 says what a transport that is not this machine would have to be. Nothing on the wire
+     moved.
 
      v19 inverts one instruction and puts a number on another, both in offer 5, and neither is a
      wire change. The instruction: this document told an adapter NOT to send `ask_resolved` after a
@@ -465,12 +478,26 @@ and expected; a running process misbehaving is not, and nothing here does that.*
 | the **project** | the secret, resolved by the hub | enrolment, at a terminal |
 | the **address** | the `lane` field of your `hello` | whoever dispatched you |
 | the **instance** | a string you mint once per process | you |
-| the **pid** | the socket's own credentials | the kernel |
+| the **pid** | the socket's own credentials, never the number you sent | the kernel |
 
 The hub builds the conversation's address from **the project the secret resolved to** plus **the
 name you sent**, and never from anything else on the wire. That construction is the whole security
 argument: a `project_id` you put in `hello` is not consulted, so naming an address can only ever
 reach a conversation of the project you already proved you are.
+
+**The pid is a local fence, and never fleet identity.** It does exactly two jobs, both on this
+machine: the hub evicts a claim whose holder is gone by looking for `/proc/<pid>`, and it accepts a
+release only from the process that took the claim. Nothing is routed by it — not a topic, not a
+conversation, not a line anybody looks up later — and the number in your `hello` is compared with
+the socket's for one line in the journal and then ignored, so a wrapper that does not know its own
+outermost pid is not penalised (§6). Which RUN you are is the `instance`, which you mint and which
+the hub compares as a string. So do not put a pid in a fleet record, do not join anything on one,
+and do not build a name for a run out of one: a pid is meaningful only to the kernel that issued it,
+it is handed out again once that kernel's numbers wrap round, and it exists at all only because this
+transport has both ends on one machine (`docs/CAPABILITIES.md` REQUIRES 3; its OPEN 4 is what a
+transport without a pid would have to fence with instead). One caution stands rather than being
+asserted away: an adapter in its own PID namespace is judged by a number that means something else
+on the host side, and that has not been measured here (§10).
 
 ---
 
@@ -749,7 +776,7 @@ direction. Every field is a JSON **string** unless this table says otherwise.
 an adapter that could name itself could claim another project's topic. `repo` and `pid` are for the
 audit record and for a human reading it, never for routing — and the hub uses the pid from the
 socket's credentials, not the one you send, so a wrapper that does not know its own outermost pid is
-not penalised.
+not penalised. §3 says what that pid is for: a fence on this machine, never fleet identity.
 
 An `ask` with **no options** is still a question — one he answers by typing rather than tapping.
 

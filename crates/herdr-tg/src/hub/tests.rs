@@ -20,6 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::*;
 use crate::registry::Registry;
+use crate::transport::{Accepted, ConnectionIdentity};
 
 const ALLOWED_CHAT: i64 = -1001;
 const SOMEONE_ELSE: i64 = 4242;
@@ -388,6 +389,51 @@ async fn harness_with_budget(per_minute: u32) -> Harness {
 /// conforming bridge may carry — the only way to watch a REAL bridge, which conforms, trip it.
 async fn harness_with(per_minute: u32, pre_pong_hold: Option<(usize, usize)>) -> Harness {
     let dir = tempfile::tempdir().expect("tmp");
+    let (hub, fake, project, secret) = hub_in(&dir, per_minute, pre_pong_hold);
+
+    let sock = dir.path().join("hub.sock");
+    // The production listener, not a bare `UnixListener`: the accept path, the credential the
+    // kernel reports for it, and the permissions on the file are the parts of the transport a
+    // test in this process CAN exercise honestly, so the socket harness exercises them.
+    let listener = crate::transport::LocalSocket::bind(&sock).expect("bind");
+    {
+        let hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            while let Ok(accepted) = listener.accept().await {
+                let hub = Arc::clone(&hub);
+                tokio::spawn(async move {
+                    let _ = hub.serve_connection(accepted).await;
+                });
+            }
+        });
+    }
+    // The registry watcher, as `serve` spawns it — at a test's cadence rather than the real one, for
+    // the same reason the settling window is shortened: what is under test is that the watch EXISTS
+    // and reaches a live connection, not how many seconds it takes.
+    Arc::clone(&hub).watch_the_registry(Duration::from_millis(50));
+
+    Harness {
+        hub,
+        fake,
+        secret,
+        project,
+        sock,
+        dir,
+    }
+}
+
+/// The hub itself, with nothing yet to reach it by: one enrolled project, the ledger and the audit
+/// on disk, and the one faked thing.
+///
+/// Split out when the transport became a seam, and shared on purpose. What a bridge's bytes travel
+/// over is now the ONLY difference between the two harnesses, which is the claim
+/// `the_semantics_layer_runs_over_an_in_memory_duplex_exactly_as_over_the_socket` makes — and that
+/// claim is only honest if both build the same hub from one place.
+fn hub_in(
+    dir: &tempfile::TempDir,
+    per_minute: u32,
+    pre_pong_hold: Option<(usize, usize)>,
+) -> (Arc<Hub<FakeTelegram>>, Arc<FakeTelegram>, ProjectId, String) {
     let repo = dir.path().join("herdr-tg");
     std::fs::create_dir_all(&repo).expect("repo");
 
@@ -415,35 +461,49 @@ async fn harness_with(per_minute: u32, pre_pong_hold: Option<(usize, usize)>) ->
         Some((frames, bytes)) => hub.with_pre_pong_hold(frames, bytes),
         None => hub,
     };
-    let hub = Arc::new(hub);
+    (Arc::new(hub), fake, project.id, secret)
+}
 
-    let sock = dir.path().join("hub.sock");
-    let listener = UnixListener::bind(&sock).expect("bind");
-    {
-        let hub = Arc::clone(&hub);
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let hub = Arc::clone(&hub);
-                tokio::spawn(async move {
-                    let _ = hub.serve_connection(stream).await;
-                });
-            }
-        });
+/// The same hub with NOTHING to dial: no socket file, no listener, nothing on the filesystem a
+/// bridge could find.
+///
+/// For the two facts about a connection that this process cannot be over a real socket — a peer
+/// that is another user, and a peer whose process is gone — and for proving that the gates above
+/// do not depend on what the bytes travelled over.
+struct InMemory {
+    hub: Arc<Hub<FakeTelegram>>,
+    fake: Arc<FakeTelegram>,
+    secret: String,
+    project: ProjectId,
+    dir: tempfile::TempDir,
+}
+
+impl InMemory {
+    /// The project speaking for itself, which is what a bridge that names no lane is.
+    fn own(&self) -> Addr {
+        Addr::project_itself(self.project.clone())
     }
-    // The registry watcher, as `serve` spawns it — at a test's cadence rather than the real one, for
-    // the same reason the settling window is shortened: what is under test is that the watch EXISTS
-    // and reaches a live connection, not how many seconds it takes.
-    Arc::clone(&hub).watch_the_registry(Duration::from_millis(50));
+}
 
-    Harness {
+async fn harness_in_memory() -> InMemory {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (hub, fake, project, secret) = hub_in(&dir, crate::queue::PER_MINUTE, None);
+    Arc::clone(&hub).watch_the_registry(Duration::from_millis(50));
+    InMemory {
         hub,
         fake,
         secret,
-        project: project.id,
-        sock,
+        project,
         dir,
     }
 }
+
+/// How much a duplex holds before a write on it blocks.
+///
+/// At least one whole frame and the newline that ends it. A buffer under
+/// [`hub_proto::MAX_FRAME_BYTES`] wedges a legal frame half-written whenever the far side is busy
+/// somewhere else, and the test then hangs instead of failing — which is worse than either.
+const DUPLEX_BUFFER: usize = hub_proto::MAX_FRAME_BYTES * 2;
 
 impl Harness {
     /// The project speaking for itself, which is what a bridge that names no lane is.
@@ -475,14 +535,14 @@ async fn restarted(h: &Harness) -> (Arc<Hub<FakeTelegram>>, Arc<FakeTelegram>, P
         .with_budget(crate::queue::PER_MINUTE, Duration::from_millis(5)),
     );
     let sock = h.dir.path().join("hub-again.sock");
-    let listener = UnixListener::bind(&sock).expect("bind");
+    let listener = crate::transport::LocalSocket::bind(&sock).expect("bind");
     {
         let hub = Arc::clone(&hub);
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok(accepted) = listener.accept().await {
                 let hub = Arc::clone(&hub);
                 tokio::spawn(async move {
-                    let _ = hub.serve_connection(stream).await;
+                    let _ = hub.serve_connection(accepted).await;
                 });
             }
         });
@@ -491,9 +551,12 @@ async fn restarted(h: &Harness) -> (Arc<Hub<FakeTelegram>>, Arc<FakeTelegram>, P
 }
 
 /// A bridge, as a bridge really behaves: connect, say hello, answer the ping.
+///
+/// Its two halves are boxed rather than named because a bridge is the same bridge over a socket
+/// and over a pipe in this process, and every property below is about what it SAYS.
 struct FakeBridge {
-    reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    reader: FrameReader<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     seq: u64,
 }
 
@@ -530,12 +593,60 @@ impl FakeBridge {
     ) -> Self {
         let stream = UnixStream::connect(sock).await.expect("connect");
         let (r, w) = stream.into_split();
-        let mut me = Self {
+        let mut me = Self::over_halves(Box::new(r), Box::new(w));
+        me.say_hello(secret, instance, claimed_id, lane, pid).await;
+        me
+    }
+
+    /// The same bridge over a pipe inside this process, against a hub with no listener at all —
+    /// and with the identity the test chooses rather than the one the kernel would give it.
+    ///
+    /// That second half is the point. Over a real socket every peer is this process: a peer that
+    /// is another user and a peer whose process is gone are the two things the hub's first and
+    /// fourth gates exist for, and neither could be put in front of `serve_connection` until the
+    /// identity stopped being read from the stream.
+    async fn over(
+        hub: &Arc<Hub<FakeTelegram>>,
+        who: ConnectionIdentity,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+    ) -> Self {
+        let (mine, hubs) = tokio::io::duplex(DUPLEX_BUFFER);
+        {
+            let hub = Arc::clone(hub);
+            tokio::spawn(async move {
+                let _ = hub.serve_connection(Accepted::over(hubs, who)).await;
+            });
+        }
+        let (r, w) = tokio::io::split(mine);
+        let mut me = Self::over_halves(Box::new(r), Box::new(w));
+        me.say_hello(secret, instance, claimed_id, None, std::process::id())
+            .await;
+        me
+    }
+
+    fn over_halves(
+        r: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        w: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+    ) -> Self {
+        Self {
             reader: FrameReader::new(r),
             writer: w,
             seq: 0,
-        };
-        me.send(BridgeFrame::Hello {
+        }
+    }
+
+    /// The one hello builder. Two of them is how the two copies of `hub-link.ts` drifted.
+    async fn say_hello(
+        &mut self,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+        lane: Option<&str>,
+        pid: u32,
+    ) {
+        self.send(BridgeFrame::Hello {
             project_id: ProjectId::new(claimed_id),
             token: secret.to_owned(),
             instance: instance.to_owned(),
@@ -544,7 +655,6 @@ impl FakeBridge {
             lane: lane.map(hub_proto::LaneId::new),
         })
         .await;
-        me
     }
 
     /// Everything the hub has sent within a short window.
@@ -576,6 +686,21 @@ impl FakeBridge {
             .await
             .expect("write");
         id
+    }
+
+    /// Did the far end CLOSE, rather than merely go quiet?
+    ///
+    /// [`FakeBridge::next`] cannot tell the two apart — it answers `None` for a timeout exactly as
+    /// it does for the end of the stream — and "closed, and told nothing" is a property where the
+    /// difference is the whole point: a connection left open and silent is a task and a descriptor
+    /// held for ever, which is what the hello timeout above exists to prevent.
+    async fn is_closed_within(&mut self, how_long: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(how_long, self.reader.next::<HubFrame>()).await,
+            // The end of the stream, or a stream that will not read any more. Both are over; only
+            // a timeout, or another frame, is not.
+            Ok(Ok(None)) | Ok(Err(_))
+        )
     }
 
     async fn next(&mut self) -> Option<Envelope<HubFrame>> {
@@ -636,12 +761,27 @@ async fn until(mut cond: impl AsyncFnMut() -> bool) {
 #[tokio::test]
 async fn an_ask_becomes_a_tap_becomes_a_choice() {
     let h = harness().await;
-
-    // ── 1. hello → welcome, and the name is the REGISTRY's ────────────────────────────────────
-    // The hello below claims to be "p-somebody-else". It is ignored: identity comes from the
-    // secret, so a bridge cannot talk its way into another project's topic.
+    // The hello claims to be "p-somebody-else". It is ignored: identity comes from the secret, so
+    // a bridge cannot talk its way into another project's topic.
     let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    the_whole_round_trip(&h.hub, &h.fake, h.dir.path(), &h.own(), &mut bridge).await;
+}
 
+/// The slice's whole proof, against a bridge the caller has already connected however it likes:
+/// hello → welcome, the settling window, an ask, the audit, the ledger, a tap, the choice coming
+/// back, and a stranger's tap resolving to nothing.
+///
+/// Written out here rather than inside its test so that the same sequence — the same asserts, in
+/// the same order, on the same fake — can be run over a transport that is not a socket. Two copies
+/// of it would be two things that could drift, and what is being claimed is that they cannot.
+async fn the_whole_round_trip(
+    hub: &Arc<Hub<FakeTelegram>>,
+    fake: &Arc<FakeTelegram>,
+    dir: &std::path::Path,
+    own: &Addr,
+    bridge: &mut FakeBridge,
+) {
+    // ── 1. hello → welcome, and the name is the REGISTRY's ────────────────────────────────────
     let welcome = bridge.next().await.expect("a welcome");
     let HubFrame::Welcome {
         project, topic_id, ..
@@ -660,17 +800,17 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
 
     // ── the settling window: the topic appears only after the pong ────────────────────────────
     assert!(
-        h.fake.topics.lock().await.is_empty(),
+        fake.topics.lock().await.is_empty(),
         "a topic was created for a bridge that had not answered yet"
     );
     let ping = bridge.next().await.expect("a ping");
     assert!(matches!(ping.payload, HubFrame::Ping));
     bridge.send(BridgeFrame::Pong { r#ref: ping.id }).await;
 
-    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    until(async || !fake.sends.lock().await.is_empty()).await;
 
     {
-        let topics = h.fake.topics.lock().await;
+        let topics = fake.topics.lock().await;
         assert_eq!(topics.len(), 1, "exactly one topic, got {topics:?}");
         assert_eq!(topics[0].0, "herdr-tg");
         assert!(
@@ -679,7 +819,7 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
             topics[0].1
         );
 
-        let sends = h.fake.sends.lock().await;
+        let sends = fake.sends.lock().await;
         assert_eq!(sends.len(), 1, "exactly one greeting, got {sends:?}");
         assert!(sends[0].2.is_empty(), "a greeting must not carry buttons");
     }
@@ -703,9 +843,9 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
         })
         .await;
 
-    until(async || h.fake.sends.lock().await.len() == 2).await;
+    until(async || fake.sends.lock().await.len() == 2).await;
 
-    let (topic, text, buttons) = h.fake.sends.lock().await[1].clone();
+    let (topic, text, buttons) = fake.sends.lock().await[1].clone();
     assert_eq!(topic, 1001, "the question went to the wrong topic");
     assert_eq!(
         text, words,
@@ -715,7 +855,7 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
     assert_eq!(buttons[0].label, "Yes, overwrite");
 
     // ── 3. the audit records the send BEFORE it happens, and its outcome after ─────────────────
-    let audit = std::fs::read_to_string(h.hub.audit.path()).expect("an audit log");
+    let audit = std::fs::read_to_string(hub.audit.path()).expect("an audit log");
     let sent_at = audit.find("sent\t").expect("a sent line");
     let done_at = audit.rfind("delivered\t").expect("an outcome line");
     assert!(
@@ -724,7 +864,7 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
     );
 
     // ── 4. what the buttons mean is written down, on disk, beside the message ─────────────────
-    let ledger_raw = std::fs::read_to_string(h.dir.path().join("asks.json")).expect("a ledger");
+    let ledger_raw = std::fs::read_to_string(dir.join("asks.json")).expect("a ledger");
     assert!(
         ledger_raw.contains("Yes, overwrite"),
         "the labels are not written down: {ledger_raw}"
@@ -733,25 +873,23 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
 
     // ── 5. a tap from the allowed chat becomes a choice the bridge receives ────────────────────
     let msg = MsgId::new("m2");
-    let (project, ask_id, option_id) = h
-        .hub
+    let (project, ask_id, option_id) = hub
         .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
         .await
         .expect("the tap resolves");
-    assert_eq!(project, h.own());
+    assert_eq!(project, own.clone());
     assert_eq!(ask_id, AskId::new("a1"));
 
     assert!(
-        h.hub
-            .deliver(
-                &project,
-                HubFrame::Choice {
-                    msg_id: msg.clone(),
-                    ask_id: ask_id.clone(),
-                    option_id: option_id.clone(),
-                }
-            )
-            .await
+        hub.deliver(
+            &project,
+            HubFrame::Choice {
+                msg_id: msg.clone(),
+                ask_id: ask_id.clone(),
+                option_id: option_id.clone(),
+            }
+        )
+        .await
     );
 
     let got = bridge
@@ -765,17 +903,197 @@ async fn an_ask_becomes_a_tap_becomes_a_choice() {
     assert_eq!(got, (AskId::new("a1"), OptionId::new("y")));
 
     // ── 6. the SAME tap from a different chat resolves to nothing at all ──────────────────────
-    let before = h.fake.sends.lock().await.len();
-    let refused = h
-        .hub
+    let before = fake.sends.lock().await.len();
+    let refused = hub
         .resolve_tap(SOMEONE_ELSE, Some(OPERATOR), &msg, &OptionId::new("y"))
         .await
         .expect_err("a stranger's tap must not resolve");
     assert_eq!(refused, TapRefusal::NotYours);
     assert_eq!(
-        h.fake.sends.lock().await.len(),
+        fake.sends.lock().await.len(),
         before,
         "a stranger's tap produced a message; it must produce silence"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The transport seam: the same hub, reached over something that is not a socket.
+
+#[tokio::test]
+async fn the_semantics_layer_runs_over_an_in_memory_duplex_exactly_as_over_the_socket() {
+    // The seam's own proof, and the reason it is worth having: everything above the bytes — the
+    // gates, the settling window, the topic, the ledger, the tap and the choice coming back — is
+    // the same sequence whatever carried it. If any of it had quietly depended on being a Unix
+    // socket, this is where that shows up, because there is no socket file anywhere in this test.
+    let h = harness_in_memory().await;
+    // The same impersonation attempt the socket version makes, for the same reason.
+    let mut bridge = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_process(),
+        &h.secret,
+        "i1",
+        "p-somebody-else",
+    )
+    .await;
+    the_whole_round_trip(&h.hub, &h.fake, h.dir.path(), &h.own(), &mut bridge).await;
+}
+
+#[tokio::test]
+async fn a_connection_whose_identity_is_another_user_is_closed_after_its_hello_and_told_nothing() {
+    // Gate 1, which had no test at all: over a real socket every peer is this process, so
+    // `ClosedSilently` was a branch nothing could reach.
+    //
+    // Two properties, and the second is the one that matters. It is closed AFTER the hello, not
+    // at the accept — the document promises a stranger's adapter that its hello will be read, and
+    // `--check` counts on it. And it is told NOTHING: not a refusal, not a version skew, not even
+    // the reason. An answer, of any kind, tells whoever is on the far end that something is
+    // listening here and that this is the port for it.
+    let h = harness_in_memory().await;
+    // With a secret that is GOOD. A refusal here would be a refusal to someone holding a working
+    // credential, which is exactly the case where saying nothing is worth the confusion.
+    let mut bridge = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::another_user(),
+        &h.secret,
+        "i1",
+        "p-whatever",
+    )
+    .await;
+
+    let said = bridge.drain_for(Duration::from_millis(300)).await;
+    assert!(
+        said.is_empty(),
+        "a peer that is not this user was answered: {said:?}"
+    );
+    assert!(
+        bridge.is_closed_within(Duration::from_secs(2)).await,
+        "the connection was left open for a peer that is not this user"
+    );
+    assert!(
+        !h.hub.is_claimed(&h.own()).await,
+        "a peer that is not this user took the conversation"
+    );
+    assert!(
+        h.fake.topics.lock().await.is_empty(),
+        "a peer that is not this user got a topic"
+    );
+    assert!(
+        h.fake.create_attempts.lock().await.is_empty(),
+        "a topic was even attempted for a peer that is not this user"
+    );
+}
+
+/// The stranger's contract, pinned rather than described.
+///
+/// `docs/ATTACHING.md` §6 promises anyone writing an adapter that a refused connection has its
+/// `hello` READ before it goes quiet, and `adapters/kickoff-hub-attach/check.ts` prints exactly
+/// that diagnosis to the operator: a socket that accepted, took a frame, and said nothing. Closing
+/// a stranger at the door instead is the obvious-looking tidy-up — the uid is known at the accept,
+/// so why read anything — and it would break both with every test above still green.
+///
+/// Driven by SILENCE rather than by a hello, because a hello vanishes into the duplex buffer
+/// whether the hub reads it or not, so a test that sends one cannot tell the two apart. A
+/// connection the hub is still waiting for a hello on is open; one it closed at the door is not.
+#[tokio::test]
+async fn a_peer_that_is_not_this_user_still_has_its_hello_waited_for_before_the_close() {
+    let h = harness_in_memory().await;
+    let (mine, hubs) = tokio::io::duplex(DUPLEX_BUFFER);
+    {
+        let hub = Arc::clone(&h.hub);
+        tokio::spawn(async move {
+            let _ = hub
+                .serve_connection(Accepted::over(hubs, ConnectionIdentity::another_user()))
+                .await;
+        });
+    }
+    let (r, w) = tokio::io::split(mine);
+    let mut bridge = FakeBridge::over_halves(Box::new(r), Box::new(w));
+
+    assert!(
+        !bridge.is_closed_within(Duration::from_millis(150)).await,
+        "the connection was closed at the door; a stranger's adapter is promised its hello is read \
+         first, and --check says so to the operator"
+    );
+    // And it still ENDS, on the hello timeout, rather than being held open for ever by a peer that
+    // was never going to be admitted.
+    assert!(
+        bridge.is_closed_within(Duration::from_secs(2)).await,
+        "a peer that is not this user and never said hello was left open"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_whose_process_is_gone_is_evicted_on_the_whole_path_not_only_in_the_claims_map() {
+    // The evict-a-corpse rule, at last through the door a real bridge comes in by.
+    //
+    // `a_crashed_bridge_does_not_lock_its_own_project_out` reaches around the connection and calls
+    // `claim` itself with a dead pid, because over a socket the incumbent's pid is this process's
+    // and this process is alive. So the rule was proved for the claims map and NOT for the path:
+    // an incumbent that had also been through `serve_connection` holds a writer task, an outbox, a
+    // ledger sweep and a kick channel, and nothing said the successor gets past all of that.
+    let h = harness_in_memory().await;
+
+    // A pid that is genuinely not a process: spawn one, wait for it, and use the number it had.
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+    assert!(
+        !crate::transport::fence_is_alive(dead_pid),
+        "the probe pid is somehow still alive"
+    );
+
+    let mut corpse = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_user_behind_a_dead_process(dead_pid),
+        &h.secret,
+        "i1",
+        h.project.as_str(),
+    )
+    .await;
+    corpse.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    // The successor: this process, alive, the same conversation.
+    let mut successor = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_process(),
+        &h.secret,
+        "i2",
+        h.project.as_str(),
+    )
+    .await;
+    let first = successor.next().await.expect("an answer");
+    assert!(
+        matches!(first.payload, HubFrame::Welcome { .. }),
+        "a live bridge was refused because a dead one held the conversation: {:?}",
+        first.payload
+    );
+    successor.become_live().await;
+
+    // And the claim is really the successor's, not just "not refused": the number the hub fences
+    // on is the living one.
+    until(async || {
+        h.hub
+            .claims
+            .lock()
+            .await
+            .get(&h.own())
+            .is_some_and(|c| c.pid == std::process::id())
+    })
+    .await;
+
+    // The corpse's connection is ended rather than left half alive holding a writer task. It is
+    // told nothing: there is nobody behind it to tell, and "switched off" would be untrue.
+    let last = corpse.drain_for(Duration::from_millis(300)).await;
+    assert!(
+        !last.iter().any(|f| matches!(f, HubFrame::Refused { .. })),
+        "the evicted connection was sent a refusal meant for a bridge that is still there: {last:?}"
+    );
+    assert!(
+        corpse.is_closed_within(Duration::from_secs(2)).await,
+        "the evicted connection was left open"
     );
 }
 
@@ -1079,7 +1397,7 @@ async fn a_session_that_is_evicted_has_its_open_questions_taken_off_the_phone() 
     let dead_pid = child.id();
     child.wait().expect("reap");
     assert!(
-        !super::pid_is_alive(dead_pid),
+        !super::fence_is_alive(dead_pid),
         "the probe pid is somehow still alive"
     );
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
@@ -1358,7 +1676,7 @@ async fn a_crashed_bridge_does_not_lock_its_own_project_out() {
     let dead_pid = child.id();
     child.wait().expect("reap");
     assert!(
-        !super::pid_is_alive(dead_pid),
+        !super::fence_is_alive(dead_pid),
         "the probe pid is somehow still alive"
     );
 
@@ -4414,7 +4732,7 @@ async fn a_question_a_gone_worktree_left_open_is_taken_off_the_phone_when_its_pr
     let dead_pid = child.id();
     child.wait().expect("reap");
     assert!(
-        !super::pid_is_alive(dead_pid),
+        !super::fence_is_alive(dead_pid),
         "the probe pid is still alive"
     );
 
@@ -4937,7 +5255,7 @@ async fn a_stuck_keyboard_is_swept_when_the_agent_that_asked_is_gone_and_an_unfi
     let dir = tempfile::tempdir().expect("tmp");
     let mut ledger = AskLedger::load(dir.path().join("asks.json"));
     let project = ProjectId::new("p-gone");
-    let dead = u32::MAX; // no such pid, so `pid_is_alive` is false without racing a real one
+    let dead = u32::MAX; // no such pid, so `fence_is_alive` is false without racing a real one
 
     let record = |closed: Option<Closed>| AskRecord {
         project: project.clone(),

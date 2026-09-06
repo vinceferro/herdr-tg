@@ -40,6 +40,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use teloxide::RequestError;
 use teloxide::prelude::*;
@@ -367,6 +368,52 @@ struct Ctx {
     username: Arc<str>,
 }
 
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// What the accept loop does with what it finds at the door.
+
+/// How long the accept loop waits after the first failed accept.
+const FIRST_WAIT: Duration = Duration::from_millis(50);
+
+/// And how long it waits at most. Doubling with no ceiling turns a squeeze that lasted a minute
+/// into a hub still asleep an hour later, with the Telegram half running and nothing anywhere
+/// saying the bridges can no longer connect.
+const LONGEST_WAIT: Duration = Duration::from_secs(5);
+
+/// The wait between a failed accept and the next attempt, and what clears it.
+///
+/// It is a type rather than a `let mut` in the loop because **the only thing that may make this
+/// loop wait is the door itself**, and that rule needs somewhere to be written and tested. Reading
+/// the peer's credentials moved from the per-connection task up to accept time when the transport
+/// seam went in, and that move creates the hazard: a loop that cannot tell "I could not name this
+/// one caller" from "the listener is unwell" does the only thing left to it and sleeps, longer
+/// each time, while every healthy bridge on the box queues behind one peer nobody could identify.
+/// So there is no way to say "wait" here for anything but the door.
+///
+/// [`crate::transport::LocalSocket::accept`] is the other half of that: it drops a connection it
+/// cannot identify and goes back to waiting, so the failure never arrives here at all.
+struct AcceptPacing {
+    wait: Duration,
+}
+
+impl AcceptPacing {
+    fn new() -> Self {
+        Self { wait: FIRST_WAIT }
+    }
+
+    /// One connection through the door is proof the squeeze is over, so the next failure starts
+    /// again at the shortest wait rather than wherever the last one left off.
+    fn a_connection_came_through(&mut self) {
+        self.wait = FIRST_WAIT;
+    }
+
+    /// How long to go deaf for before asking the door again, growing while it stays shut.
+    fn wait_after_the_door_would_not_open(&mut self) -> Duration {
+        let now = self.wait;
+        self.wait = (self.wait * 2).min(LONGEST_WAIT);
+        now
+    }
+}
+
 /// Run the bot until the process is asked to stop.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let people = config.people();
@@ -421,17 +468,23 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                 people.iter().copied().collect(),
                 forum,
             ));
-            let sock = crate::hub::socket_path();
-            match crate::hub::bind(&sock) {
+            let sock = crate::transport::socket_path();
+            match crate::transport::LocalSocket::bind(&sock) {
                 Err(e) => {
                     // Not fatal. The Telegram half still answers `/projects`, and refusing to boot
                     // over the socket would take the operator's only channel down with it.
                     tracing::error!(error = %e, path = %sock.display(), "could not open the hub's socket");
                     None
                 }
-                Ok(listener) => {
+                Ok(socket) => {
+                    // The transport says what it is and who may reach it. "It is up" and "it is up
+                    // for the right people" are different facts, and the second is the one worth
+                    // reading in a journal at three in the morning — the more so now that there is
+                    // a name for a transport that would not be this one. The path is not printed
+                    // beside it: `describe()` already carries it, and one fact under two field
+                    // names is how a reader ends up wondering which of them is the real door.
                     tracing::info!(
-                        path = %sock.display(),
+                        transport = %socket.describe(),
                         audit = %hub.audit.path().display(),
                         "the hub is listening"
                     );
@@ -446,25 +499,29 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                         // the life of the process, with the Telegram half still running and nothing
                         // anywhere saying the bridges could no longer connect. That is this
                         // system's signature failure: silence that looks exactly like health.
-                        let mut backoff = std::time::Duration::from_millis(50);
+                        let mut pacing = AcceptPacing::new();
                         loop {
-                            match listener.accept().await {
-                                Ok((stream, _)) => {
-                                    backoff = std::time::Duration::from_millis(50);
+                            match socket.accept().await {
+                                Ok(accepted) => {
+                                    pacing.a_connection_came_through();
                                     let hub = Arc::clone(&accept);
                                     tokio::spawn(async move {
-                                        if let Err(e) = hub.serve_connection(stream).await {
+                                        if let Err(e) = hub.serve_connection(accepted).await {
                                             tracing::warn!(error = %e, "a bridge connection ended badly");
                                         }
                                     });
                                 }
+                                // Only the door itself reaches here. A connection whose peer the
+                                // kernel would not name is dropped by the transport and never
+                                // becomes an error at this level, so one unidentifiable peer can
+                                // never put the hub to sleep on every other bridge's behalf.
                                 Err(e) => {
+                                    let wait = pacing.wait_after_the_door_would_not_open();
                                     tracing::warn!(
-                                        error = %e, backoff_ms = backoff.as_millis(),
+                                        error = %e, backoff_ms = wait.as_millis(),
                                         "the hub could not accept a connection; retrying"
                                     );
-                                    tokio::time::sleep(backoff).await;
-                                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                                    tokio::time::sleep(wait).await;
                                 }
                             }
                         }
@@ -1287,6 +1344,44 @@ mod key_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accept loop's pacing was four lines inside a spawned task with no test on it, and the
+    /// transport seam rewrote every one of them. These are the four properties those lines had:
+    /// the first wait is short, it doubles, it stops doubling, and a connection clears it. Lose
+    /// the last one and the hub that had a bad minute at breakfast is still deaf for five seconds
+    /// at a time at lunch; lose the ceiling and it is deaf for longer every hour, with the
+    /// Telegram half up and nothing anywhere saying the bridges cannot get in.
+    #[test]
+    fn the_wait_after_a_door_that_would_not_open_doubles_to_a_ceiling_and_one_connection_clears_it()
+    {
+        let mut pacing = AcceptPacing::new();
+        assert_eq!(pacing.wait_after_the_door_would_not_open(), FIRST_WAIT);
+        assert_eq!(
+            pacing.wait_after_the_door_would_not_open(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            pacing.wait_after_the_door_would_not_open(),
+            Duration::from_millis(200)
+        );
+
+        for _ in 0..10 {
+            pacing.wait_after_the_door_would_not_open();
+        }
+        assert_eq!(
+            pacing.wait_after_the_door_would_not_open(),
+            LONGEST_WAIT,
+            "the wait has to stop growing somewhere"
+        );
+
+        pacing.a_connection_came_through();
+        assert_eq!(
+            pacing.wait_after_the_door_would_not_open(),
+            FIRST_WAIT,
+            "a connection got through, so the squeeze is over and the next failure starts again \
+             at the shortest wait"
+        );
+    }
 
     #[test]
     fn a_refusal_that_only_says_his_tap_changed_nothing_never_costs_a_send() {

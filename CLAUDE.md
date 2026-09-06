@@ -16,8 +16,10 @@ site now forbids naming a write RPC anywhere.
 
 Three crates in one Cargo workspace.
 
-- `crates/hub-proto` — the wire contract between the hub and an adapter. NDJSON over `AF_UNIX`, nine
-  frames up, six down. Knows nothing about herdr, kickoff, claude or panes, and must not learn.
+- `crates/hub-proto` — the wire contract between the hub and an adapter. NDJSON, nine frames up, six
+  down. Knows nothing about herdr, kickoff, claude or panes, and must not learn — nor about what
+  carries it: that is `transport.rs`, the one file in the bot that knows what a socket and a peer
+  uid are, and `tests/the_hub_does_not_know_what_a_socket_is.rs` fails if the hub learns either.
 - `crates/herdr-tg` — the bot. A `clap` binary: `enroll`, `projects`, `serve`, plus four read-only
   herdr subcommands (`status`, `read`, `doctor`, `watch`). **It binds nothing** — no listening port,
   and the Unix socket is not one.
@@ -79,7 +81,8 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
 | Domain | Owner | Lives in |
 | --- | --- | --- |
 | the wire contract | `wire-protocol` | `crates/hub-proto/` |
-| the socket, identity, claims, the tap ledger | `write-safety` | `hub.rs`, `registry.rs`, `no_live_write_call_site.rs` |
+| the transport and who the kernel says is on it | `write-safety` | `transport.rs`, `the_hub_does_not_know_what_a_socket_is.rs` |
+| identity, claims, the tap ledger | `write-safety` | `hub.rs`, `registry.rs`, `no_live_write_call_site.rs` |
 | what leaves this machine | `egress` | `summarize.rs`, the de-identification guard |
 | the operator's channel | `operator-channel` | `bot.rs`, `surface.rs`, `queue.rs` |
 

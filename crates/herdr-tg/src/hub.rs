@@ -1,4 +1,4 @@
-//! The socket the bridges connect to, and everything that decides what they may do.
+//! What a bridge says, and everything that decides what it may do.
 //!
 //! # Authority flows one way
 //!
@@ -9,10 +9,11 @@
 //!
 //! # Four gates, all fail-closed, in this order
 //!
-//! 1. **Who is on the other end.** `SO_PEERCRED` off the connection. A different uid is closed
-//!    without a reply — an answer, even a refusal, is information. Mode 0600 on the socket already
-//!    implies this; reading the credential back means the check survives a permissions mistake, and
-//!    it yields the pid the single-claim rule needs.
+//! 1. **Who is on the other end.** The transport hands the hub an identity and the hub asks it two
+//!    questions: is this peer this user, and what does the single-claim rule fence on. A peer that
+//!    is not this user is closed without a reply — an answer, even a refusal, is information. HOW
+//!    the transport knows is not decided here (`transport.rs`), and that is what lets every gate
+//!    below be tested against a peer this process could not have been.
 //! 2. **Which project.** The secret resolves to one, in constant time, over the whole registry.
 //!    The `project_id` on the wire is not consulted.
 //! 3. **Switched on.** Enrolled and disabled is a real state.
@@ -72,10 +73,10 @@ use hub_proto::{
     LaneId, Limits, MsgId, OptionId, ProjectId, RefusedReason, VERSION,
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::registry::Registry;
+use crate::transport::{Accepted, ConnectionIdentity, fence_is_alive};
 
 /// How long after `hello` the hub waits for a `pong` before calling a project live.
 pub const DEFAULT_SETTLE: Duration = Duration::from_secs(5);
@@ -1140,7 +1141,7 @@ impl AskLedger {
             &r.project == project
                 && r.needs_retiring()
                 && !live.contains(&r.addr())
-                && r.pid.is_some_and(|pid| !pid_is_alive(pid))
+                && r.pid.is_some_and(|pid| !fence_is_alive(pid))
         })
     }
 
@@ -1698,14 +1699,6 @@ fn lane_is_addressable(lane: &LaneId) -> bool {
         && !s.chars().any(char::is_control)
 }
 
-/// Is a pid still a process on this machine?
-///
-/// The evict-a-corpse rule depends on this being a fact rather than a hope. `/proc/<pid>` is the
-/// fact; a signal-0 probe would answer "yes" for a pid this user does not own.
-pub(crate) fn pid_is_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
 /// What the registry file looks like from outside, for noticing that it changed.
 ///
 /// The inode is the load-bearing part: the registry is written by temp-and-rename, so every save is
@@ -1715,37 +1708,6 @@ fn registry_fingerprint(path: &Path) -> Option<(u64, u64, Option<std::time::Syst
     use std::os::unix::fs::MetadataExt;
     let m = fs::metadata(path).ok()?;
     Some((m.ino(), m.len(), m.modified().ok()))
-}
-
-// ───────────────────────────────────────────────────────────────────────────────────────────────
-// The socket.
-
-/// `/run/user/<uid>/kickoff/hub.sock`.
-///
-/// Derived on both sides, never configured. `XDG_RUNTIME_DIR` is not on kickoff's list of variables
-/// that survive its `env -i` boundary, so a bridge started by a worker would not see it — the two
-/// would derive different paths and neither would be wrong.
-pub fn socket_path() -> PathBuf {
-    let uid = rustix::process::getuid().as_raw();
-    PathBuf::from(format!("/run/user/{uid}/kickoff")).join("hub.sock")
-}
-
-/// Bind the listener, with the directory and the socket locked down before anything can connect.
-///
-/// A stale socket file from a previous run is removed first. That is safe because the hub lock is
-/// already held by this process — nothing else can be listening — and skipping it would make a
-/// crash require a manual `rm` from a keyboard.
-pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
 }
 
 /// Why a connection was turned away before it became a project.
@@ -1979,18 +1941,19 @@ impl<S: Surface> Hub<S> {
 
     /// Decide whether a `hello` may become a project.
     ///
-    /// Split out from the connection so the decision can be tested without a socket, and so the
-    /// order of the gates is visible in one place.
+    /// Split out from the connection so the decision can be tested without a transport at all, and
+    /// so the order of the gates is visible in one place. It takes the identity rather than a pair
+    /// of uids because "is this peer allowed here" is the transport's question to answer — over a
+    /// gateway it would not be a uid comparison, and the gates below must not have to care.
     pub async fn admit(
         &self,
-        peer_uid: u32,
-        our_uid: u32,
+        who: &ConnectionIdentity,
         hello: &BridgeFrame,
         version: u16,
     ) -> Admission {
-        if peer_uid != our_uid {
+        if !who.is_this_user() {
             tracing::warn!(
-                peer_uid,
+                peer_uid = who.uid_for_the_log(),
                 "a connection from another user was closed without a reply"
             );
             return Admission::ClosedSilently;
@@ -2264,7 +2227,7 @@ impl<S: Surface> Hub<S> {
             // worktree of one repo unreachable; widening it to nothing would be the takeover this
             // whole gate exists to refuse, so within one lane the rule is untouched.
             if let Some(old) = claims.get(&addr) {
-                if pid_is_alive(old.pid) {
+                if fence_is_alive(old.pid) {
                     tracing::warn!(
                         project = %addr.project, lane = addr.lane_field(),
                         incumbent = old.pid, arriving = pid,
@@ -3704,13 +3667,15 @@ impl<S: Surface> Hub<S> {
     /// The order here is the design, so it is worth reading as one sequence: identify the peer,
     /// admit or refuse, admit BEFORE creating anything, prove the far end is really there, and only
     /// then create the topic that makes the project visible.
-    pub async fn serve_connection(self: Arc<Self>, stream: UnixStream) -> anyhow::Result<()> {
-        // The kernel's own answer, both fields. The pid a bridge puts in its `hello` is a number it
-        // chose; this one is a fact about the process on the other end of THIS socket. Gate 4's
-        // liveness check runs on it, so a bridge cannot make itself look dead — or make an
-        // incumbent look dead — by reporting a pid that is not its own.
-        let peer = peer_cred(&stream)?;
-        let (rx_half, mut tx_half) = stream.into_split();
+    pub async fn serve_connection(self: Arc<Self>, accepted: Accepted) -> anyhow::Result<()> {
+        // The transport's own answer, not the bridge's. The pid a bridge puts in its `hello` is a
+        // number it chose; this one is a fact about the process on the other end of THIS
+        // connection. Gate 4's liveness check runs on it, so a bridge cannot make itself look dead
+        // — or make an incumbent look dead — by reporting a pid that is not its own.
+        let Accepted { stream, who } = accepted;
+        // `split` rather than the transport's own halves: a stream the hub was handed is one value
+        // whatever it is underneath, and the writer half has to move into a task of its own.
+        let (rx_half, mut tx_half) = tokio::io::split(stream);
         let mut reader = hub_proto::FrameReader::new(rx_half);
 
         // A connection that never says hello used to sit here forever, holding a task and a file
@@ -3743,10 +3708,7 @@ impl<S: Surface> Hub<S> {
             Ok(Ok(Some(f))) => f,
         };
 
-        let addr = match self
-            .admit(peer.uid, our_uid(), &first.payload, first.v)
-            .await
-        {
+        let addr = match self.admit(&who, &first.payload, first.v).await {
             // No reply at all. A refusal would confirm that something is listening here.
             Admission::ClosedSilently => return Ok(()),
             Admission::Refused(reason) => {
@@ -3765,17 +3727,18 @@ impl<S: Surface> Hub<S> {
         else {
             unreachable!("admit only admits a hello");
         };
-        if claimed_pid != peer.pid {
+        if claimed_pid != who.fence() {
             // Not fatal — a bridge behind a wrapper legitimately does not know its own outermost
             // pid. It IS worth a line, because the audit trail should record which number was
             // believed and which was merely offered.
             tracing::debug!(
                 claimed = claimed_pid,
-                actual = peer.pid,
-                "a bridge reported a pid that is not the one on its socket; using the socket's"
+                actual = who.fence(),
+                "a bridge reported a pid that is not the one on its connection; using the \
+                 connection's"
             );
         }
-        let pid = peer.pid;
+        let pid = who.fence();
 
         // The name the REGISTRY holds, composed for the conversation this is — so a lane's own log
         // says the same thing as the topic the operator is looking at.
@@ -3824,16 +3787,33 @@ impl<S: Surface> Hub<S> {
         // empty topic is a scar. An outbox that cannot be made, or is not the hub's own, is not
         // named — absence is "this hub carries no files" on the wire — so the adapter says so in
         // its tool result rather than sending files the hub would refuse one by one.
-        let outbox = match self.outbox.dir_for(&addr) {
-            Ok(dir) => Some(dir.to_string_lossy().into_owned()),
-            Err(e) => {
-                tracing::error!(
-                    project = %addr.project, lane = addr.lane_field(), error = %e,
-                    "the conversation's outbox is not one this hub will read from, so it was not \
-                     named to the adapter and no file of the agent's will be sent; fix the \
-                     directory and restart the session"
-                );
-                None
+        //
+        // And named only to a peer that can OPEN it. A directory path is worth nothing to a bridge
+        // that does not share this filesystem, and offering one would have it copy a file into a
+        // place the hub will never look and report the send as done. Absence already means "this
+        // hub carries no files", so a peer that cannot reach the tree is simply told that.
+        let outbox = if !who.shares_this_filesystem() {
+            tracing::info!(
+                project = %addr.project, lane = addr.lane_field(),
+                "this bridge cannot reach the files on this machine, so it was offered no \
+                 place to put them"
+            );
+            None
+        } else {
+            // Asked for only now, and not before the identity has been consulted: `dir_for` CREATES
+            // the tree, so asking first left two directories on disk for a peer that was in the
+            // same breath told it had been offered none.
+            match self.outbox.dir_for(&addr) {
+                Ok(dir) => Some(dir.to_string_lossy().into_owned()),
+                Err(e) => {
+                    tracing::error!(
+                        project = %addr.project, lane = addr.lane_field(), error = %e,
+                        "the conversation's outbox is not one this hub will read from, so it was \
+                         not named to the adapter and no file of the agent's will be sent; fix the \
+                         directory and restart the session"
+                    );
+                    None
+                }
             }
         };
         if let Err(e) = self.media.dir_for(&addr) {
@@ -5627,30 +5607,6 @@ fn megabytes(bytes: u64) -> String {
 fn next_frame_seq() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(1);
     SEQ.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Who is on the other end of a connection, according to the kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeerCred {
-    pub uid: u32,
-    /// The process on the other end of THIS socket. Not the pid the bridge says it is: gate 4's
-    /// liveness check runs on this one, so a wrong number here would let a bridge make an incumbent
-    /// look dead and take its project.
-    pub pid: u32,
-}
-
-/// Read the credentials of whoever is on the other end of a connection.
-pub fn peer_cred(stream: &UnixStream) -> std::io::Result<PeerCred> {
-    let cred = rustix::net::sockopt::socket_peercred(stream)?;
-    Ok(PeerCred {
-        uid: cred.uid.as_raw(),
-        pid: cred.pid.as_raw_nonzero().get() as u32,
-    })
-}
-
-/// This process's uid, for comparison against the peer's.
-pub fn our_uid() -> u32 {
-    rustix::process::getuid().as_raw()
 }
 
 #[cfg(test)]

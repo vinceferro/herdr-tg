@@ -159,7 +159,7 @@ pub fn vouched_for(state_dir: &Path) -> Option<Snapshot> {
         .trim()
         .parse()
         .ok()?;
-    if !crate::hub::pid_is_alive(holder) || !looks_like_a_hub(holder) {
+    if !crate::transport::fence_is_alive(holder) || !looks_like_a_hub(holder) {
         return None;
     }
     let snapshot = Presence::new(state_dir.join(FILE)).read().ok()?;

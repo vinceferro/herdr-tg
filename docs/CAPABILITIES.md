@@ -1,4 +1,23 @@
-<!-- SURFACE, v15, 6 September 2026. v15 says two things offers 4 and 5 already had to be true
+<!-- SURFACE, v16, 6 September 2026. v16 says what CARRIES the frames, which this file had never
+     separated from the frames themselves. `AF_UNIX` appeared once, inside REQUIRES 3, as though the
+     socket were part of hub-proto. It is not: the frames are one thing and the transport under them
+     is another, and the difference decides which offers a connection can have. So REQUIRES 3 now
+     says a bridge reaches the hub over a transport THE HUB OFFERS, and names the only one there is
+     — `AF_UNIX` at `/run/user/<uid>/kickoff/hub.sock`, admitted on two facts and not one: the
+     peer's uid, read off the socket by the kernel, and the secret in `hello`. Offer 9 says files
+     are a capability of that transport rather than of the wire — bytes cross by mount, so a peer
+     that does not share this hub's filesystem is offered no outbox. That half is BUILT, and it runs
+     at admission, the one moment the hub has the connection's identity in its hand; the matching
+     half going the other way — withholding a path in a `message` — is not, and offer 9 now says so
+     rather than implying the rule is already there in both directions. Every connection today is
+     local, so neither subtracts anything from anybody: the first is the rule a second transport
+     inherits, the second is work that transport brings with it. And OPEN 4 is new, because this file had no answer at all to "can a
+     bridge on another box reach this hub" and the honest one is no: that belongs under OPEN as joint
+     design rather than under REFUSES, with our proposal beside it — a gateway on the hub's box
+     holding an ordinary local connection, and a second kind of connection identity inside the hub,
+     with the meaning of every frame identical on both. Nothing on the wire moved, nothing was built,
+     and no offer was withdrawn.
+     v15 says two things offers 4 and 5 already had to be true
      for and were not. Offer 5 promised buttons come off "whoever closed it", and an edit Telegram
      refused ended the matter: the keyboard stayed live on his phone, refusing every tap, until the
      ledger dropped it two days later. It is now written down as closed, so the tap is refused, and
@@ -140,7 +159,7 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
 | 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
 | 8 | **Read-only inventory.** `herdr-tg projects --json`: one object per conversation that has ever been given a topic or was opened as a project — a vacant room is not listed until something has connected as it — `{project_id, title, repo, enabled, topic_id, connected, lanes:{address:topic_id}, connected_lanes:[address], allowed_users:[user_id]}`, in that order, sorted by title. A room's `repo` is its seed's, so join on `project_id`, never on the path alone. `topic_id` is `null` before a bridge has ever been live. `connected` is whether the project's OWN voice has a bridge on the socket now — a project reached only through its worktrees never does, and `connected_lanes` is which of its addresses are live. Both come from the running hub's own record of its claims and are `null` whenever no running hub can vouch for them — unknown said as unknown, never a `false` nobody could prove. `allowed_users` is the people let into THAT project's conversations with `herdr-tg allow` (REQUIRES 5), sorted; it is never the people who may speak anywhere, who are not in the file this reads. A registry that is there and cannot be read is refused, never reported as empty. No chat id, no path but the repo's, and no person but the project's own. | Run it at the keyboard; `docs/ATTACHING.md` §7 offer 8 has the shape. |
-| 9 | **Files, both ways.** *Built 6 September, both directions.* What he sends into a conversation's topic — a photo, a document, a voice note, a video — the hub fetches into a directory of its own, and it reaches the agent as a **path**; what an agent attaches to a `say` or a `done` the hub reads from that conversation's outbox, and it reaches his phone as a picture or a document, through the same send accounting as words. Bytes never cross the wire: they cross by a bind mount at the same path on both sides, read-only down and read-write up, one pair of directories per conversation, so a wall sees only its own conversation's files. The hub mints every path it writes; a name Telegram reports or an agent supplies is data, never a path. It trusts nothing in an outbox — not a link of either kind, not a file whose bytes have a second name, not a file it does not own, nothing outside the directory, nothing over Telegram's own ceilings (20 MB down, 50 MB up, measured) — and both trees have a shelf life, a cap and a bound on entries. One fetch is bounded in time too, by a deadline the hub chose rather than the HTTP client's. When a file does not come through, the words still do and both sides are told, the agent on the wire and the operator in one line in his topic; never a silent drop. When the hub could not put that line in his topic either — the same refusal that shed the file sheds a sentence about it — the ack says so in its own word, so an adapter never tells its agent that an explanation is waiting on a phone where there is none. An adapter older than this offer gets the words, and he is told the file did not follow. | `message{files?}` down, `say{file?}` and `done{file?}` up, `welcome{outbox?}` to say where; `docs/ATTACHING.md` §14 has the mounts, the names and every failure's line. |
+| 9 | **Files, both ways.** *Built 6 September, both directions.* What he sends into a conversation's topic — a photo, a document, a voice note, a video — the hub fetches into a directory of its own, and it reaches the agent as a **path**; what an agent attaches to a `say` or a `done` the hub reads from that conversation's outbox, and it reaches his phone as a picture or a document, through the same send accounting as words. Bytes never cross the wire: they cross by a bind mount at the same path on both sides, read-only down and read-write up, one pair of directories per conversation, so a wall sees only its own conversation's files. **This is therefore a capability of the transport, not of the wire.** A path is worth nothing to a peer that cannot open it, so a connection that does not share this hub's filesystem is offered no outbox — no `outbox` in its `welcome`, and nothing for `say{file}` to name, which is already what an adapter reads as "this hub carries no files". Every connection today is local, so this takes nothing from anybody now; it is the rule a second transport (OPEN 4) inherits rather than one that would have to be invented then. **Only the up direction is built.** It is decided at admission, which is the one moment the hub holds the connection's identity; afterwards a claim records the address, the instance and the pid, not who, so there is nowhere today to ask the same question of a `message` going down — and a `message` carrying a path nobody at the other end could open would be a file lost in silence. Whoever builds OPEN 4 builds that half. This is where the debt is written down, not where it is claimed paid. The hub mints every path it writes; a name Telegram reports or an agent supplies is data, never a path. It trusts nothing in an outbox — not a link of either kind, not a file whose bytes have a second name, not a file it does not own, nothing outside the directory, nothing over Telegram's own ceilings (20 MB down, 50 MB up, measured) — and both trees have a shelf life, a cap and a bound on entries. One fetch is bounded in time too, by a deadline the hub chose rather than the HTTP client's. When a file does not come through, the words still do and both sides are told, the agent on the wire and the operator in one line in his topic; never a silent drop. When the hub could not put that line in his topic either — the same refusal that shed the file sheds a sentence about it — the ack says so in its own word, so an adapter never tells its agent that an explanation is waiting on a phone where there is none. An adapter older than this offer gets the words, and he is told the file did not follow. | `message{files?}` down, `say{file?}` and `done{file?}` up, `welcome{outbox?}` to say where; `docs/ATTACHING.md` §14 has the mounts, the names and every failure's line. |
 
 ## REQUIRES — what you must bring
 
@@ -173,10 +192,18 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
    it was. A room granted at the terminal that has never connected is not listed anywhere; it is
    told from a project by its id and its missing topic, never by a flag.
 2. **An address that is unique within its project.** See above. We will not de-duplicate for you.
-3. **A bridge that speaks hub-proto** — NDJSON over `AF_UNIX`, nine frames up, six down — and that
-   answers a ping. A topic is minted only after `hello`, a settling window and one answered ping,
-   because a process that boots and exits in a tenth of a second would otherwise leave an empty
-   topic bound forever.
+3. **A bridge that speaks hub-proto** — NDJSON, nine frames up, six down — **over a transport the
+   hub offers**, and that answers a ping. There is exactly one transport today: `AF_UNIX` at
+   `/run/user/<uid>/kickoff/hub.sock`, in a `0700` directory, the socket itself `0600`. A connection
+   on it is admitted on two facts and not one — **the peer's uid**, which the kernel reports off the
+   socket and which must be the hub's own, and **the secret** in `hello`; a connection from any other
+   uid is closed with no reply at all, after its `hello` has been read, because a refusal would
+   confirm that something is listening. The frames mean the same thing whatever carries them; what a
+   transport decides is who may open a connection at all, how a claim is fenced when a bridge dies
+   without saying `bye` (here: the pid the kernel reports, checked in `/proc`), and which offers are
+   available — files (offer 9) are the local transport's, because bytes cross by mount. A topic is
+   minted only after `hello`, a settling window and one answered ping, because a process that boots
+   and exits in a tenth of a second would otherwise leave an empty topic bound forever.
 4. **One connection per address.** If two producers must speak for one conversation, join them on
    your side. `adapters/kickoff-hub-attach/` is our implementation — it holds the claim and opens a
    local door that speaks hub-proto unchanged, so a producer needs no second wire contract.
@@ -232,6 +259,25 @@ Each is a line, not an omission. Several were paid for.
    memory scope, charter, engine); topic ids stay in our registry and are exposed read-only; the
    join key is the repo path, which both sides already know. This avoids the hub writing into a repo
    and avoids the fact that a topic id does not exist at enrol time.
+4. **A transport that is not this machine.** Everything above assumes the bridge is a process on the
+   hub's own box. Two things depend on that and nothing else does: the uid the kernel reports, which
+   is half of admission (REQUIRES 3), and the shared filesystem, which is the whole of files (offer
+   9). Neither is a reason the frames could not cross a network; both are reasons the hub will not
+   simply listen on one, because it would then be admitting on a secret alone and offering paths
+   nobody at the other end can open. Our proposal, written down in advance so that neither side
+   designs against a different one: a **gateway** — a process on the hub's box that holds one
+   ordinary local connection per remote conversation and carries frames for a peer elsewhere over
+   something it authenticates itself — and, inside the hub, **a second kind of connection identity
+   beside today's local peer** (in the code, one more variant of the type that today says "this uid,
+   this pid").
+   What the frames MEAN would be identical on both: every frame after `hello` acked exactly once,
+   one live connection per address, a topic per address, a tap resolved against a written record,
+   retirement, and a `bye`. What differs is what the hub can prove and therefore what it can offer —
+   no uid to admit on, no `/proc` to evict a corpse from (so a remote claim needs a fence of its own,
+   probably a lease the gateway renews), and no shared filesystem, so no outbox and no path in a
+   `message` — the first of which the hub already withholds, while the second is unbuilt, for the
+   reason offer 9 gives. Nothing here is built, no frame changes if it is, and until it exists the honest answer
+   to "can a bridge on another box reach this hub" is no.
 
 ## Two measurements that bind both of us
 
