@@ -248,6 +248,17 @@ export function createRelay(cfg: RelayConfig): Relay {
     /** Whether anybody took the words at all. */
     accepted: boolean
     /**
+     * Whether the CARRIER refused them — the producer his typed words are addressed to.
+     *
+     * A refusal from it is a fact about where his words were going to go: the note names a session
+     * this worker no longer speaks to, the session is not open, the server cannot be reached. Any
+     * other voice at the door saying "I took it" first used to settle the answer for everybody, so
+     * the hub put a thumb under his line and the reason reached him nowhere — while `--check` and
+     * the document both promise that every line he types goes to the bound session or is refused.
+     * The carrier's no outlives another producer's yes.
+     */
+    carrierRefused: boolean
+    /**
      * The one answer has gone up. Kept until every producer the words were handed to has answered
      * or gone, because a late answer must be recognised as one — forgotten the moment it settled,
      * the fold let a watcher's refusal landing after the tool server's accept go up as it was:
@@ -639,6 +650,7 @@ export function createRelay(cfg: RelayConfig): Relay {
           files: Array.isArray(f.files) ? f.files.length : 0,
           handedOn: 0,
           accepted: false,
+          carrierRefused: false,
           settled: false,
         })
         while (typedWords.size > TYPED_WORDS_KEPT) {
@@ -838,6 +850,12 @@ export function createRelay(cfg: RelayConfig): Relay {
     }
     if (f.status === 'accepted') {
       about.accepted = true
+      // Recorded, then held: the one voice whose answer decides has not spoken yet, and it is the
+      // only one that knows whether his words reached the session they were addressed to.
+      if (about.carrierRefused || (cfg.carrier !== null && about.waiting.has(cfg.carrier))) {
+        settleTypedWords(ref, about)
+        return
+      }
       // The count of his files this producer handed on — the one frame this door rebuilds rather
       // than forwards, and so the one place a field the hub reads could be dropped on the way.
       // The hub reads a short count as a worker too old to take files and says so in his topic,
@@ -852,6 +870,7 @@ export function createRelay(cfg: RelayConfig): Relay {
       return
     }
     about.refusals.push({ key: p.key, reason: typeof f.reason === 'string' ? f.reason : '' })
+    if (p.key === cfg.carrier) about.carrierRefused = true
     settleTypedWords(ref, about)
   }
 
@@ -878,8 +897,9 @@ export function createRelay(cfg: RelayConfig): Relay {
       typedWords.delete(ref)
       return
     }
-    // Somebody did take them; a later producer's refusal does not unsay that.
-    if (about.accepted) {
+    // Somebody did take them; a later producer's refusal does not unsay that — unless it is the
+    // carrier's, which is the one voice that can say where his words went.
+    if (about.accepted && !about.carrierRefused) {
       acceptTypedWords(ref, about)
       return
     }

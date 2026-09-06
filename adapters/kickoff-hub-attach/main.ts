@@ -2,8 +2,8 @@
 /**
  * kickoff-hub-attach — ONE process, one command, that puts a worker on the operator's phone.
  *
- *     kickoff-hub-attach [--opencode <url>] [--run <command...>]
- *     kickoff-hub-attach --check [--opencode <url>] [--run <command...>]
+ *     kickoff-hub-attach [--opencode <url> [--opencode-binding-file <path> [--opencode-binding-generation <n>]]] [--run <command...>]
+ *     kickoff-hub-attach --check [the same flags]
  *
  * A Claude worker was always one command; an opencode worker used to be three hand-started
  * processes for one conversation — the relay that holds the slot, `opencode serve`, and the event
@@ -31,7 +31,7 @@ import { createRelay } from './relay.ts'
 import { runCheck } from './check.ts'
 import { runChild } from './run.ts'
 import { startWatcher } from './opencode.ts'
-import { PRIVATE_DOOR_PREFIX, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
+import { PRIVATE_DOOR_PREFIX, bindingFileProblem, bindingGenerationProblem, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
 
 /** Say something in this process's own transcript, prefixed so a journal tells it from the child's. */
 function note(msg: string): void {
@@ -44,14 +44,21 @@ function die(msg: string): never {
   process.exit(2)
 }
 
-type Args = { check: boolean; opencode: string | null; run: string[] | null }
+type Args = {
+  check: boolean
+  opencode: string | null
+  bindingFile: string | null
+  /** Kept as it was typed until `plan.ts` has said it is a number; a floor misread as none is a fence standing open. */
+  bindingGeneration: string | null
+  run: string[] | null
+}
 
 /**
  * Parse the command line. Everything after `--run` is the command — nothing after it is read as a
  * flag, so the engine can take flags of its own (`serve --port 9711`) without them reaching here.
  */
 function parseArgs(argv: string[]): Args {
-  const a: Args = { check: false, opencode: null, run: null }
+  const a: Args = { check: false, opencode: null, bindingFile: null, bindingGeneration: null, run: null }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--run') {
@@ -67,7 +74,23 @@ function parseArgs(argv: string[]): Args {
       if (!a.opencode) die('--opencode needs a URL, e.g. --opencode http://127.0.0.1:9711')
       continue
     }
-    die(`unknown argument "${arg}"; usage: kickoff-hub-attach [--opencode <url>] [--run <command...>] [--check]`)
+    // Which session on that server is THIS worker's own — a local fact about one wall, so a flag
+    // and not a KICKOFF_HUB_ variable: the namespace is what a fleet's dispatcher speaks, and
+    // nothing outside this wall has any business knowing the id. `docs/ATTACHING.md` §13.
+    if (arg === '--opencode-binding-file') {
+      a.bindingFile = argv[++i] ?? null
+      if (!a.bindingFile) die('--opencode-binding-file needs the path of the file whatever starts the engine writes the worker\'s binding into')
+      continue
+    }
+    // The oldest binding this run may obey. On the command line because it must survive a restart:
+    // what the process remembers about which binding it had reached dies with the process, and the
+    // stale file left behind by a launcher that has since rolled over does not.
+    if (arg === '--opencode-binding-generation') {
+      a.bindingGeneration = argv[++i] ?? null
+      if (!a.bindingGeneration) die('--opencode-binding-generation needs the number of the binding this worker was started for, e.g. --opencode-binding-generation 7')
+      continue
+    }
+    die(`unknown argument "${arg}"; usage: kickoff-hub-attach [--opencode <url> [--opencode-binding-file <path> [--opencode-binding-generation <n>]]] [--run <command...>] [--check]`)
   }
   if (a.run !== null && a.run.length === 0) die('--run needs a command, e.g. --run opencode serve --port 9711')
   return a
@@ -80,13 +103,28 @@ const ARGS = parseArgs(process.argv.slice(2))
 // makes too, through `plan.ts`, because a check that blesses what the start refuses is worse than
 // no check.
 if (ARGS.check) {
-  process.exit(await runCheck({ opencodeUrl: ARGS.opencode, run: ARGS.run }))
+  process.exit(await runCheck({
+    opencodeUrl: ARGS.opencode,
+    bindingFile: ARGS.bindingFile,
+    bindingGeneration: ARGS.bindingGeneration,
+    run: ARGS.run,
+  }))
 }
 
 // The watcher's address, before anything is opened: a URL with no port sent it to port 80 once,
 // while the claim was held and the topic made.
 if (ARGS.opencode) {
   const wrong = opencodeUrlProblem(ARGS.opencode)
+  if (wrong) die(wrong)
+}
+
+// The binding's PATH and its floor, before anything is opened — the file itself need not exist
+// yet, and the wall's normal order is to start the worker and write it a moment later. A path that
+// is not usable is a different matter: every line the operator ever types would be refused, and he
+// would be told to try again in a moment, for ever. A floor that is not a number is worse than
+// that, because it fails quietly: the fence would simply not be there.
+{
+  const wrong = bindingFileProblem(ARGS.bindingFile, ARGS.opencode) ?? bindingGenerationProblem(ARGS.bindingGeneration, ARGS.bindingFile)
   if (wrong) die(wrong)
 }
 
@@ -272,6 +310,9 @@ function watcherConfig(url: string) {
     address: CONFIG.address,
     instance: WATCHER_INSTANCE!,
     opencodeUrl: url,
+    bindingFile: ARGS.bindingFile,
+    // Proved a whole number above, so the fence is held at what the wall said and never at NaN.
+    bindingGeneration: ARGS.bindingGeneration === null ? null : Number(ARGS.bindingGeneration),
     secretOf: () => secretFor(CONFIG),
     whenNotEnrolled: notEnrolled(CONFIG),
     projectDir: CONFIG.projectDir,

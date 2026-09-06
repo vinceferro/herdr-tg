@@ -423,6 +423,43 @@ check("and when the carrier takes them the hub hears accepted, once, never the o
   takenAt.length === 1 && takenAt[0].status === 'accepted' && ocPrompts.some(p => p.text === 'try the staging one first'),
   `${JSON.stringify(takenAt)} prompts=${JSON.stringify(ocPrompts)}`)
 
+// And a voice at the door that CAN take his words does not overrule the one they were for.
+//
+// The carrier is the producer this wall's typed words are addressed to — the session `--opencode`
+// names — and every reason it refuses is a reason about where his words were going to go. Another
+// producer's "I took it" arriving first used to settle the answer for everyone, so the hub put a
+// thumb under his line and he was told nothing at all; on a wall running an engine whose tool
+// server takes typed words — a shell inside a worker inherits the door, which is exactly how a
+// second such voice arrives — that is the answer he gets for a line the bound session refused.
+{
+  const eager = rawProducer(projRelaySock, (f, send) => {
+    if (f.t === 'message') send({ v: 1, id: `e-${f.id}`, t: 'ack', ref: f.id, status: 'accepted' })
+  })
+  await eager.ready
+  eager.send({ v: 1, id: 'e1', t: 'hello', project_id: 'p', token: 'a'.repeat(64),
+    instance: 'a-voice-that-takes-typed-words', repo, pid: process.pid })
+  await until('the eager producer to be let in', () => eager.got.some(f => f.t === 'welcome'))
+  ocSessions = []
+  typedAt('h-t3', 'drop the staging database')
+  await until('an answer', () => projHub.got.some(f => f.t === 'ack' && f.ref === 'h-t3'), 12000).catch(() => {})
+  await Bun.sleep(800)
+  const overruled = projHub.got.filter(f => f.t === 'ack' && f.ref === 'h-t3')
+  check('a_line_the_carrier_refuses_is_refused_to_the_operator_even_when_another_voice_at_the_door_takes_it',
+    overruled.length === 1 && overruled[0].status === 'refused' &&
+      /no session open|worker's server|session/.test(String(overruled[0].reason)),
+    `${JSON.stringify(overruled)} · the other voice saw: ${JSON.stringify(eager.got.filter(f => f.t === 'message').map(f => f.text))}`)
+  // And the carrier taking them is still one accepted answer, with that other voice at the door.
+  ocSessions = [{ id: 'ses_000000000000000000theOne', directory: repo, time: { created: 1, updated: 2 } }]
+  typedAt('h-t4', 'the staging one then')
+  await until('the words to be taken', () => projHub.got.some(f => f.t === 'ack' && f.ref === 'h-t4'), 12000).catch(() => {})
+  await Bun.sleep(800)
+  const stillTaken = projHub.got.filter(f => f.t === 'ack' && f.ref === 'h-t4')
+  check('and_the_carrier_taking_them_is_still_one_accepted_answer_with_another_voice_beside_it',
+    stillTaken.length === 1 && stillTaken[0].status === 'accepted' && ocPrompts.some(p => p.text === 'the staging one then'),
+    `${JSON.stringify(stillTaken)} prompts=${JSON.stringify(ocPrompts.map(p => p.text))}`)
+  eager.end()
+}
+
 // THE STRANGER'S TEST, and it is the one that matters most. `docs/examples/attach-from-the-document.ts`
 // was written from `docs/ATTACHING.md` alone and imports nothing from this repository — not the
 // wire, not the configuration reader, not a type. An interface is only abstract if somebody who has

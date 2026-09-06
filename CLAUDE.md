@@ -39,8 +39,21 @@ opencode server and relays the prompts the agent did not choose (`opencode.ts`, 
 producer at its own door); and with `--run` it starts the engine as its child so a wall has one
 entrypoint (`run.ts`). The tool server (what the agent chose to say) and the watcher both attach to
 the door over a local socket speaking hub-proto unchanged, so **the hub never learns there were
-several**. `--check` proves an environment can reach the hub without creating a topic. There is one
-thing to run under `adapters/`, on purpose.
+several**. **Which** session of that server it speaks to is not a guess: `--opencode-binding-file`
+names the file a launcher writes — one JSON object, stamped `"v": 1`, carrying the session, the
+project it is for, the agent it should be running and which writing of it this is — and attach
+speaks to that session and to no other in both directions, refusing his line out loud rather than
+falling back to the most recently active one, with the file proved before a byte of it is believed
+(where it sits, the link it might be, its owner, its mode). `--opencode-binding-generation` is the
+floor that survives a restart, because what the process remembers about how far the launcher had got
+is exactly what a restart destroys and a stale launcher's file outlives — the unit carries it in the
+same env file as the port, which systemd re-reads on every start. The binding decides the answer the
+hub hears: the watcher is the door's **carrier**, and its refusal outlives another producer's
+acceptance, so a line it refused is never answered with a thumb. And a question the machine could
+not decide on — the file not written yet, the server stalled — is kept and offered again rather than
+dropped, because the thing waiting on it is an agent. `docs/ATTACHING.md` §13.10 is the whole of it.
+`--check` proves an environment can reach the hub without creating a topic. There is one thing to
+run under `adapters/`, on purpose.
 
 **One namespace, `KICKOFF_HUB_`, and one document.** `docs/ATTACHING.md` is the contract an adapter
 attaches by — eight variables of which a normal adopter sets one, the address a dispatcher mints, the
@@ -115,8 +128,9 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   survives, moved to attach; the systemd template is `deploy/kickoff-hub-attach@.service`. It ran for real on 5 September: enabled for the opencode throwaway it held the claim,
   started the engine as its child, attached the watcher, and created no topic.
 - **Typed steering reaches an opencode worker** (5 September). The watcher carries a `message` to
-  `POST /session/{id}/prompt_async` verbatim, in the session the server lists for the project
-  directory; a reply typed under a question — the hub sets `in_reply_to_ask` from the message he
+  `POST /session/{id}/prompt_async` verbatim, in the session a launcher bound it to — or, with no
+  binding, the one the server lists for the project directory; a reply typed under a question — the
+  hub sets `in_reply_to_ask` from the message he
   swiped to reply to, for a question this conversation's live session asked — goes to the session
   that asked and leaves the question open for the tap. Every `message` is answered
   `ack{status, reason?}`, and **the hub now reads it**: a `refused` becomes one line in the topic he

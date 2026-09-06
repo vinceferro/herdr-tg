@@ -562,6 +562,143 @@ console.log('\nwhen the secret the channel keeps is one the hub refuses:')
   hub.stop()
 }
 
+
+// ── S. the session note: read for what it can verify, and never a NOT for absence ─────────────
+//
+// `--opencode-binding-file` is how whatever starts the engine says which session is this worker's
+// own, so the operator's typed words go to that session and to no other. The check reads the note
+// for the two things it can know without the engine running — that the path is one attach can use,
+// and that what is written there is a shape it can read — and it must NOT fail on a note that has
+// not been written yet, because the normal order is: check the wall, start the wall, write the note.
+console.log('\nwhen a session note is named:')
+{
+  const hubSock = join(dir, 's-hub.sock')
+  const hub = recordingHub(hubSock)
+  const env = {
+    KICKOFF_HUB_PROJECT_DIR: repo,
+    KICKOFF_HUB_SOCKET: hubSock,
+    KICKOFF_HUB_RELAY_DIR: relayDir,
+  }
+  const notePath = join(dir, 's-note')
+
+  const relative = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', 'notes/session'])
+  check('the_check_refuses_a_session_note_path_that_is_not_absolute',
+    relative.code === 1 && relative.out.some(l => /^NOT\s+--opencode-binding-file .*absolute path/.test(l)),
+    JSON.stringify(relative.out.filter(l => /NOT/.test(l))))
+
+  const noEngine = await runCheck(env, ['--opencode-binding-file', notePath])
+  check('the_check_refuses_a_session_note_with_no_engine_for_it_to_name_a_session_on',
+    noEngine.code === 1 && noEngine.out.some(l => /^NOT\s+--opencode-binding-file .*--opencode/.test(l)),
+    JSON.stringify(noEngine.out.filter(l => /NOT/.test(l))))
+
+  const absent = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_blesses_a_session_note_that_has_not_been_written_yet_and_says_what_happens_meanwhile',
+    absent.code === 0 &&
+      absent.out.some(l => /^ok\s+.*session.*not written yet/.test(l)) &&
+      absent.out.some(l => /refused/.test(l)),
+    `code ${absent.code}; ${JSON.stringify(absent.out.filter(l => /session/.test(l)))}`)
+
+  writeFileSync(notePath, 'the coordinator, probably\n', { mode: 0o600 })
+  const unreadable = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_refuses_a_session_note_whose_words_it_cannot_read',
+    unreadable.code === 1 && unreadable.out.some(l => /^NOT\s+.*session.*cannot read|^NOT\s+.*not one attach can read/.test(l)),
+    JSON.stringify(unreadable.out.filter(l => /NOT/.test(l))))
+
+  // A path that is there and is not a file to read: the fix is not "wait a moment", so it must not
+  // be told apart from absence only by luck.
+  const notADirectory = join(dir, 's-note-dir')
+  mkdirSync(notADirectory, { recursive: true })
+  const unopenable = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notADirectory])
+  check('the_check_tells_a_session_note_it_cannot_open_apart_from_one_not_written_yet',
+    unopenable.code === 1 && unopenable.out.some(l => /^NOT\s+.*could not be read/.test(l)),
+    JSON.stringify(unopenable.out.filter(l => /session/.test(l))))
+
+  // The floor the fence is held at across a restart. It is a number on the same command line as
+  // the file, so a check that blesses a wall must refuse the two ways of writing it that would
+  // leave the fence open: a number that is not one, and a number with no binding to hold.
+  const notANumber = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath, '--opencode-binding-generation', 'seven'])
+  check('the_check_refuses_a_binding_generation_that_is_not_a_whole_number',
+    notANumber.code === 1 && notANumber.out.some(l => /^NOT\s+--opencode-binding-generation .*whole number/.test(l)),
+    JSON.stringify(notANumber.out.filter(l => /NOT/.test(l))))
+
+  const numberAlone = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-generation', '7'])
+  check('the_check_refuses_a_binding_generation_with_no_binding_file_for_it_to_hold',
+    numberAlone.code === 1 && numberAlone.out.some(l => /^NOT\s+--opencode-binding-generation .*--opencode-binding-file/.test(l)),
+    JSON.stringify(numberAlone.out.filter(l => /NOT/.test(l))))
+
+  // The form this flag shipped with — the id on a line — is told apart from nonsense, because a
+  // launcher still writing it is a launcher to upgrade and that is a different fix.
+  writeFileSync(notePath, 'ses_theBoundOne00000000000\n', { mode: 0o600 })
+  const oldForm = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_tells_a_binding_written_in_an_older_form_apart_from_one_it_cannot_read_at_all',
+    oldForm.code === 1 && oldForm.out.some(l => /^NOT\s+.*written in a form attach does not know/.test(l)),
+    JSON.stringify(oldForm.out.filter(l => /NOT/.test(l))))
+
+  // A binding anybody else on the box can read is one anybody else could have written, and the
+  // person who can put that right is whoever ran this check — so it is named here, in full.
+  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }))
+  chmodSync(notePath, 0o644)
+  const readableByAll = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_refuses_a_binding_file_somebody_else_on_the_box_could_have_written',
+    readableByAll.code === 1 && readableByAll.out.some(l => /^NOT\s+.*is not safe to read/.test(l)),
+    JSON.stringify(readableByAll.out.filter(l => /NOT/.test(l))))
+  chmodSync(notePath, 0o600)
+
+  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  const named = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('and_a_note_that_names_a_session_is_blessed_without_the_check_starting_or_creating_anything',
+    named.code === 0 &&
+      named.out.some(l => /^ok\s+.*session.*names a session/.test(l)) &&
+      !hub.seen.some(f => f.t === 'pong'),
+    `code ${named.code}; ${JSON.stringify(named.out.filter(l => /session/.test(l)))}`)
+  check('and_the_note_it_read_is_never_printed_back_at_whoever_ran_the_check',
+    !named.out.some(l => /ses_theBoundOne/.test(l)),
+    JSON.stringify(named.out.filter(l => /ses_/.test(l))))
+
+  // What the check blesses, the worker can do — and the binding carries two claims the start
+  // refuses OFFLINE, before any server is asked: the number it was written at, and the project it
+  // says it is for. A check that reads the shape and stops blesses a wall where every line the
+  // operator types is refused, which is the exact failure this command exists to catch.
+  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000', generation: 3 }), { mode: 0o600 })
+  const belowTheFloor = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath, '--opencode-binding-generation', '5'])
+  check('the_check_refuses_a_binding_older_than_the_number_the_same_command_line_names',
+    belowTheFloor.code === 1 && belowTheFloor.out.some(l => /^NOT\s+.*older than the one this worker was started for/.test(l)),
+    `code ${belowTheFloor.code}; ${JSON.stringify(belowTheFloor.out.filter(l => /session/.test(l)))}`)
+
+  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  const unnumbered = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath, '--opencode-binding-generation', '5'])
+  check('the_check_refuses_an_unnumbered_binding_where_the_command_line_names_a_number',
+    unnumbered.code === 1 && unnumbered.out.some(l => /^NOT\s+.*does not say how new it is/.test(l)),
+    `code ${unnumbered.code}; ${JSON.stringify(unnumbered.out.filter(l => /session/.test(l)))}`)
+
+  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000', directory: join(dir, 'somewhere-else') }), { mode: 0o600 })
+  const elsewhere = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_refuses_a_binding_that_says_it_is_for_a_different_project_than_the_one_it_runs_in',
+    elsewhere.code === 1 && elsewhere.out.some(l => /^NOT\s+.*a different project/.test(l)),
+    `code ${elsewhere.code}; ${JSON.stringify(elsewhere.out.filter(l => /session/.test(l)))}`)
+
+  // The id you can read first is not the one JSON keeps: the last of two keys of one name wins,
+  // and `Object.keys` sees one. On the one file this whole flag treats as authoritative, "what it
+  // says is not what it does" is the property that must not exist.
+  writeFileSync(notePath, '{"v":1,"session":"ses_theBoundOne00000000000","session":"ses_theOtherOne00000000000"}', { mode: 0o600 })
+  const twice = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('a_binding_that_names_the_session_twice_is_refused_rather_than_read_as_the_last_one',
+    twice.code === 1 && twice.out.some(l => /^NOT\s+.*not one attach can read/.test(l)),
+    `code ${twice.code}; ${JSON.stringify(twice.out.filter(l => /session/.test(l)))}`)
+
+  // A directory that is THERE and cannot be looked into is not one nobody has made yet, and saying
+  // both in the same run sends whoever runs the wall looking for the wrong fix.
+  const shut = join(dir, 's-shut')
+  mkdirSync(join(shut, 'inner'), { recursive: true })
+  chmodSync(shut, 0o600)
+  const cannotLook = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', join(shut, 'inner', 'binding')])
+  chmodSync(shut, 0o700)
+  check('a_directory_the_check_cannot_look_into_is_not_also_reported_as_one_nobody_has_made_yet',
+    cannotLook.code === 1 && !cannotLook.out.some(l => /nothing has made/.test(l)),
+    `code ${cannotLook.code}; ${JSON.stringify(cannotLook.out.filter(l => /session/.test(l)))}`)
+  hub.stop()
+}
+
 rmSync(dir, { recursive: true, force: true })
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} FAILED`)
 process.exit(failures === 0 ? 0 : 1)

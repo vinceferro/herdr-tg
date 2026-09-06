@@ -38,6 +38,7 @@
 import { pathToFileURL } from 'node:url'
 
 import type { Project } from '../../plugins/kickoff-channel/where.ts'
+import { readBindingFile, sameDirectory, type SessionBinding } from './plan.ts'
 import { HubLink, MAX_FRAME_BYTES, type Delivery, type Outbound, type Unanswered } from '../../plugins/kickoff-channel/hub-link.ts'
 
 /** What the watcher needs, worked out by `main.ts` from the namespace and the door it opened. */
@@ -54,6 +55,22 @@ export type WatcherConfig = {
   instance: string
   /** The opencode server to watch. Seam ②, and deliberately outside the namespace. */
   opencodeUrl: string
+  /**
+   * The file whatever starts the engine writes this worker's OWN binding into, or null.
+   *
+   * With it, the operator's words go to the session it names and to no other, and only that
+   * session's questions reach him. Without it, the watcher takes the most recently active root
+   * session the server lists for the project directory — a guess, and a wrong one on any wall
+   * running more than one session for a directory: measured on this box, a steering room's only
+   * root session was an unrestricted coordinator and not the session the room steers at all.
+   */
+  bindingFile: string | null
+  /**
+   * The oldest binding this run may obey, or null when the wall named none.
+   *
+   * The floor of the fence, and the only part of it that survives this process being restarted.
+   */
+  bindingGeneration: number | null
   /**
    * The enrolled project, resolved AFRESH on every attempt — the watcher presents the same secret
    * the door authenticated with, so the door's defence-in-depth token check passes.
@@ -91,6 +108,275 @@ export function startWatcher(cfg: WatcherConfig): void {
 
   /** This run. A new instance invalidates every question the last one left open. */
   const INSTANCE = cfg.instance
+
+  /**
+   * The file naming this worker's own session — the whole of the binding, and null when the wall
+   * did not give one. Read AFRESH every time it is needed and never cached: a launcher that starts
+   * a new session rewrites it, and the next line the operator types must go to the new session
+   * with nothing restarted. It is a path, not a session: what is in it may change under this
+   * process at any moment, and may not be there at all while the engine is still booting.
+   */
+  const BINDING_FILE = cfg.bindingFile
+
+  /**
+   * The oldest binding this run may ever obey — the wall said it on the command line, and nothing
+   * this process reads can lower it.
+   *
+   * The monotonic rule below is memory, and a restart is what destroys memory: a watcher that comes
+   * back after a crash, a redeploy or a systemd restart has never seen the binding it was obeying a
+   * second earlier, so a stale launcher's file from before the last rollover is the newest thing it
+   * has ever seen and it obeys it. That is precisely the rollback the fence exists to refuse, and
+   * only a number carried INTO the process can refuse it. Whatever starts the wall is the same
+   * party that numbers the bindings, so it is the party that can say the floor.
+   */
+  const FLOOR = cfg.bindingGeneration
+
+  /**
+   * The generation of the newest note this process has ACTED ON, and the session it named.
+   *
+   * A launcher that numbers its writings is saying which one is newer. Two walls that both think
+   * they own this conversation would otherwise take turns retargeting it — the loser's write is the
+   * last one, so the loser wins — and the operator's words would land in whichever session lost the
+   * race. Once a numbered note has been obeyed, a note carrying a smaller number, or the same
+   * number with a different session in it, is refused rather than obeyed: going backwards cannot be
+   * told apart from a stale wall writing over a newer binding, so it fails closed.
+   *
+   * Two things the fence deliberately does NOT do, each of which bricked a wall for the life of the
+   * process while telling the operator about a note he has never been told exists:
+   *
+   *   - A note carrying NO number is not "older" — unless the wall named a FLOOR, which is a wall
+   *     saying its launcher numbers every writing, and an unnumbered note there is one this cannot
+   *     place. Where no floor was named the fence only orders two numbered writers against each
+   *     other, and a note that names no generation has made no claim to be newer; reading it as
+   *     older meant that one numbered note, ever, muted a launcher that had gone back to writing
+   *     plain ones.
+   *   - The fence closes only behind a note the SERVER confirmed. A launcher that writes the note
+   *     a beat before its session is listed sees every line refused, and has no reason to raise the
+   *     number for the correction — nothing ever took the first one. Advancing on a note that then
+   *     failed every check made that correction permanently unreachable.
+   */
+  let fencedAt = -1
+  let fencedTo: string | null = null
+
+  /**
+   * Read the note and apply the fence. The sentences are the operator's, not a developer's.
+   *
+   * A refusal says WHICH KIND it is. `couldNotFindOut` means the note did not say anything — it is
+   * not there yet, it could not be read, it is written in something this cannot make sense of — as
+   * against the note saying plainly that this is not the session (the fence, another project,
+   * another agent). The two need different handling in two places: a question is kept and offered
+   * again when nothing was found out, and a reply under a question this watcher itself drew still
+   * reaches the session that asked it. Neither may EVER happen for a note that has moved on, which
+   * is the rollback the fence exists to refuse.
+   */
+  function bindingNow(): { binding: SessionBinding } | { refused: string; couldNotFindOut?: true } {
+    const read = readBindingFile(BINDING_FILE!)
+    if ('refused' in read) {
+      // The half of it only whoever runs the wall can act on. The operator's sentence can name no
+      // path, no owner and no mode — he has never been told the file exists — so the actionable
+      // words go where the person who can chmod it looks.
+      if (read.why) note(`the note naming the worker's session was not read: ${read.why}`)
+      return { refused: read.refused, couldNotFindOut: true }
+    }
+    const { generation, sessionID } = read.binding
+    // The floor first, because it is the only half of the fence a restart cannot forget. A binding
+    // under it is refused for the life of this process however many times it is rewritten.
+    if (FLOOR !== null) {
+      if (generation === null) {
+        note(
+          `this watcher was started for binding ${FLOOR}, and the note names no generation at all; ` +
+            'a wall started with a number must have every writing of the note numbered',
+        )
+        return { refused: DOES_NOT_SAY_HOW_NEW_IT_IS }
+      }
+      if (generation < FLOOR) {
+        note(
+          `the note names a session at generation ${generation}, and this watcher was started for ${FLOOR}; ` +
+            'a binding older than the one the wall was started for is never obeyed',
+        )
+        return { refused: OLDER_THAN_THE_ONE_IN_USE }
+      }
+    }
+    if (fencedAt >= 0 && generation !== null) {
+      const olderNumber = generation < fencedAt
+      const sameNumberOtherSession = generation === fencedAt && sessionID !== fencedTo
+      if (olderNumber || sameNumberOtherSession) {
+        // The one sentence he can be given is about a note he does not know exists, and the fix is
+        // in a file only whoever wrote the launcher can touch. So the actionable half is said
+        // here, where that person looks, rather than left implied on his phone.
+        note(
+          `the note names a session at generation ${generation}, and ${fencedAt} has already been acted on; ` +
+            'whatever writes the note must raise the number on every rewrite',
+        )
+        return { refused: OLDER_THAN_THE_ONE_IN_USE }
+      }
+    }
+    return read
+  }
+
+  /**
+   * Close the fence behind a binding that passed every check, including the server's.
+   *
+   * Called at the one place a note is actually obeyed, so a note that was read and refused leaves
+   * the fence exactly where it was.
+   */
+  function fenceBehind(b: SessionBinding): void {
+    if (b.generation === null) return
+    fencedAt = b.generation
+    fencedTo = b.sessionID
+  }
+
+  /** The session this conversation is bound to right now, or null when the note cannot say. */
+  function boundSessionNow(): string | null {
+    const b = bindingNow()
+    return 'refused' in b ? null : b.binding.sessionID
+  }
+
+  /**
+   * Reasons a question could not be shown that he has already been told about.
+   *
+   * One line, not one per question: a note that cannot be read stays unreadable for as long as it
+   * takes somebody to mend it, and a wall that asks a question a second every second would
+   * otherwise spend the project's whole send ceiling saying the same sentence. Cleared the moment a
+   * question does get through, so the next spell of not knowing is said again.
+   */
+  const alreadySaid = new Set<string>()
+  function tellHimOnce(key: string, text: string): void {
+    if (alreadySaid.has(key)) return
+    alreadySaid.add(key)
+    say({ t: 'say', text, hint: 'prose' }, 'a word about a question that could not be shown')
+  }
+
+  /**
+   * Whether a question opencode published is THIS conversation's to ask.
+   *
+   * One server can be running sessions for several walls, and a question from a session this
+   * conversation is not bound to is another worker's: relaying it would put another worker's
+   * keyboard on the operator's phone under this project's name, and his tap would then answer into
+   * a session nobody bound. Fails closed — a note that cannot be read relays nothing — because a
+   * question shown under the wrong name is worse than a question that waits.
+   *
+   * The SAME question the typed-words path asks, against the server, and for the same reason: two
+   * rules meant the note could be good enough to draw a session's keyboard on his phone and post
+   * his tap into it, while the very next line he typed at that session was refused. A note naming
+   * another project's directory, or a session running an agent it should not be, is exactly how a
+   * launcher reaches that by accident.
+   *
+   * And nothing here is ever dropped in silence. A question refused for a reason ABOUT THE NOTE is
+   * a question nobody has been shown while an agent waits on it for ever, so it is said once in the
+   * topic; a question from a session that simply is not this one belongs to another wall's
+   * conversation and is not his business.
+   */
+  /**
+   * Questions the machine could not decide on, kept to be offered again — the event as it came,
+   * against the moment this stops waiting for it.
+   *
+   * A question is dropped when the NOTE says it is not this conversation's. It must not be dropped
+   * when nothing was found out: a server that stalled once, a server that answered 500, a note the
+   * launcher has not written yet because the engine booted a beat before it. Dropped there, the
+   * agent that asked waits on a keyboard that never appears, no record exists to retire it, and
+   * nothing tries again when the server is well a second later. Before the note existed a question
+   * was drawn with no round trip at all, so that failure is new and it is this adapter's own worst
+   * shape — a dead keyboard — with the keyboard missing instead of stale.
+   *
+   * Bounded three ways, because a wall whose server never comes back must not grow a queue: how
+   * many are kept, how long each is kept for, and — the one that matters most — ONE is offered
+   * again per pass. Every question here costs a request with a ten-second deadline, and the events
+   * are handled strictly one after another, so offering eight of them at once against a stalled
+   * server would park every live event behind a minute and a half of timeouts.
+   */
+  const keptQuestions = new Map<Record<string, any>, number>()
+  const KEEP_A_QUESTION_FOR_MS = 60_000
+  const MOST_QUESTIONS_KEPT = 8
+  /** Long enough that a stalled server's ten-second deadline is not the whole of every window. */
+  const TRY_A_KEPT_QUESTION_AGAIN_MS = 5_000
+  /** One went through, so the server is answering: the rest need not wait out the slow interval. */
+  const OFFER_THE_NEXT_ONE_AFTER_MS = 250
+  let tryingAgain: ReturnType<typeof setTimeout> | null = null
+
+  /** Keep this question to be offered again, or false when it has waited as long as it may. */
+  function keepForLater(ev: Record<string, any>): boolean {
+    const until = keptQuestions.get(ev)
+    if (until !== undefined) {
+      if (Date.now() < until) {
+        offerAKeptQuestionAgainIn(TRY_A_KEPT_QUESTION_AGAIN_MS)
+        return true
+      }
+      keptQuestions.delete(ev)
+      return false
+    }
+    // Full: this one is given up on now rather than pushing an older one out. The oldest has been
+    // waited on longest and is closest to being answered or given up on either way.
+    if (keptQuestions.size >= MOST_QUESTIONS_KEPT) return false
+    keptQuestions.set(ev, Date.now() + KEEP_A_QUESTION_FOR_MS)
+    note('a question could not be decided on yet; it is being kept and will be offered again')
+    offerAKeptQuestionAgainIn(TRY_A_KEPT_QUESTION_AGAIN_MS)
+    return true
+  }
+
+  /** Put the oldest kept question back through the ordinary path, one at a time, later. */
+  function offerAKeptQuestionAgainIn(ms: number): void {
+    if (tryingAgain !== null || keptQuestions.size === 0) return
+    tryingAgain = setTimeout(() => {
+      tryingAgain = null
+      const next = keptQuestions.keys().next()
+      if (next.done) return
+      const ev = next.value
+      onOpencodeEvent(ev)
+      // Only once it has been decided on, so two passes can never be in flight at once. Caught,
+      // because this chain is the one every later event queues behind: a rejection left on it
+      // would be the last event this watcher ever handled.
+      handledInOrder = handledInOrder
+        .then(() =>
+          offerAKeptQuestionAgainIn(keptQuestions.has(ev) ? TRY_A_KEPT_QUESTION_AGAIN_MS : OFFER_THE_NEXT_ONE_AFTER_MS),
+        )
+        .catch(e => note(`a kept question could not be offered again: ${(e as Error)?.message ?? e}`))
+    }, ms)
+    // Never a reason for this process to stay alive on its own.
+    ;(tryingAgain as any)?.unref?.()
+  }
+
+  /** A question answered somewhere else while it waited is no longer one to offer. */
+  function stopKeeping(requestID: string): void {
+    if (!requestID) return
+    for (const ev of [...keptQuestions.keys()]) {
+      const d = ev?.properties ?? ev?.data ?? {}
+      if (String(d.id ?? '') === requestID) keptQuestions.delete(ev)
+    }
+  }
+
+  async function fromTheBoundSession(sessionID: string, ev: Record<string, any>): Promise<boolean> {
+    if (!BINDING_FILE) return true
+    if (!sessionID) {
+      // An older event shape that names no session cannot be matched against the note at all. It is
+      // still not shown — nothing can prove it is this conversation's — but the agent that asked is
+      // blocked on it, and the journal is not somewhere he looks.
+      note('an event that named no session was not passed on: nothing about it can be matched against the note')
+      tellHimOnce(
+        'named no session',
+        'The worker asked something that did not say which of its sessions it came from, so it is not being shown here.',
+      )
+      return false
+    }
+    const bound = await theSessionTheNoteNames(null)
+    if ('refused' in bound) {
+      // Nothing was found out, so nothing has been decided: kept, and offered again. He is told
+      // only once this has stopped waiting, because a sentence about a question that then appears
+      // a second later is a sentence he can do nothing with.
+      if (bound.couldNotFindOut && keepForLater(ev)) return false
+      keptQuestions.delete(ev)
+      note(`a question from ${sessionID} was not passed on: ${bound.refused}`)
+      tellHimOnce(bound.refused, `The worker asked something and it cannot be shown here — ${bound.refused}.`)
+      return false
+    }
+    keptQuestions.delete(ev)
+    if (bound.sessionID !== sessionID) {
+      note(`a question from ${sessionID} was not passed on: this conversation is bound to ${bound.sessionID}`)
+      return false
+    }
+    alreadySaid.clear()
+    return true
+  }
 
   /**
    * How long one request to the server may take before it is given up on.
@@ -446,19 +732,41 @@ export function startWatcher(cfg: WatcherConfig): void {
     return { parts, lines, count: f.files.length }
   }
 
+  // ── what he is told when the note cannot be obeyed ────────────────────────────────────────────
+  //
+  // Every one of these goes VERBATIM into the topic he typed in, under the line it refuses — the
+  // hub only strips control characters and clips — so none of them carries a path, an id, a status
+  // code or a word he has never been told exists. Each says the thing he could act on, and none of
+  // them is ever followed by the words going somewhere else instead.
+  const OLDER_THAN_THE_ONE_IN_USE = "the note naming this worker's session is older than the one already in use"
+  const DOES_NOT_SAY_HOW_NEW_IT_IS = "the note naming this worker's session does not say how new it is"
+  const BELONGS_TO_ANOTHER_PROJECT = 'the session named for this worker belongs to a different project'
+  const HAS_BEEN_ARCHIVED = 'the session named for this worker has been archived'
+  const IS_A_HELPERS_SESSION = "the session named for this worker is a helper's session, not the one to speak to"
+  const IS_NOT_OPEN = 'the session named for this worker is not open on its server'
+  const SAYS_NO_AGENT = 'the session named for this worker does not say which agent it is running'
+  const RUNS_ANOTHER_AGENT = 'the session named for this worker is running a different agent from the one it should be'
+  const THE_QUESTION_HAS_MOVED_ON = 'the question you replied to was asked by a session this worker no longer speaks to'
+  const MOVED_WHILE_ON_ITS_WAY = 'the worker moved to another session while that was on its way, so it was not delivered; send it again'
+
   /**
    * Which session his words go to. The MACHINE's answer, in this order, and never the text's:
    *
-   *   1. Typed under a question this watcher asked and still holds open: the session that asked
-   *      it. It is the one time the operator has said which session he means. The words are
-   *      still a prompt and not an answer to the question — its answers are the buttons opencode
-   *      published, and a permission takes three words and no others — so the question stays open
-   *      for his tap, and opencode runs the words once it is answered (measured, 5 September).
+   *   0. When the wall gave a note naming this worker's own session (`--opencode-binding-file`),
+   *      that session and no other — `theSessionTheNoteNames`, below. This is the only rule that
+   *      can be RIGHT on a server running sessions for more than one wall, and where it is set,
+   *      nothing here ever falls back to a guess: a line that cannot be delivered to the named
+   *      session is refused out loud, with a reason the hub puts under the line he typed.
+   *   1. Otherwise, typed under a question this watcher asked and still holds open: the session
+   *      that asked it. It is the one time the operator has said which session he means. The words
+   *      are still a prompt and not an answer to the question — its answers are the buttons
+   *      opencode published, and a permission takes three words and no others — so the question
+   *      stays open for his tap, and opencode runs the words once it is answered (measured,
+   *      5 September).
    *   2. Otherwise the session this wall's server is running for the project directory attach
    *      speaks for: `GET /session?directory=<it>&roots=true`, which the server answers most
-   *      recently updated first. The operator's decision is one server per wall, so this is
-   *      usually one; when it is several, the one that moved last is the one whose words he is
-   *      reading. Root sessions only, because a subagent's session is not the conversation on his
+   *      recently updated first. That is a guess, and it is only ever taken when nobody said
+   *      otherwise. Root sessions only, because a subagent's session is not the conversation on his
    *      phone; and nothing archived. Measured: the directory match takes a trailing slash and a
    *      symlink, and excludes a subfolder.
    *   3. None: refused, with a reason the hub can put in front of him. Never a guess — a guess is
@@ -470,26 +778,14 @@ export function startWatcher(cfg: WatcherConfig): void {
   async function sessionForTypedWords(
     inReplyTo: string | null,
   ): Promise<{ sessionID: string; how: string } | { refused: string }> {
+    if (BINDING_FILE) return await theSessionTheNoteNames(inReplyTo)
     if (inReplyTo) {
       const asked = open.get(inReplyTo)
       if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}` }
     }
-    let list: unknown
-    try {
-      const r = await fetch(`${OPENCODE}/session?directory=${encodeURIComponent(cfg.projectDir)}&roots=true`, {
-        signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
-      })
-      if (!r.ok) {
-        note(`opencode would not say which session is open (${r.status})`)
-        return { refused: "the worker's server would not say which session is open" }
-      }
-      list = await r.json()
-    } catch (e) {
-      note(`could not ask opencode which session is open: ${(e as Error)?.message ?? e}`)
-      return { refused: unreached(e) }
-    }
-    if (!Array.isArray(list)) return { refused: "the worker's server gave an answer that could not be read" }
-    const candidates = list
+    const listed = await rootSessionsHere()
+    if ('refused' in listed) return listed
+    const candidates = listed.list
       .filter((s: any) => s && typeof s.id === 'string' && s.id.startsWith('ses') && !s.parentID && !s.time?.archived)
       .sort((a: any, b: any) => Number(b.time?.updated ?? 0) - Number(a.time?.updated ?? 0))
     if (!candidates.length) {
@@ -499,6 +795,140 @@ export function startWatcher(cfg: WatcherConfig): void {
       sessionID: String(candidates[0].id),
       how: candidates.length === 1 ? 'the one session open' : `the most recently active of ${candidates.length} sessions`,
     }
+  }
+
+  /**
+   * The session the note names, proved to be the one it claims to be, on every line.
+   *
+   * Everything here is checked at DELIVERY time against the server's own answer, because each of
+   * these has a way of being true when the note was written and false a minute later: the session
+   * can be closed, archived, or replaced; the note can be a leftover from a previous run of the
+   * wall; and an id a launcher wrote for another project's worker resolves perfectly well on a
+   * server shared by several. The one measured on this box on 6 September is the last of them: the
+   * only root session in a steering room's directory was an unrestricted `coordinator`, and the
+   * session the room actually steers was a different one — so a note that says which AGENT it
+   * expects refuses the coordinator instead of handing it the operator's words.
+   *
+   * The same measured listing decides all of it — one request, `directory` and `roots=true`, the
+   * two rules captured from 1.18.25 — so a session that is not in it is not this project's root
+   * session, whatever else it may be. A second, unfiltered request is made only to choose the
+   * SENTENCE, never to widen what is accepted.
+   */
+  async function theSessionTheNoteNames(
+    inReplyTo: string | null,
+  ): Promise<{ sessionID: string; how: string } | { refused: string; couldNotFindOut?: true }> {
+    const b = bindingNow()
+    if ('refused' in b) {
+      // A question THIS watcher drew had its session proved against the note when the keyboard went
+      // up, and a reply typed under it is the one time the operator has said which session he
+      // means. While the note simply cannot be read — a launcher mid-rewrite, a file not put back
+      // yet — refusing his reply told him to try again in a moment about a thing no moment of his
+      // will mend, and left the question he was answering open in front of him. A note that has
+      // MOVED ON is a different fact and is refused below, where it always was.
+      if (b.couldNotFindOut && inReplyTo) {
+        const asked = open.get(inReplyTo)
+        if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}` }
+      }
+      return b
+    }
+    const want = b.binding
+    // The launcher's own claim about which project the session is for, checked against the project
+    // attach speaks for before anything is asked of the server: a note written for another worker
+    // must not steer this conversation even if that session is somehow listed here.
+    if (want.directory !== null && !sameDirectory(want.directory, cfg.projectDir)) {
+      return { refused: BELONGS_TO_ANOTHER_PROJECT }
+    }
+    const listed = await rootSessionsHere()
+    if ('refused' in listed) return listed
+    // The note again, now that the server has been waited on. Reading it once and delivering on
+    // what it said before a network round trip is a window — ten seconds wide on a loaded server —
+    // in which a launcher's rollover lands the operator's words in the session he has stopped
+    // talking to, acked as though it went where he meant. Refused rather than retargeted: the
+    // checks above were made about the old session, and nothing has proved them of the new one.
+    const still = bindingNow()
+    if ('refused' in still) return still
+    if (still.binding.sessionID !== want.sessionID) return { refused: MOVED_WHILE_ON_ITS_WAY }
+    const found = listed.list.find((s: any) => s && String(s.id) === want.sessionID)
+    if (!found) return { refused: await whyItIsNotListed(want.sessionID) }
+    if (found.time?.archived) return { refused: HAS_BEEN_ARCHIVED }
+    // `roots=true` already drops these, and it is checked again because the cost of being wrong is
+    // the operator steering a subagent that nobody is reading.
+    if (found.parentID) return { refused: IS_A_HELPERS_SESSION }
+    // The same reason, on the session's OWN word rather than on the query having been obeyed. The
+    // sentence-picking listing below already applies this rule; acceptance skipping it meant a
+    // server that ignored `directory=` — a proxy, a version that drops an unknown parameter —
+    // would have handed this project's operator another project's worker.
+    if (typeof found.directory === 'string' && !sameDirectory(found.directory, cfg.projectDir)) {
+      return { refused: BELONGS_TO_ANOTHER_PROJECT }
+    }
+    if (want.agent !== null) {
+      const running = typeof found.agent === 'string' && found.agent.length > 0 ? found.agent : null
+      if (running === null) return { refused: SAYS_NO_AGENT }
+      if (running !== want.agent) return { refused: RUNS_ANOTHER_AGENT }
+    }
+    if (inReplyTo) {
+      const asked = open.get(inReplyTo)
+      // A question asked before the note was rewritten belongs to a session this conversation has
+      // stopped speaking to. Carrying his reply into it would steer a worker nobody is bound to,
+      // and carrying it into the NEW session would answer a question that session never asked.
+      if (asked && asked.sessionID !== want.sessionID) return { refused: THE_QUESTION_HAS_MOVED_ON }
+      if (asked) {
+        fenceBehind(want)
+        return { sessionID: want.sessionID, how: `the session that asked ${inReplyTo}, which is the one the note names` }
+      }
+    }
+    fenceBehind(want)
+    return { sessionID: want.sessionID, how: 'the session the note names' }
+  }
+
+  /** The root sessions this server lists for the project directory — the one measured listing. */
+  async function rootSessionsHere(): Promise<{ list: any[] } | { refused: string; couldNotFindOut?: true }> {
+    let list: unknown
+    try {
+      const r = await fetch(`${OPENCODE}/session?directory=${encodeURIComponent(cfg.projectDir)}&roots=true`, {
+        signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
+      })
+      if (!r.ok) {
+        note(`opencode would not say which session is open (${r.status})`)
+        return { refused: "the worker's server would not say which session is open", couldNotFindOut: true }
+      }
+      list = await r.json()
+    } catch (e) {
+      note(`could not ask opencode which session is open: ${(e as Error)?.message ?? e}`)
+      return { refused: unreached(e), couldNotFindOut: true }
+    }
+    if (!Array.isArray(list)) return { refused: "the worker's server gave an answer that could not be read", couldNotFindOut: true }
+    return { list }
+  }
+
+  /**
+   * Why the named session is not among this project's root sessions — the SENTENCE only.
+   *
+   * Nothing this answers can make a refused line deliverable; it exists so the operator is told
+   * which of four different things went wrong, because the fix is different for each and "not
+   * open" sent somebody looking for a dead server once. One unfiltered listing, on the same
+   * deadline every request here has, and a server that will not answer it simply gets the plainest
+   * of the four.
+   */
+  async function whyItIsNotListed(sessionID: string): Promise<string> {
+    let list: unknown
+    try {
+      const r = await fetch(`${OPENCODE}/session`, { signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS) })
+      if (!r.ok) return IS_NOT_OPEN
+      list = await r.json()
+    } catch (e) {
+      note(`could not ask opencode about the session the note names: ${(e as Error)?.message ?? e}`)
+      return IS_NOT_OPEN
+    }
+    if (!Array.isArray(list)) return IS_NOT_OPEN
+    const anywhere = list.find((s: any) => s && String(s.id) === sessionID)
+    if (!anywhere) return IS_NOT_OPEN
+    if (anywhere.time?.archived) return HAS_BEEN_ARCHIVED
+    if (anywhere.parentID) return IS_A_HELPERS_SESSION
+    if (typeof anywhere.directory === 'string' && !sameDirectory(anywhere.directory, cfg.projectDir)) {
+      return BELONGS_TO_ANOTHER_PROJECT
+    }
+    return IS_NOT_OPEN
   }
 
   /**
@@ -530,6 +960,32 @@ export function startWatcher(cfg: WatcherConfig): void {
       note(`a tap named an option ${askId} never offered; nothing was answered`)
       return
     }
+    // A tap for a question this conversation can no longer speak to the asker of. Proved the same
+    // way a typed line is — against the server, not against the note's raw text — because the two
+    // directions being different rules is how his tap came to be posted into a session the next
+    // line he typed was refused for.
+    //
+    // The record is KEPT rather than forgotten: nothing was answered, and if the note names that
+    // session again the tap's own question is still the one it belongs to.
+    //
+    // And he is told. The hub has already put "Sent: X" under his tap; leaving him with that and
+    // nothing else is the dead keyboard this adapter exists to end.
+    if (BINDING_FILE) {
+      // Named with the ask, not asked in the abstract: this is his answer to a question this
+      // watcher drew, so the same rule that carries a REPLY typed under it carries the tap — a note
+      // that cannot be read at this instant does not unsay which session asked, while a note that
+      // has moved on refuses both.
+      const to = await theSessionTheNoteNames(askId)
+      const why = 'refused' in to ? to.refused : to.sessionID === o.sessionID ? null : THE_QUESTION_HAS_MOVED_ON
+      if (why !== null) {
+        note(`a tap arrived for ${askId}, whose session this conversation cannot speak to; nothing was answered`)
+        say(
+          { t: 'say', text: `Your answer did not reach the worker — ${why}. Nothing was sent to it.`, hint: 'prose' },
+          'a word about an answer that reached nobody',
+        )
+        return
+      }
+    }
     open.delete(askId)
     const url = replyUrl(o)
     // Both question endpoints take the same body — the answers to each question in order, and each
@@ -556,8 +1012,26 @@ export function startWatcher(cfg: WatcherConfig): void {
     }
   }
 
-  /** One opencode event, mapped onto the hub's vocabulary. Exported shape kept identical to before. */
+  /**
+   * Events, handled strictly one after another.
+   *
+   * Deciding whether a question is this conversation's now asks the server, so drawing a keyboard
+   * is no longer instant — and two things go wrong the moment events overlap. Two questions can be
+   * drawn in the wrong order, so the phone's second keyboard belongs to the first question; and the
+   * event that RETIRES a question can run before the question was drawn, which leaves a live
+   * keyboard on his phone for something already answered. Ordering them costs a queue and settles
+   * both. One slow answer from the server holds the rest for at most the deadline every request
+   * here shares.
+   */
+  let handledInOrder: Promise<unknown> = Promise.resolve()
   function onOpencodeEvent(ev: Record<string, any>): void {
+    handledInOrder = handledInOrder
+      .then(() => handleOpencodeEvent(ev))
+      .catch(e => note(`an event could not be handled: ${(e as Error)?.message ?? e}`))
+  }
+
+  /** One opencode event, mapped onto the hub's vocabulary. Exported shape kept identical to before. */
+  async function handleOpencodeEvent(ev: Record<string, any>): Promise<void> {
     const type = String(ev?.type ?? '')
     // opencode carries the same payload under two names. `/event` nests it in `properties`; the
     // durable per-session stream nests it in `data`. Reading only one is not a parse error — every
@@ -567,6 +1041,7 @@ export function startWatcher(cfg: WatcherConfig): void {
     switch (type) {
       case 'question.v2.asked':
       case 'question.asked': {
+        if (!(await fromTheBoundSession(String(data.sessionID ?? ''), ev))) return
         const questions: any[] = Array.isArray(data.questions) ? data.questions : []
         // opencode can publish several questions in one request. Only the first is drawn: the reply
         // shape answers them in order, and a phone that shows two keyboards for one request cannot
@@ -598,6 +1073,7 @@ export function startWatcher(cfg: WatcherConfig): void {
       }
       case 'permission.v2.asked':
       case 'permission.asked': {
+        if (!(await fromTheBoundSession(String(data.sessionID ?? ''), ev))) return
         // The reply set is opencode's own and it is closed: once, always, reject. The operator picks
         // one of three; he never names the action, and this watcher never invents a fourth.
         const askId = `p${data.id}`
@@ -639,6 +1115,10 @@ export function startWatcher(cfg: WatcherConfig): void {
         // stale keyboard cannot be tapped an hour later. This is the frame no screen could produce.
         const id = String(data.requestID ?? data.id ?? '')
         const askId = (type.startsWith('question') ? 'q' : 'p') + id
+        // Before the record is looked for: a question still waiting to be decided on has no record
+        // yet, and offering it after it has been answered at the keyboard puts a live keyboard on
+        // his phone for something already settled.
+        stopKeeping(id)
         if (!open.has(askId)) return
         open.delete(askId)
         say(
@@ -670,6 +1150,10 @@ export function startWatcher(cfg: WatcherConfig): void {
         // is not about his words.
         const sid = String(data.sessionID ?? '')
         if (sid) prompted.delete(sid)
+        // A heartbeat speaks for THIS conversation's worker, and on a server shared by two walls a
+        // stranger's turn ending says nothing about this one — it would have the hub reading a
+        // worker as settled between turns while it is still mid-turn.
+        if (BINDING_FILE && boundSessionNow() !== sid) return
         say({ t: 'beat', state: 'idle' }, 'a heartbeat')
         return
       }

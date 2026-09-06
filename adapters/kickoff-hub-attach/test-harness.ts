@@ -292,3 +292,115 @@ export function rawProducer(sock: string, onFrame?: (f: Record<string, any>, sen
     end: () => s?.end(),
   }
 }
+
+/**
+ * One session as opencode 1.18.25 lists it, captured rather than invented.
+ *
+ * Measured on this box on 6 September against two running servers: `agent` is a plain string on a
+ * session and is ABSENT on one created before agents were named, `parentID` is absent on a root and
+ * present on a subagent's, and `directory` is the session's own. A fixture invented here would only
+ * prove the suite agrees with itself, which is how the event payload came to be read out of the
+ * wrong field once.
+ */
+export function aSession(id: string, directory: string, updated: number, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    slug: 'jolly-wizard',
+    projectID: '0000000000000000000000000000000000000000',
+    directory,
+    path: '',
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    title: 'New session - 2026-09-05T11:26:25.115Z',
+    version: '1.18.25',
+    time: { created: 1788607585115, updated },
+    ...extra,
+  }
+}
+
+/**
+ * A fake opencode server: the event stream, the session listing and the two POSTs the watcher uses.
+ *
+ * Shared rather than copied, because the last time this project kept two fakes of one server they
+ * drifted, and a suite that agrees only with its own fake proves nothing about the real one. The
+ * listing answers the two rules measured against 1.18.25: `directory=` is an exact match on the
+ * session's own directory (a trailing slash resolves to it, a subfolder does not), `roots=true`
+ * drops every session carrying a `parentID`, and the answer is most recently updated first.
+ */
+export function fakeOpencode() {
+  let sessions: Record<string, any>[] = []
+  const posted: { path: string; body: any }[] = []
+  const sessionQueries: string[] = []
+  let promptStatus = 204
+  let push: ((e: unknown) => void) | null = null
+  // A listing that takes its time, once. The window between reading the note and hearing the
+  // server back is where a launcher's rollover lands in the wrong session if nothing re-reads.
+  let delayNextListingMs = 0
+  // A server that answers `directory=` with sessions from elsewhere. It is not how 1.18.25 behaves
+  // and that is the point: the acceptance must not rest on the query having been obeyed.
+  let ignoreDirectoryFilter = false
+
+  const server = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    // Bun closes an idle request after ten seconds by default, which would end a deliberately hung
+    // request from the server's side; the longest Bun allows.
+    idleTimeout: 255,
+    async fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname === '/event') {
+        return new Response(
+          new ReadableStream({
+            start(c) {
+              const enc = new TextEncoder()
+              push = e => c.enqueue(enc.encode(`data: ${JSON.stringify(e)}\n\n`))
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      }
+      if (url.pathname === '/session' && req.method === 'GET') {
+        sessionQueries.push(url.search)
+        if (delayNextListingMs > 0) {
+          const wait = delayNextListingMs
+          delayNextListingMs = 0
+          await new Promise(r => setTimeout(r, wait))
+        }
+        const dir = (url.searchParams.get('directory') ?? '').replace(/\/+$/, '')
+        return Response.json(
+          sessions
+            .filter(s => ignoreDirectoryFilter || !dir || s.directory === dir)
+            .filter(s => url.searchParams.get('roots') !== 'true' || !s.parentID)
+            .sort((a, b) => b.time.updated - a.time.updated),
+        )
+      }
+      if (req.method === 'POST') {
+        posted.push({ path: url.pathname, body: await req.json() })
+        if (url.pathname.endsWith('/prompt_async')) {
+          if (promptStatus === 204) return new Response(null, { status: 204 })
+          return Response.json({ name: 'NotFoundError', data: { message: 'Session not found' } }, { status: promptStatus })
+        }
+        return new Response('{}', { headers: { 'content-type': 'application/json' } })
+      }
+      return new Response('not found', { status: 404 })
+    },
+  })
+
+  return {
+    posted,
+    sessionQueries,
+    get url() { return `http://127.0.0.1:${server.port}` },
+    get sessions() { return sessions },
+    set sessions(v: Record<string, any>[]) { sessions = v },
+    set promptStatus(v: number) { promptStatus = v },
+    /** Make the next session listing take this long before it answers. One shot. */
+    set delayNextListingMs(v: number) { delayNextListingMs = v },
+    /** Answer every listing with every session, whatever `directory=` asked for. */
+    set ignoreDirectoryFilter(v: boolean) { ignoreDirectoryFilter = v },
+    /** Push one event down the stream; null until the watcher has subscribed. */
+    get pushing() { return push !== null },
+    push: (e: unknown) => push?.(e),
+    prompts: () => posted.filter(p => p.path.endsWith('/prompt_async')),
+    stop: () => server.stop(true),
+  }
+}

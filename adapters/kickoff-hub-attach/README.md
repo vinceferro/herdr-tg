@@ -7,8 +7,8 @@ one process, and it can start the engine as its own child so a wall (bwrap or do
 entrypoint.
 
 ```
-kickoff-hub-attach [--opencode <url>] [--run <command...>]
-kickoff-hub-attach --check [--opencode <url>] [--run <command...>]
+kickoff-hub-attach [--opencode <url> [--opencode-binding-file <path> [--opencode-binding-generation <n>]]] [--run <command...>]
+kickoff-hub-attach --check [the same flags]
 ```
 
 It holds the claim for one `(project, address)`, opens the door of `docs/ATTACHING.md` §9 so the
@@ -23,9 +23,26 @@ flag: it is `KICKOFF_HUB_PROJECT_DIR`, and `.` means "the directory I was starte
 | flag | what it does |
 | --- | --- |
 | *(none)* | Hold the claim and open the door. This alone is what `adapters/fanin/` used to be. |
-| `--opencode <url>` | Also watch the opencode server at `<url>` — its questions and permission prompts go to the phone as `ask`, a tap goes back to its own reply endpoint, and what the operator types in the topic goes to the session as a prompt, verbatim (the session the server lists for the project directory; a reply under a question goes to the session that asked it). When there is no session to hand the words to, the hub is told and puts one line in his topic. Without this flag an opencode worker is half a phone — no questions, no prompts, and typed words refused out loud rather than carried — and the start and `--check` both say so. This is what `adapters/opencode-bridge/` used to be, minus its process, plus the half of the phone it never had. |
+| `--opencode <url>` | Also watch the opencode server at `<url>` — its questions and permission prompts go to the phone as `ask`, a tap goes back to its own reply endpoint, and what the operator types in the topic goes to the session as a prompt, verbatim (the session `--opencode-binding-file` names, or, with no binding, the one the server lists for the project directory; a reply under a question goes to the session that asked it). When there is no session to hand the words to, the hub is told and puts one line in his topic. Without this flag an opencode worker is half a phone — no questions, no prompts, and typed words refused out loud rather than carried — and the start and `--check` both say so. This is what `adapters/opencode-bridge/` used to be, minus its process, plus the half of the phone it never had. |
+| `--opencode-binding-file <path>` | Bind this conversation to ONE session of that server: the one the file at `<path>` names. Whatever starts the engine writes that file; this command only ever reads it, afresh on every line, and validates it against the server every time — root session, not archived, this project's directory, and the agent the binding expects. His typed words then go to that session and to no other, a question from any other session on the server is not drawn, and a line that arrives while the binding is absent, unreadable or naming a session that is not open is **refused in his own words** rather than guessed at. Without the flag, typed words go to the most recently active root session for the project directory — right on a wall running one session, a guess on a wall running several. An absolute path, and only alongside `--opencode`. |
+| `--opencode-binding-generation <n>` | The oldest binding `--opencode-binding-file` may name for the life of this process. A launcher that numbers every writing of the file is saying which is newer; the number inside a running watcher is memory, and a restart destroys memory, so the wall says the floor on the command line where nothing it reads later can lower it. Below it, a binding is refused for ever — as is one that names no number at all, because a wall started with a floor is a wall whose launcher numbers. Only alongside `--opencode-binding-file`. |
 | `--run <command...>` | Start `<command...>` as this process's child, in the project directory, with the namespace pinned so any adapter descending from it finds the door. When the child exits, say `bye`, close the door, and exit with the child's status. Everything after `--run` is the command. |
 | `--check` | Prove this environment can reach the hub — one plain line per fact, then exit 0 if all hold, 1 otherwise. Sends `hello` and `bye` and nothing else; **creates no topic**. |
+
+**What the binding file holds** — the contract for whoever writes it. One JSON object, written
+whole by rename, mode `0600`, owned by the user attach runs as, in directories nobody else can
+write:
+
+```json
+{ "v": 1, "session": "ses_…", "directory": "/abs/path", "agent": "the-agent", "generation": 7 }
+```
+
+`v` and `session` are required; the other three narrow the binding and are checked when present.
+The key set is **closed** — a key attach does not know may be a narrowing it would be quietly
+dropping, and it refuses rather than obey the rest — and a key written **twice** is refused with it,
+because JSON keeps the last and every reader shows the first. It may be absent or empty while the engine
+boots; every line typed meanwhile is refused out loud, never queued. Rewriting it retargets the
+NEXT line, with nothing restarted. attach never writes it and never deletes it.
 
 **Exit status.** `0` a clean end · `1` a `--check` that found something to fix · `2` a refusal to
 start (the sentence names the variable on stderr) · `127` the `--run` command was not found ·

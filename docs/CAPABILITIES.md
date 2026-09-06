@@ -1,4 +1,32 @@
-<!-- SURFACE, v16, 6 September 2026. v16 says what CARRIES the frames, which this file had never
+<!-- SURFACE, v17, 6 September 2026. v17 answers a question this file had never asked: WHICH session
+     of an engine a conversation is bound to. Offer 6 promises the operator's words reach "the
+     agent's own turn", which says nothing about which turn when one engine holds several sessions
+     for one directory — and on 6 September that gap was measured on a live box: a launcher had made
+     a restricted session for a room and written down which one it was, and the only session the
+     adapter's most-recently-active rule could have picked in that directory was an unrestricted
+     one, which may edit files, run a shell and commit. No line was typed into it; what was measured
+     is that the rule pointed at the wrong session, and the next line typed would have gone there
+     with nothing refusing it. The answer is not a frame. Offer 6 is unchanged, nothing on the wire moved, and no
+     frame carries a session. It is a division of labour, and OPEN 5 is where it is written down:
+     whoever launches an engine owns the session — its lifetime and the identity it is meant to have
+     — and the adapter in front of it owns enforcement, speaking to that session and to no other and
+     refusing the operator's line out loud rather than guessing which session he meant. The mechanism
+     our own adapter uses today, a small file the launcher writes and the adapter reads
+     (`docs/ATTACHING.md` §13.10), is a LOCAL adapter detail and **not the contract between the two
+     orgs**: it works only because both are processes on one box sharing one filesystem. The durable
+     thing is the typed binding itself, which a transport that is not this machine (OPEN 4) would
+     have to carry with no filesystem under it. REFUSES 6 gains the matching sentence, because a
+     session is exactly the kind of word the hub must never learn.
+
+     A second round the same evening changed the local mechanism twice, and neither change reaches
+     this document's surface — both are named here only so OPEN 5 is read against what exists. The
+     binding is now ONE versioned shape rather than two, so a launcher and a reader that disagree
+     find out instead of meeting in the middle on the operator's words. And the number that orders
+     two writers now has a FLOOR the adapter is started with, because a reader's memory of which
+     binding it had reached is destroyed by the restart that a stale writer's file outlives — which
+     is why OPEN 5's durable form names the floor beside the generation: whoever launches is the
+     only party that can say either.
+     v16 says what CARRIES the frames, which this file had never
      separated from the frames themselves. `AF_UNIX` appeared once, inside REQUIRES 3, as though the
      socket were part of hub-proto. It is not: the frames are one thing and the transport under them
      is another, and the difference decides which offers a connection can have. So REQUIRES 3 now
@@ -156,7 +184,7 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | 3 | **Delivery you can trust.** Every frame after `hello` acked exactly once, with three values — `yes`, `no`, `unseen`. `unseen` means it went out and could not be confirmed, and it is never retried. `hello` is answered by `welcome` or `refused` instead, and is the one frame no ack is coming for. A connection refused before it is live — too much said before the pong, a frame over the ceiling, no pong at all — has every frame the hub read acked `no` before the socket closes; the hub holds 65 frames before the pong — the 64 a conforming adapter may have queued plus the one it puts back at the head of its queue on close — which is what one carries into a reconnect. | `ack{ref, delivered, why}`. |
 | 4 | **A question with buttons.** Options you mint; a tap resolves against a written record, and a question answered once can never be answered twice. A question you have said is over cannot be answered AGAIN: from the moment the hub handles your `ask_resolved`, every tap on that keyboard is refused. One `choice` can still reach you — a tap already in flight is marked before your frame is handled and delivered after it — so refuse a `choice` for an ask you have resolved. | `ask` up, `choice` down. |
 | 5 | **Retirement.** Buttons come off a question that has stopped being open, whoever closed it — which no screen-reading design can do. An edit Telegram refuses does not end it: the question stays written down as closed, so a tap on it is refused, and the next thing that can take the keyboard off does — your own `ask_resolved` after his tap, or the next session's arrival — signed off with the button he pressed wherever he pressed one. So send `ask_resolved` after a tap on the same question; it is the second chance, not a duplicate, and it cannot overwrite his words. `outcome` is clipped at 500 characters, counted over the whole note the operator reads and not your text alone, and nothing on the wire says so. | `ask_resolved{how, outcome?}`. |
-| 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
+| 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. WHICH session, turn or process on the far side takes them is the adapter's to decide and to enforce, never the hub's — the hub names none, and OPEN 5 says who owns that binding and why a wrong answer is not a delivery failure but a misdelivery. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
 | 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
 | 8 | **Read-only inventory.** `herdr-tg projects --json`: one object per conversation that has ever been given a topic or was opened as a project — a vacant room is not listed until something has connected as it — `{project_id, title, repo, enabled, topic_id, connected, lanes:{address:topic_id}, connected_lanes:[address], allowed_users:[user_id]}`, in that order, sorted by title. A room's `repo` is its seed's, so join on `project_id`, never on the path alone. `topic_id` is `null` before a bridge has ever been live. `connected` is whether the project's OWN voice has a bridge on the socket now — a project reached only through its worktrees never does, and `connected_lanes` is which of its addresses are live. Both come from the running hub's own record of its claims and are `null` whenever no running hub can vouch for them — unknown said as unknown, never a `false` nobody could prove. `allowed_users` is the people let into THAT project's conversations with `herdr-tg allow` (REQUIRES 5), sorted; it is never the people who may speak anywhere, who are not in the file this reads. A registry that is there and cannot be read is refused, never reported as empty. No chat id, no path but the repo's, and no person but the project's own. | Run it at the keyboard; `docs/ATTACHING.md` §7 offer 8 has the shape. |
 | 9 | **Files, both ways.** *Built 6 September, both directions.* What he sends into a conversation's topic — a photo, a document, a voice note, a video — the hub fetches into a directory of its own, and it reaches the agent as a **path**; what an agent attaches to a `say` or a `done` the hub reads from that conversation's outbox, and it reaches his phone as a picture or a document, through the same send accounting as words. Bytes never cross the wire: they cross by a bind mount at the same path on both sides, read-only down and read-write up, one pair of directories per conversation, so a wall sees only its own conversation's files. **This is therefore a capability of the transport, not of the wire.** A path is worth nothing to a peer that cannot open it, so a connection that does not share this hub's filesystem is offered no outbox — no `outbox` in its `welcome`, and nothing for `say{file}` to name, which is already what an adapter reads as "this hub carries no files". Every connection today is local, so this takes nothing from anybody now; it is the rule a second transport (OPEN 4) inherits rather than one that would have to be invented then. **Only the up direction is built.** It is decided at admission, which is the one moment the hub holds the connection's identity; afterwards a claim records the address, the instance and the pid, not who, so there is nowhere today to ask the same question of a `message` going down — and a `message` carrying a path nobody at the other end could open would be a file lost in silence. Whoever builds OPEN 4 builds that half. This is where the debt is written down, not where it is claimed paid. The hub mints every path it writes; a name Telegram reports or an agent supplies is data, never a path. It trusts nothing in an outbox — not a link of either kind, not a file whose bytes have a second name, not a file it does not own, nothing outside the directory, nothing over Telegram's own ceilings (20 MB down, 50 MB up, measured) — and both trees have a shelf life, a cap and a bound on entries. One fetch is bounded in time too, by a deadline the hub chose rather than the HTTP client's. When a file does not come through, the words still do and both sides are told, the agent on the wire and the operator in one line in his topic; never a silent drop. When the hub could not put that line in his topic either — the same refusal that shed the file sheds a sentence about it — the ack says so in its own word, so an adapter never tells its agent that an explanation is waiting on a phone where there is none. An adapter older than this offer gets the words, and he is told the file did not follow. | `message{files?}` down, `say{file?}` and `done{file?}` up, `welcome{outbox?}` to say where; `docs/ATTACHING.md` §14 has the mounts, the names and every failure's line. |
@@ -243,7 +271,12 @@ Each is a line, not an omission. Several were paid for.
 5. **Choosing a model, an engine, or a repository.** Those belong to whoever dispatches.
 6. **Knowing what a lane, a room, a proof or a re-ground is.** All of them reach the phone through
    the conversation primitives. The moment the hub learns one of those words it stops being a
-   multiplexer and becomes a second implementation of someone else's discipline.
+   multiplexer and becomes a second implementation of someone else's discipline. **A session of an
+   engine is the same kind of word.** Which session, turn or process on the far side takes the
+   operator's words is the adapter's to decide and to enforce (OPEN 5); no frame carries a session,
+   a directory or an engine's name, and `hub-proto` has no field for one. A hub that learned which
+   session a conversation meant would have to be told when it was replaced, and it is the wrong
+   party to tell.
 
 ## OPEN — joint design, neither side should harden yet
 
@@ -278,6 +311,32 @@ Each is a line, not an omission. Several were paid for.
    `message` — the first of which the hub already withholds, while the second is unbuilt, for the
    reason offer 9 gives. Nothing here is built, no frame changes if it is, and until it exists the honest answer
    to "can a bridge on another box reach this hub" is no.
+5. **Which session of an engine a conversation is bound to.** One engine can hold several sessions
+   for one directory, and exactly one of them is the conversation on his phone. "Whichever moved
+   last" is a guess, and on 6 September that guess was measured pointing at an unrestricted session
+   for a room whose launcher had made a restricted one — so the next line typed would have been
+   misdelivered, with nothing to refuse it. Two halves, and only one of them is ours. **Whoever launches owns the
+   binding**: it makes the session, decides its directory, its agent and what it is allowed to do,
+   knows the moment it is replaced, and is the only party that can say which session a room's
+   conversation means. **The adapter in front of the engine owns enforcement**: given a binding it
+   speaks to that session and to no other, filters what it carries the other way to the same session
+   so a stranger's session cannot speak through the topic either, and refuses the operator's line
+   out loud — never falling back to a session it chose itself — when the binding is absent, stale,
+   or names a session that is not open. The hub is in neither half: it learns nothing about
+   sessions, and no frame carries a session.
+   What is genuinely open is the **shape of the binding as a thing two orgs agree on**. Ours today
+   is a small file the launcher writes and the adapter reads (`docs/ATTACHING.md` §13.10), which
+   works only because both are processes on one box with one filesystem; it is a local
+   implementation detail and **not the contract between the two orgs**, and neither side should
+   build on the file. The durable form is the **typed binding itself** — the session, the directory
+   it is canonically for, the agent it is supposed to be, a number saying which generation of it
+   this is, so a stale writer cannot retarget a newer conversation, and the **floor** that number is
+   held at for one run of the adapter, because the adapter's own memory of how far it had got is
+   exactly what a restart destroys and a stale writer's file survives. Both numbers come from
+   whoever launches; an adapter can enforce them and can mint neither. That is what a transport
+   which is not this machine (OPEN 4) would have to carry with no filesystem under it, and what an
+   engine that can hold a tag of its own could answer for itself instead of anyone writing a file at
+   all.
 
 ## Two measurements that bind both of us
 

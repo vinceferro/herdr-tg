@@ -12,15 +12,45 @@ Type=simple
 # `-` so that a missing file is attach's own sentence ("nothing named a project directory") on the
 # journal rather than systemd's opaque refusal to start.
 EnvironmentFile=-%h/.config/kickoff-hub-attach/%i.env
-# OPENCODE_PORT is the one line in that file that is not §2's: the port belongs to the engine, not
-# the hub. It appears twice on the line so the server and the watcher can never disagree about it.
+# OPENCODE_PORT, OPENCODE_BINDING_FILE and OPENCODE_BINDING_GENERATION are the lines in that file
+# that are not §2's: the port, and the note naming this worker's own session with the number it was
+# written at, belong to the engine and not to the hub.
+# OPENCODE_PORT appears twice on the line so the server and the watcher can never disagree about it.
 # `opencode serve` without --port picks a random port, so it is not optional here — and it is
 # checked before the start, because an unset ${OPENCODE_PORT} expands to NOTHING: the watcher would
 # then dial port 80 while `opencode serve --port ''` listens on 4096, and the worker would hold the
 # claim, get its topic, and deliver nothing. attach refuses the port-less URL too; this line is the
 # one that names the variable and the file. (`$$` is a literal `$` for the shell.)
 ExecStartPre=/bin/sh -c 'test -n "$$OPENCODE_PORT" || { echo "OPENCODE_PORT is not set; put it in %h/.config/kickoff-hub-attach/%i.env" >&2; exit 2; }'
-ExecStart=%h/.local/bin/kickoff-hub-attach --opencode http://127.0.0.1:${OPENCODE_PORT} --run opencode serve --port ${OPENCODE_PORT}
+# OPENCODE_BINDING_FILE is optional, and is the path of the note whatever starts the engine writes
+# this worker's own session into (docs/ATTACHING.md §13) — attach only ever reads it. Give it a path
+# of this instance's own — two workers on one box are two sessions, and one shared note would point
+# them both at whichever was written last — and write that path OUT IN FULL:
+#     OPENCODE_BINDING_FILE=/var/lib/kickoff-hub-attach/oc-dogfood.binding
+# An environment file is not a unit file and not a shell: `%h` and `%i` are expanded in the settings
+# of THIS file and in nothing systemd reads out of the env file, so a value written with them
+# reaches attach as those four characters. attach refuses a path that is not absolute and exits 2,
+# and with Restart=always below that is a worker dying every five seconds for ever over one line the
+# operator was told to write. This box has met an unexpanded specifier as a path before.
+# OPENCODE_BINDING_GENERATION is optional too, and only with a note: it is the number of the binding
+# THIS worker was started for, and nothing the note says later may go below it. It is here rather
+# than remembered because a restart is what destroys the memory — the monotonic rule inside a
+# running watcher dies with the process, so a watcher that comes back reads whatever note it finds
+# and takes it as the newest thing it has ever seen. systemd re-reads this env file on every start,
+# so a launcher that rewrites the line at each rollover and restarts the unit is fenced ACROSS the
+# restart, which is the whole case the number exists for.
+# Refused here rather than at attach, because attach cannot know why a path is not a path and this
+# file can: it is the one that told the operator what to write.
+ExecStartPre=/bin/sh -c 'case "$$OPENCODE_BINDING_FILE" in ""|/*) ;; *) echo "OPENCODE_BINDING_FILE must be a full path written out; an environment file expands no systemd specifiers" >&2; exit 2;; esac'
+# The flag has to disappear COMPLETELY for an instance that names no note, and `${OPENCODE_BINDING_FILE}`
+# cannot do that: systemd expands an unset `${...}` to a single EMPTY argument, so attach would be
+# handed the flag with nothing after it, refuse it by name and exit 2 — every worker that never
+# wanted a binding would be dead, and the operator would read a sentence about a flag he never set.
+# `${VAR:+...}` in the shell expands to no words at all, so an instance without the line starts
+# exactly the command it started before this line existed. The number is passed the same way, and
+# attach refuses it without the file, so the two lines are set together or not at all. (`$$` is a literal `$` for the shell, as
+# above; `exec` leaves attach as the main process, which the KillMode below depends on.)
+ExecStart=/bin/sh -c 'exec %h/.local/bin/kickoff-hub-attach --opencode "http://127.0.0.1:$$OPENCODE_PORT" $${OPENCODE_BINDING_FILE:+--opencode-binding-file "$$OPENCODE_BINDING_FILE"} $${OPENCODE_BINDING_GENERATION:+--opencode-binding-generation "$$OPENCODE_BINDING_GENERATION"} --run opencode serve --port "$$OPENCODE_PORT"'
 # SIGTERM goes to attach ONLY; it forwards to the engine, waits, and says bye. SIGKILL to whatever
 # is left after TimeoutStopSec. The default, control-group, would hit the engine and attach at the
 # same instant and the goodbye would never be said.

@@ -35,11 +35,15 @@ import { join } from 'path'
 
 import { notEnrolled, readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
 import { HubLink } from '../../plugins/kickoff-channel/hub-link.ts'
-import { opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
+import { bindingFileProblem, bindingGenerationProblem, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, readBindingFile, sameDirectory, toolServerFact, typedWordsFact } from './plan.ts'
 
 export type CheckOptions = {
   /** The opencode URL, if `--opencode` was on the line — checked for a port, as the start does. */
   opencodeUrl: string | null
+  /** The file naming the worker's own session, if `--opencode-binding-file` was on the line. */
+  bindingFile: string | null
+  /** The oldest binding that file may name, as it was typed, if `--opencode-binding-generation` was. */
+  bindingGeneration: string | null
   /** The command after `--run`, if any — enables the engine, private-door and PID-1 facts. */
   run: string[] | null
 }
@@ -261,6 +265,64 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
     const wrong = opencodeUrlProblem(opts.opencodeUrl)
     if (wrong) not(wrong)
     else ok(`the engine's address: ${opts.opencodeUrl}`)
+  }
+
+  // ── the binding naming the worker's own session — only with --opencode-binding-file ───────────
+  //
+  // Two things can be known here and no more: that the path is one attach can use, and that what is
+  // written there — if anything is yet — is a shape it can read. Whether the session is OPEN is the
+  // server's answer and it is asked afresh on every line the operator types; asking it here would
+  // print "not open" for the ordinary case, which is a wall checked before its engine is running.
+  //
+  // Absence is never a NOT: the order a wall is started in is check, start, write the binding.
+  if (opts.bindingFile !== null || opts.bindingGeneration !== null) {
+    const wrong = bindingFileProblem(opts.bindingFile, opts.opencodeUrl) ?? bindingGenerationProblem(opts.bindingGeneration, opts.bindingFile)
+    if (wrong) {
+      not(wrong)
+    } else if (opts.bindingFile !== null) {
+      const binding = readBindingFile(opts.bindingFile)
+      if ('binding' in binding) {
+        // Two of the binding's own claims are decided WITHOUT a server — the number it was written
+        // at, and the project it says it is for — and the start refuses on both, on every line. A
+        // check that read the shape and stopped blessed a wall where every typed line is refused
+        // and no question is ever shown; the likeliest by hand is a launcher copying the wrong
+        // project into the binding. Whether the session is OPEN stays the server's answer and is
+        // still not asked here.
+        const { directory, generation } = binding.binding
+        if (opts.bindingGeneration !== null && generation === null) {
+          not(`the worker's session: ${opts.bindingFile} does not say how new it is, and this worker would be started for binding ${opts.bindingGeneration}; whatever writes it must number every writing`)
+        } else if (opts.bindingGeneration !== null && generation !== null && generation < Number(opts.bindingGeneration)) {
+          not(`the worker's session: ${opts.bindingFile} is older than the one this worker was started for; it is binding ${generation} and the number given is ${opts.bindingGeneration}, so every line the operator types would be refused`)
+        } else if (directory !== null && !sameDirectory(directory, CONFIG.projectDir)) {
+          not(`the worker's session: ${opts.bindingFile} is written for a different project than the one this is run in, so every line the operator types would be refused`)
+        } else {
+          ok(`the worker's session: ${opts.bindingFile} names a session, and every line the operator types goes to that one or is refused`)
+        }
+      } else if (binding.state === 'not written yet') {
+        ok(`the worker's session: ${opts.bindingFile} is not written yet; until whatever starts the engine writes it, every line the operator types is refused out loud rather than guessed at`)
+      } else if (binding.state === 'not safe to read') {
+        // Named here and nowhere else: the operator is told only that it could not be read, and the
+        // person who can put it right is the one running this check.
+        not(`the worker's session: ${opts.bindingFile} is not safe to read, so nothing it says is trusted — ${binding.why}; it must be a plain file this user owns that nobody else can read or write, in directories nobody else can write`)
+      } else if (binding.state === 'unreadable') {
+        not(`the worker's session: ${opts.bindingFile} is there and could not be read; attach must be able to read it, and it is written by whatever starts the engine`)
+      } else if (binding.state === 'a form it does not know') {
+        not(`the worker's session: ${opts.bindingFile} is written in a form attach does not know; it holds one JSON object, saying "v": 1 and naming the session as "session"`)
+      } else {
+        not(`the worker's session: ${opts.bindingFile} is not one attach can read; it holds one JSON object, saying "v": 1 and naming the session as "session"`)
+      }
+      // Only absence. A directory that is there and cannot be looked into has already been named
+      // above, in the line that says what is wrong with it; saying "nothing has made it yet" in the
+      // same run contradicts that line and sends whoever runs the wall after the wrong fix.
+      const parent = join(opts.bindingFile, '..')
+      try {
+        statSync(parent)
+      } catch (e) {
+        if ((e as { code?: string })?.code === 'ENOENT') {
+          warn(`the worker's session: nothing has made ${parent}/ yet, so whatever starts the engine must make it before it can write there`)
+        }
+      }
+    }
   }
 
   // ── the engine, and PID 1 — only under --run ─────────────────────────────────────────────────
