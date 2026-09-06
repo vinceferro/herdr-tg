@@ -1,4 +1,27 @@
-<!-- SURFACE, v8, 5 September 2026. v8 adds the second gate, WHO may speak, beside WHERE the bot
+<!-- SURFACE, v12, 6 September 2026. v12 is offer 9 attacked. Nothing new is offered and four
+     things are said more honestly. Two words join closed sets a reader must treat as open:
+     `not-stored` on a file he sent, where nothing was downloaded because the machine had nowhere
+     to put the bytes and "send it again" would be a loop with no end; and `no-file-unsaid` on an
+     ack, where the file did not go AND nothing could be said in his topic either — the one case
+     an adapter must not report as a reason waiting on his phone, and the one that mends itself.
+     An outbox file must also be the only name its bytes have, because a hard link passed every
+     other check. And the hub's line for a worker that took only his words no longer names a
+     cause it cannot see: a short count means the tool server is old or the relay in front of it
+     is, and the hub cannot tell.
+     v11 BUILDS the up half of offer 9: a file an agent
+     attaches to a `say` or a `done` is read from that conversation's outbox — opened following
+     no link, checked as what it is and not what it is called — and reaches his phone as a picture
+     or a document through the same send accounting as words; when it does not, the words go with
+     one line saying so and the agent reads `no-file`. Offer 9 is whole.
+     v10 BUILDS the down half of offer 9: what he sends into
+     a topic reaches the agent as a path, the bridge's ack counts what it handed on, and an
+     adapter older than files earns him one line saying the picture did not follow. The up half
+     — an agent attaching a file to a `say` or a `done` — is still the design.
+     v9 adds offer 9, files both ways — DESIGNED, not built.
+     Bytes never cross the wire; they cross by a bind mount at the same path on both sides, one
+     pair of directories per conversation, and the hub mints every path it writes and trusts
+     nothing an adapter names. `docs/ATTACHING.md` §14 is the design. Nothing else moved.
+     v8 adds the second gate, WHO may speak, beside WHERE the bot
      listens: REQUIRES 5 is new, REFUSES 3 names it, and offer 8 gains a ninth field,
      `allowed_users` — the people a project has let into its own conversations at the terminal,
      never the people who may speak anywhere. Until v8 the only gate was the chat allowlist, so
@@ -87,6 +110,7 @@ never in the hub, and a dispatcher that supplies its own address overrides it en
 | 6 | **Typed steering.** The operator's words relayed verbatim into the agent's own turn. Opaque: the hub does not parse them and never lets them name anything. An adapter that cannot hand them on says so with `ack{status: refused, reason}`, and the hub puts the reason in the topic he typed in, under the line it refuses — so a line he wrote never reaches nobody in silence. `in_reply_to_ask` is set when he replied to a question this conversation's live session asked. | `message{text, from, in_reply_to_ask?}` down; `ack{ref, status, reason?}` up. |
 | 7 | **An alarm that outlives us.** A watchdog sharing no code, no process and no runtime with the hub. | Nothing; it is always on. |
 | 8 | **Read-only inventory.** `herdr-tg projects --json`: one object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes:{address:topic_id}, connected_lanes:[address], allowed_users:[user_id]}`, in that order, sorted by title. `topic_id` is `null` before a bridge has ever been live. `connected` is whether the project's OWN voice has a bridge on the socket now — a project reached only through its worktrees never does, and `connected_lanes` is which of its addresses are live. Both come from the running hub's own record of its claims and are `null` whenever no running hub can vouch for them — unknown said as unknown, never a `false` nobody could prove. `allowed_users` is the people let into THAT project's conversations with `herdr-tg allow` (REQUIRES 5), sorted; it is never the people who may speak anywhere, who are not in the file this reads. A registry that is there and cannot be read is refused, never reported as empty. No chat id, no path but the repo's, and no person but the project's own. | Run it at the keyboard; `docs/ATTACHING.md` §7 offer 8 has the shape. |
+| 9 | **Files, both ways.** *Built 6 September, both directions.* What he sends into a conversation's topic — a photo, a document, a voice note, a video — the hub fetches into a directory of its own, and it reaches the agent as a **path**; what an agent attaches to a `say` or a `done` the hub reads from that conversation's outbox, and it reaches his phone as a picture or a document, through the same send accounting as words. Bytes never cross the wire: they cross by a bind mount at the same path on both sides, read-only down and read-write up, one pair of directories per conversation, so a wall sees only its own conversation's files. The hub mints every path it writes; a name Telegram reports or an agent supplies is data, never a path. It trusts nothing in an outbox — not a link of either kind, not a file whose bytes have a second name, not a file it does not own, nothing outside the directory, nothing over Telegram's own ceilings (20 MB down, 50 MB up, measured) — and both trees have a shelf life, a cap and a bound on entries. One fetch is bounded in time too, by a deadline the hub chose rather than the HTTP client's. When a file does not come through, the words still do and both sides are told, the agent on the wire and the operator in one line in his topic; never a silent drop. When the hub could not put that line in his topic either — the same refusal that shed the file sheds a sentence about it — the ack says so in its own word, so an adapter never tells its agent that an explanation is waiting on a phone where there is none. An adapter older than this offer gets the words, and he is told the file did not follow. | `message{files?}` down, `say{file?}` and `done{file?}` up, `welcome{outbox?}` to say where; `docs/ATTACHING.md` §14 has the mounts, the names and every failure's line. |
 
 ## REQUIRES — what you must bring
 

@@ -40,6 +40,7 @@ mod config;
 mod heartbeat;
 mod hub;
 mod lock;
+mod media;
 mod presence;
 mod queue;
 mod registry;

@@ -1,5 +1,48 @@
-<!-- INTERFACE, v12, 5 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v16, 6 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v16 is v14 and v15 attacked, and it moves four things a stranger's adapter has to know.
+     Two new words, both additive and both in sets a reader must treat as OPEN: `not-stored` on
+     a `message` file, for the case where nothing was downloaded because this machine had nowhere
+     to put the bytes — separate from `download-failed` because "send it again" is a loop with no
+     end in it there; and `no-file-unsaid` on an `ack`, for the case where the file did not go AND
+     nothing could be put in his topic to say so, which is the one `no-file` an adapter must not
+     report to its agent as "the reason is on his phone", and the one that mends itself in a
+     minute. §14.2's fold rule changes: an accepted answer whose `files` is short of what the
+     frame carried now WAITS for the other producers and sends the largest count, because the
+     first answer to arrive is a race between processes and the loser made the hub tell him a file
+     was lost that an agent in the same lane was looking at. And §14.3 gains a sixth check on an
+     outbox file — exactly one link — because a hard link passed the other five while sharing its
+     bytes with a name outside the outbox. Also: the operator's line for a worker that took only
+     his words no longer names a cause the hub cannot see, §14.4's too-big sentences say only
+     numbers somebody measured, one fetch is bounded by a deadline the hub chose rather than the
+     HTTP client's, and the sweep now bounds entries as well as bytes.
+
+     v15 builds the UP half of §14 and closes one hole §14 opened. `welcome{outbox}`, `say{file}`,
+     `done{file}` and `ack.why: no-file` are on the wire; the hub opens what an adapter names in
+     that conversation's outbox following no link, checks what it OPENED and never the name, and
+     uploads it through the same send accounting as words, with one line in his topic whenever it
+     will not. The hole: §14.1 claimed no lane can be called `-`, and §2 and §4 said the opposite
+     in as many words — the hub would have addressed one, and `-` is the segment BOTH trees write
+     a project's own voice under, so a lane of that name was handed the project's own two
+     directories. `-` is now `bad_lane`, and §2 and §4 say so. The namespace convention was never
+     a rule about the wire: `hello` carries a lane directly, and §14 invites adapters written from
+     §6 alone. Also on the wire and previously unpinned: a `say` or `done` carrying a file with NO
+     words still sends `text` as the empty string, because a hub older than files requires the
+     field and a frame without it is a parse error mid-turn.
+
+     v14 builds the DOWN half of §14: `message{files}` and the bridge's `ack{files}` are on the
+     wire, the media tree exists with its modes, shelf life and cap, and both of our adapters carry
+     a file into the agent's turn. The up half — `welcome{outbox}`, `say{file}`, `done{file}` — is
+     still the design v13 wrote. §14.2's `ack{files}` row now says what is counted.
+     v13 adds §14, Files — a DESIGN, not yet built: bytes never cross the wall on the wire, they
+     cross by bind mount at the same path on both sides, read-only down and read-write up, one
+     pair of directories per conversation. Five additive optional fields, absent never null:
+     `welcome{outbox?}`, `message{files?}` and `ack.why: no-file` down; `say{file?}`,
+     `done{file?}` and `ack{files?}` up. §6's tables are deliberately unchanged — an adapter
+     written from §6 alone is still complete, and carries no file. This is the first section that
+     touches `crates/hub-proto`, which §12 says this document does not; §12 is left as written
+     because it is about the namespace slice, and §14 says so itself.
 
      v12 changes nothing on the wire and one field in offer 8: `allowed_users`, a ninth field —
      the people a project has let into its own conversations at the terminal with
@@ -246,9 +289,10 @@ unset one:
 | anything else | uses it |
 
 A lone hyphen is never a path, never a socket, never a number of milliseconds, and never a
-conversation anybody would mint. The hub itself *would* address a conversation called `-`; this
-interface takes the name for its own use before the hub ever sees it, which is the one name §4's
-shape rules do not account for.
+conversation anybody would mint. This interface takes the name for its own use before the hub ever
+sees it, and since §14 the hub refuses it as a lane on its own account too: `-` is the segment both
+file trees write a project's own voice under, so a lane of that name would be handed the project's
+own two directories.
 
 **Any configuration that starts a second engine overlays all eight**, not only the project
 directory. Getting one of them wrong is not a loud failure: an inherited `KICKOFF_HUB_ADDRESS` makes
@@ -422,10 +466,13 @@ secret learns only "unknown project":
   control character reaches a topic title and the journal, where it is invisible and can reorder
   what a person reads.
 
-**One more name is unavailable, and it is this interface's doing rather than the hub's.** `-` means
-"as if this variable were not set" (§2), so `KICKOFF_HUB_ADDRESS=-` derives a default instead of
-naming a conversation. The hub would happily address a conversation called `-`; you cannot ask for
-one through this interface, and there is no reason to want to.
+**One more name is unavailable, and it is unavailable twice over.** `-` means "as if this variable
+were not set" (§2), so `KICKOFF_HUB_ADDRESS=-` derives a default instead of naming a conversation:
+you cannot ask for one through this interface. And a `hello` that names it anyway, from an adapter
+that touches no variable, is `bad_lane` — `-` is the segment both file trees write a project's own
+voice under (§14.1), so a lane admitted under that name would be handed the project's own two
+directories, reading what he sent the project's own session and writing into the outbox the hub
+uploads from under the project's name. The convention alone was not a rule; this is.
 
 **`bad_lane` is permanent.** The same name is refused every time, so retrying it is a spin. Rename or
 stop.
@@ -1709,6 +1756,465 @@ Listed so that nobody discovers it in a diff.
 * **`session.idle` as `beat`.** Still acked and dropped by the hub, as `docs/TAXONOMY.md` §7 records.
 * **Reaping at PID 1.** Declined, §13.5, and the wall's init does it.
 * **Telling the hub a check from a real connection.** A new frame, `crates/`, another slice.
+
+## 14. Files
+
+<!-- DESIGN, 5 September 2026; both halves built 6 September. The operator asked "do we
+     support media files bidirectionally?" and the answer was no — text only, both ways, and a
+     photo he sent into a topic was dropped before the words beside it were read. This section is
+     the design a build implements and a sceptic attacks. Where it says "measured" the number was
+     read off the Bot API page or the running opencode server on this box; where it says "decided"
+     it is a choice with its reason beside it.
+
+     What exists in code (6 September), phone → agent: `message{files}` down, the bridge's
+     `ack{files}` up, the media tree with its modes, shelf life and cap, the three ceiling checks,
+     every operator line in §14.4's "Down" table, the Claude tool server's channel message and the
+     opencode watcher's file part. Agent → phone: `welcome{outbox}`, `say{file}`, `done{file}`,
+     `ack.why: no-file`, the outbox tree made at admission with the media tree, the name rule
+     checked before the disk is touched, the descriptor walk of §14.3 with `O_NOFOLLOW` and
+     `O_NONBLOCK`, the five checks, the two send ceilings, the caption ceiling and the two-send
+     case, every line in §14.4's "Up" table, and `reply`/`done` taking a file on both engines
+     through the one tool server. Three things to know about the build: the hub reads the file
+     into memory (fifty megabytes at most) rather than streaming it, so a flood wait can send the
+     same bytes again; `as: photo` on a picture over 10 MB still goes as a document, because
+     Telegram would refuse it as a picture; and the ownership check on the FILE (a root-owned file
+     a wall without `--user` wrote into the hub's own directory) has no test that does not run as
+     root — the walk's ownership check, one line earlier and the same comparison, is the one a
+     test can reach, and the test says so. What does not exist: §14.5's mount-naming refusal from
+     the opencode watcher — what the server does with a `file:` URL it cannot read was not
+     measured, because measuring it means prompting a live session — and `--check` proving the
+     two mounts. -->
+
+A screenshot from his phone is the most natural steering there is; a rendered page or a chart is
+the most natural reply. Until this section the wire carried words in both directions and nothing
+else.
+
+**One principle, decided: bytes never cross the wall on the wire.** The frame ceiling is 64 KiB
+(§6) and a screenshot is a megabyte; every instance of an engine will run inside a bwrap or docker
+wall; and the hub is on the host, writing to its own state directory and nowhere else
+(`docs/CAPABILITIES.md`, REFUSES 2). So bytes cross the way the socket and the secret already cross
+— **by mount, at the same path on both sides** — and the wire carries a path, a name, a mime and a
+count, which fit in a frame with room to spare. No path is ever translated, because there is
+nothing to translate it to.
+
+Two directions, two trees, one rule each:
+
+* **Down, phone → agent.** The hub fetches what he sent into a directory of its own, and the
+  `message` frame carries a **path the hub minted**. A wall reads that path through a read-only
+  bind mount of that directory at the same path inside. On the host — a session started by hand —
+  the path is simply readable.
+* **Up, agent → phone.** `say` and `done` carry the **name of a file in the conversation's outbox**,
+  a directory the wrapper bind-mounts read-write into the wall at the same path. The adapter copies
+  the agent's file in and sends the name; the hub reads it from its own host path, checks that it
+  is what it claims to be, and uploads it through the same send accounting as words.
+
+### 14.1 The two directories
+
+`<state>` is the hub's state directory: `$XDG_STATE_HOME/herdr-tg`, or `$HOME/.local/state/herdr-tg`
+when that is unset — **as the hub's own process sees them**, which under `deploy/herdr-tg.service`
+is the operator's home with no `XDG_STATE_HOME` unless `~/.config/herdr-tg/env` sets one. The two
+segments after the tree are the conversation's, and both are things a dispatcher already holds:
+`<project_id>` is the id offer 8 prints (`p-` and twelve hex characters, minted from the canonical
+repo path — a safe path segment by construction), and `<address>` is the address it minted, or the
+single character **`-`** for the project's own voice. `-` is free for this because §4's shape
+rules refuse it as a lane name, so the two can never collide. §2 had already taken it for itself,
+but a convention about a variable is not a rule about the wire: `hello` carries a lane directly,
+and a stranger's adapter written from §6 alone touches no variable at all.
+
+| tree | path | who writes | who reads | a wall mounts it |
+| --- | --- | --- | --- | --- |
+| media | `<state>/media/<project_id>/<address>/` | the hub | the wall | **read-only**, at the same path |
+| outbox | `<state>/outbox/<project_id>/<address>/` | the wall, through its adapter | the hub | **read-write**, at the same path |
+
+**Per conversation, not per hub, decided.** A flat `media/` mounted into every wall would let a
+wall read every file he ever sent to any project — a screenshot of his bank, meant for one
+project, readable by a stranger's. Each wall sees only what was sent to its own conversation, and
+the hub uploads from a wall only what that wall's own conversation named.
+
+**Who makes them.** The hub makes `<state>/media/` and `<state>/outbox/` when it starts, and a
+conversation's two directories **when it admits the connection — at `welcome`, not at the topic**,
+because a `say` carrying a file may legally be queued before the pong (§6) and the directory has
+to be there for the copy; two empty directories for a bridge that boots and exits are nothing,
+where an empty topic is a scar. Every segment it creates is **mode `0700`**. A wrapper that starts
+a wall has nothing to mount before that moment, so it makes the conversation's two directories
+itself, `0700`, as the same uid (§14.6), and the hub then keeps only what it would have made: on
+every use it walks each segment and requires a directory, not a link, owned by its own uid, mode
+`0700` — anything else is refused, with the directory named in the log, until a person fixes it.
+The state directory itself is `0700` on this box **by history, not by code** (it is made with
+`create_dir_all` and no mode, everywhere it is made), which is why these carry the mode explicitly
+instead of inheriting a promise nothing enforces.
+
+**Files the hub writes are `0600`.** Files a wall writes are the wall's; the hub does not care what
+mode they carry, because it only reads them.
+
+**Ceilings, shelf life, cap** — the numbers, and why each is that number:
+
+| what | number | why |
+| --- | --- | --- |
+| one file, down | **20 MB** | Telegram's own ceiling on `getFile` — *"bots can download files of up to 20MB"*, measured off the Bot API page. The hub cannot fetch more, so refusing at 20 is the honest number rather than a chosen one. Checked twice: against the size Telegram reports, when it reports one, and again on the stream as bytes arrive, because the report is optional and the client library reads an absent one as four gigabytes. |
+| one file, up | **50 MB**, and **10 MB as a picture** | Telegram's multipart ceilings — *"10 MB max size for photos, 50 MB for other files"*, measured off the page. The hub measures the file itself (`fstat` on what it opened), never the adapter's word. An image between 10 and 50 MB goes as a document; over 50 is refused before any upload. |
+| shelf life, both trees | **48 hours** | One shelf life for the state directory, not two: the ask ledger keeps a question for 48 hours because Telegram refuses edits past that, and a file he sent stays readable at least as long as the question it answered can be edited. These trees are a mailbox, not an archive — an agent that needs a file for longer copies it out. |
+| cap, each tree | **256 MiB**, oldest first | Twelve files at the down ceiling, or a couple of hundred phone screenshots — more than a person sends in two days by accident, and small enough that a home disk never notices it. Oldest by the hub's own `mtime` stat, never by a name a wall chose. |
+
+The sweep runs when the hub starts, before every write into `media/`, and before every read from
+an outbox — so an idle hub keeps a stale 256 MiB for exactly as long as it is idle, which is said
+here rather than hidden. **The cap bounds what the hub keeps, not what a wall can write.** A wall
+has a read-write mount and can fill the disk between two sweeps; a quota on a wall is the
+wrapper's, not the hub's.
+
+**Entries are bounded too, and by a different rule.** A lane is a git worktree name, so a
+dispatcher that makes and destroys worktrees would otherwise leave one directory per tree in each
+of these trees for ever — nothing over the cap, and nothing the cap could ever see — and the walk
+that enforces the cap runs on the path of every file he sends. So the sweep also removes a
+conversation's directory, and then its project's, **when it is empty and has been empty for the
+shelf life**. Empty is deliberately not enough: a wall mounts a conversation's directory, and a
+mount holds the directory it was made from, so removing one under a running wall would leave that
+wall writing into a directory the hub can no longer see. Forty-eight hours with nothing written or
+taken away is the evidence that this is not the conversation a wall is using; when it is wrong
+anyway the failure is loud rather than silent — the hub finds no such file, the words go with the
+line of §14.4, and the journal names the directory — and restarting the wall, which remakes its
+mounts, is the fix.
+
+**One fetch is bounded in time as well as in bytes**: sixty seconds for `getFile` and the body
+together, chosen here rather than inherited from the HTTP client, because the fetch runs where
+Telegram's own dispatcher orders that conversation's updates and what it costs is what his next
+line in that topic waits. A minute carries 20 MB at about 2.7 Mbit/s. Past it the honest reading
+is not "slow" but "not coming", and it is `download-failed`: he is asked to send it again.
+
+### 14.2 On the wire
+
+Everything here is additive and optional, in the sense §6 gives the word: **absent when it has no
+value, never `null`**, and ignored by a side that does not know it. §6's tables are unchanged and
+remain the fields every adapter must handle; an adapter written from §6 alone is complete, and
+carries no file. Types are as in §6 — a JSON **string** unless said otherwise.
+
+**Down.**
+
+| frame | new field | what it is |
+| --- | --- | --- |
+| `welcome` | `outbox?` | The absolute path of **this conversation's** outbox, `<state>/outbox/<project_id>/<address>/`, as the hub sees it and as a wall must mount it. It has to be told: an adapter never learns its project id (§5, §7 offer 8), and inside a wall its own `$HOME` is not the hub's, so nothing it holds can derive the path. Absent on every hub before this section, and **absence means this hub carries no files**: an adapter asked to send one then sends the words ALONE — a `say` with no `file`, byte for byte what it always sent — and says in its own tool result that the file did not go and why, rather than sending a field the hub would strip in silence or refusing the words along with it. Built that way rather than as v13 wrote it (refuse the whole call) because the words are worth more delivered than withheld, and the result is the one place the agent reads. |
+| `message` | `files?` | An **array** of objects, one per file he sent. Today it holds exactly one, because a Telegram message carries one file; an album arrives as one message per file, and each gets its own frame, in the order he sent them. `text` is his caption verbatim, or the empty string when he wrote none — **a file with no words is still a message**, and an adapter that refuses an empty `text` must not. |
+| `ack` | `why` gains **`no-file`** and **`no-file-unsaid`** | Paired with `delivered: yes` only: the words reached him and the file did not. `no-file` means the hub said why **in his topic**, and an adapter may tell its agent so. `no-file-unsaid` means it could not: his messaging app turned the file away for the moment — a flood wait, a switched-off project, a topic that is gone — and a sentence about that is another send into the same refusal, so he is looking at words with nothing to explain the gap. **Do not report `no-file-unsaid` to an agent as a reason waiting on his phone**, and do say it is worth attaching again in a minute: it is the only one of the two that mends itself, where every `no-file` is permanent for that file. §14.4 has both tables. Safe to add to a closed set for the reason `bad_lane` was: only a frame that carried a file can be answered with either, and an adapter old enough not to know the words cannot have sent one. |
+
+One entry of `files`:
+
+| field | type | what it is |
+| --- | --- | --- |
+| `kind` | `photo` \| `document` \| `video` \| `animation` \| `audio` \| `voice` | What Telegram called it. A sticker and a video note are not carried (§14.4). |
+| `path` | string, **or absent** | The path the hub minted and wrote — absolute, inside `<state>/media/<project_id>/<address>/`. Present exactly when the bytes are there; **absent exactly when `why` is present.** |
+| `mime` | string, optional | What the sender's client declared — **data, never a verdict on the bytes.** For a `photo` Telegram declares nothing, and the hub records `image/jpeg`, which is what the `.jpg` on Telegram's own `file_path` says every photo is re-encoded to; the build captures one real `getFile` answer to pin that rather than assume it. |
+| `bytes` | **number**, optional | What the hub wrote, counted by the hub. Present only with `path`. |
+| `filename` | string, optional | The name the sender's client reported, verbatim, **as data**. Never part of any path, and never written into the audit file, which is one line per record and would take a newline in it as a second record. |
+| `why` | `too-big` \| `download-failed` \| `not-stored` | Present exactly when `path` is absent. **Read this as an OPEN set**: it travels down only, from a hub that may be newer than your adapter, so a word you do not know must read to your agent as one you cannot explain rather than as nothing at all. `not-stored` is not a download that broke — nothing was downloaded, because this machine had nowhere to put the bytes — and the advice is the opposite: sending it again cannot help, and whoever looks after the machine has the reason in the journal. The hub is TRYING to tell the operator, in his topic, in words; that is an ordinary send against a shared ceiling and can be shed, so **never tell your agent he has already read it.** |
+
+**Up.**
+
+| frame | new field | what it is |
+| --- | --- | --- |
+| `say`, `done` | `file?` | An **object**, `{name, mime?, filename?, as?}`. `name` is the file's name in this conversation's outbox — one path segment, under the rules of §14.3. `mime` is what the adapter says the bytes are, and it decides picture or document. `filename` is what the operator sees a document called, as data, defaulting to `name`. `as` is `photo` or `document` and overrides the mime's choice: a tall page sent as a picture is refused by Telegram — a photo's width plus height may not pass 10 000 and its ratio may not pass 20, measured off the page — and a picture is downscaled besides, so an agent that wants him to read a page at full size says `document`. `text` may be empty when `file` is present; the file is then the message. |
+| `ack` — yours, answering a `message` | `files?` | A **number**: how many entries of that message's `files` you handed to your engine — the ones with a `path` as the file, the ones with a `why` as the line saying so. Send it on every `accepted` ack for a `message` that carried `files`, and never on one that did not. **An ack without it means none did** — which is what every adapter shipped before this section says — and the hub, which compares it against the number of files that reached its own disk, then tells him so in the topic. An adapter that can take his words but not his file (an engine whose server cannot read the path) refuses the whole message with a reason (offer 6), because words that describe a picture the agent cannot see are worse than a line saying so. |
+
+**Not on `ask`, decided.** A question's message is edited when the question is retired (offer 5),
+and a photo message has a caption where a text message has text: the edit the ledger performs
+would be the wrong call for the message it was written against. A screenshot beside a question is
+a `say` with the file, then the `ask`.
+
+Three worked frames, byte for byte in the shape the hub sends and takes — `$STATE` standing for the
+hub's state directory, which is an absolute path on the wire:
+
+```
+{"v":1,"id":"h1","t":"welcome","project":"A Title Only The Registry Knows","lane":"engineering","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20},"outbox":"$STATE/outbox/p-9f3a1c2e5b7d/engineering"}
+{"v":1,"id":"h7","t":"message","msg_id":"m-4412","text":"this is what the login page looks like now","from":{"chat_id":<number>,"user_id":<number>},"files":[{"kind":"photo","path":"$STATE/media/p-9f3a1c2e5b7d/engineering/20260905-231455-9f3a1c2e.jpg","mime":"image/jpeg","bytes":1183412}]}
+{"v":1,"id":"f12","t":"say","text":"the chart, rebuilt","file":{"name":"3c9e1b7a.png","mime":"image/png","filename":"latency-p99.png"}}
+```
+
+**Behind attach's door (§9, §13) — one rule, and it is not "the first answer wins".** The door
+writes `welcome` to a producer as it received it, forwards a `say` or `done` with everything but
+the envelope untouched, and hands a hub `ack` down with only `ref` rewritten — so `outbox`,
+`file`, `no-file` and `no-file-unsaid` cross it with no change. The one frame it rebuilds is a
+producer's answer about his typed words (the fold of §7, offer 6, which turns several producers'
+answers into the one the hub hears). For a message with no files that fold still sends the FIRST
+accepted answer, so the thumb on his message arrives at once. For a message that carried files it
+sends the LARGEST count any producer reported, and it sends it as soon as no later answer could
+better it — the first producer that took them all — otherwise **it waits for the rest**, which is
+what the refusal half of the same fold has always done.
+
+Why it may not simply take the first: the producers disagree during any upgrade window and in the
+ordinary opencode layout, where a tool server answers over stdio the instant it reads a frame and
+the watcher answers after a POST. Whichever is quicker decides what the operator is told. With the
+short count winning, the hub puts *"that file did not reach the agent"* in his topic although an
+agent in that same lane is looking at the path; with the long count winning it says nothing
+although another agent got only the caption. Either way the topic states something the hub did not
+observe, which is the one thing §14.4 exists to prevent.
+
+**Upgrading the hub means restarting every long-running attach, not only the sessions.** A relay
+reads its own code once, at process start, so a `kickoff-hub-attach` under systemd with
+`Restart=always` carries the old fold indefinitely — and from the hub's side that is
+indistinguishable from a tool server that is too old. The hub's line for a short count therefore
+names neither (§14.4).
+
+**Skew, both directions, and how each is proved.**
+
+* **Old adapter, new hub.** The adapter gets `message{text, files}` and ignores `files`; the agent
+  gets the caption. Its ack carries no `files`, so the hub knows, and says so in his topic (§14.4):
+  the file is not silently lost, it is loudly not delivered. The bridge in the operator's own
+  session is the old one and cannot restart without ending his conversation, so this direction is
+  proved the way `the_real_plugin_*` proves everything — the unmodified `server.ts` against the new
+  hub over a real socket, with Telegram faked.
+* **New adapter, old hub.** The `welcome` has no `outbox`, so the adapter sends the words alone
+  and says why in the tool result; the plugin suite runs that against a fake hub whose welcome
+  names none. And a stranger's adapter that sends `say{file}` anyway is proved the way `frame.rs`
+  proves the `lane` case — the frame parsed by the `say` and `done` types as they were before the
+  field existed, coming out as the words — because the hub old enough to test against is the one
+  being replaced.
+
+### 14.3 Names
+
+**Down: the hub mints every path it writes, and nothing the sender said is in it.** The name is
+the moment and a random suffix — `<yyyymmdd>-<hhmmss>-<eight hex characters>`, UTC — so a listing
+of the directory is arrival order, which is what oldest-first needs and what an agent listing it
+sees; then an extension from this table, keyed on the declared mime, **or none**:
+
+| declared mime | extension |
+| --- | --- |
+| `image/jpeg` · `image/png` · `image/webp` · `image/gif` | `jpg` · `png` · `webp` · `gif` |
+| `application/pdf` | `pdf` |
+| `text/plain` · `text/markdown` · `text/csv` · `application/json` | `txt` · `md` · `csv` · `json` |
+| `audio/ogg` · `audio/mpeg` | `ogg` · `mp3` |
+| `video/mp4` | `mp4` |
+| `application/zip` | `zip` |
+| anything else | *(none — the mime still travels in the frame, as data)* |
+
+The extension exists so an agent's own tools can tell a picture from a text file without being
+told. It is a courtesy keyed on a string the sender chose, not a verdict on the bytes, and the
+table is short so that nothing a sender declares can name an extension the hub did not choose. The
+filename Telegram reports is carried in `filename`, verbatim, and is never joined onto anything.
+The hub does not sniff, decode, thumbnail or re-encode: what he sent is what is on disk.
+
+**Up: the hub opens what the adapter named, and checks what it opened — never the name.** A wall
+is the untrusted side. A wall that writes a link of either kind called `shot.png` pointing at the
+operator's secrets and then says `shot.png` must get a refusal, not an upload. So `name` is refused when it
+breaks **the address rules of §4** — empty, over 64 bytes, exactly `.` or `..`, containing `/` or
+`\`, containing a control character — and the file is refused when, once opened, it is not what a
+file in an outbox can honestly be:
+
+1. **Opened without following a link**, under a descriptor the hub holds on the outbox directory
+   (`openat` with `O_NOFOLLOW`), and never by resolving a path and then opening it — a wall can
+   swap the name between the check and the open, so every check is made on what was opened.
+2. **A regular file.** Not a directory, not a device, not a socket, not a FIFO — the last two would
+   park the hub for ever on the first read.
+3. **Owned by the hub's own uid.** Every supported wall runs as that uid (§10), including a
+   uid-remapped bwrap wall, whose writes land on the host as the operator's. Any other owner is a
+   file nothing in this design wrote.
+4. **Inside the outbox** — the descriptor it was opened under is the conversation's own outbox,
+   every segment of which was opened as a directory, not a link, and checked on the way in
+   (§14.1), so a name that decodes to somewhere else cannot have been opened at all. That is what
+   "canonicalised" means here: the hub never asks the filesystem to resolve a string a wall wrote.
+5. **The only name these bytes have.** `st_nlink` is exactly 1. A hard link is not a symlink, so
+   `O_NOFOLLOW` does not see it, and it passes all four checks above — it IS a regular file, it IS
+   owned by whoever owns the inode, and its directory entry IS under the descriptor the hub opened
+   — while sharing its bytes with a name anywhere else on the same filesystem, which makes
+   "inside the outbox" a rule about the NAME after all. `link` needs no read permission on its
+   source, so a file a wall may name through a read-only mount but must not read is linkable here
+   and would be uploaded. An adapter copies bytes in, and a copy has exactly one name, so nothing
+   this design writes is refused by it.
+6. **Under the ceiling**, by the hub's own `fstat`, after the open.
+
+Any of the six is `no-file`; the words still go, and the operator's line says which (§14.4). The
+hub hands the bytes to Telegram from the descriptor it checked, never by path: the upload
+library's own path-taking constructor follows links and names the upload after the last path
+segment, and both are exactly what this list forbids.
+
+**What our adapters do**, so a stranger's can meet the same bar without copying it: the tool server
+copies the agent's file into the outbox under a name it mints — eight hex characters and the
+source's extension — and puts the source's basename in `filename`. The agent's own path is never
+the `name`: it can be long, it can be anything, and where it came from is the agent's business.
+
+**Picture or document**, for the hub's choice of call: `image/jpeg`, `image/png` and `image/webp`
+go as a picture when under 10 MB and `as` does not say otherwise; everything else, and
+`as: "document"`, goes as a document. A picture Telegram refuses for its dimensions is `no-file`
+with a line saying to send it as a document — the hub does not try twice on its own, because a
+second try is a second send from a budget he is sharing with every other conversation.
+
+### 14.4 When it fails — what the agent reads, and what the operator reads
+
+**Never a silent drop.** In every case the words go, and both sides are told the file did not — the
+agent in the ack, the operator in one line in the topic, threaded under the message it is about so
+two files a second apart cannot be confused. The operator's sentences below are the exact ones, in
+the register the hub already uses for refused words (*"What you typed did not reach the agent — ….
+It will not be delivered later."*); the agent's are the ack's vocabulary, and the sentence an
+adapter makes of them is its own (§11, item 2).
+
+**Down** — a file he sent:
+
+| what happened | the frame | in his topic, under his message |
+| --- | --- | --- |
+| Telegram reported a size over 20 MB — on the message, or in the `getFile` answer | `files:[{kind, filename?, why:"too-big"}]`, no `path`; his words still in `text` | *That file did not reach the agent — it is 31 MB, and the most the bot may fetch is 20 MB. It will not be fetched later.* |
+| the stream passed 20 MB when no size was reported | the same, `why:"too-big"`; what was written is removed | *That file did not reach the agent — it was still coming at 19.9 MB, and the most the bot may fetch is 20 MB. It will not be fetched later.* — the number the hub itself counted, which is the only one anybody has here |
+| `getFile` refused BECAUSE it is too big | `why:"too-big"` | *That file did not reach the agent — Telegram says it is over the 20 MB the bot may fetch. It will not be fetched later.* — no number, because nothing here measured one: reading back the size on the message would name a figure under the ceiling as the reason it is over it |
+| `getFile` refused otherwise, the download broke, or neither finished inside the fetch deadline | `why:"download-failed"` | *That file did not reach the agent — the download from Telegram failed. Send it again.* |
+| this machine had nowhere to put the bytes — the conversation's media directory is not a directory, not the hub's, or not `0700`; the file could not be created | `why:"not-stored"`; **nothing is asked of Telegram at all** | *That file did not reach the agent — this machine had nowhere to put it. Sending it again will not help; whoever looks after this machine has the reason.* No retry, because every file he sends will meet the same directory, and the cause is a journal line naming it |
+| a sticker or a video note | nothing goes down: neither carries words | *That did not reach the agent — it takes photos, documents, voice notes, videos and audio, not stickers or video notes.* |
+| the ack came back without `files`, or short | *(the frame went, with `files`)* | *That file did not reach the agent — the worker here is too old to take files, and it got only your words. Sending it again will not help until it has been started fresh.* It names no cause and no remedy he can carry out from a phone, deliberately: a short count means the tool server is old **or** the relay in front of it is (§14.2), the hub cannot tell them apart from one number, and "restart the session" sent him round for ever against an attach service that was the real one |
+| the adapter refused the message | *(offer 6, unchanged)* | *What you typed did not reach the agent — `<reason>`. It will not be delivered later.* |
+
+A message that is not a file at all — a location, a contact, a poll — is as it was before this
+section: not relayed, and nothing said. The reactions of `docs/RATE-PROBE.md` §3 apply to a file
+as to typed words: the eyes when the hub has it, the thumb when the adapter has answered.
+
+**Up** — a file the agent attached:
+
+| what happened | the ack | in his topic |
+| --- | --- | --- |
+| `name` breaks the §4 rules, or the file is a link, not regular, not the hub's, or not in the outbox | `yes`, `why: no-file` | the words, and under them in the same message: *(The file the agent attached did not come through: it was not a file the bot may send.)* |
+| over 50 MB by the hub's own measure | `yes`, `why: no-file` | *(The file the agent attached did not come through: it is 61 MB, and the most the bot may send is 50 MB.)* |
+| Telegram refused the upload | `yes`, `why: no-file` | *(The file the agent attached did not come through: Telegram would not take it as a picture; ask for it as a document.)* — or, for any other refusal, the reason Telegram gave, in its words: the API's own `description`, unwrapped from the client library's two layers of it, stripped of control characters and clipped to one line's worth |
+| the file was shed, switched off or had no topic AFTER his words landed, or the line above could not itself be sent | `yes`, `why: no-file-unsaid` | **nothing** — whatever refused the file refuses a sentence about it just as fast, and the audit already says `shed`. This is the one case where an adapter must not tell its agent the reason is on his phone, and the one worth attaching again in a minute |
+| the upload went out and could not be confirmed | `unseen` | nothing — it may be there, and it is never retried (offer 3) |
+| the words themselves did not go | `no`, with the existing `why` | nothing |
+
+**Sends, and what they cost.** Telegram takes a caption of up to 1 024 characters on a picture or
+a document (measured off the page; `max_text` is 3 500). So a `say` with a file whose `text` fits
+is **one send** — the file, with the words as its caption — and one token from the conversation's
+share of the budget in `docs/RATE-PROBE.md` §1. Longer words are their own message and the file
+follows under it: **two sends, two tokens**, and the ack is for the pair — `yes` only when both
+landed. When the hub refuses the file before uploading, the words go alone with the line appended,
+in one send. When Telegram refuses the upload the words never landed either, so they go again
+alone with the line appended — a second send, which is the cost of finding out; when the words had
+already gone as their own message, the line goes alone under them. A file shed by the budget, or
+refused because the topic is gone, after words that landed is `yes` with **`no-file-unsaid`** and
+no line: what refused the file refuses a line too, and the audit already says `shed`. The same word
+is used when the line itself was shed or clipped, because the ack is the agent's only evidence
+about what is on his phone and the difference between the two is exactly whether there is anything
+there to read. Whether a picture
+and a document are charged against the twenty-a-minute ceiling like a text is **assumed, not
+measured**: they are sends, so they take a turn like any other, and `docs/RATE-PROBE.md` should
+list the measurement as still owed.
+
+### 14.5 What each engine receives
+
+The adapter decides how a path reaches an agent's turn; the hub decides only that it is a path.
+Both of ours, measured rather than guessed:
+
+**Claude.** The tool server hands the operator's words into the turn as a channel message
+(`deliver()`), whose content is a string. A path in that string is enough: the agent reads the
+file with its own tools, which is the whole point of mounting the directory at the same path. So
+the message is the caption, then one line per file naming the path, the mime, the size and the
+reported filename — or, for a file that did not come through, one line saying so and why. The
+exact words are the adapter's (§11, item 2), and the ack carries `files: 1` the moment the
+notification is written, at the same honesty as its `accepted` today.
+
+**opencode.** The v1 prompt body the watcher already uses has a file part, read off the running
+server's own OpenAPI at `/doc` (opencode 1.18.25) and not guessed:
+
+```
+POST /session/{id}/prompt_async
+{"parts":[{"type":"text","text":"<his caption>"},
+          {"type":"file","mime":"image/jpeg","url":"file://<the path in the frame>","filename":"<the reported name>"}]}
+```
+
+`FilePartInput` requires `type`, `mime` and `url` and forbids unknown keys; `filename` is optional;
+`source` is optional and is best omitted, because its own shape requires fields the watcher has no
+honest value for. **The server, not the model, reads the file**: for a `file:` URL it reads the
+path from disk and rewrites the part as a `data:` URL for the model (a `text/plain` file is run
+through the server's own Read tool instead). So the path must be readable by **the opencode server
+process inside the wall** — exactly the same-path rule, and nothing else. A `mime` the frame does
+not carry is sent as `application/octet-stream`. A path the server cannot read is a prompt that
+fails, which the watcher already turns into `ack{status: refused, reason}` under a deadline
+(§13.9); the reason names the mount — *the engine could not read the file at `<path>`; is the
+media directory mounted in the wall?* — and that is one line in his topic, never a silent drop.
+
+**Up is the same under both engines.** The agent's `reply` and `done` tools gain one optional
+parameter, a path to a file, and the tool server does the copy and the naming of §14.3 whichever
+engine started it. The watcher carries nothing up.
+
+### 14.6 A wall, worked — the two extra bind mounts
+
+§10 mounts two things; a wall that carries files mounts four. `STATE` is the hub's state directory
+as the hub sees it (§14.1), `PROJECT_ID` is from `herdr-tg projects --json`, and `ADDRESS` is the
+address the dispatcher minted — the same value it puts in `KICKOFF_HUB_ADDRESS`, or `-` when it
+sets none:
+
+```
+(umask 077 && mkdir -p "$STATE/media/$PROJECT_ID/$ADDRESS" "$STATE/outbox/$PROJECT_ID/$ADDRESS")
+docker run --rm --init \
+  --user "$(id -u):$(id -g)" \
+  -v "/run/user/$(id -u)/kickoff:/run/user/$(id -u)/kickoff" \
+  -v "$repo/.kickoff/hub.token:/run/secrets/hub.token:ro" \
+  -v "$worktree:/workspace" \
+  -v "$STATE/media/$PROJECT_ID/$ADDRESS:$STATE/media/$PROJECT_ID/$ADDRESS:ro" \
+  -v "$STATE/outbox/$PROJECT_ID/$ADDRESS:$STATE/outbox/$PROJECT_ID/$ADDRESS" \
+  -e KICKOFF_HUB_PROJECT_DIR=/workspace \
+  -e KICKOFF_HUB_ADDRESS="$ADDRESS" \
+  -e KICKOFF_HUB_TOKEN_FILE=/run/secrets/hub.token \
+  <image> kickoff-hub-attach --opencode http://127.0.0.1:9700 --run opencode serve --port 9700 --hostname 0.0.0.0
+```
+
+Under bwrap the two lines are `--ro-bind "$STATE/media/$PROJECT_ID/$ADDRESS" "$STATE/media/$PROJECT_ID/$ADDRESS"`
+and `--bind "$STATE/outbox/$PROJECT_ID/$ADDRESS" "$STATE/outbox/$PROJECT_ID/$ADDRESS"`; bwrap
+refuses a source that does not exist, which is what the first line is for. The `umask` is there
+because `mkdir -m` sets the mode on the last segment only, and the hub checks every segment.
+
+Line by line, why each is what it is:
+
+* **the same path on both sides.** The frame carries the host path, and the hub cannot know a wall
+  exists, let alone what it mounted where; a wall with a different `$HOME` inside still gets the
+  host's string in the frame, exactly as it gets the host's socket path (§10). Under
+  `bwrap --unshare-user --uid 0` this is the socket's story again: the path in the frame is the
+  operator's, so mount it at the operator's path.
+* **the conversation's directories, never the trees.** Mounting `$STATE/media` whole would let this
+  wall read every conversation's files; mounting `$STATE/outbox` whole would let it write into
+  another conversation's outbox, from which the hub would happily upload under that conversation's
+  name.
+* **media read-only.** The hub is the only writer, and a wall that could write there could plant a
+  file and then be told, by the hub, to read it.
+* **outbox read-write, and the hub still trusts nothing in it.** §14.3's five checks are what make
+  a read-write mount from an untrusted side safe; the mount does not.
+* **the same uid.** §10 already requires it for the socket; the ownership check requires it again,
+  and a wall as another uid writes files the hub refuses to send.
+
+What happens when each is missing:
+
+| missing | what you see |
+| --- | --- |
+| the media mount | Claude: the agent is told a path and its read fails with "no such file"; the ack still says `files: 1`, because the notification was written and the adapter cannot see inside the engine's tools. opencode: the server's read fails, the prompt fails, the watcher refuses with the reason above, and he reads one line. `--check` does not test this mount today. |
+| the outbox mount | the tool server's copy fails and the tool result says so, before the wire; nothing reaches the hub. |
+| the outbox, made as the wrong uid or with a wider mode | the hub refuses every file from that conversation, with a log line naming the directory; the words go, with the line appended. |
+| the directories, before the wall starts | bwrap refuses to start; docker makes the missing host directory **as root**, which the hub then refuses as not its own — so make them first, as the first line does. |
+
+### 14.7 Not here, said plainly
+
+* **Nothing a sender says names a path, and the hub never builds Telegram's download URL itself.**
+  That URL carries the bot token, and the client library the hub uses redacts it from every error
+  it returns — and, measured while building this, drops the whole URL from the error when the
+  token does not look like one to it, so a misconfigured token is not the one that leaks. A
+  hand-rolled fetch would put the token in the first log line of the first failure. `file_path`
+  on its own carries no token and may be logged; a test pins that neither the journal nor the
+  audit ever carries the token after a failed fetch.
+* **No thumbnails, no sniffing, no re-encoding, no unpacking.** What he sent is what is on disk;
+  what the agent wrote is what he gets.
+* **No cleanup driven by a topic going.** Topic cleanup is its own slice. The sweep does take a
+  conversation's directory once it has been empty for the shelf life (§14.1), so entries are
+  bounded; nothing watches a topic to do it sooner.
+* **Not on `ask`** (§14.2), and not on `beat`.
+* **Not measured:** whether a picture and a document are charged against the send ceiling like a
+  text; whether a real full-page screenshot is refused by `sendPhoto` for its dimensions or merely
+  downscaled. Both are cheap to measure in a throwaway topic and neither changes a frame.
+* **`--check` does not yet prove the two mounts.** It proves the socket and the secret; a line per
+  mount belongs beside them and is the first thing to add when the build lands.
+* **A hard link is refused, and it never was an escalation.** §14.3's fifth check is there because
+  the guarantee this document sells — that the hub sends only files written into the outbox for it
+  — was not the one the code held, not because a link reached anything a wall could not already
+  read. `link` is made in the wall's own namespace, so the reach it adds is a file the wall may
+  NAME but not read; the symlink case, which resolves in the hub's namespace and so could reach
+  anything at all, was refused from the start.
+* **The file-level ownership check is untested without root.** §14.3's third check is made twice —
+  on every directory of the walk and on the file — and a test can only move the hub's idea of its
+  own uid, which the walk refuses first. The file's check exists for a wall started as root that
+  writes a root-owned file into a directory that IS the hub's; proving it needs a root-owned
+  regular file inside a hub-owned `0700` directory, which no test on this box can make.
+
+---
 
 ## Changing this file
 

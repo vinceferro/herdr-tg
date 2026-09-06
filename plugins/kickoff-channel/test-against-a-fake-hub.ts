@@ -14,7 +14,7 @@
  * could never find its secret passed every test it had.
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -219,8 +219,12 @@ check('it found that repo without being told its own directory',
 // The real hub admits a connection with exactly one `welcome` before anything else, and the bridge
 // holds its frames until it arrives — so a fake hub that skips it is a fake the bridge would sit
 // mute against forever.
+// And since files (`docs/ATTACHING.md` §14) the welcome names this conversation's outbox: the
+// directory the bridge copies an agent's file into before it sends the NAME, never the bytes.
+const outbox = join(dir, 'outbox')
+mkdirSync(outbox, { recursive: true, mode: 0o700 })
 toBridge({ v: 1, id: 'h-welcome', t: 'welcome', project: 'repo',
-  limits: { max_frame_bytes: 65536, per_minute: 20 } })
+  limits: { max_frame_bytes: 65536, per_minute: 20 }, outbox })
 
 toBridge({ v: 1, id: 'h-ping-1', t: 'ping' })
 await until('pong', () => fromBridge.some(f => f.t === 'pong'))
@@ -266,6 +270,69 @@ await until('the bridge to answer for his words', () => fromBridge.some(f => f.t
 const forHisWords = fromBridge.find(f => f.t === 'ack' && f.ref === 'h10')
 check("and the hub is told the words reached the agent's turn",
   forHisWords?.status === 'accepted', JSON.stringify(forHisWords ?? 'no ack at all'))
+
+// A photo he sent (`docs/ATTACHING.md` §14). The hub fetched it into its own directory and the
+// frame carries the PATH the hub minted, the mime, the count, and the name his phone reported as
+// DATA. The agent reads the file with its own tools — that is the whole point of mounting the
+// directory at the same path — so the channel message is his caption and one line per file naming
+// the path; and the ack counts what was handed on, so the hub can tell this bridge from one older
+// than files, which reads the caption and drops the entry.
+const minted = '/state/media/p-9f3a1c2e5b7d/-/20260905-231455-9f3a1c2e.jpg'
+toBridge({ v: 1, id: 'h11', t: 'message', msg_id: 'm4', text: 'this is what the login page looks like now',
+  from: { chat_id: -1, user_id: 1 },
+  files: [{ kind: 'photo', path: minted, mime: 'image/jpeg', bytes: 1183412, filename: '../../.ssh/id_ed25519' }] })
+await until('the photo message', () => outLines.filter(l => l.method === 'notifications/claude/channel').length >= 3)
+const withPhoto = outLines.filter(l => l.method === 'notifications/claude/channel')[2]
+check('a_photo_he_sends_reaches_the_agent_as_the_path_the_hub_minted',
+  withPhoto.params.content.includes('this is what the login page looks like now')
+    && withPhoto.params.content.includes(minted)
+    && withPhoto.params.content.includes('image/jpeg'),
+  withPhoto.params.content)
+check('and_the_name_his_phone_reported_is_shown_as_a_name_and_never_joined_onto_the_path',
+  withPhoto.params.content.includes('../../.ssh/id_ed25519')
+    && !withPhoto.params.content.includes('/-/../../.ssh')
+    && !withPhoto.params.content.includes('media/../../.ssh'),
+  withPhoto.params.content)
+await until('the ack for the photo', () => fromBridge.some(f => f.t === 'ack' && f.ref === 'h11'), 3000).catch(() => {})
+const forThePhoto = fromBridge.find(f => f.t === 'ack' && f.ref === 'h11')
+check('and_the_ack_counts_the_file_it_handed_on',
+  forThePhoto?.status === 'accepted' && forThePhoto?.files === 1, JSON.stringify(forThePhoto ?? 'no ack at all'))
+
+// One that did not come through: no path, a reason. Said to the agent in the same message, so a
+// caption about a picture the agent cannot see is never read as if the picture were there.
+toBridge({ v: 1, id: 'h12', t: 'message', msg_id: 'm5', text: '', from: { chat_id: -1, user_id: 1 },
+  files: [{ kind: 'document', filename: 'build.log', why: 'too-big' }] })
+await until('the message about a file that did not come',
+  () => outLines.filter(l => l.method === 'notifications/claude/channel').length >= 4)
+const withoutFile = outLines.filter(l => l.method === 'notifications/claude/channel')[3]
+check('a_file_that_did_not_come_through_is_said_to_the_agent_never_dropped',
+  withoutFile.params.content.includes('build.log') && /did not come through/.test(withoutFile.params.content)
+    && /20 MB/.test(withoutFile.params.content),
+  withoutFile.params.content)
+// The hub only TRIES to put that line in his topic: it is an ordinary send against a shared
+// ceiling, and a shed, a switched-off project or a Telegram refusal leaves nothing on his phone
+// and only the journal knowing. Told "He has been told" as a fact, the agent answers "as you saw,
+// the screenshot did not come through" to somebody who saw nothing.
+check('and_the_agent_is_never_told_the_operator_has_already_read_something_nobody_confirmed',
+  !/has been told/i.test(withoutFile.params.content), withoutFile.params.content)
+
+// A file this machine could not store: its own word on the wire, because the advice is the
+// opposite of a failed download's. Anything else would read as "the hub did not say why".
+toBridge({ v: 1, id: 'h12b', t: 'message', msg_id: 'm5b', text: 'have a look', from: { chat_id: -1, user_id: 1 },
+  files: [{ kind: 'photo', why: 'not-stored' }] })
+await until('the message about a file with nowhere to go',
+  () => outLines.filter(l => l.method === 'notifications/claude/channel').length >= 5)
+const notStored = outLines
+  .filter(l => l.method === 'notifications/claude/channel')
+  .find(l => String(l.params.content).includes('have a look'))!
+check('a_file_the_hub_could_not_store_is_told_apart_from_a_download_that_broke',
+  !/did not say why/.test(notStored.params.content) && !/send it again/i.test(notStored.params.content)
+    && /store|storing|nowhere/i.test(notStored.params.content),
+  notStored.params.content)
+await until('the ack for the missing file', () => fromBridge.some(f => f.t === 'ack' && f.ref === 'h12'), 3000).catch(() => {})
+const forNoFile = fromBridge.find(f => f.t === 'ack' && f.ref === 'h12')
+check('and_its_ack_still_counts_the_entry_it_handed_on',
+  forNoFile?.status === 'accepted' && forNoFile?.files === 1, JSON.stringify(forNoFile ?? 'no ack at all'))
 
 check('every tool tells the agent to read what it returns',
   outLines.find(l => l.id === 2)!.result.tools.every((t: any) => /Read what it returns/.test(t.description)),
@@ -333,6 +400,95 @@ check('a message the hub had to shorten says so, rather than reading as delivere
   clipped !== '' && /clipped|shortened|too long/i.test(clipped), clipped)
 check('and it still says he got something, because he did',
   clipped !== '' && !/never got|could not confirm/i.test(clipped), clipped)
+
+// ── Files, up: a file the agent names goes with its words (`docs/ATTACHING.md` §14) ──────────
+//
+// Bytes never cross the wire. The tool takes a PATH the agent holds, copies the file into the
+// outbox the welcome named under a name of the bridge's own — eight hex characters and the
+// source's extension, never the agent's path — and the frame carries that name, the mime read
+// off the extension, and the source's basename as what he sees it called. The result says the
+// file went WITH the words, and a later `no-file` ack is turned into a line in the agent's turn.
+const pngBytes = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(3000, 7)])
+const shot = join(dir, 'latency-p99.png')
+writeFileSync(shot, pngBytes)
+const withFile = await call(b, 8, 'reply', { text: 'the chart, rebuilt', file: shot })
+check('the_reply_tool_takes_a_file_and_says_in_its_result_whether_it_went',
+  /^said/.test(withFile.text) && /with the file/.test(withFile.text) && withFile.text.includes('latency-p99.png') && !withFile.isError,
+  withFile.text)
+// The agent reads this sentence and nothing else about whether the file went, so it has to BE a
+// sentence: the file is named inside the verb phrase, not spliced in with punctuation left over
+// where the rest of the sentence used to start.
+check('and_the_sentence_it_returns_reads_as_one',
+  !/[,;]\s*$/.test(withFile.text) && !/,\s*—/.test(withFile.text) && !/\s,/.test(withFile.text),
+  withFile.text)
+await until('the say with a file', () => fromBridge.some(f => f.t === 'say' && f.file), 3000).catch(() => {})
+const sayWithFile = fromBridge.find(f => f.t === 'say' && f.file)
+check('and_the_frame_names_a_file_in_the_outbox_never_the_agents_own_path',
+  sayWithFile !== undefined
+    && sayWithFile.text === 'the chart, rebuilt'
+    && typeof sayWithFile.file?.name === 'string'
+    && /^[0-9a-f]{8}\.png$/.test(sayWithFile.file.name)
+    && sayWithFile.file.mime === 'image/png'
+    && sayWithFile.file.filename === 'latency-p99.png'
+    && !JSON.stringify(sayWithFile).includes(shot),
+  JSON.stringify(sayWithFile ?? 'no say with a file at all'))
+check('and_the_bytes_are_in_the_outbox_under_that_name_and_the_agents_file_is_untouched',
+  sayWithFile !== undefined
+    && existsSync(join(outbox, sayWithFile.file.name))
+    && readFileSync(join(outbox, sayWithFile.file.name)).equals(pngBytes)
+    && readFileSync(shot).equals(pngBytes),
+  sayWithFile ? String(existsSync(join(outbox, sayWithFile.file.name))) : 'no frame')
+// The hub says the words landed and the file did not — its reason is in his topic; the agent
+// reads that the file is not on his phone, in its own turn, never "he never got it".
+if (sayWithFile) toBridge({ v: 1, id: 'h14', t: 'ack', ref: sayWithFile.id, delivered: 'yes', why: 'no-file' })
+await until('the notice that the file did not come through', () => noticesTo(b).length >= 4, 8000).catch(() => {})
+const noFile = String(noticesTo(b)[3]?.params?.content ?? '')
+check('when_the_hub_says_the_file_did_not_come_through_the_agent_is_told_in_its_own_turn',
+  noFile !== '' && /file/.test(noFile) && /did not/.test(noFile) && !/never got/.test(noFile) && !/could not confirm/.test(noFile),
+  noFile)
+// The other half of the same ack. `no-file-unsaid` is the hub saying it could put NOTHING in his
+// topic either — the file was shed by the same budget that would have carried the sentence — so
+// he is looking at words with nothing to explain the gap. An agent told the reason is on his
+// phone talks to him as if he had read one, and is pointed at `as: "document"`, which takes
+// another turn and is shed identically; the truth is that this one mends itself in a minute.
+const againWithFile = await call(b, 81, 'reply', { text: 'the chart again', file: shot })
+check('the tool takes a second file just as happily', /^said/.test(againWithFile.text), againWithFile.text)
+await until('the second say with a file', () => fromBridge.filter(f => f.t === 'say' && f.file).length >= 2, 3000).catch(() => {})
+const secondWithFile = fromBridge.filter(f => f.t === 'say' && f.file)[1]
+if (secondWithFile) toBridge({ v: 1, id: 'h14b', t: 'ack', ref: secondWithFile.id, delivered: 'yes', why: 'no-file-unsaid' })
+await until('the notice that nothing was said either', () => noticesTo(b).length >= 5, 8000).catch(() => {})
+const unsaid = String(
+  noticesTo(b).find(l => /nothing to explain the gap|no reason|not been told/i.test(String(l.params?.content)))
+    ?.params?.content ?? '',
+)
+check('and_when_nothing_reached_his_topic_either_the_agent_is_not_told_a_reason_is_waiting_there',
+  unsaid !== '' && !/said why in his topic/.test(unsaid) && /nothing|no explanation|not been told/i.test(unsaid),
+  unsaid)
+check('and_it_is_told_that_this_one_is_worth_saying_again',
+  /again/.test(unsaid) && !/as: "document"/.test(unsaid), unsaid)
+// A path that is not a file the bridge can read: refused before the wire, as an error, so the
+// agent can say the words again with a file that exists — nothing went out for it.
+const saysBefore = fromBridge.filter(f => f.t === 'say').length
+const missing = await call(b, 9, 'reply', { text: 'see this', file: join(dir, 'nothing-here.png') })
+check('a_file_that_cannot_be_copied_into_the_outbox_is_refused_before_the_wire',
+  missing.isError && /^NOT/.test(missing.text) && missing.text.includes('nothing-here.png'), missing.text)
+await Bun.sleep(150)
+check('and nothing went out for it', fromBridge.filter(f => f.t === 'say').length === saysBefore,
+  JSON.stringify(fromBridge.filter(f => f.t === 'say').slice(saysBefore)))
+// `done` takes one too, and `as: "document"` travels: a tall page sent as a picture is refused by
+// Telegram or downscaled, and the agent is the one that knows which it wants.
+const page = join(dir, 'page.png')
+writeFileSync(page, pngBytes)
+const finished = await call(b, 10, 'done', { text: 'the whole page', file: page, as: 'document' })
+check('done_takes_a_file_too_and_carries_as_document_when_the_agent_says_so',
+  /^sent/.test(finished.text) && /with the file/.test(finished.text) && !finished.isError, finished.text)
+await until('the done with a file', () => fromBridge.some(f => f.t === 'done' && f.file), 3000).catch(() => {})
+const doneWithFile = fromBridge.find(f => f.t === 'done' && f.file)
+check('and the frame carries it',
+  doneWithFile?.file?.as === 'document' && doneWithFile?.file?.mime === 'image/png' && doneWithFile?.text === 'the whole page',
+  JSON.stringify(doneWithFile ?? 'no done with a file'))
+const wrongAs = await call(b, 11, 'reply', { text: 'x', file: page, as: 'sticker' })
+check('a way of sending the hub cannot read is refused here', wrongAs.isError, wrongAs.text)
 
 b.child.kill()
 hub.stop()
@@ -1181,6 +1337,32 @@ check('and_the_frames_it_had_queued_are_blamed_on_the_switch_and_never_on_his_ph
   JSON.stringify(offNotices))
 off.child.kill()
 offHub.stop()
+
+// ── A new bridge against a hub older than files ───────────────────────────────────────────────
+//
+// The welcome names no outbox, so there is nowhere to copy a file to and no hub that would read
+// it. The WORDS still go — a `say` without the field, byte for byte what this bridge always sent
+// — and the result says the file did not, and why, rather than sending a frame the hub would
+// silently strip or refusing the words along with it.
+const noOutboxSock = join(dir, 'older-than-files.sock')
+const noOutboxHub = fakeHub(noOutboxSock, (_h, s) => welcome(s), (f, s) => {
+  if (f.t !== 'pong' && f.t !== 'bye') s.write(JSON.stringify({ v: 1, id: `h-old-${f.id}`, t: 'ack', ref: f.id, delivered: 'yes' }) + '\n')
+})
+const newBridge = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: noOutboxSock })
+await handshake(newBridge)
+await until('the old hub to welcome the new bridge', () => noOutboxHub.got.some(f => f.t === 'hello'))
+await Bun.sleep(300)
+const forOld = join(dir, 'for-an-old-hub.png')
+writeFileSync(forOld, Buffer.alloc(100, 1))
+const toOld = await call(newBridge, 890, 'reply', { text: 'the chart, rebuilt', file: forOld })
+await until('the words at the old hub', () => noOutboxHub.got.some(f => f.t === 'say'), 3000).catch(() => {})
+const atOld = noOutboxHub.got.find(f => f.t === 'say')
+check('a_new_bridge_told_of_no_outbox_sends_the_words_alone_and_says_the_file_did_not_go',
+  atOld !== undefined && atOld.text === 'the chart, rebuilt' && !('file' in atOld)
+    && /^said/.test(toOld.text) && /WITHOUT the file/.test(toOld.text) && /older than files/.test(toOld.text) && !toOld.isError,
+  `${JSON.stringify(atOld ?? 'no say')} / ${toOld.text}`)
+newBridge.child.kill()
+noOutboxHub.stop()
 
 rmSync(dir, { recursive: true, force: true })
 console.log(`\n${failures === 0 ? 'all checks passed' : `${failures} FAILED`}`)

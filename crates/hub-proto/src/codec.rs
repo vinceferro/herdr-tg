@@ -161,6 +161,7 @@ mod tests {
             BridgeFrame::Say {
                 text: text.into(),
                 hint: None,
+                file: None,
             },
         )
     }
@@ -190,7 +191,8 @@ mod tests {
             back.payload,
             BridgeFrame::Say {
                 text: "one\ntwo".into(),
-                hint: None
+                hint: None,
+                file: None,
             }
         );
     }
@@ -208,7 +210,8 @@ mod tests {
                 f.payload,
                 BridgeFrame::Say {
                     text: t.into(),
-                    hint: None
+                    hint: None,
+                    file: None,
                 }
             );
         }

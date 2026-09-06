@@ -35,6 +35,8 @@
  * a test fails if any adapter starts writing its own again.
  */
 
+import { pathToFileURL } from 'node:url'
+
 import type { Project } from '../../plugins/kickoff-channel/where.ts'
 import { HubLink, MAX_FRAME_BYTES, type Delivery, type Outbound, type Unanswered } from '../../plugins/kickoff-channel/hub-link.ts'
 
@@ -349,11 +351,20 @@ export function startWatcher(cfg: WatcherConfig): void {
       return
     }
     const sid = encodeURIComponent(target.sessionID)
+    // His words, then one file part per file the hub fetched, then — inside the words — one line
+    // per file that did not come through. A file with no caption is a prompt with no text part.
+    const about = filesOn(f)
+    const text = [f.text, ...about.lines].filter(s => s.length > 0).join('\n')
+    const parts: Record<string, unknown>[] = [...(text.length > 0 ? [{ type: 'text', text }] : []), ...about.parts]
+    if (parts.length === 0) {
+      answerFor(ref, 'the message arrived without any words in it')
+      return
+    }
     try {
       const r = await fetch(`${OPENCODE}/session/${sid}/prompt_async`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ parts: [{ type: 'text', text: f.text }] }),
+        body: JSON.stringify({ parts }),
         signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
       })
       if (!r.ok) {
@@ -365,7 +376,7 @@ export function startWatcher(cfg: WatcherConfig): void {
       }
       note(`the operator's words went to ${target.how} as a prompt`)
       rememberPrompted(target.sessionID)
-      answerFor(ref)
+      answerFor(ref, undefined, about.count)
     } catch (e) {
       note(`could not reach opencode with the operator's words: ${(e as Error)?.message ?? e}`)
       answerFor(ref, unreached(e))
@@ -379,12 +390,65 @@ export function startWatcher(cfg: WatcherConfig): void {
       : "the worker's server could not be reached"
   }
 
-  /** Tell the hub what became of one `message`, on the wire. The hub acks this like any frame. */
-  function answerFor(ref: string, refused?: string): void {
+  /**
+   * Tell the hub what became of one `message`, on the wire. The hub acks this like any frame.
+   *
+   * `files` is how many entries of the message's `files` went into the prompt, sent only when the
+   * message carried any: the hub reads its absence as "an adapter older than files took the words
+   * and dropped the picture", and an ack about words alone stays byte for byte what it always was.
+   */
+  function answerFor(ref: string, refused?: string, files?: number): void {
     say(
-      refused ? { t: 'ack', ref, status: 'refused', reason: refused } : { t: 'ack', ref, status: 'accepted' },
+      refused
+        ? { t: 'ack', ref, status: 'refused', reason: refused }
+        : { t: 'ack', ref, status: 'accepted', ...(files !== undefined ? { files } : {}) },
       'an answer about typed words',
     )
+  }
+
+  /**
+   * The file parts for one of his messages, and the lines for the files that did not come.
+   *
+   * `FilePartInput` as captured off `/doc` of opencode 1.18.25, not guessed: `type`, `mime` and
+   * `url` required, `filename` optional, nothing else allowed (`additionalProperties: false`, so a
+   * stray key is a refused prompt). The URL is the hub's own path as a `file:` URL; the SERVER reads
+   * it from disk and hands the model a data URL, so the same-path mount rule binds the server
+   * process and nothing here reads a byte. The name his phone reported goes in `filename`, as
+   * data, and is never part of the URL. A mime the frame does not carry is sent as the type that
+   * declares nothing.
+   */
+  function filesOn(f: Record<string, any>): { parts: Record<string, unknown>[]; lines: string[]; count?: number } {
+    if (!Array.isArray(f.files)) return { parts: [], lines: [] }
+    const parts: Record<string, unknown>[] = []
+    const lines: string[] = []
+    for (const file of f.files as any[]) {
+      const kind = typeof file?.kind === 'string' ? file.kind : 'file'
+      const filename = typeof file?.filename === 'string' ? file.filename : undefined
+      if (typeof file?.path === 'string') {
+        parts.push({
+          type: 'file',
+          mime: typeof file.mime === 'string' ? file.mime : 'application/octet-stream',
+          url: pathToFileURL(file.path).href,
+          ...(filename !== undefined ? { filename } : {}),
+        })
+        continue
+      }
+      // The last arm is not decoration: this word travels DOWN from a hub that may be newer than
+      // this watcher, and a reason it has never heard of has to read as one it cannot explain
+      // rather than as nothing at all.
+      const why =
+        file?.why === 'too-big'
+          ? 'it is larger than the 20 MB the bot may fetch from Telegram, and it will not be fetched later'
+          : file?.why === 'download-failed'
+            ? 'the download from Telegram failed, and he is being asked to send it again'
+            : file?.why === 'not-stored'
+              ? 'this machine had nowhere to store it, so nothing was downloaded — sending it again will not help, and whoever looks after the machine has the reason'
+              : 'the hub did not say why'
+      // Never "he has been told": what the hub does about telling him is an ordinary send against
+      // a ceiling every project shares, and it can be shed with only the journal knowing.
+      lines.push(`[${kind}]${filename !== undefined ? ` ${JSON.stringify(filename)}` : ''} did not come through: ${why}. The hub is saying so under his message too, though it cannot confirm that landed.`)
+    }
+    return { parts, lines, count: f.files.length }
   }
 
   /**

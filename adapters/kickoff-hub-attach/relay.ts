@@ -230,7 +230,16 @@ export function createRelay(cfg: RelayConfig): Relay {
    * carrier's reason when the carrier is among them (`cfg.carrier`). Bounded, oldest first out,
    * because a producer that never answers must not turn this into a leak.
    */
-  type TypedWords = { waiting: Set<string>; refusals: { key: string; reason: string }[] }
+  type TypedWords = {
+    waiting: Set<string>
+    refusals: { key: string; reason: string }[]
+    /** How many entries his message carried in `files`. Zero for ordinary typed words. */
+    files: number
+    /** The most any one producer has said it handed on. */
+    handedOn: number
+    /** Whether anybody took the words at all. */
+    accepted: boolean
+  }
   const typedWords = new Map<string, TypedWords>()
   const TYPED_WORDS_KEPT = 64
 
@@ -608,8 +617,15 @@ export function createRelay(cfg: RelayConfig): Relay {
           )
           break
         }
-        // Everyone it was handed to has to answer, or go, before the hub hears a refusal.
-        typedWords.set(String(f.id), { waiting: handedTo, refusals: [] })
+        // Everyone it was handed to has to answer, or go, before the hub hears a refusal — and,
+        // when his message carried a file, before it hears a count that is short.
+        typedWords.set(String(f.id), {
+          waiting: handedTo,
+          refusals: [],
+          files: Array.isArray(f.files) ? f.files.length : 0,
+          handedOn: 0,
+          accepted: false,
+        })
         while (typedWords.size > TYPED_WORDS_KEPT) {
           const oldest = typedWords.keys().next()
           if (oldest.done) break
@@ -798,17 +814,41 @@ export function createRelay(cfg: RelayConfig): Relay {
     // says nothing the first did not.
     if (!about.waiting.delete(p.key)) return
     if (f.status === 'accepted') {
-      typedWords.delete(ref)
-      answerHub({ t: 'ack', ref, status: 'accepted' }, 'an answer about typed words')
+      about.accepted = true
+      // The count of his files this producer handed on — the one frame this door rebuilds rather
+      // than forwards, and so the one place a field the hub reads could be dropped on the way.
+      // The hub reads a short count as a worker too old to take files and says so in his topic,
+      // which this door must never make a producer look like.
+      if (typeof f.files === 'number') about.handedOn = Math.max(about.handedOn, f.files)
+      // As soon as it cannot be improved on, and not before. For ordinary typed words that is the
+      // first accepted answer, exactly as it always was, so his thumb still arrives at once. For a
+      // message carrying a file it is the first producer that took ALL of them — and when the one
+      // that answers first took none, waiting for the rest is the only way the number is a fact
+      // rather than a race between processes, which is what the refusal path has always done.
+      if (about.handedOn >= about.files || !about.waiting.size) acceptTypedWords(ref, about)
       return
     }
     about.refusals.push({ key: p.key, reason: typeof f.reason === 'string' ? f.reason : '' })
     settleTypedWords(ref, about)
   }
 
-  /** Nobody left to answer: one refusal goes up, with the reason that matters most. */
+  /** Somebody took his words: one accepted answer goes up, with the count nobody can better. */
+  function acceptTypedWords(ref: string, about: TypedWords): void {
+    typedWords.delete(ref)
+    answerHub(
+      { t: 'ack', ref, status: 'accepted', ...(about.files > 0 ? { files: about.handedOn } : {}) },
+      'an answer about typed words',
+    )
+  }
+
+  /** Nobody left to answer: one answer goes up, with the reason that matters most if it is no. */
   function settleTypedWords(ref: string, about: TypedWords): void {
     if (about.waiting.size) return
+    // Somebody did take them; a later producer's refusal does not unsay that.
+    if (about.accepted) {
+      acceptTypedWords(ref, about)
+      return
+    }
     typedWords.delete(ref)
     const said = about.refusals.find(r => r.key === cfg.carrier) ?? about.refusals[0]
     const reason = said?.reason || 'everything attached to the worker went away before taking it'

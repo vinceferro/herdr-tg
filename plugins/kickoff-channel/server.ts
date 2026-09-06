@@ -48,7 +48,9 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync } from 'fs'
+import { randomBytes } from 'crypto'
+import { constants as fsConstants, copyFileSync, readFileSync, statSync } from 'fs'
+import { basename, extname, join } from 'path'
 
 import { readConfig, secretFor, type Attachment } from './attach.ts'
 import { HubLink, type Delivery, type Identity, type Outbound, type Unanswered } from './hub-link.ts'
@@ -140,6 +142,128 @@ const CANNOT_TAKE_TYPED_WORDS =
   'nothing on this engine can take typed words from the phone by itself; a worker started with --opencode carries them'
 
 /**
+ * Where a file the agent wants him to see is put, as the hub said at `welcome` — or null, which is
+ * every hub built before files existed (`docs/ATTACHING.md` §14).
+ *
+ * Bytes never cross the wire: a frame is 64 KiB and a screenshot is a megabyte. The agent's file
+ * is COPIED into this directory under a name this bridge mints, and the frame carries that name;
+ * the hub reads the file from the same path on its own side and uploads it. Inside a wall the
+ * directory is a bind mount at the same path, which is why the path is the hub's to name and not
+ * something this process could work out from its own `$HOME`. Null is not a gap to fill in: a hub
+ * that named no outbox will strip the field and say nothing, so the words go alone and the agent
+ * is told that the file did not.
+ */
+let outbox: string | null = null
+
+/** The most a bot may upload — *"50 MB for other files"*, the Bot API page. Not ours to raise. */
+const MOST_A_BOT_MAY_SEND = 50_000_000
+
+/**
+ * The mime a file is declared as, from its extension. The hub's own table, so a picture the hub
+ * sends as a picture is exactly one it would name `.png` coming the other way; anything else is
+ * declared as bytes and goes as a document, which is honest rather than a guess.
+ */
+const MIME_BY_EXTENSION: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+  pdf: 'application/pdf', txt: 'text/plain', md: 'text/markdown', csv: 'text/csv', json: 'application/json',
+  ogg: 'audio/ogg', mp3: 'audio/mpeg', mp4: 'video/mp4', zip: 'application/zip',
+}
+
+/** What `reply` and `done` put on the wire for a file, and what the result calls it. */
+type Attached = { file: Record<string, unknown>; called: string }
+
+/**
+ * A call refused whole, before the wire, because of its file. Its message is already the sentence
+ * the agent reads — it starts with the "NOT …" marker the instructions block teaches, as every
+ * failure that nothing will mend on its own does — so the handler below returns it bare rather
+ * than behind the tool's name.
+ */
+class NotSent extends Error {}
+
+/**
+ * Copy the agent's file into the outbox and say how to name it on the wire.
+ *
+ * Refused as an ERROR, before anything is queued, when the file cannot be read, is not a file, is
+ * over what the bot may send, or cannot be copied: those are things a person or the agent can mend
+ * — the mount, the path, a smaller file — and words about a picture nobody will see are worse than
+ * a result that says so. The name in the outbox is the bridge's own, eight hex characters and the
+ * source's extension; the agent's path never reaches the wire, where it would be a string somebody
+ * else chose that the hub is told never to join onto anything. `filename` is the basename, as
+ * data, which is what he sees a document called on his phone.
+ *
+ * Returns `{ file: null, why }` — no error — when there is nowhere to put it: the hub is older
+ * than files, or the link is not up yet and no hub has said where files go. The words still go.
+ */
+function attached(a: Record<string, unknown>, never: string): Attached | { file: null; why: string } | null {
+  if (a.file === undefined || a.file === null || a.file === '') return null
+  const src = String(a.file)
+  const as = a.as === undefined || a.as === null ? undefined : String(a.as)
+  if (as !== undefined && as !== 'photo' && as !== 'document') {
+    throw new Error(`as must be photo or document — "${as}" is neither`)
+  }
+  if (!outbox) {
+    return {
+      file: null,
+      why: link.isUp
+        ? 'the hub on this machine is older than files and cannot carry one. Restart herdr-tg and say it again with the file.'
+        : 'the link to his phone is not up, so no hub has said where files go yet. Say it again with the file once it is.',
+    }
+  }
+  let size: number
+  try {
+    const st = statSync(src)
+    if (!st.isFile()) throw new Error('it is not a file')
+    size = st.size
+  } catch (err) {
+    throw new NotSent(`${never} The file ${src} cannot be sent: ${err instanceof Error ? err.message : err}`)
+  }
+  if (size > MOST_A_BOT_MAY_SEND) {
+    throw new NotSent(`${never} The file ${src} is ${(size / 1_000_000).toFixed(1)} MB and the most the bot may send is 50 MB.`)
+  }
+  const ext = extname(src).slice(1).toLowerCase()
+  const name = `${randomBytes(4).toString('hex')}${/^[a-z0-9]{1,8}$/.test(ext) ? `.${ext}` : ''}`
+  try {
+    // Exclusive, so a name that already exists is a refusal and never an overwrite of a file
+    // another call is still sending.
+    copyFileSync(src, join(outbox, name), fsConstants.COPYFILE_EXCL)
+  } catch (err) {
+    throw new NotSent(
+      `${never} The file ${src} could not be copied into the outbox at ${outbox}: ${err instanceof Error ? err.message : err}. ` +
+        'Is that directory mounted in this wall?',
+    )
+  }
+  return {
+    file: { name, mime: MIME_BY_EXTENSION[ext] ?? 'application/octet-stream', filename: basename(src), ...(as ? { as } : {}) },
+    called: basename(src),
+  }
+}
+
+/**
+ * The three sentences a tool returns, with the file said in each — or, when the words go alone,
+ * the reason in front of them. The agent reads nothing but this, so "with the file" is said only
+ * on a frame that carries one.
+ */
+function withTheFile(
+  said: { reached: string; waiting: string; never: string },
+  att: ReturnType<typeof attached>,
+): { reached: string; waiting: string; never: string } {
+  if (!att) return said
+  if (att.file === null) {
+    const alone = `— but WITHOUT the file: ${att.why}`
+    return { reached: `${said.reached} ${alone}`, waiting: `${said.waiting} ${alone}`, never: said.never }
+  }
+  return {
+    // The file is named inside the verb phrase and the rest of the sentence follows it untouched:
+    // "said" becomes "said, with the file x.png", and "said — and that is the last you will hear
+    // of it…" keeps its clause. Nothing is appended after the name — a comma there ends the one
+    // sentence the agent reads about the file with punctuation and no clause behind it.
+    reached: said.reached.replace(/^(said|sent)/, `$1, with the file ${att.called}`),
+    waiting: `${said.waiting} The file ${att.called} is with it.`,
+    never: said.never,
+  }
+}
+
+/**
  * Whether the client on the other end of this stdio can hand the agent something this bridge did
  * not return from a tool call — the operator's tap, his typed words, and every notice below saying
  * that a message reported as on its way never arrived.
@@ -223,6 +347,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           text: { type: 'string', description: 'Plain words. He is reading on a phone.' },
+          file: {
+            type: 'string',
+            description:
+              'Optional: the absolute path of a file to send with the words — a screenshot, a chart, a ' +
+              'rendered page. A png, jpeg or webp reaches him as a picture; anything else as a document. ' +
+              'At most 50 MB. Read what it returns: it says whether the file went with the words.',
+          },
+          as: {
+            type: 'string',
+            enum: ['photo', 'document'],
+            description:
+              'Optional: "document" to send a picture at full size — a picture is downscaled on his ' +
+              'phone and a tall page sent as one is refused — or "photo" to insist on a picture.',
+          },
         },
         required: ['text'],
       },
@@ -268,7 +406,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'it returns: it says whether he was reached.',
       inputSchema: {
         type: 'object',
-        properties: { text: { type: 'string' } },
+        properties: {
+          text: { type: 'string' },
+          file: {
+            type: 'string',
+            description:
+              'Optional: the absolute path of a file to send with the summary — what was built, ' +
+              'rendered. A png, jpeg or webp reaches him as a picture; anything else as a document. ' +
+              'At most 50 MB. Read what it returns: it says whether the file went with the words.',
+          },
+          as: { type: 'string', enum: ['photo', 'document'], description: 'Optional: "document" for full size.' },
+        },
         required: ['text'],
       },
     },
@@ -295,15 +443,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const a = (req.params.arguments ?? {}) as Record<string, unknown>
   try {
     switch (req.params.name) {
-      case 'reply':
-        return outcome(link.send({ t: 'say', text: String(a.text), hint: 'prose' }, 'a message for him'), {
-          reached: canCarryAChannelMessage()
-            ? 'said'
-            : 'said — and that is the last you will hear of it: nothing on this engine can tell you later that he never got it, so say it went out, not that he has seen it.',
-          waiting:
-            'not said yet — he has not seen this. It is waiting in line and goes out when the link to his phone comes back.',
-          never: 'NOT said. He has not seen this.',
-        })
+      case 'reply': {
+        // The copy happens BEFORE the frame is queued, and a copy that fails is the whole call
+        // failing: the agent can say it again with a file that exists, where words already on
+        // their way about a picture nobody will see cannot be taken back.
+        const att = attached(a, 'NOT said. He has not seen this.')
+        return outcome(
+          link.send(
+            { t: 'say', text: String(a.text), hint: 'prose', ...(att?.file ? { file: att.file } : {}) },
+            att?.file ? `a message for him, with the file ${att.called}` : 'a message for him',
+          ),
+          withTheFile(
+            {
+              reached: canCarryAChannelMessage()
+                ? 'said'
+                : 'said — and that is the last you will hear of it: nothing on this engine can tell you later that he never got it, so say it went out, not that he has seen it.',
+              waiting:
+                'not said yet — he has not seen this. It is waiting in line and goes out when the link to his phone comes back.',
+              never: 'NOT said. He has not seen this.',
+            },
+            att,
+          ),
+        )
+      }
       case 'ask': {
         const askId = `a${link.nextSeq()}`
         const opts = (a.options as { id: string; label: string }[] | undefined) ?? []
@@ -340,15 +502,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               },
         )
       }
-      case 'done':
-        return outcome(link.send({ t: 'done', text: String(a.text) }, 'the summary of what happened'), {
-          reached: canCarryAChannelMessage()
-            ? 'sent'
-            : 'sent — and that is the last you will hear of it: nothing on this engine can tell you later that he never got it, so say it went out, not that he has seen it.',
-          waiting:
-            'not sent yet — he has not seen this. It is waiting in line and goes out when the link to his phone comes back.',
-          never: 'NOT sent. He has not seen this.',
-        })
+      case 'done': {
+        const att = attached(a, 'NOT sent. He has not seen this.')
+        return outcome(
+          link.send(
+            { t: 'done', text: String(a.text), ...(att?.file ? { file: att.file } : {}) },
+            att?.file ? `the summary of what happened, with the file ${att.called}` : 'the summary of what happened',
+          ),
+          withTheFile(
+            {
+              reached: canCarryAChannelMessage()
+                ? 'sent'
+                : 'sent — and that is the last you will hear of it: nothing on this engine can tell you later that he never got it, so say it went out, not that he has seen it.',
+              waiting:
+                'not sent yet — he has not seen this. It is waiting in line and goes out when the link to his phone comes back.',
+              never: 'NOT sent. He has not seen this.',
+            },
+            att,
+          ),
+        )
+      }
       case 'ask_resolved': {
         const askId = String(a.ask_id)
         // Checked here for the same reason the option ids are, and it was not: `how` went to the
@@ -389,7 +562,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   } catch (err) {
     return {
-      content: [{ type: 'text', text: `${req.params.name}: ${err instanceof Error ? err.message : err}` }],
+      content: [{ type: 'text', text: err instanceof NotSent ? err.message : `${req.params.name}: ${err instanceof Error ? err.message : err}` }],
       isError: true,
     }
   }
@@ -458,6 +631,54 @@ function deliver(content: string, meta: Record<string, unknown>): void {
     method: 'notifications/claude/channel',
     params: { content, meta: { chat_id: 'hub', user: 'operator', ts: new Date().toISOString(), ...meta } },
   })
+}
+
+/**
+ * What the agent reads about the files on one of his messages — one line each, under his words.
+ *
+ * The hub fetched the bytes into its own directory and the frame names the PATH it minted; the
+ * agent reads the file with its own tools, which is why a wall mounts that directory at the same
+ * path (`docs/ATTACHING.md` §14). The name his phone reported is shown as what he CALLED it, in
+ * quotes, and is never joined onto the path: it is a string somebody else chose. A file that did
+ * not come through is said here, in the same message, so a caption about a picture the agent
+ * cannot see is never read as if the picture were there.
+ */
+function linesAboutFiles(files: unknown): string[] {
+  if (!Array.isArray(files)) return []
+  return files.map((f: any) => {
+    const kind = typeof f?.kind === 'string' ? f.kind : 'file'
+    const called = typeof f?.filename === 'string' ? ` — he called it ${JSON.stringify(f.filename)}` : ''
+    if (typeof f?.path === 'string') {
+      const mime = typeof f.mime === 'string' ? f.mime : 'type not declared'
+      const bytes = typeof f.bytes === 'number' ? `${f.bytes} bytes` : 'size unknown'
+      return `[${kind}] ${f.path} (${mime}, ${bytes})${called}. Read it from that path.`
+    }
+    // What the hub does about telling HIM is an ordinary send against a ceiling every project
+    // shares, so it can be shed, refused or lost with only the journal knowing. Stated as a fact
+    // — "He has been told" — this had the agent answering "as you saw, the screenshot did not
+    // come through" to somebody who had seen nothing at all.
+    return `[${kind}]${called} did not come through: ${whyNoFile(f?.why)}. The hub is saying so under his message too, though it cannot confirm that landed.`
+  })
+}
+
+/**
+ * Why a file of his is not on disk, in the agent's register, from the hub's reasons.
+ *
+ * The last arm is not decoration: this word travels DOWN from a hub that may be newer than this
+ * bridge, and a reason it has never heard of has to read as one it cannot explain rather than as
+ * nothing at all.
+ */
+function whyNoFile(why: unknown): string {
+  switch (why) {
+    case 'too-big':
+      return 'it is larger than the 20 MB the bot may fetch from Telegram, and it will not be fetched later'
+    case 'download-failed':
+      return 'the download from Telegram failed, and he is being asked to send it again'
+    case 'not-stored':
+      return 'this machine had nowhere to store it, so nothing was downloaded — sending it again will not help, and whoever looks after the machine has the reason'
+    default:
+      return 'the hub did not say why'
+  }
 }
 
 /**
@@ -645,7 +866,11 @@ function onFrame(frame: Record<string, any>): void {
       }
       heldByAnother = 0
       liveRefusalWhy = null
-      note(`connected as "${frame.project}"`)
+      // Where this conversation's files go, as the hub sees the path. Read from every welcome
+      // rather than once: a hub replaced under a reconnecting bridge may be the first to carry
+      // files, or the last.
+      outbox = typeof frame.outbox === 'string' && frame.outbox.length > 0 ? frame.outbox : null
+      note(`connected as "${frame.project}"${outbox ? `; files go to ${outbox}` : '; this hub carries no files'}`)
       link.markUp()
       break
     }
@@ -756,15 +981,29 @@ function onFrame(frame: Record<string, any>): void {
         )
         break
       }
-      deliver(frame.text, {
-        message_id: frame.msg_id,
-        ...(frame.in_reply_to_ask ? { in_reply_to_ask: frame.in_reply_to_ask } : {}),
-      })
-      // Said the moment the words are in the agent's turn, at the same honesty as the opencode
-      // watcher's "handed to the engine": the hub turns it into the thumb on his own message, the
-      // second stage of the receipt on his phone. Nothing on this engine sent it before, so on the
-      // engine the round trip was proven on every line he typed kept the eyes for ever.
-      link.send({ t: 'ack', ref: String(frame.id), status: 'accepted' }, 'an answer about typed words')
+      {
+        // His words, and under them one line per file he sent — the path the hub minted, which
+        // the agent reads with its own tools. A file with no caption is still a message.
+        const about = linesAboutFiles(frame.files)
+        deliver([String(frame.text ?? ''), ...about].filter(s => s.length > 0).join('\n'), {
+          message_id: frame.msg_id,
+          ...(frame.in_reply_to_ask ? { in_reply_to_ask: frame.in_reply_to_ask } : {}),
+          ...(about.length > 0 ? { files: about.length } : {}),
+        })
+        // Said the moment the words are in the agent's turn, at the same honesty as the opencode
+        // watcher's "handed to the engine": the hub turns it into the thumb on his own message, the
+        // second stage of the receipt on his phone. Nothing on this engine sent it before, so on the
+        // engine the round trip was proven on every line he typed kept the eyes for ever.
+        //
+        // `files` counts the entries handed on, and only when the frame carried any — a bridge
+        // older than this field sends none, and that absence is how the hub knows an old bridge
+        // read the caption and dropped the picture. An ack about words alone stays byte for byte
+        // what it always was.
+        link.send(
+          { t: 'ack', ref: String(frame.id), status: 'accepted', ...(Array.isArray(frame.files) ? { files: about.length } : {}) },
+          'an answer about typed words',
+        )
+      }
       break
     case 'choice':
       // The answer to a question this session asked. It arrives as a message in the agent's own
@@ -800,6 +1039,33 @@ function onFrame(frame: Record<string, any>): void {
               'in "… (clipped)" and he has not read a word after that. Say the rest in a second, ' +
               'shorter message if it mattered.',
             { about: 'he got a shortened version', user: 'the channel itself' },
+          )
+        }
+        // The other thing `yes` can hide: the words landed and the file with them did not. The
+        // hub's reason is in his topic, in words; the ack carries only the fact, and the agent
+        // must not go on as if he were looking at the picture.
+        if (frame.why === 'no-file' && was) {
+          deliver(
+            `He got ${was.what} — but the file with it did not come through. The hub would not send ` +
+              'it, and said why in his topic: it was not a file the bot may send, it was over 50 MB, ' +
+              'or Telegram refused it as a picture (say it again with as: "document" for that one). ' +
+              'He is not looking at it, so do not refer to it as if he were.',
+            { about: 'he got the words but not the file', user: 'the channel itself' },
+          )
+        }
+        // The other half of the same fact, and the reason it is a second word rather than one.
+        // Here the hub could put NOTHING in his topic: his messaging app refused the file for the
+        // moment, and a sentence about it is another send into the same refusal. So there is no
+        // explanation on his phone to point the agent at — and this is the one of the two that
+        // mends itself, where the refusals behind `no-file` are permanent for that file.
+        if (frame.why === 'no-file-unsaid' && was) {
+          deliver(
+            `He got ${was.what} — but the file with it did not come through, and the hub could not ` +
+              'put a line in his topic to say so either: he is looking at words with nothing to ' +
+              'explain the gap. His messaging app turned the file away for the moment rather than ' +
+              'for good, so attaching it again in a minute is worth doing — and saying in words ' +
+              'that a picture was meant to come with that message is worth more.',
+            { about: 'he got the words, not the file, and no reason for it', user: 'the channel itself' },
           )
         }
         break

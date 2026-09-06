@@ -64,7 +64,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use hub_proto::{
@@ -133,6 +133,16 @@ pub const GOODBYE_SHELF_LIFE: Duration = Duration::from_secs(2);
 /// corrects itself later from the ack.
 pub const PROSE_SHELF_LIFE: Duration = Duration::from_secs(90);
 
+/// The longest the hub will spend fetching ONE of his files before it gives up.
+///
+/// The fetch runs inside the update handler, which the client library serialises per conversation,
+/// so what it costs is what his next line in that topic waits — and unbounded it was the HTTP
+/// client's own default twice over, once for `getFile` and once for the body, against a Telegram
+/// that had simply stopped answering. A minute carries the 20 MB ceiling at about 2.7 Mbit/s,
+/// which is slower than any link that could have sent the screenshot in the first place; past it
+/// the honest reading is not "slow" but "not coming", and he is asked to send it again.
+pub const FETCH_DEADLINE: Duration = Duration::from_secs(60);
+
 /// How long the topic opened at connection time will queue for, and it is deliberately the shortest
 /// of the three.
 ///
@@ -182,6 +192,16 @@ pub const TOPIC_RETRY_AFTER: Duration = Duration::from_secs(60);
 ///
 /// The `h|` prefix comes out of this budget, which is why the check is `len + 2`.
 pub const CALLBACK_DATA_MAX: usize = 64;
+
+/// The longest caption Telegram puts under a picture or a document. Not ours to raise.
+///
+/// *"0-1024 characters after entities parsing"* — the Bot API page, on `sendPhoto` and
+/// `sendDocument`. Words that fit go as the file's caption, one send; longer words are their own
+/// message and the file follows under it, two sends and two tokens.
+/// Telegram's caption ceiling, in UTF-16 code units — which is how the API counts it, and not
+/// how `str::chars` does. Unlike `MAX_TEXT`, which sits well under its limit, this is the limit
+/// itself, so the unit of measurement is load-bearing.
+pub const CAPTION_MAX: usize = 1024;
 
 /// What the hub will accept from one connection.
 pub const LIMITS: Limits = Limits {
@@ -378,6 +398,87 @@ pub trait Surface: Send + Sync + 'static {
         msg_id: &MsgId,
         mark: Mark,
     ) -> impl std::future::Future<Output = Result<(), Refused>> + Send;
+
+    /// Ask Telegram where one of HIS files is and how big it is — `getFile`.
+    ///
+    /// Two calls rather than one, so the hub owns every decision between them: the size check
+    /// against the answer, the path it mints, the mode it opens with, and the ceiling on the
+    /// stream. A surface that fetched in one go would be making those on the hub's behalf, out of
+    /// sight of the tests that pin them.
+    fn locate(
+        &self,
+        file_id: &str,
+    ) -> impl std::future::Future<Output = Result<Located, Refused>> + Send;
+
+    /// Stream one file's bytes into `into`. `file_path` is the one [`Self::locate`] answered with.
+    ///
+    /// The destination is the hub's: opened by the hub, `0600`, at a path the hub minted, and
+    /// counting — so the bytes past Telegram's ceiling are refused by the writer, whatever size
+    /// was reported. Nothing about where the bytes go is the surface's to decide.
+    fn download(
+        &self,
+        file_path: &str,
+        into: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    ) -> impl std::future::Future<Output = Result<(), Refused>> + Send;
+
+    /// Put one of an AGENT's files in a topic, with the words as its caption — `sendPhoto` when
+    /// [`Upload::as_photo`], `sendDocument` otherwise.
+    ///
+    /// The bytes are the hub's, read off a descriptor it opened and checked; this surface never
+    /// takes a path. The upload library's path-taking constructor follows links and names the
+    /// upload after the last path segment, and both are exactly what the outbox rules forbid.
+    /// A refusal comes back through the same classification as a text send, so a flood wait
+    /// drains the chat and a deleted topic rebinds: a file is a send like any other.
+    fn send_file(
+        &self,
+        topic_id: i32,
+        file: &Upload,
+        caption: &str,
+    ) -> impl std::future::Future<Output = SendOutcome> + Send;
+}
+
+/// A file on its way to his phone, as the hub read it off the descriptor it checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upload {
+    /// The bytes, whole. Read into memory rather than streamed so that a flood wait can send the
+    /// same bytes again a moment later; fifty megabytes at the very most, and once at a time.
+    pub bytes: Vec<u8>,
+    /// What he sees a document called: the adapter's `filename`, or its `name`, with nothing in
+    /// it a phone cannot show.
+    pub filename: String,
+    pub mime: Option<String>,
+    /// `sendPhoto` rather than `sendDocument`: a jpeg, png or webp under the picture ceiling,
+    /// unless the agent said `document`.
+    pub as_photo: bool,
+}
+
+/// What `getFile` answers, in the shape the Bot API returns it.
+///
+/// The field names are the API's own — `file_id`, `file_unique_id`, `file_size`, `file_path` —
+/// so the fake surface in the tests is built from a literal in that shape rather than from a
+/// struct this crate invented. `file_size` is optional on the wire and stays optional here: the
+/// client library reads an absent one as four gigabytes, which is not a size anyone should act on.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Located {
+    pub file_id: String,
+    pub file_unique_id: String,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    pub file_path: String,
+}
+
+/// One file he sent, as the message described it and before anything was fetched.
+///
+/// Everything here except `kind` and `file_id` is what a phone said about itself: `size` is an
+/// optional claim the hub checks again on the stream, `mime` is a declaration, and `filename` is
+/// a string somebody chose that is carried as DATA and is never a segment of any path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SentFile {
+    pub kind: hub_proto::FileKind,
+    pub file_id: String,
+    pub size: Option<u64>,
+    pub mime: Option<String>,
+    pub filename: Option<String>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -979,6 +1080,22 @@ impl HubAudit {
         ))
     }
 
+    /// The same, for a file an agent attached: recorded BEFORE the upload, with its size and the
+    /// name in the outbox — which has passed the address rules by now, so it can carry nothing
+    /// that forges a line here.
+    pub fn sent_file(
+        &self,
+        addr: &Addr,
+        topic_id: i32,
+        bytes: usize,
+        name: &str,
+    ) -> std::io::Result<()> {
+        self.line(&format!(
+            "sent-file\t{}\ttopic={topic_id}\tbytes={bytes}\tname={name}",
+            subject(addr)
+        ))
+    }
+
     pub fn outcome(&self, addr: &Addr, outcome: &SendOutcome) -> std::io::Result<()> {
         let word = match outcome {
             SendOutcome::Sent(id) => format!("delivered\tmessage={id}"),
@@ -996,6 +1113,32 @@ impl HubAudit {
     /// process stopped rather than that the hub decided something quietly.
     pub fn refused(&self, addr: &Addr, why: &str) -> std::io::Result<()> {
         self.line(&format!("refused\t{}\twhy={why}", subject(addr)))
+    }
+
+    /// One file he sent, and what became of it: on disk at a path the hub minted, or not and why.
+    ///
+    /// The reported filename is NOT written here, on purpose. This file is one record per line,
+    /// and a name from a phone can carry a newline — which would be a second record of the
+    /// sender's choosing. The path is the hub's own and carries nothing anybody else chose.
+    pub fn file(&self, addr: &Addr, file: &hub_proto::MessageFile) -> std::io::Result<()> {
+        let kind = format!("{:?}", file.kind).to_lowercase();
+        let word = match (&file.path, file.why) {
+            (Some(path), _) => format!(
+                "fetched\t{}\tkind={kind}\tbytes={}\tpath={path}",
+                subject(addr),
+                file.bytes.unwrap_or(0)
+            ),
+            (None, why) => format!(
+                "not-fetched\t{}\tkind={kind}\twhy={}",
+                subject(addr),
+                match why {
+                    Some(hub_proto::FileWhy::TooBig) => "too-big",
+                    Some(hub_proto::FileWhy::NotStored) => "not-stored",
+                    Some(hub_proto::FileWhy::DownloadFailed) | None => "download-failed",
+                }
+            ),
+        };
+        self.line(&word)
     }
 
     /// Something arrived from a person who may not speak where it arrived, and was dropped.
@@ -1286,6 +1429,10 @@ struct WordsDown {
     /// an address on Telegram: every chat numbers its own.
     chat_id: i64,
     msg_id: MsgId,
+    /// How many of the files on that message actually reached the hub's disk and went down as
+    /// paths. The bridge's `ack` says how many it handed on; fewer than this is a file the agent
+    /// never saw, and he is told.
+    files_on_disk: u32,
 }
 
 /// How many of his messages the hub keeps waiting for an answer about, before the oldest is
@@ -1351,7 +1498,7 @@ impl std::fmt::Display for Addr {
 /// Is this a name the hub can safely address a conversation by?
 ///
 /// Refused rather than sanitised, and refused before a claim is taken, before a topic exists and
-/// before a byte is audited. Four things it stops, and only the first is obvious:
+/// before a byte is audited. Five things it stops, and only the first is obvious:
 ///
 /// * A tab or a newline FORGES A LINE IN THE AUDIT. That file is one tab-separated record per line
 ///   and it interpolates its subject exactly as given, so a lane carrying either writes records of
@@ -1362,12 +1509,21 @@ impl std::fmt::Display for Addr {
 ///   cheapest moment to close that door is before anyone is tempted to.
 /// * An empty name is not "no lane" — sending none is. A conversation with no name is not one the
 ///   hub can address, and guessing what was meant is how the wrong agent gets an answer.
+/// * A lone `-` IS the project's own voice on disk. Both file trees write a project speaking for
+///   itself under that segment (`media.rs`), so a lane admitted under the name would be handed the
+///   project's own two directories: it would read every screenshot he sent the project's own
+///   session out of a mount given to it for its own, and write into the outbox the hub uploads
+///   from under the project's name. `docs/ATTACHING.md` §2 already takes `-` for "as if this
+///   variable were not set", so nothing going through the namespace can ask for one — but `hello`
+///   carries the lane itself, and §14 invites a stranger to write an adapter from §6 alone, which
+///   touches no variable. The shape rule is what makes the collision unreachable from the wire.
 fn lane_is_addressable(lane: &LaneId) -> bool {
     let s = lane.as_str();
     !s.is_empty()
         && s.len() <= MAX_LANE
         && s != "."
         && s != ".."
+        && s != "-"
         && !s.contains('/')
         && !s.contains('\\')
         && !s.chars().any(char::is_control)
@@ -1522,7 +1678,20 @@ pub struct Hub<S: Surface> {
     /// The one forum every topic lives in. Routing is a single rule — topic, inside this chat —
     /// and every other rule this bridge used to have is deleted rather than tested against.
     forum_chat: i64,
+    /// Where what he sends is written, one directory per conversation. Beside the audit log, so
+    /// every state file of this hub lives in one directory — and so a test's hub writes into its
+    /// own temp dir rather than into the operator's.
+    media: crate::media::MediaStore,
+    /// Where an agent's adapter puts a file it wants him to see, one directory per conversation,
+    /// named to the adapter at `welcome`. The untrusted side: nothing in it is sent until it has
+    /// been opened following no link and found to be a regular file of the hub's own.
+    outbox: crate::media::MediaStore,
     settle: Duration,
+    /// How long one of his files may take to fetch. [`FETCH_DEADLINE`], except under the test
+    /// that has to watch a Telegram which never answers be given up on — held as a number rather
+    /// than a constant for the same reason `MediaStore`'s owner is: the only way to see a bound
+    /// bite is to move it, and waiting the real one out is a minute of a test suite doing nothing.
+    fetch_deadline: AtomicU64,
     /// How many frames, and how many bytes of them, are held for a bridge before its pong. The
     /// constants, except under a test that has to watch a real bridge trip the bound.
     pre_pong: (usize, usize),
@@ -1552,6 +1721,18 @@ impl<S: Surface> Hub<S> {
                  unknown until a bridge arrives or leaves"
             );
         }
+        // Made at start, because `docs/ATTACHING.md` §14.1 tells a dispatcher they are there from
+        // then on — and because a root somebody else owns, or one left wider than 0700, then
+        // reaches the journal in the first second rather than on the first screenshot he sends.
+        //
+        // Swept at start as well as before every write, so a hub that was down for a week does
+        // not keep a week-old mailbox for exactly as long as nobody sends anything.
+        let media = crate::media::MediaStore::new(audit.path().with_file_name("media"));
+        media.make_the_tree();
+        media.sweep(std::time::SystemTime::now());
+        let outbox = crate::media::MediaStore::new(audit.path().with_file_name("outbox"));
+        outbox.make_the_tree();
+        outbox.sweep(std::time::SystemTime::now());
         Self {
             surface,
             registry: Arc::new(Mutex::new(registry)),
@@ -1571,6 +1752,9 @@ impl<S: Surface> Hub<S> {
             allowed_chats: Arc::new(allowed_chats),
             people: Arc::new(people.into_iter().collect()),
             forum_chat,
+            fetch_deadline: AtomicU64::new(FETCH_DEADLINE.as_millis() as u64),
+            media,
+            outbox,
             settle: DEFAULT_SETTLE,
             pre_pong: (PRE_PONG_FRAMES, PRE_PONG_BYTES),
         }
@@ -1583,6 +1767,14 @@ impl<S: Surface> Hub<S> {
     pub fn with_settle(mut self, settle: Duration) -> Self {
         self.settle = settle;
         self
+    }
+
+    /// Give up on one of his files sooner than [`FETCH_DEADLINE`]. Test-only: the real bound is a
+    /// minute, and a test that waited it out would be a minute of a suite doing nothing.
+    #[cfg(test)]
+    pub fn give_up_fetching_after(&self, how_long: Duration) {
+        self.fetch_deadline
+            .store(how_long.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// Hold less before the pong than [`PRE_PONG_FRAMES`] and [`PRE_PONG_BYTES`] say. Test-only:
@@ -2233,6 +2425,10 @@ impl<S: Surface> Hub<S> {
     /// that is the one time he says which question, and so which session, his words are for. The
     /// adapter side decides what to do with it; this side hardcoded the field to nothing for a
     /// slice, while three documents described the reply path as built.
+    ///
+    /// Words alone. The update handler calls [`Self::relay_with`], which is this with the files
+    /// he sent beside his words; this spelling stays for the tests, which are about the words.
+    #[cfg(test)]
     pub async fn relay(
         &self,
         addr: &Addr,
@@ -2241,6 +2437,38 @@ impl<S: Surface> Hub<S> {
         msg_id: &MsgId,
         text: &str,
         replied_to: Option<&MsgId>,
+    ) -> bool {
+        self.relay_with(addr, chat_id, user, msg_id, text, replied_to, Vec::new())
+            .await
+    }
+
+    /// What the test-only `relay` does — his words — with the files he sent beside them.
+    ///
+    /// Each file is fetched into the conversation's own media directory FIRST, and what went down
+    /// is a path the hub minted — never the bytes, which do not fit a frame, and never a name
+    /// anybody else chose. A file that did not come through still lets the words go: its entry
+    /// carries `why` instead of a path, and one line under his message says the same to him.
+    ///
+    /// Fetched before delivery is tried, not after: the delivery path must not ask whether
+    /// anybody is connected, because a read taken a moment earlier can be wrong by the time it is
+    /// acted on, and the honest way to find out is to deliver. So a file sent to a conversation
+    /// with nobody in it is fetched and then swept with everything else — twenty megabytes of
+    /// disk for two days, against a check this code has a documented reason not to make.
+    ///
+    /// Fetched INSIDE the update handler rather than in a task of its own, which holds this chat's
+    /// updates behind a download of up to twenty megabytes. Deliberate: Telegram's dispatcher
+    /// runs one chat's updates in order, and that order is the only thing that keeps "see the
+    /// screenshot above" from reaching the agent before the screenshot does.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn relay_with(
+        &self,
+        addr: &Addr,
+        chat_id: i64,
+        user: Option<i64>,
+        msg_id: &MsgId,
+        text: &str,
+        replied_to: Option<&MsgId>,
+        files: Vec<SentFile>,
     ) -> bool {
         if !self.chat_is_allowed(chat_id) {
             return false;
@@ -2258,6 +2486,14 @@ impl<S: Surface> Hub<S> {
             Some(under) => self.ask_replied_to(addr, chat_id, under).await,
             None => None,
         };
+        // The bytes, onto the hub's own disk, before the frame that names them exists.
+        let mut carried = Vec::with_capacity(files.len());
+        for sent in &files {
+            let fetched = self.fetch(addr, sent).await;
+            let _ = self.audit.file(addr, &fetched.file);
+            carried.push(fetched);
+        }
+        let files_on_disk = carried.iter().filter(|f| f.file.path.is_some()).count() as u32;
         // Written down BEFORE the frame is on the wire, so the bridge's `ack` — which can arrive
         // the moment it is — always finds the record it names. Taken back if the send fails, so a
         // record never waits for an answer to a frame nothing received.
@@ -2269,6 +2505,7 @@ impl<S: Surface> Hub<S> {
                 addr: addr.clone(),
                 chat_id,
                 msg_id: msg_id.clone(),
+                files_on_disk,
             });
             while down.len() > WORDS_DOWN_KEPT {
                 down.pop_front();
@@ -2288,6 +2525,8 @@ impl<S: Surface> Hub<S> {
                     text: text.to_owned(),
                     from: hub_proto::From { chat_id, user_id },
                     in_reply_to_ask,
+                    files: (!carried.is_empty())
+                        .then(|| carried.iter().map(|f| f.file.clone()).collect()),
                 },
             )
             .await;
@@ -2329,6 +2568,23 @@ impl<S: Surface> Hub<S> {
             });
         } else {
             drop(in_order);
+        }
+        // A file that did not come through, said under his message — only once the words have
+        // gone, because when they have not he is already being told that nothing was sent, and
+        // "the file did not reach the agent" under "nothing reached the agent" reads as two
+        // failures where there was one.
+        //
+        // AFTER the permit has gone to the eyes, and never inside it. This is a full budgeted
+        // send whose deadline is ninety seconds; held under the permit, one failed file stopped
+        // every ack in the hub from putting a thumb on anything and every other conversation's
+        // words from going down at all — for as long as the chat was thin, which is exactly when
+        // he sends a screenshot at a busy forum. The permit exists to keep the thumb behind the
+        // eyes; a sentence about a file is neither of them.
+        if delivered {
+            for f in carried.iter().filter(|f| f.file.path.is_none()) {
+                self.say_the_file_did_not_come(addr, msg_id, &f.file, f.how_big)
+                    .await;
+            }
         }
         delivered
     }
@@ -2524,7 +2780,12 @@ impl<S: Surface> Hub<S> {
         // The greeting's outcome is READ, not discarded. A topic that was made, written down, and
         // never greeted is a conversation he cannot find at all: Telegram does not list an empty
         // one. Without this the hub could not tell that state from a healthy topic.
-        match self.send_into(addr, id, &greeting, &[], None, until).await {
+        let greeting = Outbound::Words {
+            text: &greeting,
+            buttons: &[],
+            reply_to: None,
+        };
+        match self.send_into(addr, id, &greeting, until).await {
             SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {}
             outcome => tracing::error!(
                 project = %addr.project, lane = addr.lane_field(), topic = id, title = %title,
@@ -2573,14 +2834,17 @@ impl<S: Surface> Hub<S> {
         &self,
         addr: &Addr,
         topic_id: i32,
-        text: &str,
-        buttons: &[AskOption],
-        reply_to: Option<&MsgId>,
+        out: &Outbound<'_>,
         until: std::time::Instant,
     ) -> SendOutcome {
         // Clipped here rather than by the surface, because whether anything was lost is a fact the
-        // BRIDGE has to be told, and only this side is holding the ack.
-        let (text, clamped) = crate::queue::fit(text, crate::queue::MAX_TEXT);
+        // BRIDGE has to be told, and only this side is holding the ack. A caption has a ceiling of
+        // its own, and the caller has already chosen to send the words separately when they are
+        // over it, so the clip on a caption is a backstop rather than the rule.
+        let (text, clamped) = match out {
+            Outbound::Words { text, .. } => crate::queue::fit(text, crate::queue::MAX_TEXT),
+            Outbound::File { caption, .. } => crate::queue::fit(caption, CAPTION_MAX),
+        };
 
         // A loop, because Telegram's own answer can be "not yet" — and when it is, the wait it
         // names goes into the budget and this frame queues again behind it, exactly like any other
@@ -2592,8 +2856,22 @@ impl<S: Surface> Hub<S> {
             if let Err(too_fast) = self.take_a_turn(addr, until).await {
                 return too_fast;
             }
-            let _ = self.audit.sent(addr, topic_id, text.len());
-            let mut outcome = self.surface.send(topic_id, &text, buttons, reply_to).await;
+            let mut outcome = match out {
+                Outbound::Words {
+                    buttons, reply_to, ..
+                } => {
+                    let _ = self.audit.sent(addr, topic_id, text.len());
+                    self.surface.send(topic_id, &text, buttons, *reply_to).await
+                }
+                // A file is a send, audited and metered exactly like words: it takes the turn
+                // above, and the flood-wait drain and the rebinding below read its outcome too.
+                Outbound::File { upload, name, .. } => {
+                    let _ = self
+                        .audit
+                        .sent_file(addr, topic_id, upload.bytes.len(), name);
+                    self.surface.send_file(topic_id, upload, &text).await
+                }
+            };
             if clamped && let SendOutcome::Sent(id) = outcome {
                 outcome = SendOutcome::Clamped(id);
             }
@@ -2795,11 +3073,46 @@ impl<S: Surface> Hub<S> {
         kind: Perishable,
         reply_to: Option<&MsgId>,
     ) -> SendOutcome {
+        self.say_outbound(
+            addr,
+            &Outbound::Words {
+                text,
+                buttons,
+                reply_to,
+            },
+            kind,
+        )
+        .await
+    }
+
+    /// A file an agent attached, with the words as its caption, into the conversation's topic.
+    /// Prose: late is fine, missing is not — and a file that missed its turn is said to have.
+    async fn say_file(
+        &self,
+        addr: &Addr,
+        upload: &Upload,
+        name: &str,
+        caption: &str,
+    ) -> SendOutcome {
+        self.say_outbound(
+            addr,
+            &Outbound::File {
+                upload,
+                name,
+                caption,
+            },
+            Perishable::Prose,
+        )
+        .await
+    }
+
+    /// One thing somebody wanted to say — words or a file — with its deadline and its loss count.
+    async fn say_outbound(&self, addr: &Addr, out: &Outbound<'_>, kind: Perishable) -> SendOutcome {
         // Minted ONCE, here, and shared by every turn this message has to take. A brand-new
         // conversation queues three times before its first word — the topic, the greeting, then the
         // message — and each of those used to start a deadline of its own.
         let until = std::time::Instant::now() + kind.shelf_life();
-        let outcome = self.try_to_say(addr, text, buttons, reply_to, until).await;
+        let outcome = self.try_to_say(addr, out, until).await;
         // THE ONE PLACE A LOST MESSAGE IS COUNTED. One call to this function is one thing somebody
         // wanted to say, however many turns it took, so counting here is what makes the number he
         // reads the number of messages he missed. Every give-up below funnels into exactly one
@@ -2816,9 +3129,7 @@ impl<S: Surface> Hub<S> {
     async fn try_to_say(
         &self,
         addr: &Addr,
-        text: &str,
-        buttons: &[AskOption],
-        reply_to: Option<&MsgId>,
+        out: &Outbound<'_>,
         until: std::time::Instant,
     ) -> SendOutcome {
         let topic_id = match self.topic_for(addr, until).await {
@@ -2838,9 +3149,7 @@ impl<S: Surface> Hub<S> {
                 return SendOutcome::Refused(e.to_string());
             }
         };
-        let outcome = self
-            .send_into(addr, topic_id, text, buttons, reply_to, until)
-            .await;
+        let outcome = self.send_into(addr, topic_id, out, until).await;
 
         if outcome == SendOutcome::TopicGone {
             // Exactly once, and never as a retry: Telegram gives no service message when a topic is
@@ -2855,10 +3164,7 @@ impl<S: Surface> Hub<S> {
             // message again — and giving them a fresh shelf life would let one message spend two of
             // them, which is the doubling this deadline was moved out of `take_a_turn` to stop.
             return match self.topic_for(addr, until).await {
-                Ok(fresh) => {
-                    self.send_into(addr, fresh, text, buttons, reply_to, until)
-                        .await
-                }
+                Ok(fresh) => self.send_into(addr, fresh, out, until).await,
                 // The ceiling refusing the rebinding is a busy chat, not a missing topic, and
                 // saying "there is nowhere in his chat to put it" about it tells the agent to give
                 // up on a thing that mends itself inside a minute.
@@ -3298,6 +3604,31 @@ impl<S: Surface> Hub<S> {
             }
         };
 
+        // The conversation's two directories, made at ADMISSION rather than at the topic: a `say`
+        // carrying a file may legally be queued before the pong, and the adapter needs somewhere to
+        // copy it to. Two empty directories for a bridge that boots and exits are nothing, where an
+        // empty topic is a scar. An outbox that cannot be made, or is not the hub's own, is not
+        // named — absence is "this hub carries no files" on the wire — so the adapter says so in
+        // its tool result rather than sending files the hub would refuse one by one.
+        let outbox = match self.outbox.dir_for(&addr) {
+            Ok(dir) => Some(dir.to_string_lossy().into_owned()),
+            Err(e) => {
+                tracing::error!(
+                    project = %addr.project, lane = addr.lane_field(), error = %e,
+                    "the conversation's outbox is not one this hub will read from, so it was not \
+                     named to the adapter and no file of the agent's will be sent; fix the \
+                     directory and restart the session"
+                );
+                None
+            }
+        };
+        if let Err(e) = self.media.dir_for(&addr) {
+            tracing::error!(
+                project = %addr.project, lane = addr.lane_field(), error = %e,
+                "the conversation's media directory is not one this hub will write into; a file \
+                 he sends will not be fetched until it is fixed"
+            );
+        }
         // Admitted, with no topic yet. See `HubFrame::Welcome` for why that is not an omission.
         let _ = tx
             .send(Envelope::new(
@@ -3310,6 +3641,7 @@ impl<S: Surface> Hub<S> {
                     lane: addr.lane.clone(),
                     topic_id: None,
                     limits: LIMITS,
+                    outbox,
                 },
             ))
             .await;
@@ -3818,7 +4150,16 @@ impl<S: Surface> Hub<S> {
         frame: BridgeFrame,
     ) -> (Delivered, Option<hub_proto::AckWhy>) {
         match frame {
-            BridgeFrame::Say { text, .. } | BridgeFrame::Done { text } => {
+            BridgeFrame::Say {
+                text,
+                file: Some(file),
+                ..
+            }
+            | BridgeFrame::Done {
+                text,
+                file: Some(file),
+            } => self.say_with_file_and_ack(addr, &text, &file).await,
+            BridgeFrame::Say { text, .. } | BridgeFrame::Done { text, .. } => {
                 self.say_and_ack(addr, &text, &[]).await
             }
             BridgeFrame::Ask {
@@ -3977,8 +4318,9 @@ impl<S: Surface> Hub<S> {
                 r#ref,
                 status,
                 reason,
+                files,
             } => {
-                self.what_became_of_his_words(addr, &r#ref, status, reason.as_deref())
+                self.what_became_of_his_words(addr, &r#ref, status, reason.as_deref(), files)
                     .await;
                 (Delivered::Yes, None)
             }
@@ -4018,6 +4360,7 @@ impl<S: Surface> Hub<S> {
         frame: &FrameId,
         status: AckStatus,
         reason: Option<&str>,
+        files: Option<u32>,
     ) {
         let his = {
             let mut down = self.words_down.lock().await;
@@ -4042,6 +4385,37 @@ impl<S: Surface> Hub<S> {
             self.mark_his_message(his.chat_id, &his.msg_id, mark).await;
         }
         if status == AckStatus::Accepted {
+            // The words were taken. Were the files? An adapter older than files does not know the
+            // field, so its ack says nothing about them — and nothing is the honest count for a
+            // bridge that ignored the entry. The thumb stays: his words did reach the agent. The
+            // line says what did not.
+            let handed_on = files.unwrap_or(0);
+            if handed_on < his.files_on_disk {
+                let _ = self.audit.refused(
+                    addr,
+                    &format!(
+                        "the worker took his words (message {}) and {} of {} files",
+                        his.msg_id, handed_on, his.files_on_disk
+                    ),
+                );
+                // What this line may NOT say is why. A short count means the worker is older
+                // than files — or that the relay in front of it is, since a door from before
+                // files rebuilds exactly this one frame and drops the field on the way. The
+                // first is mended by starting the session again and the second is not, the hub
+                // cannot tell them apart from one number, and "restart the session" sent him
+                // round for ever against a long-running attach service he cannot restart from a
+                // phone at all. So it says what happened and stops there.
+                let text = "That file did not reach the agent — the worker here is too old to \
+                            take files, and it got only your words. Sending it again will not \
+                            help until it has been started fresh.";
+                let outcome = self.say_under(addr, text, &his.msg_id).await;
+                if !matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
+                    tracing::warn!(
+                        project = %addr.project, lane = addr.lane_field(), outcome = ?outcome,
+                        "could not tell him the adapter dropped his file"
+                    );
+                }
+            }
             return;
         }
         let why = plain_reason(reason);
@@ -4074,6 +4448,214 @@ impl<S: Surface> Hub<S> {
         }
     }
 
+    /// One of his files, from Telegram onto the hub's own disk — or the reason it is not there.
+    ///
+    /// The ceiling is checked three times, and each catches a case the others cannot: the size on
+    /// the message, before any call is made; the size `getFile` answers, before any byte moves;
+    /// and the stream itself, because both sizes are optional and the client library reads an
+    /// absent one as four gigabytes. A file cut off by the stream is removed, not kept: a half
+    /// screenshot at a path the agent was never told about is disk and nothing else.
+    ///
+    /// Nothing Telegram or the phone said is in the path. The extension is keyed on a declared
+    /// mime through a short table; for a photo, which declares none, the mime is read off the
+    /// extension of Telegram's OWN storage path in the `getFile` answer, per file, rather than
+    /// assumed for every photo ever.
+    async fn fetch(&self, addr: &Addr, sent: &SentFile) -> Fetched {
+        use crate::media::{Capped, FETCH_CEILING, MediaStore};
+        use hub_proto::FileWhy;
+        let mut file = hub_proto::MessageFile {
+            kind: sent.kind,
+            path: None,
+            mime: sent.mime.clone(),
+            bytes: None,
+            filename: sent.filename.clone(),
+            why: None,
+        };
+        if let Some(size) = sent.size.filter(|s| *s > FETCH_CEILING) {
+            file.why = Some(FileWhy::TooBig);
+            return Fetched::too_big(file, HowBig::Reported(size));
+        }
+        self.media.sweep(std::time::SystemTime::now());
+        let dir = match self.media.dir_for(addr) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::error!(
+                    project = %addr.project, lane = addr.lane_field(), error = %e,
+                    "the conversation's media directory is not one this hub will write into, so \
+                     his file was not fetched; nothing he does from his phone can mend it"
+                );
+                // NOT `download-failed`. Nothing was downloaded — no call was made at all — and
+                // the sentence that word earns is "send it again", which is a loop with no end
+                // in it: every file he sends meets the same directory.
+                file.why = Some(FileWhy::NotStored);
+                return Fetched::plain(file);
+            }
+        };
+        // One deadline for the whole of one file — `getFile` and the body together — because what
+        // is being bounded is the time this conversation's next update waits, and that does not
+        // care which half of the fetch stopped moving.
+        let by_then = tokio::time::Instant::now()
+            + Duration::from_millis(self.fetch_deadline.load(Ordering::SeqCst));
+        let gave_up = |what: &str| Refused {
+            why: format!("Telegram did not finish {what} before the hub gave up on it"),
+            flood_wait: None,
+        };
+        let located = match tokio::time::timeout_at(by_then, self.surface.locate(&sent.file_id))
+            .await
+            .unwrap_or_else(|_| Err(gave_up("saying where his file is")))
+        {
+            Ok(located) => located,
+            Err(refused) => {
+                // Telegram refuses `getFile` for a file over its ceiling with one sentence, and
+                // that is the honest reason rather than "the download failed, send it again" —
+                // which would send him round once more for the same answer. Nothing measured a
+                // byte here, so the line that follows claims no number: the size on the message
+                // is what Telegram said about a file it is now refusing to hand over, and
+                // repeating it back as if it were the reason reads as the opposite of the truth.
+                let too_big = telegram_said_too_big(&refused.why);
+                file.why = Some(if too_big {
+                    FileWhy::TooBig
+                } else {
+                    FileWhy::DownloadFailed
+                });
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(), error = %refused,
+                    "Telegram would not say where his file is"
+                );
+                return if too_big {
+                    Fetched::too_big(file, HowBig::OnlyTelegramSaysSo)
+                } else {
+                    Fetched::plain(file)
+                };
+            }
+        };
+        if let Some(size) = located.file_size.filter(|s| *s > FETCH_CEILING) {
+            file.why = Some(FileWhy::TooBig);
+            return Fetched::too_big(file, HowBig::Reported(size));
+        }
+        if file.mime.is_none() && sent.kind == hub_proto::FileKind::Photo {
+            file.mime =
+                crate::media::mime_from_telegram_path(&located.file_path).map(str::to_owned);
+        }
+        let path = MediaStore::mint(&dir, file.mime.as_deref());
+        let opened = match MediaStore::create(&path) {
+            Ok(opened) => opened,
+            Err(e) => {
+                tracing::error!(
+                    project = %addr.project, lane = addr.lane_field(), error = %e,
+                    path = %path.display(), "could not open a file to fetch his file into"
+                );
+                // A full disk, or a directory that changed under the hub between the check and
+                // here. Nothing was downloaded, so this is the store's failure and not Telegram's.
+                file.why = Some(FileWhy::NotStored);
+                return Fetched::plain(file);
+            }
+        };
+        let mut into = Capped::new(opened, FETCH_CEILING);
+        match tokio::time::timeout_at(
+            by_then,
+            self.surface.download(&located.file_path, &mut into),
+        )
+        .await
+        .unwrap_or_else(|_| Err(gave_up("sending his file")))
+        {
+            Ok(()) => {
+                file.bytes = Some(into.written());
+                file.path = Some(path.to_string_lossy().into_owned());
+                tracing::info!(
+                    project = %addr.project, lane = addr.lane_field(),
+                    bytes = into.written(), path = %path.display(), "fetched a file he sent"
+                );
+            }
+            Err(refused) => {
+                let ceiling = into.hit_the_ceiling();
+                // Read BEFORE the writer is dropped: with no size on the message and none in the
+                // `getFile` answer this is the only number anybody has, and `docs/ATTACHING.md`
+                // §14.4 promises him the number it reached rather than the ceiling read back.
+                let reached = into.written();
+                drop(into);
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!(
+                        error = %e, path = %path.display(),
+                        "could not remove the partial file; the sweep will take it"
+                    );
+                }
+                file.why = Some(if ceiling {
+                    FileWhy::TooBig
+                } else {
+                    FileWhy::DownloadFailed
+                });
+                if !ceiling {
+                    tracing::warn!(
+                        project = %addr.project, lane = addr.lane_field(), error = %refused,
+                        "the download of his file from Telegram broke"
+                    );
+                    return Fetched::plain(file);
+                }
+                return Fetched::too_big(file, HowBig::Counted(reached));
+            }
+        }
+        Fetched::plain(file)
+    }
+
+    /// One line under his message for a file that is not on the hub's disk, in words.
+    ///
+    /// Under the message it is about, so two files a second apart cannot be confused. The
+    /// sentences are the ones `docs/ATTACHING.md` §14.4 promises, in the register the refusal of
+    /// his typed words already uses.
+    async fn say_the_file_did_not_come(
+        &self,
+        addr: &Addr,
+        msg_id: &MsgId,
+        file: &hub_proto::MessageFile,
+        how_big: HowBig,
+    ) {
+        let ceiling = megabytes(crate::media::FETCH_CEILING);
+        let text = match file.why {
+            // Three roads to "too big" and they know different things. The size the message
+            // reported is a number to say back; the stream running past the ceiling with no size
+            // reported leaves only the count the hub took, which is the number §14.4 promises;
+            // and a `getFile` that refused for size measured nothing at all, so it claims no
+            // number — reading back the size on the message there would name a figure UNDER the
+            // ceiling as the reason it is over it.
+            Some(hub_proto::FileWhy::TooBig) => match how_big {
+                HowBig::Reported(size) => format!(
+                    "That file did not reach the agent — it is {}, and the most the bot may fetch \
+                     is {ceiling}. It will not be fetched later.",
+                    megabytes(size)
+                ),
+                HowBig::Counted(reached) => format!(
+                    "That file did not reach the agent — it was still coming at {}, and the most \
+                     the bot may fetch is {ceiling}. It will not be fetched later.",
+                    megabytes(reached)
+                ),
+                HowBig::OnlyTelegramSaysSo | HowBig::NotAsked => format!(
+                    "That file did not reach the agent — Telegram says it is over the {ceiling} \
+                     the bot may fetch. It will not be fetched later."
+                ),
+            },
+            // No retry, because there is nothing on his end to retry: the bytes were never asked
+            // for, and every file he sends will meet the same directory until somebody with a
+            // terminal fixes it. Saying "send it again" here is a loop with no end in it.
+            Some(hub_proto::FileWhy::NotStored) => "That file did not reach the agent — this \
+                 machine had nowhere to put it. Sending it again will not help; whoever looks \
+                 after this machine has the reason."
+                .to_owned(),
+            Some(hub_proto::FileWhy::DownloadFailed) | None => {
+                "That file did not reach the agent — the download from Telegram failed. Send it \
+                 again."
+                    .to_owned()
+            }
+        };
+        let outcome = self.say_under(addr, &text, msg_id).await;
+        if !matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(), outcome = ?outcome,
+                "could not tell him his file did not come through"
+            );
+        }
+    }
+
     async fn say_and_ack(
         &self,
         addr: &Addr,
@@ -4082,6 +4664,239 @@ impl<S: Surface> Hub<S> {
     ) -> (Delivered, Option<hub_proto::AckWhy>) {
         let outcome = self.say(addr, text, options).await;
         self.ack_for(&outcome)
+    }
+
+    /// A `say` or a `done` that carries a file: the words, and the file from the outbox with
+    /// them — or the words with one line saying the file did not come, never the words alone
+    /// in silence (`docs/ATTACHING.md` §14.4).
+    ///
+    /// One send when the words fit a caption, the file with the words under it. Two when they do
+    /// not — the words first, then the file — and the ack is for the pair: `yes` only when both
+    /// landed. A file refused before any upload goes out as the words with the line appended, in
+    /// one send. A file Telegram refused is the same line: appended to the words sent again when
+    /// they were its caption and so never landed, alone under them when they had already gone.
+    /// Whatever happened to the file, the ack tells the truth about the WORDS first, and says
+    /// `no-file` only when they reached him.
+    async fn say_with_file_and_ack(
+        &self,
+        addr: &Addr,
+        text: &str,
+        file: &hub_proto::SayFile,
+    ) -> (Delivered, Option<hub_proto::AckWhy>) {
+        use hub_proto::AckWhy;
+        let upload = match self.open_for_sending(addr, file).await {
+            Ok(upload) => upload,
+            Err(line) => {
+                let outcome = self.say(addr, &with_the_line(text, &line), &[]).await;
+                return match self.ack_for(&outcome) {
+                    // Clamped clips the END of a message and the line is the end of this one, so
+                    // he has the words and may not have the sentence that explains the gap. Only
+                    // a whole send is proof he can read the reason.
+                    (Delivered::Yes, _) => (
+                        Delivered::Yes,
+                        Some(no_file(matches!(outcome, SendOutcome::Sent(_)))),
+                    ),
+                    other => other,
+                };
+            }
+        };
+        // Counted the way Telegram counts — UTF-16 code units, not characters. A caption of seven
+        // hundred emoji is seven hundred characters and fourteen hundred units: by characters it
+        // fits, and Telegram refuses it, so the words went out again alone with a line explaining
+        // the gap — one send wasted and a caption he reads as a separate message. Deciding by units
+        // sends such a caption words-first from the start, which is the same shape with nothing
+        // wasted. `fit` below still clips by character; that is safe here because anything that
+        // reaches it has at most 1024 units and therefore at most 1024 characters.
+        let words_first = text.encode_utf16().count() > CAPTION_MAX;
+        let mut words_clamped = false;
+        if words_first {
+            match self.say(addr, text, &[]).await {
+                SendOutcome::Sent(_) => {}
+                SendOutcome::Clamped(_) => words_clamped = true,
+                // The words themselves did not go; nothing is said about a file under words he
+                // never got, and the ack is theirs.
+                other => return self.ack_for(&other),
+            }
+        }
+        let caption = if words_first { "" } else { text };
+        let outcome = self.say_file(addr, &upload, &file.name, caption).await;
+        match outcome {
+            SendOutcome::Sent(_) | SendOutcome::Clamped(_) => (
+                Delivered::Yes,
+                (words_clamped || matches!(outcome, SendOutcome::Clamped(_)))
+                    .then_some(AckWhy::Clamped),
+            ),
+            // It went out and could not be checked. Nothing is said and nothing is retried: it
+            // may be on his phone, and a second copy of a picture is a second picture.
+            SendOutcome::Unseen => (Delivered::Unseen, None),
+            SendOutcome::Refused(why) => {
+                let _ = self.audit.refused(
+                    addr,
+                    &format!(
+                        "the file the agent attached ({}) was refused by Telegram",
+                        file.name
+                    ),
+                );
+                let line = telegram_refused_the_file(&why, upload.as_photo);
+                let said = if words_first {
+                    with_the_line("", &line)
+                } else {
+                    with_the_line(text, &line)
+                };
+                let outcome = self.say(addr, &said, &[]).await;
+                // The line is its own send into the same chat, and it can be shed or refused like
+                // any other. When it is, he has words and no explanation, and the agent has to
+                // know that rather than be told the reason is waiting on his phone.
+                let landed = matches!(outcome, SendOutcome::Sent(_));
+                if words_first || matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_))
+                {
+                    (Delivered::Yes, Some(no_file(landed)))
+                } else {
+                    self.ack_for(&outcome)
+                }
+            }
+            // Shed, switched off, or nowhere to put it. When the words had already gone the truth
+            // is "he has the words and not the file"; no line, because whatever refused the file
+            // refuses a line too, and the audit already says `shed`. So the ack says NOT-SAID as
+            // well as NOT-SENT: this is the one `no-file` where there is nothing on his phone to
+            // explain the gap, and the one that mends itself if the agent attaches it again in a
+            // minute.
+            other => {
+                if words_first {
+                    (Delivered::Yes, Some(AckWhy::NoFileUnsaid))
+                } else {
+                    self.ack_for(&other)
+                }
+            }
+        }
+    }
+
+    /// The file an agent named, opened from the conversation's outbox and read — or the sentence
+    /// that goes under his words instead, with the reason in the audit.
+    ///
+    /// The name is checked against the address rules BEFORE the outbox is touched, so nothing an
+    /// agent says can be a path; then `media.rs` opens it following no link and checks what it
+    /// opened; then the bytes are read, bounded once more on the stream — the wall can append
+    /// between the `fstat` and the read — and never by the size it reported.
+    async fn open_for_sending(
+        &self,
+        addr: &Addr,
+        file: &hub_proto::SayFile,
+    ) -> Result<Upload, String> {
+        use crate::media::{MediaStore, NotSendable, PHOTO_CEILING, SEND_CEILING};
+        const NOT_A_FILE: &str = "it was not a file the bot may send";
+        if !MediaStore::name_is_openable(&file.name) {
+            // The name is not echoed anywhere: it can carry a tab, which forges a record in the
+            // audit, or a control character, which reorders what a person reads in the journal.
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(), len = file.name.len(),
+                "an agent named a file the hub will not open; the words went without it"
+            );
+            let _ = self.audit.refused(
+                addr,
+                "the file the agent attached was not sent: the name is not one the hub will open",
+            );
+            return Err(NOT_A_FILE.to_owned());
+        }
+        self.outbox.sweep(std::time::SystemTime::now());
+        let opened = match self.outbox.open_for_sending(addr, &file.name, SEND_CEILING) {
+            Ok(opened) => opened,
+            Err(NotSendable::TooBig(size)) => {
+                let _ = self.audit.refused(
+                    addr,
+                    &format!(
+                        "the file the agent attached ({}) was not sent: it is {size} bytes, over \
+                         the {SEND_CEILING} the bot may send",
+                        file.name
+                    ),
+                );
+                return Err(format!(
+                    "it is {}, and the most the bot may send is {}",
+                    megabytes(size),
+                    megabytes(SEND_CEILING)
+                ));
+            }
+            Err(NotSendable::NotAFile(why)) => {
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(), name = %file.name, why,
+                    "the file an agent attached is not one the hub will send; the words went \
+                     without it"
+                );
+                let _ = self.audit.refused(
+                    addr,
+                    &format!(
+                        "the file the agent attached ({}) was not sent: {why}",
+                        file.name
+                    ),
+                );
+                return Err(NOT_A_FILE.to_owned());
+            }
+        };
+        // Read off the checked descriptor, on a thread that may block: fifty megabytes from the
+        // page cache is milliseconds, but not milliseconds every other connection's read loop
+        // should wait through. Bounded at one byte past the ceiling, so a file that grew between
+        // the `fstat` and this read is refused rather than sent at whatever size it reached.
+        let size = opened.size;
+        let read = tokio::task::spawn_blocking(move || {
+            use std::io::Read as _;
+            let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            (&opened.file)
+                .take(SEND_CEILING + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        })
+        .await;
+        let bytes = match read {
+            Ok(Ok(bytes)) if bytes.len() as u64 <= SEND_CEILING => bytes,
+            Ok(Ok(bytes)) => {
+                let _ = self.audit.refused(
+                    addr,
+                    &format!(
+                        "the file the agent attached ({}) was not sent: it grew past the ceiling \
+                         while being read",
+                        file.name
+                    ),
+                );
+                return Err(format!(
+                    "it is over {}, the most the bot may send (it was {} when read)",
+                    megabytes(SEND_CEILING),
+                    megabytes(bytes.len() as u64)
+                ));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(), name = %file.name,
+                    error = %e, "could not read the file an agent attached"
+                );
+                let _ = self.audit.refused(
+                    addr,
+                    &format!(
+                        "the file the agent attached ({}) was not sent: it could not be read",
+                        file.name
+                    ),
+                );
+                return Err(NOT_A_FILE.to_owned());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "the thread reading an agent's file did not finish");
+                return Err(NOT_A_FILE.to_owned());
+            }
+        };
+        let is_picture = matches!(
+            file.mime.as_deref(),
+            Some("image/jpeg" | "image/png" | "image/webp")
+        );
+        let as_photo = match file.r#as {
+            Some(hub_proto::FileAs::Document) => false,
+            Some(hub_proto::FileAs::Photo) => true,
+            None => is_picture,
+        } && bytes.len() as u64 <= PHOTO_CEILING;
+        Ok(Upload {
+            bytes,
+            filename: shown_as(file.filename.as_deref(), &file.name),
+            mime: file.mime.clone(),
+            as_photo,
+        })
     }
 
     /// Turn what actually happened into the three-valued answer the bridge branches on.
@@ -4297,7 +5112,7 @@ enum Settled {
 fn frame_cost(frame: &BridgeFrame) -> usize {
     let cost = match frame {
         BridgeFrame::Say { text, .. }
-        | BridgeFrame::Done { text }
+        | BridgeFrame::Done { text, .. }
         | BridgeFrame::Ask { text, .. } => text.len() + 64,
         _ => 64,
     };
@@ -4323,9 +5138,162 @@ fn plain_reason(reason: Option<&str>) -> String {
     crate::queue::fit(&cleaned.join(" "), MOST).0
 }
 
+/// Did Telegram refuse `getFile` because the file is over its own ceiling?
+///
+/// Deliberately narrow, like the deleted-topic match: the Bot API answers exactly "Bad Request:
+/// file is too big" for a file over 20 MB, and a broader match would turn some other refusal into
+/// "too big", which tells him a smaller file would have worked when it would not.
+fn telegram_said_too_big(why: &str) -> bool {
+    why.to_lowercase().contains("file is too big")
+}
+
+/// One of his files after the hub has tried to fetch it: the frame's entry, and what the hub
+/// measured on the way — which the entry cannot carry, because `bytes` on the wire means "what
+/// is on disk" and there is nothing on disk here.
+struct Fetched {
+    file: hub_proto::MessageFile,
+    how_big: HowBig,
+}
+
+impl Fetched {
+    fn plain(file: hub_proto::MessageFile) -> Self {
+        Self {
+            file,
+            how_big: HowBig::NotAsked,
+        }
+    }
+    fn too_big(file: hub_proto::MessageFile, how_big: HowBig) -> Self {
+        Self { file, how_big }
+    }
+}
+
+/// What is known about the size of a file that was not fetched — which is not always a number.
+///
+/// Three roads reach `too-big` and only two of them have measured anything. Keeping them apart is
+/// the difference between a true sentence and one that names a figure under the ceiling as the
+/// reason a file is over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HowBig {
+    /// Telegram reported this size, and it is over the ceiling.
+    Reported(u64),
+    /// Nobody reported one. The hub counted this many bytes before the ceiling stopped the stream.
+    Counted(u64),
+    /// `getFile` refused, saying only that the file is too big. Nothing here measured a byte.
+    OnlyTelegramSaysSo,
+    /// Not a size failure at all.
+    NotAsked,
+}
+
+/// What one send carries: an agent's words with their buttons, or an agent's file with the words
+/// as its caption. One type so that `send_into` — the one place a message goes out — stays one
+/// place, and a file takes its turn, its audit pair and its flood-wait drain exactly as words do.
+enum Outbound<'a> {
+    Words {
+        text: &'a str,
+        buttons: &'a [AskOption],
+        reply_to: Option<&'a MsgId>,
+    },
+    File {
+        upload: &'a Upload,
+        /// Its name in the outbox, for the audit line; past the address rules by now.
+        name: &'a str,
+        caption: &'a str,
+    },
+}
+
+/// Which of the two file reasons an ack carries: whether the operator can SEE why.
+///
+/// `no-file` promises an adapter that the hub's reason is in his topic, and an adapter says so to
+/// its agent. When the line did not land — shed by the same budget, refused by the same topic —
+/// that promise is false, and an agent that answers "as you saw, the screenshot did not come
+/// through" is talking to somebody who saw nothing.
+fn no_file(the_line_landed: bool) -> hub_proto::AckWhy {
+    if the_line_landed {
+        hub_proto::AckWhy::NoFile
+    } else {
+        hub_proto::AckWhy::NoFileUnsaid
+    }
+}
+
+/// The words, and under them in the same message the one line saying the file did not come.
+///
+/// The sentence is `docs/ATTACHING.md` §14.4's, in the register the refusal of his typed words
+/// already uses. When there were no words the line is the message.
+fn with_the_line(text: &str, why: &str) -> String {
+    let line = format!("(The file the agent attached did not come through: {why}.)");
+    if text.trim().is_empty() {
+        line
+    } else {
+        format!("{text}\n\n{line}")
+    }
+}
+
+/// Telegram's refusal of an upload, as one reason under his words.
+///
+/// A picture refused for its shape gets the one sentence that names the fix — send it as a
+/// document — because the hub does not try twice on its own: a second try is a second send from
+/// a budget every conversation shares. Anything else is Telegram's own words, minus the "Bad
+/// Request:" every one of them starts with.
+fn telegram_refused_the_file(why: &str, as_photo: bool) -> String {
+    let said = why.to_lowercase();
+    if as_photo && (said.contains("photo") || said.contains("image")) {
+        return "Telegram would not take it as a picture; ask for it as a document".to_owned();
+    }
+    let plain = why
+        .trim()
+        .trim_start_matches("Bad Request:")
+        .trim_start_matches("Bad Request")
+        .trim();
+    // Somebody else's string, on its way into his topic. It gets what an adapter's refusal gets
+    // (`plain_reason`): no control character survives, because a newline here reads as the bot
+    // speaking a second time and forges a record in the audit, which is one line per record; and
+    // one line's worth and no more, because nobody has promised this string a length.
+    let plain = crate::queue::fit(
+        &plain
+            .split(|c: char| c.is_control() || c.is_whitespace())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        200,
+    )
+    .0;
+    let plain = plain.trim_end_matches('.');
+    if plain.is_empty() {
+        "Telegram would not take it".to_owned()
+    } else {
+        format!("Telegram would not take it — {plain}")
+    }
+}
+
+/// What he sees a document called: the adapter's `filename` when it is something a phone can
+/// show, otherwise the outbox name. Control characters are dropped and it is clipped to what a
+/// file name can be, because it lands in a multipart header and on his screen, never on a path.
+fn shown_as(filename: Option<&str>, name: &str) -> String {
+    let cleaned: String = filename
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    if cleaned.trim().is_empty() {
+        name.to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// A byte count as he reads it: megabytes, one decimal when it is not a round number.
+fn megabytes(bytes: u64) -> String {
+    let tenths = bytes / 100_000;
+    if tenths % 10 == 0 {
+        format!("{} MB", tenths / 10)
+    } else {
+        format!("{}.{} MB", tenths / 10, tenths % 10)
+    }
+}
+
 /// Per-process frame counter. Opaque and monotonic is all the protocol asks for.
 fn next_frame_seq() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(1);
     SEQ.fetch_add(1, Ordering::Relaxed)
 }

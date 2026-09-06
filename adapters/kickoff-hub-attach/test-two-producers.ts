@@ -18,7 +18,7 @@
  * other suite so the two can never come to disagree about what the wire is.
  */
 
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync } from 'fs'
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 import {
@@ -53,7 +53,9 @@ console.log('\nwith a relay in front of it:')
 
 const hubSock = join(dir, 'hub.sock')
 const faninDir = join(dir, 'fanin')
-const hub = claimingHub(hubSock)
+const outbox = join(dir, 'outbox')
+mkdirSync(outbox, { recursive: true, mode: 0o700 })
+const hub = claimingHub(hubSock, outbox)
 const relay = startAttach(laneDir, { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir })
 await until('the relay to say hello to the hub', () => hub.got.some(f => f.t === 'hello'))
 
@@ -97,6 +99,36 @@ check('two_producers_for_one_lane_share_one_hub_connection_rather_than_racing_fo
   `${hub.got.filter(f => f.t === 'hello').length} hellos, ${hub.refusals.length} refusals`)
 check('and the hub was told the worktree, once, by the relay itself',
   hub.got.find(f => f.t === 'hello')!.lane === LANE)
+
+// A message that carries a FILE, at a door with three producers behind it — one of them older
+// than files, which is what any upgrade window and the ordinary opencode layout both look like.
+// The count in the one ack the hub hears decides whether it puts "that file did not reach the
+// agent" in his topic, and the first answer to arrive is a race between processes: the older one
+// wins it whenever it is a lookup and the newer one is a POST. Answered from the loser, the hub
+// tells him a file was lost that an agent in this same lane is looking at.
+{
+  const socks = readdirSync(faninDir).filter(f => f.endsWith('.sock'))
+  const older = rawProducer(join(faninDir, socks[0]), (f, send) => {
+    // The instant it reads his words, and it has never heard of `files`.
+    if (f.t === 'message') send({ v: 1, id: `o-${f.id}`, t: 'ack', ref: f.id, status: 'accepted' })
+  })
+  await older.ready
+  older.send({ v: 1, id: 'o1', t: 'hello', project_id: 'p', token: 'a'.repeat(64),
+    instance: 'older-than-files', repo, pid: process.pid, lane: LANE })
+  await until('the older producer to be let in', () => older.got.some(f => f.t === 'welcome'))
+  hub.to({ v: 1, id: 'h-f1', t: 'message', msg_id: 'mf1', text: 'the login page, as it is now',
+    from: { chat_id: -1, user_id: 1 },
+    files: [{ kind: 'photo', path: join(dir, 'shot.jpg'), mime: 'image/jpeg', bytes: 1183412 }] })
+  await until('an answer about the file', () => hub.got.some(f => f.t === 'ack' && f.ref === 'h-f1'), 8000)
+    .catch(() => {})
+  await Bun.sleep(900)
+  const folded = hub.got.filter(f => f.t === 'ack' && f.ref === 'h-f1')
+  check('a_short_count_from_one_producer_never_answers_for_the_one_that_took_the_file',
+    folded.length === 1 && folded[0].status === 'accepted' && folded[0].files === 1,
+    JSON.stringify(folded))
+  older.end()
+  await Bun.sleep(200)
+}
 
 // Both producers are the same build with the same counter, so their first question is the same
 // string on both. The hub resolves a tap BY ask id against a written record, so two questions
@@ -152,6 +184,34 @@ await Bun.sleep(300)
 check('and are not written into a channel the other engine cannot read',
   channelMessages(B).length === beforeMsgB,
   JSON.stringify(channelMessages(B).slice(beforeMsgB).map(l => l.params?.content)))
+
+// Files cross the door with no change to it (`docs/ATTACHING.md` §14.2): the welcome's `outbox`
+// reaches a producer as the hub wrote it — which is how the producer knows where to copy — a
+// `say` carrying `file` reaches the hub with the field the producer wrote, and the hub's `no-file`
+// ack comes back down to the producer that sent it and no other. Asserted against the real door
+// rather than assumed from the relay's source, because "forwards everything" is exactly the kind
+// of sentence a later edit makes false.
+const shot = join(dir, 'shot.png')
+writeFileSync(shot, Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(500, 3)]))
+hub.ack = null
+const withFile = await call(A, 'reply', { text: 'the chart', file: shot })
+await until('the say with a file at the hub', () => hub.got.some(f => f.t === 'say' && f.file), 3000).catch(() => {})
+const fileAtHub = hub.got.find(f => f.t === 'say' && f.file)
+check('a_file_a_producer_names_crosses_the_door_to_the_hub_with_its_bytes_in_the_outbox_the_hub_named',
+  /^said, with the file shot\.png/.test(withFile.text)
+    && fileAtHub !== undefined && fileAtHub.text === 'the chart' && fileAtHub.file.mime === 'image/png'
+    && fileAtHub.file.filename === 'shot.png' && existsSync(join(outbox, fileAtHub.file.name)),
+  `${withFile.text} / ${JSON.stringify(fileAtHub ?? 'no say with a file')}`)
+const noticesA = noticesTo(A).length
+const noticesB = noticesTo(B).length
+if (fileAtHub) hub.to({ v: 1, id: 'h-nf', t: 'ack', ref: fileAtHub.id, delivered: 'yes', why: 'no-file' })
+await until('the producer to hear the file did not go', () => noticesTo(A).length > noticesA, 5000).catch(() => {})
+check('and_the_hubs_no_file_ack_reaches_the_producer_that_sent_it_and_no_other',
+  noticesTo(A).length === noticesA + 1
+    && /file with it did not come through/.test(String(noticesTo(A).at(-1)?.params?.content ?? ''))
+    && noticesTo(B).length === noticesB,
+  JSON.stringify(noticesTo(A).slice(noticesA).map(n => n.params?.content)))
+hub.ack = 'yes'
 
 // Liveness is what keeps the claim. A producer that has wedged must not be able to cost the lane
 // its place on the phone, so the ping is answered by the relay itself and never handed on.

@@ -28,8 +28,9 @@ pub mod ids;
 pub use codec::{FrameReader, write_frame};
 pub use error::ProtoError;
 pub use frame::{
-    AckStatus, AckWhy, AskEnd, AskOption, BeatState, BridgeFrame, Delivered, Envelope, From,
-    HubFrame, Limits, RefusedReason, SayHint, VERSION,
+    AckStatus, AckWhy, AskEnd, AskOption, BeatState, BridgeFrame, Delivered, Envelope, FileAs,
+    FileKind, FileWhy, From, HubFrame, Limits, MessageFile, RefusedReason, SayFile, SayHint,
+    VERSION,
 };
 pub use ids::{AskId, FrameId, LaneId, MsgId, OptionId, ProjectId};
 

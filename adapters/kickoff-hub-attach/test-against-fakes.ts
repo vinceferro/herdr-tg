@@ -583,6 +583,94 @@ try {
     JSON.stringify(ackFor('h-m1') ?? null),
   )
 
+  console.log('\na file he sent reaches the session as a file part beside his words')
+  // The frame carries the PATH the hub minted (`docs/ATTACHING.md` §14). opencode's v1 prompt has
+  // a file part, read off the running server's own `/doc` (1.18.25) and not guessed: `FilePartInput`
+  // requires `type`, `mime` and `url`, allows `filename`, and forbids anything else. For a `file:`
+  // URL the SERVER reads the path from disk and hands the model a data URL — so the same-path
+  // mount rule binds the server process, and nothing here reads a byte.
+  const minted = '/state/media/p-9f3a1c2e5b7d/-/20260905-231455-9f3a1c2e.jpg'
+  const promptsBeforeFile = prompts().length
+  typed('h-m1f', 'this is what the login page looks like now', {
+    files: [{ kind: 'photo', path: minted, mime: 'image/jpeg', bytes: 1183412 }],
+  })
+  check(
+    'a_photo_he_sends_reaches_the_opencode_session_as_a_file_part_beside_his_words',
+    (await until('the prompt with the file', () => prompts().length > promptsBeforeFile)) &&
+      JSON.stringify(prompts().at(-1)?.body) ===
+        JSON.stringify({
+          parts: [
+            { type: 'text', text: 'this is what the login page looks like now' },
+            { type: 'file', mime: 'image/jpeg', url: `file://${minted}` },
+          ],
+        }),
+    JSON.stringify(prompts().at(-1)?.body ?? null),
+  )
+  check(
+    'and_the_ack_counts_the_file_it_handed_on',
+    (await until('the ack', () => ackFor('h-m1f') !== undefined)) &&
+      ackFor('h-m1f')?.status === 'accepted' &&
+      ackFor('h-m1f')?.files === 1,
+    JSON.stringify(ackFor('h-m1f') ?? null),
+  )
+  // The reported name travels in `filename`, as data, and never becomes the URL.
+  const promptsBeforeNamed = prompts().length
+  typed('h-m1n', '', {
+    files: [{ kind: 'document', path: '/state/media/p-9f3a1c2e5b7d/-/20260905-231501-0a1b2c3d', mime: 'application/x-pem-file', bytes: 400, filename: '../../.ssh/id_ed25519' }],
+  })
+  check(
+    'the_name_his_phone_reported_is_the_file_parts_filename_and_never_its_url',
+    (await until('the prompt with the named file', () => prompts().length > promptsBeforeNamed)) &&
+      JSON.stringify(prompts().at(-1)?.body) ===
+        JSON.stringify({
+          parts: [
+            { type: 'file', mime: 'application/x-pem-file', url: 'file:///state/media/p-9f3a1c2e5b7d/-/20260905-231501-0a1b2c3d', filename: '../../.ssh/id_ed25519' },
+          ],
+        }),
+    JSON.stringify(prompts().at(-1)?.body ?? null),
+  )
+  // A file that did not come through is one line in the text part, and no file part at all.
+  const promptsBeforeNoFile = prompts().length
+  typed('h-m1g', '', { files: [{ kind: 'document', filename: 'build.log', why: 'too-big' }] })
+  check(
+    'a_file_that_did_not_come_through_is_said_in_the_prompt_and_is_never_a_file_part',
+    (await until('the prompt without the file', () => prompts().length > promptsBeforeNoFile)) &&
+      prompts().at(-1)?.body?.parts?.length === 1 &&
+      prompts().at(-1)?.body?.parts?.[0]?.type === 'text' &&
+      /build\.log/.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)) &&
+      /did not come through/.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)) &&
+      /20 MB/.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)),
+    JSON.stringify(prompts().at(-1)?.body ?? null),
+  )
+  check(
+    'and_its_ack_still_counts_the_entry_it_handed_on',
+    (await until('the ack', () => ackFor('h-m1g') !== undefined)) &&
+      ackFor('h-m1g')?.status === 'accepted' &&
+      ackFor('h-m1g')?.files === 1,
+    JSON.stringify(ackFor('h-m1g') ?? null),
+  )
+  // What the hub does about telling HIM is an ordinary send against a ceiling every project
+  // shares, and it can be shed with only the journal knowing. Stated as a fact, it had the agent
+  // answering "as you saw, the screenshot did not come through" to somebody who saw nothing.
+  check(
+    'and_the_agent_is_never_told_the_operator_has_already_read_something_nobody_confirmed',
+    !/has been told/i.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)),
+    String(prompts().at(-1)?.body?.parts?.[0]?.text),
+  )
+  // A file this machine could not store: nothing was downloaded, so the advice is the opposite of
+  // a failed download's, and a watcher that did not know the word would say "the hub did not
+  // say why" for the one case where it said exactly why.
+  const promptsBeforeNotStored = prompts().length
+  typed('h-m1h', 'have a look', { files: [{ kind: 'photo', why: 'not-stored' }] })
+  check(
+    'a_file_the_hub_could_not_store_is_told_apart_from_a_download_that_broke',
+    (await until('the prompt', () => prompts().length > promptsBeforeNotStored)) &&
+      !/did not say why/.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)) &&
+      !/send it again/i.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)) &&
+      /store|storing|nowhere/i.test(String(prompts().at(-1)?.body?.parts?.[0]?.text)),
+    String(prompts().at(-1)?.body?.parts?.[0]?.text),
+  )
+
   console.log('\nwords typed at a wall with no session are refused, with a reason')
   sessions = []
   const promptsBeforeNone = prompts().length

@@ -20,11 +20,11 @@
 use hub_proto::{AskOption, MsgId};
 use teloxide::prelude::*;
 use teloxide::types::{
-    InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, ReactionType,
-    ReplyParameters, Rgb, ThreadId,
+    FileId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId, ParseMode,
+    ReactionType, ReplyParameters, Rgb, ThreadId,
 };
 
-use crate::hub::{Mark, Refused, SendOutcome, Surface};
+use crate::hub::{Located, Mark, Refused, SendOutcome, Surface, Upload};
 use crate::render::escape_html;
 
 /// The six colours Telegram permits for a topic icon, in the order the design's `hash % 6` indexes.
@@ -67,8 +67,31 @@ fn what_became_of_it(
                 );
                 SendOutcome::TooFast(wait)
             }
-            None => SendOutcome::Refused(e.to_string()),
+            None => SendOutcome::Refused(telegrams_own_words(&e)),
         },
+    }
+}
+
+/// What Telegram itself said, out of the wrapper the client library puts round it.
+///
+/// `Refused.why` is read by a person: it lands in his topic under an agent's words when an upload
+/// is turned away (`hub::telegram_refused_the_file`). The library's `Display` wraps a description
+/// twice — `A Telegram's error: ` round everything, and `Unknown error: "…"`, debug quotes and
+/// all, round any description it has no variant of its own for — so passing that on put a
+/// library's grammar and an escaped string in front of him, and made the hub's own attempt to trim
+/// the `Bad Request:` prefix dead code, because the prefix was no longer at the start.
+///
+/// Unwrapped HERE rather than in the hub, so the hub is never parsing a `Display` it does not own.
+fn telegrams_own_words(e: &teloxide::RequestError) -> String {
+    match e {
+        // The description the API sent, held verbatim. Its own `Display` is the debug quoting.
+        teloxide::RequestError::Api(teloxide::ApiError::Unknown(said)) => said.clone(),
+        // A description the library has a variant for renders as a sentence — usually Telegram's
+        // words exactly, measured in the test beside this.
+        teloxide::RequestError::Api(known) => known.to_string(),
+        // Everything else is the library talking about itself — a network failure, a body it
+        // could not parse. The hub says "Telegram would not take it" and nothing more for these.
+        other => other.to_string(),
     }
 }
 
@@ -185,7 +208,10 @@ impl Surface for Telegram {
             // on topic creation became an opaque sentence and the chat's budget never heard about
             // it — while every other project carried on sending into a chat Telegram had shut.
             Err(e) => Err(Refused {
-                why: e.to_string(),
+                // Telegram's own words, never the library's wrapper round them: a reason that
+                // reaches a person must not read as a Rust type, and the hub matches on phrases
+                // in here — "file is too big" — that a wrapper would one day move.
+                why: telegrams_own_words(&e),
                 flood_wait: flood_wait(&e),
             }),
         }
@@ -310,6 +336,80 @@ impl Surface for Telegram {
             "a question stopped being asked"
         );
         Ok(())
+    }
+
+    async fn locate(&self, file_id: &str) -> Result<Located, Refused> {
+        match self.bot.get_file(FileId(file_id.to_owned())).await {
+            Ok(file) => Ok(Located {
+                file_id: file.meta.id.0,
+                file_unique_id: file.meta.unique_id.0,
+                // The library fills an absent `file_size` with `u32::MAX` rather than leaving it
+                // absent. Four gigabytes is not a size, and the hub must not act on it as one.
+                file_size: (file.meta.size != u32::MAX).then_some(u64::from(file.meta.size)),
+                file_path: file.path,
+            }),
+            Err(e) => Err(Refused {
+                // Telegram's own words, never the library's wrapper round them: a reason that
+                // reaches a person must not read as a Rust type, and the hub matches on phrases
+                // in here — "file is too big" — that a wrapper would one day move.
+                why: telegrams_own_words(&e),
+                flood_wait: flood_wait(&e),
+            }),
+        }
+    }
+
+    async fn download(
+        &self,
+        file_path: &str,
+        into: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    ) -> Result<(), Refused> {
+        // The library builds the URL — `file/bot<token>/<file_path>` — and streams the body into
+        // the hub's writer. This surface never builds that URL itself: it carries the token, and a
+        // hand-rolled fetch would put the token in the first log line of the first failure.
+        use teloxide::net::Download as _;
+        self.bot
+            .download_file(file_path, into)
+            .await
+            .map_err(|e| Refused {
+                why: e.to_string(),
+                flood_wait: None,
+            })
+    }
+
+    async fn send_file(&self, topic_id: i32, file: &Upload, caption: &str) -> SendOutcome {
+        // From MEMORY, never from a path. `InputFile::file(path)` opens with a plain `open`, which
+        // follows links, and names the upload after the last path segment — exactly the two
+        // things the outbox rules forbid. The hub read these bytes off a descriptor it opened
+        // without following anything and checked; what he sees the file called is set here, as
+        // data, from what the adapter said.
+        let input = InputFile::memory(file.bytes.clone()).file_name(file.filename.clone());
+        let thread = ThreadId(MessageId(topic_id));
+        // The caption is escaped like every other agent-authored string that goes out as HTML;
+        // an empty caption is left off entirely rather than sent as an empty string.
+        let answered = if file.as_photo {
+            let mut req = self
+                .bot
+                .send_photo(self.forum, input)
+                .message_thread_id(thread);
+            if !caption.is_empty() {
+                req = req
+                    .caption(escape_html(caption))
+                    .parse_mode(ParseMode::Html);
+            }
+            req.await
+        } else {
+            let mut req = self
+                .bot
+                .send_document(self.forum, input)
+                .message_thread_id(thread);
+            if !caption.is_empty() {
+                req = req
+                    .caption(escape_html(caption))
+                    .parse_mode(ParseMode::Html);
+            }
+            req.await
+        };
+        what_became_of_it(answered)
     }
 
     async fn mark(&self, chat_id: i64, msg_id: &MsgId, mark: Mark) -> Result<(), Refused> {
@@ -492,6 +592,41 @@ mod tests {
                 None,
                 "{other} was mistaken for a flood wait, which would silence the chat"
             );
+        }
+    }
+
+    #[test]
+    fn a_refusal_the_hub_reads_is_the_words_telegram_sent_and_not_the_librarys_wrapper() {
+        // What comes out of here is what the operator reads in his topic, under an agent's words,
+        // when Telegram will not take a file. The client library wraps a description TWICE on the
+        // way — "A Telegram's error: " round everything, and `Unknown error: "…"`, with the debug
+        // quotes, round any description it has no variant of its own for — so handing its Display
+        // on put a library's grammar and an escaped string in front of a person, in the one
+        // register this repo says carries no jargon.
+        let raw = "Bad Request: file must be non-empty";
+        let wrapped = teloxide::RequestError::Api(teloxide::ApiError::Unknown(raw.to_owned()));
+        assert!(
+            wrapped.to_string().contains("Unknown error:"),
+            "the library stopped wrapping, and this is a test about the wrapping: {wrapped}"
+        );
+        match what_became_of_it(Err(wrapped)) {
+            SendOutcome::Refused(why) => assert_eq!(why, raw),
+            other => panic!("a refusal came back as {other:?}"),
+        }
+
+        // A description the library DOES have a variant for is its own English, which is a
+        // sentence rather than a wrapper — measured, not assumed: `WrongFileIdOrUrl` renders the
+        // description Telegram sent, verbatim.
+        let known: teloxide::ApiError = serde_json::from_value(serde_json::json!(
+            "Bad Request: wrong file identifier/HTTP URL specified"
+        ))
+        .expect("the library knows this one");
+        match what_became_of_it(Err(teloxide::RequestError::Api(known))) {
+            SendOutcome::Refused(why) => {
+                assert!(!why.contains("A Telegram's error"), "{why}");
+                assert!(why.contains("wrong file identifier"), "{why}");
+            }
+            other => panic!("a refusal came back as {other:?}"),
         }
     }
 

@@ -91,6 +91,22 @@ pub enum AckWhy {
     NoTopic,
     /// Telegram itself refused it.
     TelegramRefused,
+    /// The words reached him and the file the frame carried did not. Paired with `yes` only.
+    ///
+    /// Safe to add to a closed set the bridge branches on, for the reason `bad_lane` was: only a
+    /// frame that CARRIED a file can be answered with it, and a bridge old enough not to know the
+    /// word cannot have sent one. The reason is in his topic, in words; this is the agent's copy
+    /// of the fact.
+    NoFile,
+    /// The same, except that nothing could be put in his topic to say so either.
+    ///
+    /// The words landed and then his messaging app shed the file — a flood wait, a project
+    /// switched off, a topic deleted — and whatever refused the file refuses a sentence about it
+    /// just as fast. So he is looking at words with nothing to explain the gap, which is the one
+    /// case where an adapter must NOT tell its agent that the reason is on his phone. It is also
+    /// the case that mends itself: a shed file is worth attaching again in a minute, where the
+    /// refusals behind [`AckWhy::NoFile`] are permanent for that file.
+    NoFileUnsaid,
 }
 
 /// Why the hub refused a connection outright. The frame is followed by a close.
@@ -138,6 +154,103 @@ pub enum SayHint {
     Prose,
     /// A command's output. Monospace, and clipped rather than reflowed.
     Output,
+}
+
+/// What Telegram called a file the operator sent. A sticker and a video note are not carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileKind {
+    Photo,
+    Document,
+    Video,
+    Animation,
+    Audio,
+    Voice,
+}
+
+/// Why a file he sent is not on disk. The words beside it still went, and he has already been
+/// told in his topic; this is the agent's copy of the same fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileWhy {
+    /// Larger than the most a bot may fetch from Telegram. Never fetched, never retried.
+    TooBig,
+    /// Telegram would not hand it over, or the transfer broke. He was asked to send it again.
+    DownloadFailed,
+    /// The download was never attempted, because this machine had nowhere to put the bytes.
+    ///
+    /// Separate from [`FileWhy::DownloadFailed`] because the two need opposite advice and the hub
+    /// cannot give both from one word: a broken transfer is worth sending again, and a media
+    /// directory the hub will not write into is not — every file he sends will meet it, so "send
+    /// it again" would be a loop with no end in it. Whoever runs the machine has a line in the
+    /// journal naming the directory; nobody holding a phone can do anything at all.
+    NotStored,
+}
+
+/// One file the operator sent, as it reached the hub's own disk — or did not.
+///
+/// **The bytes are never on the wire.** A frame is 64 KiB and a screenshot is a megabyte, so what
+/// travels is a PATH the hub minted, inside a directory a wall mounts read-only at the same path.
+/// `path` is present exactly when the bytes are there and `why` exactly when they are not, and a
+/// reader that finds both or neither is looking at a hub this crate did not build.
+///
+/// `filename` is what the sender's client reported, carried verbatim **as data**. It is never a
+/// segment of `path`, and nothing on either side may join it onto one: a name from a phone is a
+/// string somebody else chose, and `../../.ssh/id_ed25519` is a name a phone can send.
+///
+/// `why` is written as a closed set and must be READ as an open one: it travels down only, to
+/// adapters that are not this crate, and every one of them needs a fallback arm for a word it
+/// does not know — which is what let [`FileWhy::NotStored`] be added without a version bump.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MessageFile {
+    pub kind: FileKind,
+    /// Absolute, minted by the hub, inside the conversation's own media directory.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub path: Option<String>,
+    /// What the sender's client declared, or for a photo what Telegram's own path says. Data,
+    /// never a verdict on the bytes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mime: Option<String>,
+    /// What the hub wrote, counted by the hub. Present only with `path`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub why: Option<FileWhy>,
+}
+
+/// How an agent wants a file shown: a picture, or a document at full size.
+///
+/// A picture is downscaled on the phone, and a tall page sent as one is refused outright — a
+/// photo's width plus height may not pass 10 000 and its ratio may not pass 20 — so an agent that
+/// wants him to READ a page says `document`. The hub sniffs no pixels; the agent is the one that
+/// knows what it rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAs {
+    Photo,
+    Document,
+}
+
+/// A file an agent attached to a `say` or a `done`.
+///
+/// **The bytes are never on the wire.** `name` is the name of a file in THIS conversation's
+/// outbox — the directory the `welcome` named in `outbox`, which a wall mounts read-write at the
+/// same path — one path segment under the address rules, and nothing else: no `/`, no `..`, no
+/// control character. The hub opens what the name says, following no link, and checks what it
+/// opened rather than the name; a name that breaks the rules is refused before the disk is
+/// touched. `filename` is what he sees a document called, as data, defaulting to `name`; `mime`
+/// is the adapter's word for the bytes and decides picture or document unless `as` says.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SayFile {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filename: Option<String>,
+    #[serde(rename = "as", skip_serializing_if = "Option::is_none", default)]
+    pub r#as: Option<FileAs>,
 }
 
 /// What an agent is doing, as the bridge sees it from inside its own turn.
@@ -199,6 +312,13 @@ pub enum BridgeFrame {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         hint: Option<SayHint>,
+        /// A file to go with the words — see [`SayFile`]. `text` may be empty when this is
+        /// present; the file is then the message.
+        ///
+        /// `skip_serializing_if`, so a say with no file puts BYTE FOR BYTE what it always put on
+        /// the wire, and a hub older than files reads it as the words alone.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        file: Option<SayFile>,
     },
     /// A question the agent is waiting on. Buzzes.
     Ask {
@@ -220,7 +340,12 @@ pub enum BridgeFrame {
         outcome: Option<String>,
     },
     /// The turn finished. Buzzes.
-    Done { text: String },
+    Done {
+        text: String,
+        /// As on [`BridgeFrame::Say`]: what was built, rendered.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        file: Option<SayFile>,
+    },
     /// Liveness and state. Does not buzz.
     Beat {
         state: BeatState,
@@ -234,6 +359,16 @@ pub enum BridgeFrame {
         status: AckStatus,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         reason: Option<String>,
+        /// Answering a [`HubFrame::Message`] that carried `files`: how many of them the bridge
+        /// handed to its engine.
+        ///
+        /// Absent means NONE did — which is what every bridge shipped before files existed says,
+        /// since it does not know the field — and the hub then tells him, in his topic, that the
+        /// agent got only his words. Without this the hub could not tell an old bridge that took
+        /// the caption and dropped the picture from a new one that took both, and would put the
+        /// thumb on his message for a file nobody received.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        files: Option<u32>,
     },
     /// Going away. Inside the grace window after a clean `bye` the hub says nothing at all: a
     /// phone that buzzes on every context refresh is worse than useless.
@@ -298,6 +433,17 @@ pub enum HubFrame {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         topic_id: Option<i32>,
         limits: Limits,
+        /// The absolute path of THIS conversation's outbox, as the hub sees it and as a wall must
+        /// mount it: where an adapter copies a file before it sends the name on a `say`.
+        ///
+        /// It has to be told. An adapter never learns its project id — `hello` carries a
+        /// placeholder and this frame carries a title — and inside a wall its own `$HOME` is not
+        /// the hub's, so nothing it holds can derive the path. Absent on every hub before files,
+        /// and **absence means this hub carries no files**: an adapter asked to send one then
+        /// sends the words alone and says so in its own tool result, rather than sending a field
+        /// the hub would strip in silence.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        outbox: Option<String>,
     },
     /// Not admitted. The connection closes immediately after.
     Refused { reason: RefusedReason },
@@ -307,10 +453,20 @@ pub enum HubFrame {
     /// anything. Inbound content selects; it never names.
     Message {
         msg_id: MsgId,
+        /// His caption, verbatim, or the empty string when he sent a file and wrote nothing. A
+        /// file with no words is still a message.
         text: String,
         from: From,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         in_reply_to_ask: Option<AskId>,
+        /// The files he sent with it, one entry each — see [`MessageFile`]. A Telegram message
+        /// carries one file, so today this holds one; an album arrives as one message per file.
+        ///
+        /// `skip_serializing_if`, so a message with no file puts BYTE FOR BYTE what it always put
+        /// on the wire: the bridge in the operator's own session is older than this field and
+        /// restarts only with his conversation.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        files: Option<Vec<MessageFile>>,
     },
     /// A tap, resolved against the record written down beside the message.
     Choice {
@@ -368,6 +524,7 @@ mod tests {
     fn an_envelope_is_one_flat_object_carrying_v_and_id_and_the_kind() {
         let json = serde_json::to_string(&env(BridgeFrame::Done {
             text: "built it".into(),
+            file: None,
         }))
         .expect("serialises");
         assert_eq!(json, r#"{"v":1,"id":"f1","t":"done","text":"built it"}"#);
@@ -395,6 +552,7 @@ mod tests {
             BridgeFrame::Say {
                 text: "hi".into(),
                 hint: Some(SayHint::Prose),
+                file: None,
             }
         );
     }
@@ -510,6 +668,16 @@ mod tests {
             BridgeFrame::Say {
                 text: "x".into(),
                 hint: None,
+                file: None,
+            },
+            BridgeFrame::Done {
+                text: "the chart".into(),
+                file: Some(SayFile {
+                    name: "3c9e1b7a.png".into(),
+                    mime: Some("image/png".into()),
+                    filename: None,
+                    r#as: Some(FileAs::Document),
+                }),
             },
             BridgeFrame::Ask {
                 ask_id: AskId::new("a1"),
@@ -532,6 +700,7 @@ mod tests {
                 r#ref: FrameId::new("f3"),
                 status: AckStatus::Refused,
                 reason: Some("busy".into()),
+                files: Some(1),
             },
             BridgeFrame::Bye {
                 reason: "refresh".into(),
@@ -572,5 +741,471 @@ mod tests {
         }))
         .expect("serialises");
         assert!(json.contains(r#""reason":"already_claimed""#), "{json}");
+    }
+
+    // ── files ─────────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_message_without_files_is_byte_for_byte_the_message_this_protocol_has_always_sent() {
+        // The bridge in the operator's own session predates files and restarts only with his
+        // conversation. It keeps receiving exactly this. Pinned as BYTES rather than as a round
+        // trip, because a round trip is green even when a `"files":null` or `"files":[]` has
+        // appeared on the wire — a field an older bridge has to tolerate for no reason at all.
+        let json = serde_json::to_string(&env(HubFrame::Message {
+            msg_id: MsgId::new("m-4412"),
+            text: "try it with --dry-run first".into(),
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            in_reply_to_ask: None,
+            files: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"message","msg_id":"m-4412","text":"try it with --dry-run first","from":{"chat_id":-1001,"user_id":7}}"#
+        );
+    }
+
+    #[test]
+    fn a_message_carrying_a_file_names_a_path_a_mime_a_count_and_the_reported_name_as_data() {
+        // The worked frame in `docs/ATTACHING.md` §14.2, byte for byte. `bytes` is a number and
+        // `filename` is a string that is never joined onto the path: a bridge reading this has
+        // the path to open and the name to show, and no reason to build one from the other.
+        let json = serde_json::to_string(&env(HubFrame::Message {
+            msg_id: MsgId::new("m-4412"),
+            text: "this is what the login page looks like now".into(),
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            in_reply_to_ask: None,
+            files: Some(vec![MessageFile {
+                kind: FileKind::Photo,
+                path: Some("/state/media/p-9f3a1c2e5b7d/-/20260905-231455-9f3a1c2e.jpg".into()),
+                mime: Some("image/jpeg".into()),
+                bytes: Some(1_183_412),
+                filename: Some("../../.ssh/id_ed25519".into()),
+                why: None,
+            }]),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"message","msg_id":"m-4412","text":"this is what the login page looks like now","from":{"chat_id":-1001,"user_id":7},"files":[{"kind":"photo","path":"/state/media/p-9f3a1c2e5b7d/-/20260905-231455-9f3a1c2e.jpg","mime":"image/jpeg","bytes":1183412,"filename":"../../.ssh/id_ed25519"}]}"#
+        );
+        // And the one that did not come through: no path, a reason, and the words beside it.
+        let json = serde_json::to_string(&env(HubFrame::Message {
+            msg_id: MsgId::new("m-4413"),
+            text: String::new(),
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            in_reply_to_ask: None,
+            files: Some(vec![MessageFile {
+                kind: FileKind::Document,
+                path: None,
+                mime: None,
+                bytes: None,
+                filename: Some("build.log".into()),
+                why: Some(FileWhy::TooBig),
+            }]),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"message","msg_id":"m-4413","text":"","from":{"chat_id":-1001,"user_id":7},"files":[{"kind":"document","filename":"build.log","why":"too-big"}]}"#
+        );
+    }
+
+    #[test]
+    fn an_old_bridge_ignores_the_attachment_and_still_gets_the_text() {
+        // The skew that actually happens: the hub is replaced, the bridge in his session is not.
+        // "A build that has never heard of files" is modelled here as a TYPE — the `message`
+        // variant exactly as this crate shipped it before the field existed, same tag, same
+        // envelope, same flatten — reading the frame the new hub sends. It must come out as his
+        // words with the file simply absent, never as a parse error that ends his conversation.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum HubFrameBeforeFiles {
+            Message {
+                msg_id: MsgId,
+                text: String,
+                from: From,
+                #[serde(default)]
+                in_reply_to_ask: Option<AskId>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(HubFrame::Message {
+            msg_id: MsgId::new("m-4412"),
+            text: "this is what the login page looks like now".into(),
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            in_reply_to_ask: None,
+            files: Some(vec![MessageFile {
+                kind: FileKind::Photo,
+                path: Some("/state/media/p-9f3a1c2e5b7d/-/20260905-231455-9f3a1c2e.jpg".into()),
+                mime: Some("image/jpeg".into()),
+                bytes: Some(1_183_412),
+                filename: None,
+                why: None,
+            }]),
+        }))
+        .expect("serialises");
+        let old: Envelope<HubFrameBeforeFiles> =
+            serde_json::from_str(&sent).expect("a bridge older than files must still read this");
+        assert_eq!(
+            old.payload,
+            HubFrameBeforeFiles::Message {
+                msg_id: MsgId::new("m-4412"),
+                text: "this is what the login page looks like now".into(),
+                from: From {
+                    chat_id: -1001,
+                    user_id: 7,
+                },
+                in_reply_to_ask: None,
+            },
+            "the words beside the file did not survive a bridge that ignores the file"
+        );
+    }
+
+    #[test]
+    fn an_ack_that_counts_files_parses_on_a_hub_that_has_never_heard_of_them() {
+        // The other direction, modelled the same way: the `ack` variant as it was before `files`,
+        // reading what a new bridge sends. And on THIS build, an ack from an old bridge — no
+        // `files` at all — reads as none handed on, which is the truth about that bridge.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BridgeFrameBeforeFiles {
+            Ack {
+                #[serde(rename = "ref")]
+                r#ref: FrameId,
+                status: AckStatus,
+                #[serde(default)]
+                reason: Option<String>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let new = serde_json::to_string(&env(BridgeFrame::Ack {
+            r#ref: FrameId::new("h7"),
+            status: AckStatus::Accepted,
+            reason: None,
+            files: Some(1),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            new,
+            r#"{"v":1,"id":"f1","t":"ack","ref":"h7","status":"accepted","files":1}"#
+        );
+        let old: Envelope<BridgeFrameBeforeFiles> =
+            serde_json::from_str(&new).expect("a hub older than files must still read this");
+        assert!(
+            matches!(
+                old.payload,
+                BridgeFrameBeforeFiles::Ack {
+                    status: AckStatus::Accepted,
+                    ..
+                }
+            ),
+            "{old:?}"
+        );
+
+        let from_an_old_bridge: Envelope<BridgeFrame> =
+            serde_json::from_str(r#"{"v":1,"id":"b3","t":"ack","ref":"h7","status":"accepted"}"#)
+                .expect("the ack every bridge has always sent");
+        assert_eq!(
+            from_an_old_bridge.payload,
+            BridgeFrame::Ack {
+                r#ref: FrameId::new("h7"),
+                status: AckStatus::Accepted,
+                reason: None,
+                files: None,
+            }
+        );
+    }
+
+    // ── files, up ─────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_say_without_a_file_is_byte_for_byte_the_say_this_protocol_has_always_sent() {
+        // Every bridge that never attaches anything — which is every bridge until today — keeps
+        // putting exactly this on the wire. Pinned as BYTES: a round trip is green even when a
+        // `"file":null` has appeared, which a hub older than files would have to tolerate for
+        // nothing.
+        let json = serde_json::to_string(&env(BridgeFrame::Say {
+            text: "hi".into(),
+            hint: Some(SayHint::Prose),
+            file: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"say","text":"hi","hint":"prose"}"#
+        );
+    }
+
+    #[test]
+    fn a_say_carrying_a_file_names_it_in_the_outbox_and_the_reported_name_as_data() {
+        // The worked frame in `docs/ATTACHING.md` §14.2, byte for byte. `name` is one segment in
+        // the outbox the welcome named; `filename` is what he sees it called and is never joined
+        // onto anything; `as` is absent unless the agent chose, and it is spelt `as` on the wire.
+        let json = serde_json::to_string(&env(BridgeFrame::Say {
+            text: "the chart, rebuilt".into(),
+            hint: None,
+            file: Some(SayFile {
+                name: "3c9e1b7a.png".into(),
+                mime: Some("image/png".into()),
+                filename: Some("latency-p99.png".into()),
+                r#as: None,
+            }),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"say","text":"the chart, rebuilt","file":{"name":"3c9e1b7a.png","mime":"image/png","filename":"latency-p99.png"}}"#
+        );
+        let json = serde_json::to_string(&env(BridgeFrame::Done {
+            text: String::new(),
+            file: Some(SayFile {
+                name: "page.png".into(),
+                mime: None,
+                filename: None,
+                r#as: Some(FileAs::Document),
+            }),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"done","text":"","file":{"name":"page.png","as":"document"}}"#
+        );
+    }
+
+    #[test]
+    fn a_new_bridge_sending_an_attachment_to_an_old_hub_still_delivers_its_text() {
+        // The direction that cannot be run end to end, because the hub old enough to test against
+        // is the one being replaced. "A hub that has never heard of files" is modelled as a TYPE:
+        // the `say` and `done` variants exactly as this crate shipped them before `file` existed,
+        // same tag, same envelope, same flatten. The words must come out as a say of the words,
+        // never as a parse error that ends the agent's connection — the file is simply not there,
+        // and the bridge, which was told no outbox, has already said so in its tool result.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BridgeFrameBeforeFiles {
+            Say {
+                text: String,
+                #[serde(default)]
+                hint: Option<SayHint>,
+            },
+            Done {
+                text: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let file = SayFile {
+            name: "3c9e1b7a.png".into(),
+            mime: Some("image/png".into()),
+            filename: Some("latency-p99.png".into()),
+            r#as: Some(FileAs::Photo),
+        };
+        let sent = serde_json::to_string(&env(BridgeFrame::Say {
+            text: "the chart, rebuilt".into(),
+            hint: Some(SayHint::Prose),
+            file: Some(file.clone()),
+        }))
+        .expect("serialises");
+        let old: Envelope<BridgeFrameBeforeFiles> =
+            serde_json::from_str(&sent).expect("a hub older than files must still read a say");
+        assert_eq!(
+            old.payload,
+            BridgeFrameBeforeFiles::Say {
+                text: "the chart, rebuilt".into(),
+                hint: Some(SayHint::Prose),
+            },
+            "the words did not survive a hub that ignores the file"
+        );
+        let sent = serde_json::to_string(&env(BridgeFrame::Done {
+            text: "built it".into(),
+            file: Some(file),
+        }))
+        .expect("serialises");
+        let old: Envelope<BridgeFrameBeforeFiles> =
+            serde_json::from_str(&sent).expect("a hub older than files must still read a done");
+        assert_eq!(
+            old.payload,
+            BridgeFrameBeforeFiles::Done {
+                text: "built it".into()
+            }
+        );
+
+        // And the case §14.2 allows and nothing else here covers: NO WORDS, the file being the
+        // message. `text` must still go on the wire as the empty string, because a hub older than
+        // files REQUIRES the field — dropping it as "nothing to say" turns the frame into a parse
+        // error, and a parse error on a `say` is the agent's connection ending mid-turn. This is
+        // the one edit that would break this skew and read like a tidy-up while doing it.
+        for empty in [
+            env(BridgeFrame::Say {
+                text: String::new(),
+                hint: None,
+                file: Some(SayFile {
+                    name: "page.png".into(),
+                    mime: None,
+                    filename: None,
+                    r#as: None,
+                }),
+            }),
+            env(BridgeFrame::Done {
+                text: String::new(),
+                file: Some(SayFile {
+                    name: "page.png".into(),
+                    mime: None,
+                    filename: None,
+                    r#as: None,
+                }),
+            }),
+        ] {
+            let sent = serde_json::to_string(&empty).expect("serialises");
+            assert!(
+                sent.contains(r#""text":"""#),
+                "a file with no words dropped `text`, which a hub older than files requires: {sent}"
+            );
+            let old: Envelope<BridgeFrameBeforeFiles> = serde_json::from_str(&sent)
+                .unwrap_or_else(|e| panic!("a hub older than files could not read {sent}: {e}"));
+            assert!(
+                matches!(
+                    old.payload,
+                    BridgeFrameBeforeFiles::Say { ref text, .. }
+                        | BridgeFrameBeforeFiles::Done { ref text }
+                        if text.is_empty()
+                ),
+                "{old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_welcome_without_an_outbox_is_byte_for_byte_the_welcome_this_protocol_has_always_sent() {
+        let json = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#
+        );
+    }
+
+    #[test]
+    fn a_welcome_naming_an_outbox_still_parses_on_a_bridge_that_has_never_heard_of_files() {
+        // The bridge in the operator's own session predates files and restarts only with his
+        // conversation. The welcome it reads now names an outbox it does not know the word for,
+        // and it must go on being welcomed — a parse error at `welcome` is a project that can
+        // never connect. Modelled as a type, like the `lane` case above.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum HubFrameBeforeFiles {
+            Welcome {
+                project: String,
+                #[serde(default)]
+                lane: Option<crate::ids::LaneId>,
+                #[serde(default)]
+                topic_id: Option<i32>,
+                limits: Limits,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            lane: Some(crate::ids::LaneId::new("engineering")),
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: Some("/state/outbox/p-9f3a1c2e5b7d/engineering".into()),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            sent,
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","lane":"engineering","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20},"outbox":"/state/outbox/p-9f3a1c2e5b7d/engineering"}"#
+        );
+        let old: Envelope<HubFrameBeforeFiles> =
+            serde_json::from_str(&sent).expect("a bridge older than files must still be welcomed");
+        assert!(
+            matches!(old.payload, HubFrameBeforeFiles::Welcome { ref project, .. } if project == "A Title"),
+            "{old:?}"
+        );
+    }
+
+    #[test]
+    fn an_ack_saying_the_file_did_not_go_spells_it_the_way_the_document_does() {
+        let json = serde_json::to_string(&env(HubFrame::Ack {
+            r#ref: FrameId::new("f12"),
+            delivered: Delivered::Yes,
+            why: Some(AckWhy::NoFile),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"ack","ref":"f12","delivered":"yes","why":"no-file"}"#
+        );
+        // And the one that says nothing reached his topic either. Two words, not one, because an
+        // adapter that told its agent "the reason is on his phone" would be wrong in this case and
+        // right in the other, and it has only this field to tell them apart.
+        let json = serde_json::to_string(&env(HubFrame::Ack {
+            r#ref: FrameId::new("f13"),
+            delivered: Delivered::Yes,
+            why: Some(AckWhy::NoFileUnsaid),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"ack","ref":"f13","delivered":"yes","why":"no-file-unsaid"}"#
+        );
+    }
+
+    #[test]
+    fn a_file_this_machine_could_not_store_is_spelt_the_way_the_document_does() {
+        // Its own word, not `download-failed`: nothing was downloaded, and the two need opposite
+        // advice — send it again, against nothing you can do from a phone.
+        let json = serde_json::to_string(&env(HubFrame::Message {
+            msg_id: MsgId::new("m-4414"),
+            text: "have a look".into(),
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            in_reply_to_ask: None,
+            files: Some(vec![MessageFile {
+                kind: FileKind::Photo,
+                path: None,
+                mime: None,
+                bytes: None,
+                filename: None,
+                why: Some(FileWhy::NotStored),
+            }]),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"message","msg_id":"m-4414","text":"have a look","from":{"chat_id":-1001,"user_id":7},"files":[{"kind":"photo","why":"not-stored"}]}"#
+        );
     }
 }

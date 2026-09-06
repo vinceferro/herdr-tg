@@ -255,6 +255,24 @@ mod tests {
         ) -> Result<(), crate::hub::Refused> {
             unreachable!("the inventory marks nothing")
         }
+        async fn locate(&self, _: &str) -> Result<crate::hub::Located, crate::hub::Refused> {
+            unreachable!("the inventory fetches nothing")
+        }
+        async fn download(
+            &self,
+            _: &str,
+            _: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> Result<(), crate::hub::Refused> {
+            unreachable!("the inventory downloads nothing")
+        }
+        async fn send_file(
+            &self,
+            _: i32,
+            _: &crate::hub::Upload,
+            _: &str,
+        ) -> crate::hub::SendOutcome {
+            unreachable!("the inventory uploads nothing")
+        }
     }
 
     /// A hub whose state files all live in `dir`, which is what the running hub's look like.

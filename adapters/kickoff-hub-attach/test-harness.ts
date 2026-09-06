@@ -60,7 +60,7 @@ export function makeRepo(dir: string, laneName: string) {
  * A hub that admits ONE live connection per (repo, lane) and refuses the second, which is the rule
  * `hub.rs` actually enforces and the only reason any of this exists.
  */
-export function claimingHub(path: string) {
+export function claimingHub(path: string, outbox?: string) {
   type Conn = { s: any; acc: string; addr?: string }
   const conns = new Map<any, Conn>()
   const claims = new Map<string, any>()
@@ -116,6 +116,9 @@ export function claimingHub(path: string) {
               v: 1, id: 'h-w', t: 'welcome', project: 'repo',
               ...(f.lane ? { lane: f.lane } : {}),
               limits: { max_frame: 262144, max_text: 3500, frames_per_min: 20 },
+              // Where this conversation's files go (`docs/ATTACHING.md` §14), when the suite
+              // gave the hub one to name; absent otherwise, as on every hub before files.
+              ...(outbox ? { outbox } : {}),
             })
             continue
           }
@@ -245,7 +248,7 @@ export function startAttach(projectDir: string, env: Record<string, string>, cap
 }
 
 /** A producer with no MCP in it, for the frames a real one will not send. */
-export function rawProducer(sock: string) {
+export function rawProducer(sock: string, onFrame?: (f: Record<string, any>, send: (o: Record<string, unknown>) => void) => void) {
   const got: Record<string, any>[] = []
   let acc = ''
   let s: any = null
@@ -260,7 +263,12 @@ export function rawProducer(sock: string) {
           const nl = acc.indexOf('\n')
           if (nl < 0) break
           const l = acc.slice(0, nl); acc = acc.slice(nl + 1)
-          if (l.trim()) got.push(JSON.parse(l))
+          if (!l.trim()) continue
+          const f = JSON.parse(l)
+          got.push(f)
+          // Answered on the socket's own callback, not from a polling loop, so a test that is
+          // about WHICH producer answers first can actually be first.
+          if (onFrame) onFrame(f, o => s?.write(JSON.stringify(o) + '\n'))
         }
       },
       close() { s = null; open = false }, error() {},

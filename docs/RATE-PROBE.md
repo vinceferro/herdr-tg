@@ -1,6 +1,8 @@
-<!-- MEASUREMENT, 3 September 2026; §3 added 5 September. The probe docs/HUB-DESIGN.md §12 specified
-     and nobody ran, run at last against the real Bot API and a real forum. Numbers here are
-     observed, not quoted. -->
+<!-- MEASUREMENT, 3 September 2026; §3 added 5 September; two owed measurements about uploads
+     added 6 September with files (docs/ATTACHING.md §14). The probe docs/HUB-DESIGN.md §12
+     specified and nobody ran, run at last against the real Bot API and a real forum. Numbers here
+     are observed, not quoted. What is listed as NOT measured is not measured: nothing below the
+     fold has been quietly assumed into a number above it. -->
 
 # What the Bot API actually charges
 
@@ -117,6 +119,15 @@ but no message of his was in a throwaway topic to try it on.
 * Whether `answerCallbackQuery` or `createForumTopic` are charged. Topic creation was routed through
   the budget on 2 September on the assumption that it is.
 * Whether the reaction ceiling is per chat, like the send ceiling, or per bot.
+* Whether `sendPhoto` and `sendDocument` are charged against the 20/min ceiling like a text.
+  `docs/ATTACHING.md` §14.4 assumes they are and takes a turn from the conversation's budget for
+  every upload, which is the assumption that fails closed: an upload that took no turn would be
+  paid for by whichever project sent next. Settling it costs one throwaway topic and a handful of
+  small pictures.
+* Whether a real full-page screenshot is refused by `sendPhoto` for its dimensions or merely
+  downscaled. The hub already refuses to guess — an agent that wants him to READ a page says
+  `as: "document"` — but which of the two Telegram does decides whether the sentence he gets back
+  ("ask for it as a document") is ever the right advice.
 * Anything about the paid broadcast tier.
 
 ## Running it again

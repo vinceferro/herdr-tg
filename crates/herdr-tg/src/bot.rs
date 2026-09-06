@@ -149,6 +149,89 @@ fn what_arrived(text: Option<&str>) -> &'static str {
     }
 }
 
+/// The file he sent with a message, as the message describes it — nothing fetched yet.
+///
+/// Everything a phone said about the file is carried as DATA: the size is a claim the hub checks
+/// again on the stream, the mime is a declaration, and the name is a string somebody chose that
+/// never becomes a segment of a path. A photo declares neither a mime nor a name — Telegram
+/// re-encodes it — and comes in several sizes, of which the last is the largest.
+fn what_he_sent(msg: &Message) -> Option<crate::hub::SentFile> {
+    use crate::hub::SentFile;
+    use hub_proto::FileKind;
+    // The library fills an absent `file_size` with `u32::MAX`. That is "unknown", not a size.
+    let size =
+        |meta: &teloxide::types::FileMeta| (meta.size != u32::MAX).then_some(u64::from(meta.size));
+    if let Some(sizes) = msg.photo() {
+        let best = sizes.last()?;
+        return Some(SentFile {
+            kind: FileKind::Photo,
+            file_id: best.file.id.0.clone(),
+            size: size(&best.file),
+            mime: None,
+            filename: None,
+        });
+    }
+    if let Some(d) = msg.document() {
+        return Some(SentFile {
+            kind: FileKind::Document,
+            file_id: d.file.id.0.clone(),
+            size: size(&d.file),
+            mime: d.mime_type.as_ref().map(|m| m.essence_str().to_owned()),
+            filename: d.file_name.clone(),
+        });
+    }
+    if let Some(v) = msg.video() {
+        return Some(SentFile {
+            kind: FileKind::Video,
+            file_id: v.file.id.0.clone(),
+            size: size(&v.file),
+            mime: v.mime_type.as_ref().map(|m| m.essence_str().to_owned()),
+            filename: v.file_name.clone(),
+        });
+    }
+    if let Some(a) = msg.animation() {
+        return Some(SentFile {
+            kind: FileKind::Animation,
+            file_id: a.file.id.0.clone(),
+            size: size(&a.file),
+            mime: a.mime_type.as_ref().map(|m| m.essence_str().to_owned()),
+            filename: a.file_name.clone(),
+        });
+    }
+    if let Some(a) = msg.audio() {
+        return Some(SentFile {
+            kind: FileKind::Audio,
+            file_id: a.file.id.0.clone(),
+            size: size(&a.file),
+            mime: a.mime_type.as_ref().map(|m| m.essence_str().to_owned()),
+            filename: a.file_name.clone(),
+        });
+    }
+    if let Some(v) = msg.voice() {
+        return Some(SentFile {
+            kind: FileKind::Voice,
+            file_id: v.file.id.0.clone(),
+            size: size(&v.file),
+            mime: v.mime_type.as_ref().map(|m| m.essence_str().to_owned()),
+            filename: None,
+        });
+    }
+    None
+}
+
+/// Something he could reasonably expect the agent to see, and that the bot does not carry.
+///
+/// A sticker is a reaction; a video note is a video. Both are answered with what the bot does
+/// carry, because silence on something he sent reads as the bot having missed it. A location, a
+/// contact or a poll is not something he sent TO the agent, and gets what it always got: nothing.
+fn something_the_bot_does_not_carry(msg: &Message) -> bool {
+    msg.sticker().is_some() || msg.video_note().is_some()
+}
+
+/// What he is told when he sends one of those.
+const NOT_CARRIED: &str = "That did not reach the agent — it takes photos, documents, voice \
+                           notes, videos and audio, not stickers or video notes.";
+
 /// May this person speak here — asked of the hub when there is one, of the gate alone when not.
 ///
 /// No hub means no registry to hold a project's people, so only the bot-wide list can answer. It
@@ -434,12 +517,43 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![ctx])
+        .distribution_function(which_conversation)
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
 
     Ok(())
+}
+
+/// Which conversation an update belongs to, for the one purpose of ordering.
+///
+/// The client library runs one key's updates strictly one after another and different keys at the
+/// same time. Its default key is the CHAT — and this bot's whole herd lives in ONE chat, a forum
+/// whose topics are the conversations, so the default made every project's typed line and every
+/// tap in the forum queue behind whatever the last one was doing. Fetching a file he sent is
+/// twenty megabytes off Telegram, inside that handler, and a tap arriving late is the one thing
+/// this product exists to deliver.
+///
+/// The topic is the right unit and not merely a smaller one: it is exactly the conversation, so
+/// "see the screenshot above" still lands behind the screenshot for the agent it was meant for,
+/// which is the ordering the fetch was put on this path for in the first place.
+///
+/// A tap whose message is too old for Telegram to describe carries no topic; it keys on the chat,
+/// which orders it with General and is the safe answer rather than a guess.
+fn which_conversation(u: &Update) -> Option<(i64, i32)> {
+    use teloxide::types::UpdateKind;
+    let chat = u.chat()?.id.0;
+    let topic = match &u.kind {
+        UpdateKind::Message(m) | UpdateKind::EditedMessage(m) => m.thread_id,
+        UpdateKind::CallbackQuery(q) => q
+            .message
+            .as_ref()
+            .and_then(|m| m.regular_message())
+            .and_then(|m| m.thread_id),
+        _ => None,
+    };
+    Some((chat, topic.map_or(0, |t| t.0.0)))
 }
 
 /// Say at startup who may speak anywhere this bot listens, and where each of them came from.
@@ -676,11 +790,31 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
         refused_sender(&ctx, user, chat_id, at.as_ref(), what_arrived(msg.text())).await;
         return Ok(());
     }
-    let Some(text) = msg.text() else {
-        return Ok(());
+    // His words, or his file and the words under it. A photo used to return here, so a screenshot
+    // from his phone — the most natural steering there is — reached nobody, and the caption he
+    // wrote under it was dropped with it.
+    let (text, files) = match msg.text() {
+        Some(text) => (text, Vec::new()),
+        None => match what_he_sent(&msg) {
+            // No caption is still a message: the file is the message.
+            Some(file) => (msg.caption().unwrap_or(""), vec![file]),
+            None => {
+                if something_the_bot_does_not_carry(&msg) && at.is_some() {
+                    told_the_operator(&ctx, chat_id).await;
+                    reply(&ctx, &bot, msg.chat.id, thread, &escape_html(NOT_CARRIED)).await;
+                }
+                return Ok(());
+            }
+        },
     };
 
-    let typed = what_he_typed(text, &ctx.username);
+    // A caption is never a command. `/help` written under a photo is a photo with `/help` on it,
+    // and the photo is the point; answering the command would drop the photo.
+    let typed = if files.is_empty() {
+        what_he_typed(text, &ctx.username)
+    } else {
+        Typed::Steering
+    };
     // Somebody else's, by name. Nothing is relayed, nothing is said back, nothing is written
     // down: Telegram hands every group bot every command, and this one was not for us.
     if typed == Typed::ForAnotherBot {
@@ -725,11 +859,15 @@ async fn on_message(bot: Bot, msg: Message, ctx: Ctx) -> anyhow::Result<()> {
                     let under = msg
                         .reply_to_message()
                         .map(|m| hub_proto::MsgId::new(m.id.0.to_string()));
+                    let n_files = files.len();
                     if hub
-                        .relay(who, chat_id, user, &mid, text, under.as_ref())
+                        .relay_with(who, chat_id, user, &mid, text, under.as_ref(), files)
                         .await
                     {
-                        tracing::info!(chat_id, who = %who, bytes = text.len(), "relayed to a project");
+                        tracing::info!(
+                            chat_id, who = %who, bytes = text.len(), files = n_files,
+                            "relayed to a project"
+                        );
                         // Nothing is said back. A confirmation under every line the operator types
                         // turns a conversation into a receipt printer; the agent's own answer is
                         // the acknowledgement, and it is the one he is waiting for.
@@ -1034,6 +1172,49 @@ fn toast(html: &str) -> String {
 }
 
 #[cfg(test)]
+mod key_tests {
+    use super::which_conversation;
+    use teloxide::types::Update;
+
+    /// One update, from the shape the Bot API documents for a forum: `message_thread_id` and
+    /// `is_topic_message` beside the chat.
+    fn in_topic(update_id: i64, message_id: i64, thread: Option<i64>) -> Update {
+        let thread = thread.map_or(String::new(), |t| {
+            format!(r#""message_thread_id":{t},"is_topic_message":true,"#)
+        });
+        let json = format!(
+            r#"{{"update_id":{update_id},"message":{{"message_id":{message_id},{thread}"date":1675229140,"chat":{{"id":-1001,"type":"supergroup","title":"the forum","is_forum":true}},"from":{{"id":7,"is_bot":false,"first_name":"the operator"}},"text":"a line"}}}}"#
+        );
+        serde_json::from_str(&json).expect("the Bot API's own shape for a forum message")
+    }
+
+    #[test]
+    fn two_topics_of_one_forum_are_two_conversations_and_never_one_queue() {
+        // The whole herd lives in one chat. Keyed on the chat — the client library's default —
+        // every project's typed line and every tap in the forum queued behind whatever the last
+        // one was doing, and one of his files is twenty megabytes off Telegram inside that
+        // handler. Keyed on the topic, a slow conversation is slow by itself.
+        let engineering = which_conversation(&in_topic(1, 5, Some(4))).expect("a key");
+        let docs = which_conversation(&in_topic(2, 6, Some(9))).expect("a key");
+        assert_ne!(
+            engineering, docs,
+            "two topics of one forum share a queue, so one file holds the other's taps"
+        );
+        // And within one conversation the order is still the order: this is what keeps "see the
+        // screenshot above" behind the screenshot.
+        assert_eq!(
+            engineering,
+            which_conversation(&in_topic(3, 7, Some(4))).expect("a key")
+        );
+        // General has no topic of its own and keys on the chat, which is the safe answer.
+        assert_ne!(
+            engineering,
+            which_conversation(&in_topic(4, 8, None)).expect("a key")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1112,6 +1293,24 @@ mod tests {
             _mark: crate::hub::Mark,
         ) -> Result<(), crate::hub::Refused> {
             unreachable!("the project list marks nothing")
+        }
+        async fn locate(&self, _: &str) -> Result<crate::hub::Located, crate::hub::Refused> {
+            unreachable!("the project list fetches nothing")
+        }
+        async fn download(
+            &self,
+            _: &str,
+            _: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> Result<(), crate::hub::Refused> {
+            unreachable!("the project list downloads nothing")
+        }
+        async fn send_file(
+            &self,
+            _: i32,
+            _: &crate::hub::Upload,
+            _: &str,
+        ) -> crate::hub::SendOutcome {
+            unreachable!("the project list uploads nothing")
         }
     }
 
@@ -2050,5 +2249,296 @@ mod tests {
             !said.lines().any(|l| l.contains("WARN")),
             "one private chat is the expected shape and must not warn:\n{said}"
         );
+    }
+
+    // ── files: what he sends, as the update handler sees it ───────────────────────────────────
+
+    /// A Telegram that ANSWERS. One canned reply per request, chosen by the request's path, and
+    /// every path written down so a test can say what the bot asked for. The token is in every
+    /// path — that is how the Bot API is shaped — which is exactly what the test about the token
+    /// needs to be true.
+    async fn a_telegram_that_answers(
+        answer: impl Fn(&str) -> (u16, Vec<u8>) + Send + Sync + 'static,
+    ) -> (Bot, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = reqwest::Url::parse(&format!("http://{}/", listener.local_addr().expect("addr")))
+            .expect("url");
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                let answer = Arc::clone(&answer);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let head_end = loop {
+                        let Ok(n) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+                    let want: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + want {
+                        let Ok(n) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let path = head
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_owned();
+                    seen.lock().expect("not poisoned").push(path.clone());
+                    let (code, body) = answer(&path);
+                    let phrase = match code {
+                        200 => "OK",
+                        500 => "Internal Server Error",
+                        _ => "Bad Request",
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {code} {phrase}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (Bot::new("1:not-a-token").set_api_url(url), asked)
+    }
+
+    /// What `getFile` answers for a photo, in the Bot API's own shape, wrapped the way the API
+    /// wraps every answer.
+    fn a_get_file_answer(size: u64) -> Vec<u8> {
+        serde_json::json!({
+            "ok": true,
+            "result": {
+                "file_id": "AgACAgQAAxkBAAIBQ2i9YQ3xkZQAAT0rY4Z0",
+                "file_unique_id": "AQADqwEAAr8nCVN9",
+                "file_size": size,
+                "file_path": "photos/file_12.jpg"
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// The API's refusal of anything a test did not expect the bot to ask for.
+    fn not_here() -> (u16, Vec<u8>) {
+        (
+            400,
+            br#"{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}"#
+                .to_vec(),
+        )
+    }
+
+    /// A photo with a caption, as Telegram delivers one: several sizes, the largest last, and no
+    /// name or mime for any of them.
+    fn a_captioned_photo(
+        chat: i64,
+        thread: Option<i32>,
+        from: serde_json::Value,
+        caption: &str,
+        size: u64,
+    ) -> Message {
+        serde_json::from_value(message_json(
+            chat,
+            thread,
+            from,
+            serde_json::json!({
+                "caption": caption,
+                "photo": [
+                    {"file_id": "AgACAgQAAxkBAAIBQ2i9YQ3xkZQAAT0rY4Z0small", "file_unique_id": "AQADqwEAAr8nCVN9s", "file_size": 1200, "width": 90, "height": 160},
+                    {"file_id": "AgACAgQAAxkBAAIBQ2i9YQ3xkZQAAT0rY4Z0", "file_unique_id": "AQADqwEAAr8nCVN9", "file_size": size, "width": 720, "height": 1280}
+                ]
+            }),
+        ))
+        .expect("a photo Telegram would send")
+    }
+
+    #[tokio::test]
+    async fn a_photo_from_the_operator_reaches_the_hub_with_its_caption() {
+        // The update handler returned the moment a message had no `text`, so his photo — and
+        // the caption he typed under it — reached nobody, with no line in the audit and nothing
+        // on his phone. Now the largest size is fetched through the real surface into the hub's
+        // own directory, the audit says so, and the caption goes with it as his words.
+        let jpeg = b"\xFF\xD8\xFF\xE0 the bytes Telegram serves".repeat(300);
+        let served = jpeg.clone();
+        let (bot, asked) = a_telegram_that_answers(move |path| {
+            let p = path.to_lowercase();
+            if p.contains("/getfile") {
+                (200, a_get_file_answer(served.len() as u64))
+            } else if p.contains("/file/bot") && p.contains("file_12.jpg") {
+                // The library puts `file_path` on the URL as ONE segment, so its slash arrives
+                // percent-encoded; the route is on the file's name, not on the slash.
+                (200, served.clone())
+            } else {
+                not_here()
+            }
+        })
+        .await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, _repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+
+        on_message(
+            bot.clone(),
+            a_captioned_photo(
+                THE_FORUM,
+                Some(TOPIC),
+                a_person(OPERATOR),
+                "this is what the login page looks like now",
+                jpeg.len() as u64,
+            ),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+
+        let audit = std::fs::read_to_string(hub.audit.path()).unwrap_or_default();
+        let fetched = audit
+            .lines()
+            .find(|l| l.contains("\tfetched\t") && l.contains("kind=photo"))
+            .unwrap_or_else(|| panic!("his photo was not fetched:\n{audit}"));
+        let path = fetched
+            .split('\t')
+            .find_map(|f| f.strip_prefix("path="))
+            .expect("the audit names the path");
+        assert!(
+            path.starts_with(&d.path().join("media").to_string_lossy().into_owned()),
+            "the file is not in the hub's own media directory: {path}"
+        );
+        assert_eq!(std::fs::read(path).expect("the file"), jpeg);
+        // The LARGEST size was asked for, by the id Telegram gave it.
+        let asked = asked.lock().expect("not poisoned").clone();
+        assert!(
+            asked.iter().any(|p| p.to_lowercase().contains("/getfile")),
+            "getFile was never called: {asked:?}"
+        );
+        // Nobody is connected, so his message went nowhere — and he is told so, as for words.
+        assert!(audit.contains("the project was not connected"), "{audit}");
+        assert!(
+            asked
+                .iter()
+                .any(|p| p.to_lowercase().contains("sendmessage")),
+            "he was not told nothing is connected: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_download_url_carrying_the_token_never_reaches_a_log_or_the_audit() {
+        // The URL a file is fetched from is `file/bot<token>/<path>`. When the fetch fails the
+        // error names the URL — and the client library redacts the token only when it looks like
+        // a real one, which this test's does not and a misconfigured one might not. So the
+        // failure must be said, in the journal and in the audit, with the token gone from both.
+        let (_guard, journal) = a_journal();
+        let (bot, _asked) = a_telegram_that_answers(|path| {
+            let p = path.to_lowercase();
+            if p.contains("/getfile") {
+                (200, a_get_file_answer(3_000))
+            } else if p.contains("/file/bot") {
+                (500, b"<html>gateway wept</html>".to_vec())
+            } else {
+                not_here()
+            }
+        })
+        .await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, _repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+
+        on_message(
+            bot.clone(),
+            a_captioned_photo(THE_FORUM, Some(TOPIC), a_person(OPERATOR), "", 3_000),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+
+        let audit = std::fs::read_to_string(hub.audit.path()).unwrap_or_default();
+        let said = read(&journal);
+        assert!(
+            audit
+                .lines()
+                .any(|l| l.contains("not-fetched") && l.contains("why=download-failed")),
+            "the failure was not written down:\n{audit}"
+        );
+        assert!(
+            said.contains("download"),
+            "the failure was not said in the journal:\n{said}"
+        );
+        assert!(
+            !said.contains("not-a-token"),
+            "the bot token reached the journal:\n{said}"
+        );
+        assert!(
+            !audit.contains("not-a-token"),
+            "the bot token reached the audit:\n{audit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sticker_is_answered_with_what_the_bot_carries_and_a_location_with_nothing() {
+        // A sticker is something he could expect the agent to see; silence reads as the bot
+        // having missed it, so it gets one line saying what the bot does carry. A location is
+        // not something sent TO the agent, and gets what it always got: nothing at all.
+        let (bot, calls) = a_telegram_that_only_counts().await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, _repo, _hub) = a_forum_with_one_project(d.path(), &bot).await;
+        let sticker: Message = serde_json::from_value(message_json(
+            THE_FORUM,
+            Some(TOPIC),
+            a_person(OPERATOR),
+            serde_json::json!({"sticker": {
+                "file_id": "CAACAgIAAxkBAAIBSmi9", "file_unique_id": "AgADEwADwDZVBw", "file_size": 20000,
+                "width": 512, "height": 512, "type": "regular", "is_animated": false, "is_video": false
+            }}),
+        ))
+        .expect("a sticker Telegram would send");
+        on_message(bot.clone(), sticker, ctx.clone())
+            .await
+            .expect("handled");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a sticker in his topic did not earn exactly one line"
+        );
+
+        let location: Message = serde_json::from_value(message_json(
+            THE_FORUM,
+            Some(TOPIC),
+            a_person(OPERATOR),
+            serde_json::json!({"location": {"longitude": 4.9, "latitude": 52.37}}),
+        ))
+        .expect("a location Telegram would send");
+        on_message(bot.clone(), location, ctx.clone())
+            .await
+            .expect("handled");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a location was answered");
     }
 }
