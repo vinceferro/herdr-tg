@@ -137,7 +137,7 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   `adopt-secrets --apply` copies the three enrolled projects' secrets across once, never writing
   `projects.json`; `remove-repo-secret <repo>` is step 7's verb, per project, at his hand, and
   has NOT been run on any real repo. **Before either runs on the real box, install this build
-  where the shell finds `herdr-tg` (`~/.cargo/bin` and `~/.local/bin` both hold an older one) and
+  where the shell finds `herdr-tg` (`~/.cargo/bin` shadows `~/.local/bin` on PATH; both got this build on 6 September) and
   restart the hub on it**: an older `enroll` rewrites the repo's copy alone and leaves the
   channel's stale, and every new session then presents the stale one. The bridge answers "which
   conversation am I" by a four-term ladder (`attach.ts`) — told, bound (a link looked for on the
