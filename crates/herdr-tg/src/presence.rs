@@ -118,7 +118,7 @@ impl Presence {
                 .collect(),
         };
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
+            crate::conversations::private_state_dir(dir)?;
         }
         let tmp = self
             .path

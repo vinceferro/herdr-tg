@@ -116,7 +116,9 @@ export function typedWordsFact(run: string[] | null, opencodeUrl: string | null)
  */
 export function toolServerFact(c: Attachment, door: string | null, run: boolean): { ok: boolean; text: string; warn: boolean } | null {
   if (!door) return null
-  const gitDoor = doorDerivedFromGit(c)
+  // Under --run the child is handed the conversation attach was told; hand-started, a tool server
+  // working from git has only git, which never names a room.
+  const gitDoor = doorDerivedFromGit(c, run)
   if (!gitDoor) {
     if (run) return { ok: true, warn: false, text: 'a tool server here must be told the door, and a worker started with --run tells it' }
     return {
@@ -140,6 +142,16 @@ export function toolServerFact(c: Attachment, door: string | null, run: boolean)
       ok: true,
       warn: true,
       text: `the door was named by KICKOFF_HUB_RELAY_SOCKET, so a tool server that works one out from git would look for ${gitDoor}; give the engine the same KICKOFF_HUB_RELAY_SOCKET=${door}`,
+    }
+  }
+  if (c.conversation) {
+    // Told a conversation, hand-started: git names the folder's own conversation, never a room,
+    // so the two derive different doors — and "use the worktree's own name" would be a
+    // wild-goose chase, because the address may well be git's already.
+    return {
+      ok: false,
+      warn: true,
+      text: `a tool server that works out its door from git here would look for ${gitDoor}, the door of the conversation this folder is bound to and not of conversation ${c.conversation}; give the engine KICKOFF_HUB_CONVERSATION=${c.conversation}, or a config that names KICKOFF_HUB_RELAY_SOCKET=${door}`,
     }
   }
   return {

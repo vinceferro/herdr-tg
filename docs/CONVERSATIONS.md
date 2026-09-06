@@ -1,7 +1,63 @@
-<!-- PROPOSAL, 3 September 2026. NOT BUILT. No production code was changed to write this; every
-     file:line below was read at HEAD e2ec3fb and every measurement was taken on this box. It is one
-     design synthesised from four, and each idea taken from a proposal that was not the base names
-     the proposal it came from. -->
+<!-- PROPOSAL, 3 September 2026. No production code was changed to write this; every file:line
+     below was read at HEAD e2ec3fb and every measurement was taken on this box. It is one design
+     synthesised from four, and each idea taken from a proposal that was not the base names the
+     proposal it came from.
+
+     BUILT, 6 September 2026 — steps 0 to 6 of §5, and the deletion VERB of step 7; never step 7
+     itself on a real repo, and not step 8. The operator answered §7 as defaults a config line can
+     reverse, and the build follows them: (1) the space is the hub's existing state directory —
+     one home, no `HERDR_TG_CHANNEL_HOME`; (2) a dispatcher may name a room through the `title`
+     file, shape-refused as an address is; (3) the book is sixteen vacant slots per seed, refilled
+     only at a terminal; (4) nothing is returned to the book and nothing is pruned; (5) the
+     operator-facing word is "conversation" wherever it was "worktree"; (6) deleting a repo's
+     token is his hand, per project — `herdr-tg remove-repo-secret <repo>` — and the legacy walk
+     stays as the LAST term of the ladder, with the git guard at the enrol door.
+
+     What shipped, against the tree as it is (the file:lines below predate ten commits):
+       step 0  `crates/herdr-tg/src/conversations.rs` — the home and every tree under it 0700,
+               re-asserted; the seven bare `create_dir_all` sites of the state directory go
+               through `private_state_dir`. A conversation id is shape-refused at every door and
+               canonicalised containment is asserted immediately before every write.
+       step 1  `<state>/conversations/`, `by-repo/`, `grants/` — made by the terminal verbs.
+       step 2  `herdr-tg adopt-secrets [--apply]` — dry run by default, under the registry lock,
+               never through `Registry::enrol`, never writing `projects.json`, idempotent.
+       step 3  `herdr-tg open <repo>` and `herdr-tg grant <repo> --rooms N`, both refusing unless
+               a person is at the keyboard; `enrol` rewrites the secret where it already lives —
+               the channel's copy always, the repo's only where the repo holds one or nothing was
+               enrolled there before — with rollback, so a rotation after adoption cannot leave
+               the channel's copy stale and a rotation of an opened project puts no token back;
+               `open` on a row whose channel copy is STALE refuses naming `adopt-secrets --apply`
+               (or `enroll`, when the repo's is stale too) rather than saying "already open";
+               `grant` takes its slots and secrets back when the list cannot be saved, and sweeps
+               a vacant slot naming a room the list has never heard of; `disable`/`enable` by
+               repo path switch the SEED AND EVERY ROOM of it, and a room by its id alone (the
+               first build reached the seed alone, in silence); `allow`/`disallow` by path reach
+               the seed alone, because a room's people are its own.
+       step 4  one `display_title` for the three places that composed a name; it prefers the
+               `title` file and falls back to the registry's, and reads the file ONCE PER RUN —
+               the first time the name is composed — never again while the hub runs.
+       step 5  vacant rooms hidden from `/projects`, the terminal table and `--json` — told by
+               the id's shape and the missing topic, not by a flag: the hub on the box rewrites
+               the file on every topic bind with only the fields it knows.
+       step 6  the four-term ladder in `attach.ts`/`where.ts` (told — a path or a conversation —,
+               bound, legacy, then refuse naming a verb and never a path); the bound term looks
+               for the link on exactly the legacy walk, so a folder with no git or a project
+               opened below the top of a repository is found where `open` said it would be; the
+               relay's door keyed on the conversation, so two rooms get two doors and a project's
+               door does not move; `KICKOFF_HUB_CONVERSATION`, the ninth variable, pinned into a
+               `--run` child when attach was told one (and the token path blanked), because the
+               documented second-engine overlay blanks the path and never the conversation.
+     BEFORE `adopt-secrets --apply` OR `grant` ON THE REAL BOX: install this build wherever the
+     shell finds `herdr-tg` — both `~/.cargo/bin` and `~/.local/bin` hold one from before this
+     change — and restart the hub on it. An older `enroll` rewrites the repo's copy alone and
+     leaves the channel's stale, so every new session presents the stale one and is turned away
+     (`open` then refuses naming `adopt-secrets --apply`); an older hub greets a room under its
+     registry name and reads no title.
+     Deferred, on purpose: step 7 on any real repo, step 8 (`TOKEN_FILE`, the git guard, the
+     override flag, term 3, the 54 `.kickoff/hub.token` literals), media on rooms, the launcher,
+     a second bot, topic cleanup, an index. The wire: zero frames, as §4 says.
+     `docs/ATTACHING.md` §5 is the ladder as an adopter reads it; `docs/CAPABILITIES.md`
+     REQUIRES 1 is the promise, changed. -->
 
 # Conversations
 

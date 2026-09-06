@@ -17,6 +17,10 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
+// The channel's home, pointed at a directory of this run's own for every process spawned below,
+// so nothing under test reads the operator's real one.
+process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), 'kha-state-'))
+
 let failures = 0
 function check(what: string, ok: boolean, detail?: string): void {
   if (ok) {

@@ -59,7 +59,9 @@ export type WatcherConfig = {
    * the door authenticated with, so the door's defence-in-depth token check passes.
    */
   secretOf: () => Project | null
-  /** The directory to name in the "not enrolled" instruction. */
+  /** What to say when `secretOf` finds nothing: a verb, never a path. */
+  whenNotEnrolled: { why: string; note: string }
+  /** The directory the opencode server lists sessions for, and names in a developer's note. */
   projectDir: string
   /** Say something in this process's own transcript. The operator cannot see it; a developer can. */
   note: (msg: string) => void
@@ -163,16 +165,9 @@ export function startWatcher(cfg: WatcherConfig): void {
     identify() {
       const project = cfg.secretOf()
       if (!project) {
-        // Retried, NOT permanent. The documented recovery from "not enrolled" is to run
-        // `herdr-tg enroll` while the adapter is running.
-        return {
-          refuse: {
-            permanent: true,
-            why: `This project is not enrolled, so nothing from it reaches his phone. Run:  herdr-tg enroll ${cfg.projectDir}`,
-            note: `no secret for ${cfg.projectDir}. Run:  herdr-tg enroll ${cfg.projectDir}`,
-            retryMs: 30_000,
-          },
-        }
+        // Retried: the documented recovery from "not enrolled" is to open or enrol the project
+        // while the adapter is running. A verb, never a path: `attach.ts` says why.
+        return { refuse: { permanent: true, ...cfg.whenNotEnrolled, retryMs: 30_000 } }
       }
       return {
         socket: cfg.door,

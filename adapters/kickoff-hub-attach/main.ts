@@ -26,7 +26,7 @@
 import { chmodSync, mkdtempSync, rmSync } from 'fs'
 import { join } from 'path'
 
-import { readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
+import { notEnrolled, readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
 import { createRelay } from './relay.ts'
 import { runCheck } from './check.ts'
 import { runChild } from './run.ts'
@@ -150,7 +150,7 @@ function makePrivateDoor(): [string, string] {
 }
 
 // ── the door, opened ─────────────────────────────────────────────────────────────────────────────
-note(`speaking for ${CONFIG.projectDir}${CONFIG.address ? ` · ${CONFIG.address}` : ''}`)
+note(`speaking for ${CONFIG.conversation ? `conversation ${CONFIG.conversation} in ` : ''}${CONFIG.projectDir}${CONFIG.address ? ` · ${CONFIG.address}` : ''}`)
 note(`the door is ${door}`)
 // The split-brain named in words at start, not only by `--check`: when the door is not the one a
 // tool server would work out from git here, a config that derives its own looks for a door that
@@ -179,8 +179,9 @@ const relay = createRelay({
   hubSocket: CONFIG.hubSocket,
   graceMs: CONFIG.relayGraceMs,
   carrier: WATCHER_INSTANCE,
-  // Resolved AFRESH on every attempt: the operator may `herdr-tg enroll` while this runs.
+  // Resolved AFRESH on every attempt: the operator may `herdr-tg open` or `enroll` while this runs.
   secretOf: () => secretFor(CONFIG),
+  whenNotEnrolled: notEnrolled(CONFIG),
   note,
   die,
 })
@@ -202,20 +203,30 @@ function goodbye(): void {
 
 // ── the engine, as a child (only under --run) ────────────────────────────────────────────────────
 if (ARGS.run) {
-  // The eight namespace variables, every one set explicitly, so nothing is derived twice and nothing
+  // The nine namespace variables, every one set explicitly, so nothing is derived twice and nothing
   // is inherited from above. The engine inherits this, and the tool server it spawns inherits the
   // engine's — so a Claude plugin with no environment block of its own, and any adapter a stranger
   // writes, finds the door with no further configuration (§13.3).
   //
-  // The secret's path is the one attach was told OR the one it found: a lane worktree holds no
-  // secret of its own and attach finds the main tree's by the search, and a child that does not
-  // search (the stranger, §5) was refusing "no secret at <lane>/.kickoff/hub.token" while attach
-  // above it had just authenticated with that very file. Resolved here, at spawn time, as
-  // everywhere else; the child still reads the file on every dial of its own.
+  // The secret's path is the one attach was told OR the one it found — wherever the ladder found
+  // it, the channel's home included: a lane worktree holds no secret of its own and attach finds
+  // the main tree's, and a child that does not search (the stranger, §5) was refusing "no secret
+  // at <lane>/.kickoff/hub.token" while attach above it had just authenticated with that very
+  // file. Resolved here, at spawn time, as everywhere else; the child still reads the file on
+  // every dial of its own.
+  //
+  // EXCEPT when attach was told a conversation: then the conversation is what is pinned, and the
+  // path is "as if unset", because a child given both is refused as two answers to one question —
+  // and because the documented overlay for a second engine (§2) blanks the path and never the
+  // conversation. The first version pinned the path and blanked the conversation, so a tool
+  // server behind that overlay derived the SEED's door and read the SEED's secret, and every word
+  // of the room's agent landed in the seed's topic. The one variable an overlay must not blank is
+  // the one that has to carry the answer.
   const pinned: Record<string, string> = {
     KICKOFF_HUB_PROJECT_DIR: CONFIG.projectDir,
     KICKOFF_HUB_ADDRESS: CONFIG.address ?? '-',
-    KICKOFF_HUB_TOKEN_FILE: CONFIG.tokenFile ?? secretFor(CONFIG)?.tokenFile ?? '-',
+    KICKOFF_HUB_CONVERSATION: CONFIG.conversation ?? '-',
+    KICKOFF_HUB_TOKEN_FILE: CONFIG.conversation ? '-' : (CONFIG.tokenFile ?? secretFor(CONFIG)?.tokenFile ?? '-'),
     KICKOFF_HUB_SOCKET: CONFIG.hubSocket,
     KICKOFF_HUB_RELAY: '1',
     KICKOFF_HUB_RELAY_SOCKET: door,
@@ -255,6 +266,7 @@ function watcherConfig(url: string) {
     instance: WATCHER_INSTANCE!,
     opencodeUrl: url,
     secretOf: () => secretFor(CONFIG),
+    whenNotEnrolled: notEnrolled(CONFIG),
     projectDir: CONFIG.projectDir,
     note,
   }

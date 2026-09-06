@@ -14,11 +14,19 @@
  * could never find its secret passed every test it had.
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs'
+import { createHash } from 'crypto'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
+import { readConfig } from './attach.ts'
+
 const dir = mkdtempSync(join(tmpdir(), 'kc-'))
+// The channel's home, where a conversation's secret lives now: pointed at THIS run's directory for
+// every bridge below, so the plugin under test never reads the operator's real one — a real
+// `by-repo/` link for a real repo would otherwise be one hash away from a fixture.
+process.env.XDG_STATE_HOME = join(dir, 'xdg')
+const channelHome = join(dir, 'xdg', 'herdr-tg')
 const sock = join(dir, 'hub.sock')
 const repo = join(dir, 'repo')
 mkdirSync(join(repo, '.kickoff'), { recursive: true })
@@ -132,7 +140,7 @@ check('a question asked by an unenrolled session never claims his phone buzzed',
 check('it says in plain words that he was not asked',
   /not asked/i.test(askedInVain.text), askedInVain.text)
 check('it names the command that would fix it',
-  askedInVain.text.includes('herdr-tg enroll'), askedInVain.text)
+  /herdr-tg (open|enroll)/.test(askedInVain.text), askedInVain.text)
 check('and a failure nothing can mend on its own comes back as an error',
   askedInVain.isError, askedInVain.text)
 
@@ -789,8 +797,8 @@ for (let i = 0; i < 60 && !/worktree/.test(heldSaid.text); i++) {
   heldSaid = await call(heldBridge, 600 + i, 'reply', { text: 'anything' })
   await Bun.sleep(50)
 }
-check('a worktree told its link is already held is told WHICH thing is holding it',
-  /worktree/.test(heldSaid.text) && heldSaid.text.includes('lane-0902-201212-2783563'), heldSaid.text)
+check('a conversation told its link is already held is told WHICH thing is holding it, and never called a worktree',
+  /conversation/.test(heldSaid.text) && !/worktree/.test(heldSaid.text) && heldSaid.text.includes('lane-0902-201212-2783563'), heldSaid.text)
 heldBridge.child.kill()
 heldHub.stop()
 
@@ -1273,17 +1281,18 @@ check('a_session_that_named_no_conversation_is_never_told_to_remake_a_worktree',
 noName.child.kill()
 foldedRelay.stop()
 
-// The one refusal an agent reads that has to carry a command a person can run. Its two sources are
-// git's answer and a secret it just failed to find, so in a container — or any directory git will
-// not talk about — both are empty and what the agent read, and then repeated to the operator, was
-// the literal words "<the project folder>".
+// The one refusal an agent reads that has to carry a command a person can run. It used to carry a
+// folder — the top of the working tree, or the launch directory — and in a lane worktree that
+// folder was the worktree, so following the hint minted a SECOND project for the same repository
+// and moved a live conversation somewhere new on the phone. So it names the verb and never a
+// path: the person at the keyboard knows which folder, and the agent does not get to guess.
 const nowhere = join(dir, 'no-git-and-no-secret')
 mkdirSync(nowhere, { recursive: true })
 const unenrolled = startBridge({ KICKOFF_HUB_PROJECT_DIR: nowhere, KICKOFF_HUB_SOCKET: oneSock })
 await handshake(unenrolled)
 const unenrolledSaid = await call(unenrolled, 880, 'reply', { text: 'anything' })
-check('an_instruction_to_enrol_names_a_folder_even_where_git_cannot_answer',
-  unenrolledSaid.text.includes(`herdr-tg enroll ${nowhere}`) && !unenrolledSaid.text.includes('<the project folder>'),
+check('every_hint_an_agent_reads_names_a_verb_and_never_a_path',
+  /herdr-tg open/.test(unenrolledSaid.text) && !unenrolledSaid.text.includes(nowhere) && !unenrolledSaid.text.includes(dir),
   unenrolledSaid.text)
 unenrolled.child.kill()
 
@@ -1363,6 +1372,270 @@ check('a_new_bridge_told_of_no_outbox_sends_the_words_alone_and_says_the_file_di
   `${JSON.stringify(atOld ?? 'no say')} / ${toOld.text}`)
 newBridge.child.kill()
 noOutboxHub.stop()
+
+// ── Conversations: the ladder, the door, and the two doors two rooms get ──────────────────────
+//
+// A conversation is a row minted at a terminal whose secret lives in the channel's home, outside
+// every repo. A bridge answers "which conversation am I" in four terms, strict order: told
+// (KICKOFF_HUB_CONVERSATION), bound (the repo's own link), legacy (the walk to the repo's token),
+// nothing. Term 1 never falls through: a fall-through under a failed mount is a session speaking
+// as the wrong conversation.
+console.log('\nconversations:')
+
+const repoKey = (mainTop: string) => createHash('sha256').update(realpathSync(mainTop)).digest('hex').slice(0, 16)
+const seedIdOf = (mainTop: string) => `p-${createHash('sha256').update(realpathSync(mainTop)).digest('hex').slice(0, 12)}`
+const mint = (id: string, secret: string) => {
+  mkdirSync(join(channelHome, 'conversations', id), { recursive: true, mode: 0o700 })
+  writeFileSync(join(channelHome, 'conversations', id, 'secret'), secret, { mode: 0o600 })
+}
+const bind = (mainTop: string, id: string) => {
+  mkdirSync(join(channelHome, 'by-repo'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(channelHome, 'by-repo', repoKey(mainTop)), `${id}\n`, { mode: 0o600 })
+}
+const echoingHub = (path: string) => fakeHub(path, (h, s) =>
+  s.write(JSON.stringify({ v: 1, id: 'h-w', t: 'welcome', project: 'repo', ...(h.lane ? { lane: h.lane } : {}),
+    limits: { max_frame_bytes: 65536, per_minute: 20 } }) + '\n'))
+
+// A repository with a lane worktree and NO token anywhere in it: the shape of a repo opened with
+// `herdr-tg open`, or one whose repo copy was taken away.
+const cleanRepo = join(dir, 'clean')
+mkdirSync(cleanRepo, { recursive: true })
+const cleanGit = (...args: string[]) => {
+  const r = Bun.spawnSync(['git', '-C', cleanRepo, ...args], { stdout: 'ignore', stderr: 'ignore' })
+  if (r.exitCode !== 0) { console.log(`git ${args.join(' ')} failed`); process.exit(1) }
+}
+cleanGit('init', '-q')
+cleanGit('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'x')
+const cleanLane = join(dir, 'lane-0906-090000-1')
+cleanGit('worktree', 'add', '-q', cleanLane, '-b', 'lane/clean')
+const seedId = seedIdOf(cleanRepo)
+mint(seedId, 'c'.repeat(64))
+bind(cleanRepo, seedId)
+
+// Term 2, from a lane: the main tree's link, by construction, with no cross-boundary hop and no
+// token in any repo.
+const boundSock = join(dir, 'bound.sock')
+const boundHub = echoingHub(boundSock)
+const bound = startBridge({ CLAUDE_PROJECT_DIR: cleanLane, KICKOFF_HUB_SOCKET: boundSock })
+await handshake(bound)
+await until('a lane to find its conversation', () => boundHub.got.some(f => f.t === 'hello'))
+const boundHello = boundHub.got.find(f => f.t === 'hello')!
+check('a_session_in_a_lane_finds_the_conversation_its_main_tree_is_bound_to_with_no_token_in_any_repo',
+  boundHello.token === 'c'.repeat(64) && boundHello.lane === 'lane-0906-090000-1',
+  JSON.stringify({ token: boundHello.token?.slice(0, 4), lane: boundHello.lane }))
+bound.child.kill()
+boundHub.stop()
+
+// Term 3 still works: a repo with only its old token and nothing in the channel's home — the shape
+// of every repo on a box before `adopt-secrets` — attaches exactly as it always did.
+const legacySock = join(dir, 'legacy.sock')
+const legacyHub = echoingHub(legacySock)
+const legacy = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: legacySock })
+await handshake(legacy)
+await until('the legacy walk', () => legacyHub.got.some(f => f.t === 'hello'))
+check('the_legacy_walk_still_finds_a_repo_token_when_the_channel_holds_nothing_for_it',
+  legacyHub.got.find(f => f.t === 'hello')!.token === 'a'.repeat(64))
+legacy.child.kill()
+legacyHub.stop()
+
+// Term 1: a dispatcher names a ROOM, in a repo bound to its seed and holding a token besides. The
+// room's secret, and nothing else — the repo's link and the repo's token are both there to be
+// taken by mistake.
+const roomA = 'c-0a0a0a0a0a0a'
+const roomB = 'c-0b0b0b0b0b0b'
+mint(roomA, 'd'.repeat(64))
+mint(roomB, 'e'.repeat(64))
+writeFileSync(join(cleanRepo, '.kickoff-not-used'), '')
+const namedSock = join(dir, 'named.sock')
+const namedHub = echoingHub(namedSock)
+const named = startBridge({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_CONVERSATION: roomB, KICKOFF_HUB_SOCKET: namedSock })
+await handshake(named)
+await until('a named room', () => namedHub.got.some(f => f.t === 'hello'))
+const namedHello = namedHub.got.find(f => f.t === 'hello')!
+check('a_dispatcher_naming_a_conversation_gets_that_conversations_secret_and_nothing_else',
+  namedHello.token === 'e'.repeat(64) && !('lane' in namedHello),
+  JSON.stringify({ token: namedHello.token?.slice(0, 4), lane: namedHello.lane }))
+named.child.kill()
+namedHub.stop()
+
+// Term 1, set and unreadable: a permanent refusal, never a fall-through to the repo's link or its
+// token — both of which are RIGHT THERE and would attach this session as the seed.
+const unreadableSock = join(dir, 'unreadable.sock')
+const unreadableHub = echoingHub(unreadableSock)
+const unreadable = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_CONVERSATION: 'c-0c0c0c0c0c0c', KICKOFF_HUB_SOCKET: unreadableSock })
+await handshake(unreadable)
+const unreadableSaid = await call(unreadable, 900, 'reply', { text: 'anything' })
+await Bun.sleep(400)
+check('a_conversation_it_cannot_read_is_refused_and_never_falls_through',
+  !unreadableHub.got.some(f => f.t === 'hello') && unreadableSaid.isError && unreadableSaid.text.includes('c-0c0c0c0c0c0c'),
+  `${unreadableHub.got.length} frames at the hub; ${unreadableSaid.text}`)
+check('and the refusal names a verb and never a path',
+  /herdr-tg (open|grant)/.test(unreadableSaid.text) && !unreadableSaid.text.includes(dir),
+  unreadableSaid.text)
+unreadable.child.kill()
+unreadableHub.stop()
+
+// A conversation id becomes a path segment. Refused at the door, naming the variable, before a
+// path is joined and before anything is dialled.
+for (const bad of ['../../etc', 'p-0123456789AB', 'c-0123456789a', 'p-0123456789ab/secret', 'room-3']) {
+  const badSock = join(dir, `bad-${bad.replace(/[^a-z0-9]/g, '_')}.sock`)
+  const badHub = echoingHub(badSock)
+  const badBridge = startBridge({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_CONVERSATION: bad, KICKOFF_HUB_SOCKET: badSock })
+  await handshake(badBridge)
+  const badSaid = await call(badBridge, 910, 'reply', { text: 'anything' })
+  await Bun.sleep(150)
+  check(`a_conversation_id_that_is_not_a_valid_segment_is_refused_at_every_door (${JSON.stringify(bad)})`,
+    badHub.got.length === 0 && badSaid.isError && badSaid.text.includes('KICKOFF_HUB_CONVERSATION'),
+    `${badHub.got.length} frames at the hub; ${badSaid.text}`)
+  badBridge.child.kill()
+  badHub.stop()
+}
+
+// Told the secret's path AND a conversation: two answers to one question, refused rather than
+// one silently outranking the other.
+{
+  const r = readConfig({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_CONVERSATION: roomA,
+    KICKOFF_HUB_TOKEN_FILE: join(repo, '.kickoff', 'hub.token'), HOME: process.env.HOME, XDG_STATE_HOME: process.env.XDG_STATE_HOME })
+  check('a_session_told_both_a_secret_path_and_a_conversation_is_refused_rather_than_guessed',
+    'problem' in r && r.problem.note.includes('KICKOFF_HUB_TOKEN_FILE') && r.problem.note.includes('KICKOFF_HUB_CONVERSATION'),
+    'problem' in r ? r.problem.note : 'attached')
+}
+
+// The relay's door is keyed on the CONVERSATION, so two rooms in one repo get two doors — where a
+// door keyed on the repo gave both the same one and the second room's opencode path was dead the
+// first time the feature was used for what it is for. And a project's door does not move when it
+// crosses from the legacy walk to the repo's link, because the link names the very id the
+// registry's own formula mints.
+{
+  const relayDir = join(dir, 'fanin')
+  const env = (extra: Record<string, string>) => ({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_RELAY_DIR: relayDir,
+    HOME: process.env.HOME, XDG_STATE_HOME: process.env.XDG_STATE_HOME, ...extra })
+  const door = (extra: Record<string, string>) => { const r = readConfig(env(extra)); return 'config' in r ? r.config.relaySocket : `refused: ${r.problem.note}` }
+  const doorA = door({ KICKOFF_HUB_CONVERSATION: roomA })
+  const doorB = door({ KICKOFF_HUB_CONVERSATION: roomB })
+  const doorA2 = door({ KICKOFF_HUB_CONVERSATION: roomA })
+  check('the_relay_door_is_keyed_on_the_conversation_and_two_rooms_get_two_doors',
+    typeof doorA === 'string' && doorA.startsWith(relayDir) && doorA !== doorB && doorA === doorA2,
+    `${doorA} / ${doorB}`)
+  // The seed's door: by its link today, and by the registry's own formula when the link is gone —
+  // the same door either way.
+  const byLink = door({})
+  rmSync(join(channelHome, 'by-repo', repoKey(cleanRepo)))
+  const byFormula = door({})
+  bind(cleanRepo, seedId)
+  check('a_projects_door_does_not_move_when_it_crosses_from_the_legacy_walk_to_the_repos_link',
+    byLink === byFormula && byLink !== doorA,
+    `${byLink} / ${byFormula}`)
+  // And a room's door stands beside the seed's, in the same lane namespace: a lane of the room is
+  // not a lane of the seed.
+  const laneOfRoom = door({ KICKOFF_HUB_CONVERSATION: roomA, KICKOFF_HUB_ADDRESS: 'engineering' })
+  const laneOfSeed = door({ KICKOFF_HUB_ADDRESS: 'engineering' })
+  check('a_lane_of_a_room_is_not_a_lane_of_its_seed', laneOfRoom !== laneOfSeed && laneOfRoom !== doorA, `${laneOfRoom} / ${laneOfSeed}`)
+  // A checkout reached through a symlinked parent is the same conversation: the hub hashes the
+  // canonical path, so the link is resolved before hashing on this side too — the same door, and
+  // the same secret. Never another project's: the worst a mismatch can do is fall to the legacy
+  // walk, which is bounded to this repository.
+  const { symlinkSync } = await import('fs')
+  const viaLink = join(dir, 'link-to-clean')
+  symlinkSync(cleanRepo, viaLink)
+  const throughLink = door({ KICKOFF_HUB_PROJECT_DIR: viaLink })
+  const linkedRead = readConfig(env({ KICKOFF_HUB_PROJECT_DIR: viaLink }))
+  const linkedSecret = 'config' in linkedRead ? (await import('./attach.ts')).secretFor(linkedRead.config) : null
+  check('a_checkout_reached_through_a_symlinked_parent_is_the_same_conversation_and_never_another',
+    throughLink === byLink && linkedSecret?.token === 'c'.repeat(64) && linkedSecret?.conversation === seedId,
+    `${throughLink} / ${byLink} / ${JSON.stringify(linkedSecret && { how: linkedSecret.how, conversation: linkedSecret.conversation })}`)
+}
+
+// The link is keyed on the folder the operator OPENED, and the bridge looked it up by git's main
+// working tree alone — so a folder with no git, or a project opened below the top of a repository,
+// was never found, while `open` had just said a session there would find it on its own. The bound
+// term walks exactly where the legacy walk went: upward from the launch directory to the top of the
+// working tree, the one crossing to the main tree, and with no git the named directory alone.
+{
+  const plain = join(dir, 'plain-folder')
+  mkdirSync(plain, { recursive: true })
+  const plainId = seedIdOf(plain)
+  mint(plainId, 'f'.repeat(64))
+  bind(plain, plainId)
+  const plainSock = join(dir, 'plain.sock')
+  const plainHub = echoingHub(plainSock)
+  const plainBridge = startBridge({ KICKOFF_HUB_PROJECT_DIR: plain, KICKOFF_HUB_SOCKET: plainSock })
+  await handshake(plainBridge)
+  await until('a folder with no git to find its link', () => plainHub.got.some(f => f.t === 'hello'), 4000).catch(() => {})
+  check('a_folder_with_no_git_opened_at_a_terminal_attaches_through_its_link',
+    plainHub.got.find(f => f.t === 'hello')?.token === 'f'.repeat(64),
+    `${plainHub.got.length} frames at the hub`)
+  plainBridge.child.kill()
+  plainHub.stop()
+
+  // A project opened below the top of a repository is found from its own folder and everything
+  // under it; the top of the repository, bound to a conversation of its own, is untouched.
+  const sub = join(cleanRepo, 'packages', 'app')
+  mkdirSync(join(sub, 'src'), { recursive: true })
+  const subId = seedIdOf(sub)
+  mint(subId, '9'.repeat(64))
+  bind(sub, subId)
+  const subSock = join(dir, 'sub.sock')
+  const subHub = echoingHub(subSock)
+  const subBridge = startBridge({ KICKOFF_HUB_PROJECT_DIR: join(sub, 'src'), KICKOFF_HUB_SOCKET: subSock })
+  await handshake(subBridge)
+  await until('a subfolder project to find its link', () => subHub.got.some(f => f.t === 'hello'), 4000).catch(() => {})
+  const topSock = join(dir, 'top.sock')
+  const topHub = echoingHub(topSock)
+  const topBridge = startBridge({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_SOCKET: topSock })
+  await handshake(topBridge)
+  await until('the repository top to find its own link', () => topHub.got.some(f => f.t === 'hello'), 4000).catch(() => {})
+  check('a_project_opened_below_the_top_of_a_repository_is_found_from_its_own_folder_and_never_from_the_top',
+    subHub.got.find(f => f.t === 'hello')?.token === '9'.repeat(64) &&
+      topHub.got.find(f => f.t === 'hello')?.token === 'c'.repeat(64),
+    `below: ${subHub.got.find(f => f.t === 'hello')?.token?.slice(0, 4)}; top: ${topHub.got.find(f => f.t === 'hello')?.token?.slice(0, 4)}`)
+  subBridge.child.kill()
+  topBridge.child.kill()
+  subHub.stop()
+  topHub.stop()
+  // And the door a relay derives here is keyed on the subfolder project's own conversation.
+  const subRead = readConfig({ KICKOFF_HUB_PROJECT_DIR: join(sub, 'src'), KICKOFF_HUB_RELAY_DIR: join(dir, 'fanin'),
+    HOME: process.env.HOME, XDG_STATE_HOME: process.env.XDG_STATE_HOME })
+  check('and_the_door_is_keyed_on_the_conversation_the_folder_is_bound_to',
+    'config' in subRead && subRead.config.conversationKey === subId,
+    'config' in subRead ? String(subRead.config.conversationKey) : subRead.problem.note)
+}
+
+// A secret the channel keeps that the hub refuses — a stale copy left by a rotation typed with a
+// herdr-tg from before conversations existed — arrives as `unknown_project`, and the sentence sent
+// the agent to `open`, which says "already open". The verb that mends it is adopt-secrets, and for
+// a room there is no folder to enrol at all.
+{
+  const refusing = (path: string) => fakeHub(path, (_h, s) => {
+    s.write(JSON.stringify({ v: 1, id: 'r', t: 'refused', reason: 'unknown_project' }) + '\n')
+    s.end()
+  })
+  const staleSock = join(dir, 'stale.sock')
+  const staleHub = refusing(staleSock)
+  const stale = startBridge({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_SOCKET: staleSock })
+  await handshake(stale)
+  await until('the refusal', () => staleHub.got.some(f => f.t === 'hello'), 4000).catch(() => {})
+  await Bun.sleep(300)
+  const staleSaid = await call(stale, 890, 'reply', { text: 'anything' })
+  check('a_bound_secret_the_hub_refuses_names_the_verb_that_copies_the_current_one_across',
+    /adopt-secrets --apply/.test(staleSaid.text) && !staleSaid.text.includes(dir),
+    staleSaid.text)
+  stale.child.kill()
+  staleHub.stop()
+
+  const staleRoomSock = join(dir, 'stale-room.sock')
+  const staleRoomHub = refusing(staleRoomSock)
+  const staleRoom = startBridge({ KICKOFF_HUB_PROJECT_DIR: cleanRepo, KICKOFF_HUB_CONVERSATION: roomA, KICKOFF_HUB_SOCKET: staleRoomSock })
+  await handshake(staleRoom)
+  await until('the refusal', () => staleRoomHub.got.some(f => f.t === 'hello'), 4000).catch(() => {})
+  await Bun.sleep(300)
+  const staleRoomSaid = await call(staleRoom, 891, 'reply', { text: 'anything' })
+  check('a_named_rooms_secret_the_hub_refuses_names_the_room_and_the_grant_and_never_an_enrolment',
+    staleRoomSaid.text.includes(roomA) && /herdr-tg grant/.test(staleRoomSaid.text) && !/herdr-tg enroll/.test(staleRoomSaid.text),
+    staleRoomSaid.text)
+  staleRoom.child.kill()
+  staleRoomHub.stop()
+}
 
 rmSync(dir, { recursive: true, force: true })
 console.log(`\n${failures === 0 ? 'all checks passed' : `${failures} FAILED`}`)

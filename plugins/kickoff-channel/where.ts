@@ -11,7 +11,8 @@
  * MACHINE says once a directory has been named.
  */
 
-import { readFileSync, existsSync } from 'fs'
+import { createHash } from 'crypto'
+import { readFileSync, existsSync, lstatSync, realpathSync } from 'fs'
 import { dirname, join, resolve } from 'path'
 
 /** Ask git one question about a directory, or null when it will not answer. */
@@ -78,9 +79,14 @@ export type Facts = {
 /** Read repo and lane off the machine, for a directory something was launched in. */
 export function factsFor(launchedIn: string | null): Facts {
   if (!launchedIn) return { projectTop: null, mainTop: null, lane: null }
-  const projectTop = gitDir(launchedIn, '--show-toplevel')
+  // Both through every link before they are compared. git answers `--show-toplevel` with the REAL
+  // path and `--git-common-dir` relative to the directory it was asked about, so a main tree
+  // reached through a symlinked parent compared unequal to itself and was taken for a linked
+  // worktree — with a lane named after the link, a door of its own, and a topic of its own.
+  const top = gitDir(launchedIn, '--show-toplevel')
+  const projectTop = top ? realPath(top) : null
   const common = gitDir(launchedIn, '--git-common-dir')
-  const mainTop = common ? dirname(common) : null
+  const mainTop = common ? realPath(dirname(common)) : null
   let lane: string | null = null
   if (projectTop && mainTop && projectTop !== mainTop) {
     const own = gitDir(projectTop, '--git-dir')
@@ -91,7 +97,147 @@ export function factsFor(launchedIn: string | null): Facts {
 }
 
 /** The enrolled project a directory belongs to, or null when it is not inside one. */
-export type Project = { repo: string; tokenFile: string; token: string }
+export type Project = {
+  repo: string
+  tokenFile: string
+  token: string
+  /** The conversation the secret was read for, when it came from the channel's home. */
+  conversation?: string
+  /**
+   * Which term of the ladder found it: told a path, named a conversation, bound by the repo's
+   * own link, or the legacy walk to the repo's token. For a line a person reads; nothing routes
+   * on it.
+   */
+  how?: 'told' | 'named' | 'bound' | 'legacy'
+}
+
+/**
+ * The shape a conversation id has — `p-` and twelve hex characters for a project minted from its
+ * repo path, `c-` and twelve for a room — and the ONLY string this file joins onto a path. An id
+ * becomes a directory name under the channel's home, so anything else is refused before a path
+ * exists: not a dot, not a slash, not an uppercase digit.
+ */
+export const CONVERSATION_ID = /^[pc]-[0-9a-f]{12}$/
+export const isConversationId = (s: string): boolean => CONVERSATION_ID.test(s)
+
+/**
+ * The channel's home: the hub's own state directory, `$XDG_STATE_HOME/herdr-tg` or
+ * `$HOME/.local/state/herdr-tg` — the same derivation the hub makes, so the two cannot disagree
+ * about where a conversation's secret is. One home, not two.
+ */
+export function channelHome(xdgStateHome: string | undefined, home: string | undefined): string | null {
+  if (xdgStateHome && xdgStateHome.length) return join(xdgStateHome, 'herdr-tg')
+  if (home && home.length) return join(home, '.local', 'state', 'herdr-tg')
+  return null
+}
+
+/** The `by-repo` key for a repository: sixteen hex characters of the SHA-256 of its real path. */
+function repoKey(mainTop: string): string {
+  return createHash('sha256').update(realPath(mainTop)).digest('hex').slice(0, 16)
+}
+
+/**
+ * The id the hub's own registry mints for a repository: `p-` and twelve hex characters of the
+ * same hash the link is keyed on. It is what the repo's link names for every project adopted or
+ * opened, so a relay keyed on it gets the same door whether the link is there yet or not.
+ */
+export function seedIdOf(mainTop: string): string {
+  return `p-${createHash('sha256').update(realPath(mainTop)).digest('hex').slice(0, 12)}`
+}
+
+/**
+ * The real path, through every link — because the hub hashes the CANONICAL path and a checkout
+ * reached through a symlinked parent would otherwise miss its own link and fall to the legacy
+ * walk (fails closed: the same project or nothing, never another). The string as given when the
+ * filesystem will not say.
+ */
+function realPath(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+
+/**
+ * The conversation ONE directory is bound to, by the link the channel wrote — or null when there
+ * is no link, or the link names something that is not a conversation id.
+ */
+export function boundConversation(home: string, dir: string): string | null {
+  const id = readSecret(join(home, 'by-repo', repoKey(dir)))
+  return id && isConversationId(id) ? id : null
+}
+
+/**
+ * The conversation a launch directory is bound to, and the folder whose link named it.
+ *
+ * A link is keyed on the folder the operator OPENED, and that is routinely not the top of the
+ * repository: a folder with no git at all, or a project opened below the top of a monorepo. The
+ * first version looked the link up by git's main working tree alone, so neither was ever found —
+ * while `open` had just told the operator a session there would find it on its own — and a
+ * project that had its repo copy taken away would have gone off the air with no sentence saying
+ * why. So this walks exactly where the legacy walk to `.kickoff/hub.token` went, and finds a link
+ * wherever a token could have been: upward from the launch directory to the top of the working
+ * tree, then the one legal crossing to the main working tree, and with no git the named directory
+ * alone. Two sibling projects opened in one repository stay distinct, because the walk stops at
+ * the first link it meets.
+ */
+export function boundConversationFor(home: string, launchedIn: string, facts: Facts): { id: string; repo: string } | null {
+  let dir = realPath(resolve(launchedIn))
+  const top = facts.projectTop
+  for (;;) {
+    const id = boundConversation(home, dir)
+    if (id) return { id, repo: dir }
+    if (!top || dir === top) break
+    const up = dirname(dir)
+    if (up === dir) break
+    dir = up
+  }
+  if (facts.mainTop && facts.mainTop !== top) {
+    const id = boundConversation(home, facts.mainTop)
+    if (id) return { id, repo: facts.mainTop }
+  }
+  return null
+}
+
+/**
+ * The folder the legacy walk would find a token in, WITHOUT reading it — for keying a door on the
+ * project the registry minted for that folder before its link exists. Null when no token is on the
+ * walk.
+ */
+export function legacyTokenFolder(launchedIn: string, facts: Facts): string | null {
+  let dir = realPath(resolve(launchedIn))
+  const top = facts.projectTop
+  for (;;) {
+    if (existsSync(join(dir, '.kickoff', 'hub.token'))) return dir
+    if (!top || dir === top) break
+    const up = dirname(dir)
+    if (up === dir) break
+    dir = up
+  }
+  if (facts.mainTop && facts.mainTop !== top && existsSync(join(facts.mainTop, '.kickoff', 'hub.token'))) {
+    return facts.mainTop
+  }
+  return null
+}
+
+/**
+ * The secret of one conversation, read from the channel's home — or null when there is none
+ * readable there. The id is shape-checked HERE, immediately before it becomes a path segment,
+ * and the file is refused when it is a link: a credential read through a link out of the tree is
+ * one nobody minted there.
+ */
+export function conversationSecret(home: string, id: string): { tokenFile: string; token: string } | null {
+  if (!isConversationId(id)) return null
+  const tokenFile = join(home, 'conversations', id, 'secret')
+  try {
+    if (lstatSync(tokenFile).isSymbolicLink()) return null
+  } catch {
+    return null
+  }
+  const token = readSecret(tokenFile)
+  return token ? { tokenFile, token } : null
+}
 
 /**
  * Find the enrolled project this session is inside.
@@ -122,7 +268,7 @@ function searchUpward(from: string, top: string | null): Project | null {
   for (;;) {
     const tokenFile = join(dir, '.kickoff', 'hub.token')
     const token = readSecret(tokenFile)
-    if (token) return { repo: dir, tokenFile, token }
+    if (token) return { repo: dir, tokenFile, token, how: 'legacy' }
     if (!top || dir === top) return null
     const up = dirname(dir)
     if (up === dir) return null

@@ -117,7 +117,9 @@ impl HubLock {
             source,
         };
 
-        std::fs::create_dir_all(state_dir).map_err(io_err)?;
+        // 0700 from the first touch, not from history: this is the first thing `serve` makes on a
+        // fresh box, and every credential the channel keeps lives under it.
+        crate::conversations::private_state_dir(state_dir).map_err(io_err)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)

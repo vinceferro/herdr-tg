@@ -139,6 +139,52 @@ console.log('\nwhat the child inherits:')
   hub.stop()
 }
 
+// ── D2. the child of a ROOM inherits the conversation, and the overlay of §2 cannot lose it ────
+//
+// attach pinned `KICKOFF_HUB_CONVERSATION=-` and carried a room's identity only in the token path,
+// and the documented second-engine overlay (ATTACHING §2) blanks the token path with `-` and never
+// touches the ninth variable — so a tool server behind that overlay derived the SEED's door and
+// read the SEED's secret, and every word of the room's agent landed in the seed's topic. The one
+// variable an overlay must not blank is the one that has to carry the answer.
+console.log('\nwhat the child of a room inherits:')
+{
+  const xdg = join(dir, 'd2-xdg')
+  const room = 'c-0d0d0d0d0d0d'
+  mkdirSync(join(xdg, 'herdr-tg', 'conversations', room), { recursive: true, mode: 0o700 })
+  writeFileSync(join(xdg, 'herdr-tg', 'conversations', room, 'secret'), 'r'.repeat(64), { mode: 0o600 })
+  const hubSock = join(dir, 'd2-hub.sock')
+  const hub = claimingHub(hubSock)
+  const relayDir = join(dir, 'd2-fanin')
+  const r = startRun(
+    { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: relayDir, KICKOFF_HUB_CONVERSATION: room, XDG_STATE_HOME: xdg },
+    ['sh', '-c', 'env | grep ^KICKOFF_HUB_'],
+  )
+  await r.child.exited
+  await Bun.sleep(50)
+  const env: Record<string, string> = {}
+  for (const l of r.out().split('\n')) {
+    const eq = l.indexOf('=')
+    if (l.startsWith('KICKOFF_HUB_') && eq > 0) env[l.slice(0, eq)] = l.slice(eq + 1)
+  }
+  check('the_run_child_of_a_room_inherits_the_conversation_and_no_path_to_a_secret',
+    env.KICKOFF_HUB_CONVERSATION === room && env.KICKOFF_HUB_TOKEN_FILE === '-',
+    JSON.stringify(env))
+  // The §2 overlay on top of the pinned environment, as opencode applies it. The relay directory
+  // is kept rather than blanked only so the two doors are comparable: attach was told one for
+  // this test, where the unit and the overlay both take the default.
+  const { readConfig, secretFor } = await import('../../plugins/kickoff-channel/attach.ts')
+  const overlaid = { ...env, KICKOFF_HUB_PROJECT_DIR: '.', KICKOFF_HUB_RELAY: '1', KICKOFF_HUB_ADDRESS: '-',
+    KICKOFF_HUB_TOKEN_FILE: '-', KICKOFF_HUB_SOCKET: '-', KICKOFF_HUB_RELAY_SOCKET: '-', KICKOFF_HUB_RELAY_DIR: relayDir,
+    KICKOFF_HUB_RELAY_GRACE_MS: '-', CLAUDE_PROJECT_DIR: '', XDG_STATE_HOME: xdg, HOME: process.env.HOME }
+  const read = readConfig(overlaid, repo)
+  const secret = 'config' in read ? secretFor(read.config) : null
+  check('and_behind_the_documented_overlay_a_tool_server_derives_the_rooms_door_and_reads_the_rooms_secret',
+    'config' in read && read.config.relaySocket === env.KICKOFF_HUB_RELAY_SOCKET &&
+      secret?.token === 'r'.repeat(64) && secret?.conversation === room,
+    `door ${'config' in read ? read.config.relaySocket : read.problem.note} vs ${env.KICKOFF_HUB_RELAY_SOCKET}; secret ${JSON.stringify(secret && { how: secret.how, conversation: secret.conversation, token: secret.token.slice(0, 4) })}`)
+  hub.stop()
+}
+
 // ── E. the stranger, as the engine attach starts, with no git and no door named ───────────────
 console.log('\nthe stranger written from the document alone, as the engine:')
 {

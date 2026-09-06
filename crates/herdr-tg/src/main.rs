@@ -37,6 +37,7 @@
 mod bot;
 mod cmd;
 mod config;
+mod conversations;
 mod heartbeat;
 mod hub;
 mod lock;
@@ -178,6 +179,59 @@ enum Cmd {
         even_if_git_would_commit_it: bool,
     },
 
+    /// Open a project as a conversation, writing nothing into its repo.
+    ///
+    /// The newer door. The secret lands where the channel keeps one — under the hub's own state
+    /// directory, outside every repository — so there is nothing in the working tree for git to
+    /// commit. The row is the one `enroll` would mint for the same folder, so the two doors
+    /// agree about which project a repo is. Opening it again changes nothing; rotation is
+    /// `enroll`'s job, and on an opened project it writes nothing into the repo either.
+    /// Terminal-only, and it asks for a person at the keyboard.
+    Open {
+        /// The project's own directory.
+        repo: PathBuf,
+    },
+
+    /// Grant a project rooms: complete conversations of its own, each with its own secret and
+    /// its own topic, vacant until a dispatcher starts something as one.
+    ///
+    /// A room is a sibling of its seed, in the seed's repo, with no folder of its own. Sixteen
+    /// may be vacant at once; a taken room is spent, never recycled. A dispatcher takes a room
+    /// by renaming its slot in the book and handing the room's id to what it starts. Terminal-only.
+    Grant {
+        /// The seed's own directory, as it was enrolled.
+        repo: PathBuf,
+        /// How many rooms to add to the book.
+        #[arg(long, default_value = "1")]
+        rooms: usize,
+    },
+
+    /// Copy every enrolled project's secret to where the channel keeps one. Dry run by default.
+    ///
+    /// The migration, once per box. Reads each repo's `.kickoff/hub.token`, copies the same bytes
+    /// under the hub's state directory, and links the repo to its row. Writes nothing to the list
+    /// of projects and touches no service; the repo's copy stays where it is until
+    /// `remove-repo-secret` takes it, per project. Safe to run twice.
+    #[command(name = "adopt-secrets")]
+    AdoptSecrets {
+        /// Write the copies. Without this, only say what would be written.
+        #[arg(long)]
+        apply: bool,
+    },
+
+    /// Remove a project's secret from its repo, once the channel provably holds the same bytes.
+    ///
+    /// The first irreversible step, per project, at your hand. Refused until the channel's copy
+    /// is there, is 0600, matches the repo's byte for byte, and the repo is linked to its row. A
+    /// bridge from before conversations existed reads the repo's copy on every redial, so a live
+    /// session started before this ran will be turned away on its next redial until it is
+    /// restarted; the way back is `enroll`, which writes both places again.
+    #[command(name = "remove-repo-secret")]
+    RemoveRepoSecret {
+        /// The project's own directory, as it was enrolled.
+        repo: PathBuf,
+    },
+
     /// Every enrolled project, and whether it has a topic yet.
     ///
     /// `--json` is the read-only inventory another org's dispatcher reads topic ids from: one
@@ -195,24 +249,26 @@ enum Cmd {
         json: bool,
     },
 
-    /// Switch an enrolled project off: its bridge is turned away, and one already connected is
-    /// dropped. Its topic and its history stay.
+    /// Switch an enrolled project off — the project and every room of it: their bridges are
+    /// turned away, and any already connected are dropped. Topics and history stay.
     ///
     /// Terminal-only, like enrolment: no message and no frame can do this. When one project of
     /// fourteen is loud and all of them share one chat's twenty messages a minute, this is the
-    /// lever — and it stops a live bridge, not only the next one.
+    /// lever — and it stops a live bridge, not only the next one. Given a room's id instead of a
+    /// folder, it switches that one room and nothing else.
     Disable {
-        /// The project's own directory, as it was enrolled.
+        /// The project's own directory, as it was enrolled — or one room's id, for that room alone.
         repo: PathBuf,
     },
 
-    /// Switch a project back on. Its bridge is admitted the next time it dials.
+    /// Switch a project back on — the project and every room of it, or one room by its id. A
+    /// bridge is admitted the next time it dials.
     Enable {
-        /// The project's own directory, as it was enrolled.
+        /// The project's own directory, as it was enrolled — or one room's id, for that room alone.
         repo: PathBuf,
     },
 
-    /// Let a person speak in one project's conversations: its topic, and its worktrees' topics.
+    /// Let a person speak in one project's conversations: its topic, and its lanes' topics.
     ///
     /// Terminal-only, like enrolment: no message, no tap and no command can do this. The person
     /// is heard within about a second, with no restart. He may type at that project's agents and
@@ -310,6 +366,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             repo,
             even_if_git_would_commit_it,
         } => cmd::enroll::enrol(&repo, even_if_git_would_commit_it),
+        Cmd::Open { repo } => cmd::conversations::open(&repo),
+        Cmd::Grant { repo, rooms } => cmd::conversations::grant(&repo, rooms),
+        Cmd::AdoptSecrets { apply } => cmd::conversations::adopt_secrets(apply),
+        Cmd::RemoveRepoSecret { repo } => cmd::conversations::remove_repo_secret(&repo),
         Cmd::Projects { json } => cmd::projects::projects(json),
         Cmd::Disable { repo } => cmd::enroll::switch(&repo, false),
         Cmd::Enable { repo } => cmd::enroll::switch(&repo, true),

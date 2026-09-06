@@ -2161,6 +2161,9 @@ async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {
         .arg("server.ts")
         .current_dir(&plugin)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The channel's home, pointed at this harness's own directory: the plugin under test must
+        // never read the operator's real one, where a real `by-repo/` link is one hash away.
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
         // Byte for byte how Claude Code starts it: cwd is the plugin, and the project is named only
         // here. The socket is the one thing a tempdir harness cannot help overriding.
         .env("CLAUDE_PROJECT_DIR", &repo)
@@ -2504,6 +2507,9 @@ async fn the_real_plugin_finds_its_project_in_the_directory_claude_code_names_an
         .arg("server.ts")
         .current_dir(&plugin)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The channel's home, pointed at this harness's own directory: the plugin under test must
+        // never read the operator's real one, where a real `by-repo/` link is one hash away.
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
         .env("CLAUDE_PROJECT_DIR", &repo)
         // Without this, a FAILING assertion below leaks the bun process, which keeps the inherited
         // stderr pipe open and leaves `cargo test` waiting on it forever. A red test has to be able
@@ -2583,6 +2589,9 @@ async fn the_real_plugin_finds_its_project_when_the_session_started_in_a_folder_
         .arg("server.ts")
         .current_dir(&plugin)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The channel's home, pointed at this harness's own directory: the plugin under test must
+        // never read the operator's real one, where a real `by-repo/` link is one hash away.
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
         // The one difference from the test above, and the whole point of this one.
         .env("CLAUDE_PROJECT_DIR", &deep)
         .kill_on_drop(true)
@@ -2691,6 +2700,9 @@ async fn the_real_plugin_finds_its_project_from_inside_a_lane_worktree_of_it() {
         .arg("server.ts")
         .current_dir(&plugin)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The channel's home, pointed at this harness's own directory: the plugin under test must
+        // never read the operator's real one, where a real `by-repo/` link is one hash away.
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
         // The one difference from the tests above: the session started in the LANE.
         .env("CLAUDE_PROJECT_DIR", &lane)
         .kill_on_drop(true)
@@ -4644,6 +4656,9 @@ async fn the_real_plugin_gives_two_worktrees_of_one_folder_name_two_conversation
             .arg("server.ts")
             .current_dir(&plugin)
             .env("KICKOFF_HUB_SOCKET", &h.sock)
+            // The channel's home, pointed at this harness's own directory: the plugin under test must
+            // never read the operator's real one, where a real `by-repo/` link is one hash away.
+            .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
             .env("CLAUDE_PROJECT_DIR", &tree)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
@@ -5655,9 +5670,7 @@ async fn a_project_switched_off_at_the_terminal_loses_its_live_connection_now() 
     // The operator, at a terminal, in a process of his own: a second handle on the same file.
     let repo = h.dir.path().join("herdr-tg");
     let mut at_the_terminal = Registry::load(h.dir.path().join("projects.json"));
-    at_the_terminal
-        .set_enabled(&repo, false)
-        .expect("switches off");
+    at_the_terminal.switch(&repo, false).expect("switches off");
 
     // The bridge is told why — with the reason it already knows how to put into words — and then
     // the socket ends, exactly as if it had dialled a switched-off project fresh.
@@ -5715,9 +5728,7 @@ async fn a_project_switched_off_at_the_terminal_loses_its_live_connection_now() 
     );
 
     // Switched back on at the terminal, the next dial is admitted: off is a state, not a grave.
-    at_the_terminal
-        .set_enabled(&repo, true)
-        .expect("switches on");
+    at_the_terminal.switch(&repo, true).expect("switches on");
     let mut back = FakeBridge::connect(&h.sock, &h.secret, "i3", h.project.as_str()).await;
     assert!(
         matches!(
@@ -5758,7 +5769,7 @@ async fn a_switched_off_project_stops_posting_at_once_rather_than_draining_its_b
 
     let repo = h.dir.path().join("herdr-tg");
     Registry::load(h.dir.path().join("projects.json"))
-        .set_enabled(&repo, false)
+        .switch(&repo, false)
         .expect("switches off");
     let thrown_at = std::time::Instant::now();
 
@@ -5826,6 +5837,9 @@ async fn a_bridge_told_its_project_is_off_relays_the_reason_in_plain_words_throu
         .arg("server.ts")
         .current_dir(&plugin)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The channel's home, pointed at this harness's own directory: the plugin under test must
+        // never read the operator's real one, where a real `by-repo/` link is one hash away.
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
         .env("CLAUDE_PROJECT_DIR", &repo)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
@@ -5870,7 +5884,7 @@ async fn a_bridge_told_its_project_is_off_relays_the_reason_in_plain_words_throu
     until(async || h.fake.sends.lock().await.len() >= 3).await;
 
     Registry::load(h.dir.path().join("projects.json"))
-        .set_enabled(&repo, false)
+        .switch(&repo, false)
         .expect("switches off");
     until(async || !h.hub.is_claimed(&h.own()).await).await;
     // Everything the bridge tells the agent in the seconds after the switch.
@@ -6269,7 +6283,7 @@ async fn the_switch_reaches_a_bridge_whose_backlog_has_filled_the_hubs_queue_at_
 
     let repo = h.dir.path().join("herdr-tg");
     Registry::load(h.dir.path().join("projects.json"))
-        .set_enabled(&repo, false)
+        .switch(&repo, false)
         .expect("switches off");
     let thrown_at = std::time::Instant::now();
 
@@ -7754,6 +7768,9 @@ async fn the_real_plugin_from_before_files_gets_the_caption_and_he_is_told_the_p
         .arg("server.ts")
         .current_dir(&old)
         .env("KICKOFF_HUB_SOCKET", &h.sock)
+        // The channel's home, pointed at this harness's own directory: the plugin under test must
+        // never read the operator's real one, where a real `by-repo/` link is one hash away.
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
         .env("CLAUDE_PROJECT_DIR", &repo)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
@@ -8498,4 +8515,650 @@ async fn a_lane_cannot_be_called_dash_and_take_the_projects_own_two_directories(
         "a lane called `-` was admitted: {:?}",
         frame.payload
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Rooms: conversations minted at a terminal, in the seed's repo, with no directory of their own.
+
+/// `n` rooms of the harness's project, minted at a terminal AFTER the hub started — which is how
+/// a dispatcher finds them: rows in the registry the hub re-reads at every hello, and secrets
+/// where the channel keeps them. Each with the bytes a bridge would present.
+fn rooms_of(h: &Harness, n: usize) -> Vec<(crate::registry::Project, String)> {
+    let repo = h.dir.path().join("herdr-tg");
+    let mut registry = Registry::load(h.dir.path().join("projects.json"));
+    let home = crate::conversations::ChannelHome::at(h.dir.path());
+    registry
+        .grant(&repo, n)
+        .expect("grants")
+        .into_iter()
+        .map(|p| {
+            let secret = home
+                .read_secret(&p.id)
+                .expect("reads")
+                .expect("a room has a secret");
+            (p, secret)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn three_rooms_in_one_repo_are_three_conversations_not_one_and_two_lockouts() {
+    // Today three rooms as plain directories of one repo present the identical (secret, no lane)
+    // pair, and the second and third are refused `already_claimed`: one conversation, two
+    // lockouts. A room is its own row with its own secret, so `admit` resolves each to itself.
+    let h = harness().await;
+    let rooms = rooms_of(&h, 3);
+    let mut bridges = Vec::new();
+    for (i, (room, secret)) in rooms.iter().enumerate() {
+        let mut b = FakeBridge::connect(&h.sock, secret, &format!("room-{i}"), "x").await;
+        let welcome = b.become_live_with_welcome().await;
+        assert!(
+            matches!(welcome, Some(HubFrame::Welcome { .. })),
+            "room {} was not admitted: {welcome:?}",
+            room.id
+        );
+        bridges.push(b);
+    }
+    until(async || h.fake.topics.lock().await.len() >= 3).await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(topics.len(), 3, "{topics:?}");
+    let names: std::collections::BTreeSet<&str> = topics.iter().map(|t| t.0.as_str()).collect();
+    assert_eq!(names.len(), 3, "two rooms share one topic name: {topics:?}");
+
+    // Three claims, each on the room's own address — and the seed's own voice is still free.
+    let connected = h.hub.connected_ids().await;
+    assert_eq!(connected.len(), 3, "{connected:?}");
+    for (room, _) in &rooms {
+        assert!(
+            connected.contains(&Addr::project_itself(room.id.clone())),
+            "{} is not connected as itself: {connected:?}",
+            room.id
+        );
+    }
+    let mut seed = FakeBridge::connect(&h.sock, &h.secret, "seed", "x").await;
+    assert!(
+        matches!(
+            seed.become_live_with_welcome().await,
+            Some(HubFrame::Welcome { .. })
+        ),
+        "the seed was locked out by its own rooms"
+    );
+
+    // On disk: every room's topic is bound to the room's own row, and none to the seed's.
+    let r = Registry::load(h.dir.path().join("projects.json"));
+    for (room, _) in &rooms {
+        assert!(
+            r.topic_of(&Addr::project_itself(room.id.clone())).is_some(),
+            "{}'s topic is not bound to it",
+            room.id
+        );
+    }
+    let seed_row = r.get(&h.project).expect("the seed");
+    assert!(
+        seed_row.lane_topics.is_empty() && seed_row.topic_id.is_none(),
+        "a room's topic landed on the seed: {seed_row:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_room_named_by_its_dispatcher_reaches_the_phone_under_that_name_or_the_projects() {
+    // A room needs to arrive on his phone named after its function, not as "room 3". The title
+    // is display only, read once when the topic is minted, and shape-refused on the clauses a
+    // lane name is; anything unshowable falls back to the registry's own name for the row.
+    let h = harness().await;
+    let rooms = rooms_of(&h, 3);
+    let home = crate::conversations::ChannelHome::at(h.dir.path());
+    let title_of = |room: &crate::registry::Project| {
+        home.conversations()
+            .join(room.id.as_str())
+            .join(crate::conversations::TITLE)
+    };
+    std::fs::write(title_of(&rooms[0].0), "Customer onboarding\n").expect("title");
+    std::fs::write(title_of(&rooms[2].0), "bad\x07name").expect("title");
+    let mut bridges = Vec::new();
+    for (i, (_, secret)) in rooms.iter().enumerate() {
+        let mut b = FakeBridge::connect(&h.sock, secret, &format!("room-{i}"), "x").await;
+        b.become_live().await;
+        until(async || h.fake.topics.lock().await.len() > i).await;
+        bridges.push(b);
+    }
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(topics[0].0, "Customer onboarding", "{topics:?}");
+    assert_eq!(
+        topics[1].0, rooms[1].0.title,
+        "a room with no title file is not named by the registry: {topics:?}"
+    );
+    assert_eq!(
+        topics[2].0, rooms[2].0.title,
+        "a title a topic cannot carry was shown: {topics:?}"
+    );
+    // The greeting — the first thing in a brand-new topic — says the same name.
+    until(async || h.fake.sends.lock().await.len() >= 3).await;
+    let sends = h.fake.sends.lock().await.clone();
+    assert!(
+        sends
+            .iter()
+            .any(|s| s.1 == "Customer onboarding is connected."),
+        "the greeting does not say the room's name: {sends:?}"
+    );
+    // A room's colour is its seed's, so an organisation's conversations read as one block.
+    let seed_colour = Registry::load(h.dir.path().join("projects.json"))
+        .get(&h.project)
+        .expect("the seed")
+        .icon_color;
+    assert!(topics.iter().all(|t| t.1 == seed_colour), "{topics:?}");
+}
+
+#[tokio::test]
+async fn a_title_rewritten_after_the_topic_exists_changes_nothing_he_reads() {
+    // The design's promise: display only, read ONCE, when the topic is minted. The first build
+    // read the file afresh on every admission and every throttled message, so whoever held a
+    // room could change what the log's subject and the "nothing is waiting on you" notice called
+    // it after the topic existed, and the topic and the notice disagreed. The name a lane's
+    // topic is composed from is the same read, and it is what he can see: minted after the
+    // rewrite, it must still carry the name the room's topic was minted under.
+    let h = harness().await;
+    let rooms = rooms_of(&h, 1);
+    let (room, secret) = &rooms[0];
+    let home = crate::conversations::ChannelHome::at(h.dir.path());
+    let title = home
+        .conversations()
+        .join(room.id.as_str())
+        .join(crate::conversations::TITLE);
+    std::fs::write(&title, "Customer onboarding\n").expect("title");
+    let mut b = FakeBridge::connect(&h.sock, secret, "room-0", "x").await;
+    b.become_live().await;
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    assert_eq!(h.fake.topics.lock().await[0].0, "Customer onboarding");
+
+    // Whoever holds the room rewrites its title after the topic exists.
+    std::fs::write(&title, "Renamed\n").expect("title");
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, secret, "room-0-lane", "x", Some("lane-1")).await;
+    lane.become_live().await;
+    until(async || h.fake.topics.lock().await.len() >= 2).await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(
+        topics[1].0, "Customer onboarding · lane-1",
+        "a title rewritten after the topic existed changed what he reads: {topics:?}"
+    );
+    until(async || h.fake.sends.lock().await.len() >= 2).await;
+    let sends = h.fake.sends.lock().await.clone();
+    assert!(
+        sends.iter().all(|s| !s.1.contains("Renamed")),
+        "the rewritten title reached his phone: {sends:?}"
+    );
+    assert!(
+        sends
+            .iter()
+            .any(|s| s.1.contains("lane-1") && s.1.contains("Customer onboarding")),
+        "the lane's greeting does not carry the name the topic was minted under: {sends:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_lanes_greeting_calls_it_a_conversation_and_never_a_worktree() {
+    // The greeting is the first message in a brand-new topic, and it asserted a fact the hub is
+    // documented not to know: that an address is a git worktree. A dispatcher may mint any name.
+    let h = harness().await;
+    let mut b =
+        FakeBridge::connect_as(&h.sock, &h.secret, "i1", "x", Some("lane-0902-201212-1")).await;
+    b.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let greeting = h.fake.sends.lock().await[0].1.clone();
+    assert!(
+        greeting.contains("lane-0902-201212-1")
+            && greeting.contains("conversation")
+            && !greeting.contains("worktree"),
+        "{greeting}"
+    );
+}
+
+/// The plugin as it shipped at the commit before this change, checked out of git into a folder of
+/// its own beside the real one's `node_modules` — because that is the build running in the
+/// operator's session until his next restart, and it reads `<repo>/.kickoff/hub.token` and nothing
+/// else. The migration COPIES the bytes and leaves that file where it is, so the old bridge keeps
+/// resolving through every step; this is the proof, over a real socket against the real hub.
+///
+/// It shares the `the_real_plugin` prefix because that string is the filter
+/// `scripts/install-channel-plugin.sh` runs, and a test outside it is one nothing runs.
+#[tokio::test]
+#[ignore = "needs bun, the plugin's dependencies and the repository's git history; run it deliberately"]
+async fn the_real_plugin_from_before_this_change_still_attaches_through_the_legacy_walk() {
+    let h = harness().await;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the repository");
+    let plugin = root.join("plugins/kickoff-channel");
+    let old = h.dir.path().join("plugin-before-conversations");
+    std::fs::create_dir_all(&old).expect("dir");
+    for file in ["server.ts", "attach.ts", "where.ts", "hub-link.ts"] {
+        let before = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["show", &format!("1ea6c2e:plugins/kickoff-channel/{file}")])
+            .output()
+            .expect("git runs");
+        assert!(
+            before.status.success(),
+            "the plugin from before this change is not in this clone's history: {}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+        std::fs::write(old.join(file), &before.stdout).expect("write");
+    }
+    std::os::unix::fs::symlink(plugin.join("node_modules"), old.join("node_modules"))
+        .expect("the real dependencies");
+
+    // The harness enrolled the OLD way as far as this bridge is concerned: the repo holds the
+    // token, and the old bridge knows of nothing else.
+    let repo = h.dir.path().join("herdr-tg");
+    std::fs::create_dir_all(repo.join(".kickoff")).expect("repo");
+    std::fs::write(repo.join(".kickoff/hub.token"), &h.secret).expect("token");
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&old)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
+        .env("CLAUDE_PROJECT_DIR", &repo)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(
+        topics.len(),
+        1,
+        "the bridge from before this change could not attach: {topics:?}"
+    );
+    assert_eq!(topics[0].0, "herdr-tg");
+    let _ = child.kill().await;
+}
+
+/// A lane worktree and its main tree read ONE credential by construction: the main tree's own link
+/// under the channel's home names the conversation, a lane computes the same main tree from
+/// `--git-common-dir`, and no token exists in any repo at all — the shape of a project opened with
+/// `herdr-tg open`, or one whose repo copy was taken away.
+#[tokio::test]
+#[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
+async fn the_real_plugin_finds_its_conversation_from_a_lane_with_no_token_in_any_repo() {
+    let h = harness().await;
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plugins/kickoff-channel")
+        .canonicalize()
+        .expect("the plugin is in the repo");
+
+    // The channel's home as the plugin will derive it, holding the harness's own secret under the
+    // harness's own id, linked from the repo — and the repo holding NOTHING.
+    let repo = h.dir.path().join("herdr-tg");
+    let home = crate::conversations::ChannelHome::at(h.dir.path().join("xdg").join("herdr-tg"));
+    home.write_secret(&h.project, &h.secret)
+        .expect("the channel's copy");
+    home.link_repo(&repo, &h.project).expect("the link");
+    // The harness enrolled the way `enroll` does, which writes the repo's copy too. Taken away,
+    // as `remove-repo-secret` would: this test is about a repo holding nothing.
+    std::fs::remove_dir_all(repo.join(".kickoff")).expect("the repo's copy goes");
+    assert!(
+        !repo.join(".kickoff").exists(),
+        "this test needs a repo with no token in it"
+    );
+
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(ok.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+    let lane_name = "lane-0906-101010-4242";
+    let lane = h.dir.path().join(lane_name);
+    git(&[
+        "worktree",
+        "add",
+        "-q",
+        lane.to_str().expect("a path"),
+        "-b",
+        "lane/y",
+    ]);
+
+    let mut child = tokio::process::Command::new("bun")
+        .arg("server.ts")
+        .current_dir(&plugin)
+        .env("KICKOFF_HUB_SOCKET", &h.sock)
+        .env("XDG_STATE_HOME", h.dir.path().join("xdg"))
+        .env("CLAUDE_PROJECT_DIR", &lane)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("bun is on PATH");
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
+        .await
+        .expect("initialize");
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .expect("initialized");
+    // A topic exists only for a connection the hub ADMITTED, and it admits on the secret — so a
+    // topic here is proof the lane read the main tree's conversation, with no token anywhere.
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(
+        topics.len(),
+        1,
+        "a lane could not find the conversation its main tree is bound to"
+    );
+    assert!(
+        topics[0].0.starts_with("herdr-tg") && topics[0].0.contains("4242"),
+        "the lane spoke as the project itself rather than as a conversation of it: {topics:?}"
+    );
+    let _ = child.kill().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The room case with the REAL adapter over a REAL socket — three rooms of one repo, dispatched
+// with a conversation id and no directory of their own. `three_rooms_in_one_repo_...` proves the
+// hub's half with a fake bridge; this proves the adapter's half — the ladder's told term, the door
+// keyed on the conversation — against the real hub. It shares the `the_real_plugin` prefix because
+// that string is the filter `scripts/install-channel-plugin.sh` runs, and a test outside it is one
+// nothing runs.
+
+/// Longer than `until`: three bun processes starting at once take more than two seconds.
+async fn until_within(secs: u64, mut cond: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    while tokio::time::Instant::now() < deadline {
+        if cond().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the hub never reached the state this test was waiting for");
+}
+
+/// One `kickoff-hub-attach`, holding a claim for a conversation it was TOLD, and its stderr.
+struct AttachRun {
+    child: tokio::process::Child,
+    stderr: Arc<std::sync::Mutex<String>>,
+}
+
+impl AttachRun {
+    fn said(&self) -> String {
+        self.stderr.lock().expect("stderr").clone()
+    }
+}
+
+fn start_attach(
+    attach: &std::path::Path,
+    repo: &std::path::Path,
+    sock: &std::path::Path,
+    xdg: &std::path::Path,
+    relay_dir: &std::path::Path,
+    conversation: &str,
+) -> AttachRun {
+    use tokio::io::AsyncBufReadExt;
+    let mut cmd = tokio::process::Command::new("bun");
+    cmd.arg("main.ts").current_dir(attach);
+    // Nothing of this session's own attachment may leak into the one under test.
+    for v in [
+        "KICKOFF_HUB_PROJECT_DIR",
+        "KICKOFF_HUB_ADDRESS",
+        "KICKOFF_HUB_CONVERSATION",
+        "KICKOFF_HUB_TOKEN_FILE",
+        "KICKOFF_HUB_SOCKET",
+        "KICKOFF_HUB_RELAY",
+        "KICKOFF_HUB_RELAY_SOCKET",
+        "KICKOFF_HUB_RELAY_DIR",
+        "KICKOFF_HUB_RELAY_GRACE_MS",
+        "CLAUDE_PROJECT_DIR",
+    ] {
+        cmd.env_remove(v);
+    }
+    let mut child = cmd
+        // A room has no directory of its own: it is dispatched IN the seed's repo, and told
+        // which conversation it is.
+        .env("KICKOFF_HUB_PROJECT_DIR", repo)
+        .env("KICKOFF_HUB_CONVERSATION", conversation)
+        .env("KICKOFF_HUB_SOCKET", sock)
+        .env("KICKOFF_HUB_RELAY_DIR", relay_dir)
+        .env("XDG_STATE_HOME", xdg)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("bun is on PATH");
+    let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = Arc::clone(&stderr);
+    let mut lines = tokio::io::BufReader::new(child.stderr.take().expect("stderr")).lines();
+    tokio::spawn(async move {
+        while let Ok(Some(l)) = lines.next_line().await {
+            let mut s = sink.lock().expect("stderr");
+            s.push_str(&l);
+            s.push('\n');
+        }
+    });
+    AttachRun { child, stderr }
+}
+
+#[tokio::test]
+#[ignore = "needs bun and the adapter's dependencies; run it deliberately"]
+async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_is_refused_not_swapped()
+ {
+    let h = harness().await;
+    let attach = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../adapters/kickoff-hub-attach")
+        .canonicalize()
+        .expect("the adapter is in the repo");
+    let repo = h.dir.path().join("herdr-tg");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(ok.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+
+    // Three rooms, minted at a terminal after the hub started. The adapter derives the channel's
+    // home as `$XDG_STATE_HOME/herdr-tg`; the harness keeps the hub's beside its registry, so the
+    // rooms' bytes are held under the adapter's derivation too — on a real box the two are one.
+    let rooms = rooms_of(&h, 3);
+    let xdg = h.dir.path().join("xdg");
+    let attach_home = crate::conversations::ChannelHome::at(xdg.join("herdr-tg"));
+    for (room, secret) in &rooms {
+        attach_home
+            .write_secret(&room.id, secret)
+            .expect("the adapter's copy");
+    }
+    let hub_home = crate::conversations::ChannelHome::at(h.dir.path());
+    std::fs::write(
+        hub_home
+            .conversations()
+            .join(rooms[0].0.id.as_str())
+            .join(crate::conversations::TITLE),
+        "Customer onboarding\n",
+    )
+    .expect("a title");
+    let relay_dir = h.dir.path().join("fanin");
+
+    let mut runs: Vec<AttachRun> = rooms
+        .iter()
+        .map(|(room, _)| start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room.id.as_str()))
+        .collect();
+
+    // Three topics, three names, and the dispatcher's title on the one that has it.
+    until_within(30, async || h.fake.topics.lock().await.len() >= 3).await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(topics.len(), 3, "{topics:?}");
+    let names: std::collections::BTreeSet<&str> = topics.iter().map(|t| t.0.as_str()).collect();
+    assert_eq!(names.len(), 3, "two rooms share one topic name: {topics:?}");
+    assert!(
+        names.contains("Customer onboarding"),
+        "the dispatcher's title did not reach the topic: {topics:?}"
+    );
+
+    // Three claims, each on the room's own address; the seed's own voice untouched.
+    until_within(10, async || h.hub.connected_ids().await.len() >= 3).await;
+    let connected = h.hub.connected_ids().await;
+    assert_eq!(connected.len(), 3, "{connected:?}");
+    for (room, _) in &rooms {
+        assert!(
+            connected.contains(&Addr::project_itself(room.id.clone())),
+            "{} is not connected as itself: {connected:?}",
+            room.id
+        );
+    }
+    assert!(
+        !connected.contains(&h.own()),
+        "a room took the seed's address"
+    );
+
+    // Three doors, each at the path §9's formula gives for the conversation, each answering.
+    let doors: std::collections::BTreeSet<std::path::PathBuf> = std::fs::read_dir(&relay_dir)
+        .expect("the relay dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+        .collect();
+    assert_eq!(doors.len(), 3, "{doors:?}");
+    for (room, _) in &rooms {
+        let want = relay_dir.join(format!(
+            "{}.sock",
+            &crate::registry::sha256_hex(format!("{}\0", room.id).as_bytes())[..16]
+        ));
+        assert!(
+            doors.contains(&want),
+            "{}'s door is not where the formula puts it: {doors:?}",
+            room.id
+        );
+        UnixStream::connect(&want)
+            .await
+            .unwrap_or_else(|e| panic!("{}'s door does not answer: {e}", room.id));
+    }
+    let pids_before: BTreeMap<Addr, u32> = h
+        .hub
+        .claims
+        .lock()
+        .await
+        .iter()
+        .map(|(a, c)| (a.clone(), c.pid))
+        .collect();
+
+    // A fourth dispatch reusing room 0, at the same door: turned away at the door, before hello.
+    let room0 = rooms[0].0.id.as_str();
+    let mut fourth = start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room0);
+    let status = tokio::time::timeout(Duration::from_secs(20), fourth.child.wait())
+        .await
+        .expect("the fourth attach exits")
+        .expect("a status");
+    assert_eq!(status.code(), Some(2), "{}", fourth.said());
+    assert!(
+        fourth.said().contains("already holding"),
+        "the fourth attach was not turned away at the door:\n{}",
+        fourth.said()
+    );
+
+    // A fifth, reusing room 0 through a door of its own, so it reaches the hub: refused
+    // `already_claimed`, and nothing moved — same claims, same pids, same three topics.
+    let mut fifth = start_attach(
+        &attach,
+        &repo,
+        &h.sock,
+        &xdg,
+        &h.dir.path().join("fanin-2"),
+        room0,
+    );
+    until_within(20, async || fifth.said().contains("already_claimed")).await;
+    assert_eq!(
+        h.hub.connected_ids().await,
+        connected,
+        "the fifth dispatch moved a claim"
+    );
+    let pids_after: BTreeMap<Addr, u32> = h
+        .hub
+        .claims
+        .lock()
+        .await
+        .iter()
+        .map(|(a, c)| (a.clone(), c.pid))
+        .collect();
+    assert_eq!(
+        pids_before, pids_after,
+        "the fifth dispatch SWAPPED an incumbent"
+    );
+    assert_eq!(
+        h.fake.topics.lock().await.len(),
+        3,
+        "a refused dispatch minted a topic"
+    );
+    let _ = fifth.child.kill().await;
+
+    // A room outlives its session: room 0's attach dies, a new one for room 0 is admitted, and it
+    // lands in the SAME topic — the fourth topic that would prove the id moved never appears.
+    let _ = runs[0].child.kill().await;
+    let addr0 = Addr::project_itself(rooms[0].0.id.clone());
+    until_within(10, async || !h.hub.connected_ids().await.contains(&addr0)).await;
+    let again = start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room0);
+    until_within(30, async || h.hub.connected_ids().await.contains(&addr0)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        h.fake.topics.lock().await.len(),
+        3,
+        "a room's second session minted a second topic: {:?}",
+        h.fake.topics.lock().await
+    );
+    assert!(
+        !again.said().contains("refused"),
+        "the room's second session was refused:\n{}",
+        again.said()
+    );
+    drop(again);
+    for r in runs.iter_mut() {
+        let _ = r.child.kill().await;
+    }
 }

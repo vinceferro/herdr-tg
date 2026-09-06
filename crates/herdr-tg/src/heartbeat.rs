@@ -93,7 +93,7 @@ impl Heartbeat {
     /// the instant of absence that a create-and-rename briefly can.
     pub fn stamp(&self, health: HubHealth) -> io::Result<()> {
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
+            crate::conversations::private_state_dir(dir)?;
         }
         fs::write(&self.path, format!("{}\n", health.word()))
     }

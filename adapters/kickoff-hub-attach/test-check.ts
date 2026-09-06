@@ -20,6 +20,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 import { relaySocketPath } from '../../plugins/kickoff-channel/attach.ts'
+import { seedIdOf } from '../../plugins/kickoff-channel/where.ts'
 import { makeRepo } from './test-harness.ts'
 
 const ATTACH = join(import.meta.dir, 'main.ts')
@@ -208,10 +209,11 @@ console.log('\nwhen the hub refuses, beside a live door:')
 {
   const { mkdirSync: mk } = await import('fs')
   mk(relayDir, { recursive: true, mode: 0o700 })
-  const doorPath = relaySocketPath(relayDir, repo, lane)
+  // Keyed on the CONVERSATION — the id the registry mints for this repo — not the repo path.
+  const doorPath = relaySocketPath(relayDir, seedIdOf(repo), lane)
   const holder = Bun.listen({ unix: doorPath, socket: { open() {}, data() {}, close() {}, error() {} } })
   const sentences: Record<string, RegExp> = {
-    unknown_project: /the hub does not know this project.*herdr-tg enroll/,
+    unknown_project: /the hub does not know this project.*herdr-tg open/,
     bad_token: /the secret is not one the hub knows/,
     not_enabled: /enrolled but switched off/,
     version_skew: /do not speak the same version/,
@@ -296,7 +298,7 @@ console.log('\nwhen a worker already holds the door:')
   // A live socket at the derived door, so `--check`'s door fact finds it held. The check dials it
   // like the door-binder does, so a plain listener is enough to read as "held".
   const { relaySocketPath } = await import('../../plugins/kickoff-channel/attach.ts')
-  const doorPath = relaySocketPath(relayDir, repo, lane)
+  const doorPath = relaySocketPath(relayDir, seedIdOf(repo), lane)
   const { mkdirSync } = await import('fs')
   mkdirSync(relayDir, { recursive: true, mode: 0o700 })
   const holder = Bun.listen({ unix: doorPath, socket: { open() {}, data() {}, close() {}, error() {} } })
@@ -500,6 +502,63 @@ console.log('\nwhen the door was named by KICKOFF_HUB_RELAY_SOCKET:')
   check('with no git and no --run, a told door is not a NOT',
     r2.code === 0 && /^ok\s+/.test(line2) && /must be given the same KICKOFF_HUB_RELAY_SOCKET=.*told2\.sock/.test(line2),
     `code ${r2.code}; ${JSON.stringify(r2.out.filter(l => /tool server|NOT/.test(l)))}`)
+  hub.stop()
+}
+
+// ── Q. told a conversation: what a tool server working from git would find ────────────────────
+//
+// `doorDerivedFromGit` keyed the comparison door on the conversation attach was TOLD, so the
+// check compared attach's door with itself and said a tool server working from git "finds this
+// one". A tool server that works from git is, by definition, not told a conversation: hand-started
+// beside a bare attach it derives the seed's door. Under `--run` the child is handed the
+// conversation, and only then is the sentence true.
+console.log('\nwhen attach is told a conversation:')
+{
+  const xdg = join(dir, 'q-xdg')
+  const room = 'c-0e0e0e0e0e0e'
+  mkdirSync(join(xdg, 'herdr-tg', 'conversations', room), { recursive: true, mode: 0o700 })
+  writeFileSync(join(xdg, 'herdr-tg', 'conversations', room, 'secret'), 'q'.repeat(64), { mode: 0o600 })
+  const hubSock = join(dir, 'q-hub.sock')
+  const hub = recordingHub(hubSock)
+  const env = { KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: relayDir,
+    KICKOFF_HUB_CONVERSATION: room, XDG_STATE_HOME: xdg }
+  const r = await runCheck(env)
+  const line = r.out.find(l => /tool server/.test(l)) ?? ''
+  check('without --run, a tool server working from git would find another door, and the check says which variable to give it',
+    /^NOT\s+/.test(line) && /KICKOFF_HUB_CONVERSATION=c-0e0e0e0e0e0e/.test(line),
+    JSON.stringify(line))
+  const r2 = await runCheck(env, ['--run', 'true'])
+  const line2 = r2.out.find(l => /tool server/.test(l)) ?? ''
+  check('under --run the child is handed the conversation, so a tool server there finds this door',
+    /^ok\s+/.test(line2) && /finds this one/.test(line2),
+    JSON.stringify(line2))
+  hub.stop()
+}
+
+// ── R. a secret the channel keeps that the hub refuses ─────────────────────────────────────────
+//
+// A stale channel copy — left by a rotation typed with a herdr-tg from before conversations
+// existed — arrives as `unknown_project`, and the sentence sent whoever read it to `open`, which
+// says "already open". The verb that mends it is adopt-secrets.
+console.log('\nwhen the secret the channel keeps is one the hub refuses:')
+{
+  const xdg = join(dir, 'r-xdg')
+  const id = seedIdOf(repo)
+  const { createHash } = await import('crypto')
+  const { realpathSync } = await import('fs')
+  const key = createHash('sha256').update(realpathSync(repo)).digest('hex').slice(0, 16)
+  mkdirSync(join(xdg, 'herdr-tg', 'conversations', id), { recursive: true, mode: 0o700 })
+  writeFileSync(join(xdg, 'herdr-tg', 'conversations', id, 'secret'), 'b'.repeat(64), { mode: 0o600 })
+  mkdirSync(join(xdg, 'herdr-tg', 'by-repo'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(xdg, 'herdr-tg', 'by-repo', key), `${id}\n`, { mode: 0o600 })
+  const hubSock = join(dir, 'r-hub.sock')
+  const hub = recordingHub(hubSock, { refuse: 'unknown_project' })
+  const r = await runCheck({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: relayDir, XDG_STATE_HOME: xdg })
+  check('a bound secret the hub refuses names adopt-secrets --apply, not open',
+    r.out.some(l => /the secret: .*bound to/.test(l)) &&
+      r.out.some(l => /^NOT\s+.*adopt-secrets --apply/.test(l)) &&
+      !r.out.some(l => /^NOT\s+.*herdr-tg open/.test(l)),
+    JSON.stringify(r.out.filter(l => /secret|NOT/.test(l))))
   hub.stop()
 }
 

@@ -25,7 +25,7 @@ use hub_proto::{LaneId, ProjectId};
 use serde::Serialize;
 
 use crate::hub::Addr;
-use crate::registry::{Project, Registry};
+use crate::registry::{Project, Registry, is_nothing_yet};
 
 /// One project, in the offered shape. Field order is the promise; `serde` keeps a struct's.
 #[derive(Debug, Serialize)]
@@ -95,14 +95,15 @@ fn projects_in(
         return Ok(());
     }
     let mut any = false;
-    for p in registry.all() {
+    for p in registry.all().filter(|p| !is_nothing_yet(p)) {
         any = true;
         let state = if p.enabled { "" } else { "  (switched off)" };
-        // The middle column is 34 wide because "no topic of its own yet, 12 worktrees" is 37 at its
-        // longest realistic value and a column that overruns takes the repo paths out of line.
+        // The middle column is 44 wide because "no topic of its own yet, 12 other conversations"
+        // is 46 at its longest realistic value, and a column that overruns takes the repo paths
+        // out of line.
         writeln!(
             out,
-            "{:<24} {:<34} {}{}{}",
+            "{:<24} {:<44} {}{}{}",
             p.title,
             where_it_talks(p),
             p.repo.display(),
@@ -129,7 +130,7 @@ pub(crate) fn inventory<'a>(registry: &'a Registry, state_dir: &Path) -> Vec<Row
     // project's `connected` is then `null`, never `false`.
     let live: Option<BTreeSet<Addr>> = crate::presence::vouched_for(state_dir)
         .map(|s| s.connected.iter().map(|c| c.addr()).collect());
-    let mut projects: Vec<&Project> = registry.all().collect();
+    let mut projects: Vec<&Project> = registry.all().filter(|p| !is_nothing_yet(p)).collect();
     projects.sort_by(|a, b| {
         a.title
             .cmp(&b.title)
@@ -162,6 +163,12 @@ pub(crate) fn inventory<'a>(registry: &'a Registry, state_dir: &Path) -> Vec<Row
         .collect()
 }
 
+// A room minted at a terminal that nothing has connected as is hidden from both surfaces, the
+// way the phone hides it — a seed's book is minted whole, and a dispatcher joining `--json` on
+// the repo path would otherwise meet eight rows sharing one repo that are nothing yet. It appears
+// the moment a topic binds. One predicate, the registry's `is_nothing_yet`, because it has to
+// survive any writer of the file (see it for why).
+
 /// The project's own people, for the terminal listing — and nothing when there are none, so the
 /// ordinary row of a project with no guests is exactly what it was.
 fn who_may_also_speak(p: &Project) -> String {
@@ -174,9 +181,9 @@ fn who_may_also_speak(p: &Project) -> String {
 
 /// Which topics a project has, for the terminal listing.
 ///
-/// The worktree count is here because this is the only VISIBLE sign a lane ever ran: a worktree's
-/// topic outlives the worktree by design, and nothing else on the box names how many a project has
-/// collected. Not a size warning — the file itself is cheap, and the measured numbers are on
+/// The count of its other conversations is here because this is the only VISIBLE sign a lane ever
+/// ran: a lane's topic outlives the lane by design, and nothing else on the box names how many a
+/// project has collected. Not a size warning — the file itself is cheap, and the measured numbers are on
 /// `Project::lane_topics`.
 fn where_it_talks(p: &Project) -> String {
     let topic = match p.topic_id {
@@ -189,8 +196,8 @@ fn where_it_talks(p: &Project) -> String {
     };
     match p.lane_topics.len() {
         0 => topic,
-        1 => format!("{topic}, 1 worktree"),
-        n => format!("{topic}, {n} worktrees"),
+        1 => format!("{topic}, 1 other conversation"),
+        n => format!("{topic}, {n} other conversations"),
     }
 }
 
@@ -607,22 +614,117 @@ mod tests {
             1002,
         )
         .expect("binds");
-        assert_eq!(said(&r), "topic 1001, 1 worktree", "{}", said(&r));
+        assert_eq!(said(&r), "topic 1001, 1 other conversation", "{}", said(&r));
 
         r.bind_topic(
             &Addr::lane_of(p.id.clone(), LaneId::new("lane-0902-204418-2")),
             1003,
         )
         .expect("binds");
-        assert_eq!(said(&r), "topic 1001, 2 worktrees", "{}", said(&r));
+        assert_eq!(
+            said(&r),
+            "topic 1001, 2 other conversations",
+            "{}",
+            said(&r)
+        );
 
-        for jargon in ["lane_topics", "Some", "None", "BTreeMap"] {
+        for jargon in ["lane_topics", "Some", "None", "BTreeMap", "worktree"] {
             assert!(
                 !said(&r).contains(jargon),
                 "jargon in the listing: {}",
                 said(&r)
             );
         }
+    }
+
+    #[test]
+    fn vacant_rooms_are_not_listed_until_one_has_a_topic() {
+        // Both surfaces. The dispatcher reading `--json` joins on the repo path, and eight rows
+        // sharing the seed's repo would make that join ambiguous for rows that are nothing yet;
+        // the person reading the table gets the same list the phone gets.
+        let d = tempfile::tempdir().expect("tmp");
+        let seed = enrol(d.path(), "org");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let rooms = r.grant(&seed.repo, 4).expect("grants");
+        r.bind_topic(&Addr::project_itself(rooms[1].id.clone()), 3001)
+            .expect("binds");
+        let rows = inventory(&r, d.path());
+        let ids: Vec<&str> = rows.iter().map(|row| row.project_id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "vacant rooms reached the inventory: {}",
+            as_json(&rows)
+        );
+        assert!(ids.contains(&seed.id.as_str()) && ids.contains(&rooms[1].id.as_str()));
+
+        let mut out = Vec::new();
+        projects_in(&d.path().join("projects.json"), d.path(), false, &mut out).expect("lists");
+        let table = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            table.lines().count(),
+            2,
+            "vacant rooms reached the table: {table}"
+        );
+        assert!(table.contains(&rooms[1].title), "{table}");
+    }
+
+    #[test]
+    fn a_room_stays_hidden_after_a_writer_that_never_heard_of_rooms_rewrites_the_list() {
+        // The hub running on the box was built before rooms existed, and it rewrites this file
+        // on every topic bind, serialising only the fields it knows. Hiding a room rested on a
+        // `vacant` flag, so the first lane `hello` anywhere on the box after a `grant` dropped it
+        // from every row and every room reached the phone and `--json` as a row of nothing, for
+        // good — nothing ever set it again. Hidden now by two facts no writer can drop.
+        let d = tempfile::tempdir().expect("tmp");
+        let seed = enrol(d.path(), "org");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let rooms = r.grant(&seed.repo, 3).expect("grants");
+        r.bind_topic(&Addr::project_itself(rooms[1].id.clone()), 3001)
+            .expect("binds");
+
+        // The file as a pre-rooms build's `bind_topic` leaves it: every field it knows, and
+        // nothing else.
+        let path = d.path().join("projects.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("readable")).expect("json");
+        let known = [
+            "id",
+            "title",
+            "repo",
+            "token_sha256",
+            "enabled",
+            "topic_id",
+            "icon_color",
+            "lane_topics",
+            "allowed_users",
+        ];
+        for (_, project) in doc.as_object_mut().expect("an object").iter_mut() {
+            project
+                .as_object_mut()
+                .expect("a project")
+                .retain(|k, _| known.contains(&k.as_str()));
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).expect("json")).expect("write");
+
+        let r = Registry::load(&path);
+        assert_eq!(r.all().count(), 4, "the rewrite lost a row");
+        let rows = inventory(&r, d.path());
+        let ids: Vec<&str> = rows.iter().map(|row| row.project_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![seed.id.as_str(), rooms[1].id.as_str()]
+                .into_iter()
+                .filter(|id| ids.contains(id))
+                .collect::<Vec<_>>(),
+            "a room nothing has connected as reached the inventory after an old writer's rewrite: {}",
+            as_json(&rows)
+        );
+        assert_eq!(ids.len(), 2, "{}", as_json(&rows));
+        let mut out = Vec::new();
+        projects_in(&path, d.path(), false, &mut out).expect("lists");
+        let table = String::from_utf8(out).expect("utf8");
+        assert_eq!(table.lines().count(), 2, "{table}");
     }
 
     #[test]

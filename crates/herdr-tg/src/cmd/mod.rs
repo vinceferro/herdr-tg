@@ -11,6 +11,7 @@
 //! directory and fails the suite on a mention. `enroll` writing files does not weaken that: it
 //! never reaches a terminal, and it is reachable only from argv at a keyboard.
 
+pub(crate) mod conversations;
 pub(crate) mod doctor;
 pub(crate) mod enroll;
 pub(crate) mod projects;

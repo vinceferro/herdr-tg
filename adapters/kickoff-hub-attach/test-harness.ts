@@ -13,8 +13,14 @@
  * run — and the operator's phone is not a test fixture.
  */
 
-import { mkdirSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
 import { join } from 'path'
+
+// The channel's home, where a conversation's secret lives now: pointed at a directory of this
+// run's own for every process the suites spawn, so nothing under test reads the operator's real
+// one — a real `by-repo/` link would be one hash away from a fixture.
+process.env.XDG_STATE_HOME = mkdtempSync(join(tmpdir(), 'kha-state-'))
 
 export const HERE = import.meta.dir
 export const SERVER = join(HERE, '..', '..', 'plugins', 'kickoff-channel', 'server.ts')

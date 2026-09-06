@@ -45,7 +45,19 @@
 import { createHash } from 'crypto'
 import { isAbsolute, join } from 'path'
 
-import { factsFor, findProject, readSecret, type Facts, type Project } from './where.ts'
+import {
+  boundConversationFor,
+  channelHome,
+  conversationSecret,
+  factsFor,
+  findProject,
+  isConversationId,
+  legacyTokenFolder,
+  readSecret,
+  seedIdOf,
+  type Facts,
+  type Project,
+} from './where.ts'
 
 /** The hub refuses an address longer than this, counted in bytes — `MAX_LANE` in `hub.rs`. */
 export const MAX_ADDRESS_BYTES = 64
@@ -75,6 +87,7 @@ const AS_IF_UNSET = '-'
 const NAMESPACE = [
   'KICKOFF_HUB_PROJECT_DIR',
   'KICKOFF_HUB_ADDRESS',
+  'KICKOFF_HUB_CONVERSATION',
   'KICKOFF_HUB_TOKEN_FILE',
   'KICKOFF_HUB_SOCKET',
   'KICKOFF_HUB_RELAY',
@@ -113,6 +126,23 @@ export type Attachment = {
   relayDir: string
   /** The secret's path when something named it, or null to search for it. */
   tokenFile: string | null
+  /**
+   * The conversation a dispatcher said this is (`KICKOFF_HUB_CONVERSATION`), or null. The first
+   * term of the ladder, and the one that never falls through.
+   */
+  conversation: string | null
+  /**
+   * Where the channel keeps every conversation's secret — the hub's own state directory, derived
+   * the way the hub derives it. Null on a box with neither `XDG_STATE_HOME` nor `HOME`, where
+   * only a told path or the legacy walk can find a secret.
+   */
+  channelHome: string | null
+  /**
+   * Which conversation the relay's door is keyed on: the one told, else the one the repo's link
+   * names, else the id the registry's own formula mints for the main tree. Null when nothing can
+   * say — no conversation told and no git.
+   */
+  conversationKey: string | null
   /** How long a relay gives a vanished producer to come home. */
   relayGraceMs: number
 }
@@ -171,15 +201,37 @@ export function addressProblem(address: string): string | null {
  * by a NUL, which cannot occur in either, so no pair of (repo, address) can be spelled two ways and
  * land on one socket.
  *
- * `mainTop` is git's MAIN working tree, never the directory the adapter was pointed at — an engine
- * routinely names a subfolder, and hashing that derives a different door from the one the relay is
- * listening at, with both sides looking right and never meeting. So both sides derive this from
- * facts they already have only where both sides have git; a container has none, and is told the
- * path with `KICKOFF_HUB_RELAY_SOCKET` instead.
+ * Keyed on the CONVERSATION, never on the repository: two rooms in one repo are both top-level
+ * with no lane, and a door keyed on the repo gave both the same one — the relay re-checked the
+ * secret and turned the second away, so the second room's opencode path was dead the first time
+ * the feature was used for what it is for. `conversationKeyFor` says which id that is; a
+ * container with no git and no conversation told is told the door with `KICKOFF_HUB_RELAY_SOCKET`
+ * instead.
  */
-export function relaySocketPath(relayDir: string, mainTop: string, address: string | null): string {
-  const digest = createHash('sha256').update(`${mainTop}\0${address ?? ''}`).digest('hex').slice(0, 16)
+export function relaySocketPath(relayDir: string, conversation: string, address: string | null): string {
+  const digest = createHash('sha256').update(`${conversation}\0${address ?? ''}`).digest('hex').slice(0, 16)
   return join(relayDir, `${digest}.sock`)
+}
+
+/**
+ * The conversation the door is keyed on, worked out without reading a secret — so a relay and
+ * its producers, sharing one environment and one filesystem, derive one door whether or not
+ * either has authenticated yet. Told; else bound by a link on the same walk the secret takes;
+ * else the registry's own formula for the folder the legacy walk would find a token in, which is
+ * the id its link names once it has one — so a project's door does not move the day its link is
+ * written; else that formula for the main tree; else nothing, when there is no git and no link.
+ */
+export function conversationKeyFor(conversation: string | null, home: string | null, projectDir: string, facts: Facts): string | null {
+  if (conversation) return conversation
+  // No git and no conversation told is no derived door, whatever links or tokens are here: a wall
+  // is told its door or given a private one (§9, §13.3), and a door derived under the host's
+  // runtime directory is one nothing in a wall could open.
+  if (!facts.mainTop) return null
+  const bound = home ? boundConversationFor(home, projectDir, facts) : null
+  if (bound) return bound.id
+  const tokenAt = legacyTokenFolder(projectDir, facts)
+  if (tokenAt) return seedIdOf(tokenAt)
+  return seedIdOf(facts.mainTop)
 }
 
 /**
@@ -220,6 +272,7 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
   const blank = [
     'KICKOFF_HUB_PROJECT_DIR',
     'KICKOFF_HUB_ADDRESS',
+    'KICKOFF_HUB_CONVERSATION',
     'KICKOFF_HUB_TOKEN_FILE',
     'KICKOFF_HUB_SOCKET',
     'KICKOFF_HUB_RELAY_SOCKET',
@@ -345,8 +398,36 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
     address = facts.lane
   }
 
+  // ── which conversation, when a dispatcher said so ───────────────────────────────────────────
+  //
+  // An id becomes a path segment under the channel's home, so it is refused at THIS door — before
+  // a path is joined, before anything is dialled — on the exact shape the registry mints. Set and
+  // unreadable is a permanent refusal later, in `secretFor`, never a fall-through: a fall-through
+  // under a failed bind-mount is a session speaking as the wrong conversation.
+  const conversation = named(env.KICKOFF_HUB_CONVERSATION)
+  if (conversation && !isConversationId(conversation)) {
+    return problem(
+      `This session was told it is conversation "${conversation}", which is not the shape a conversation's id has, so the bridge cannot look it up. Whoever set KICKOFF_HUB_CONVERSATION has to give it the id the terminal printed.`,
+      `KICKOFF_HUB_CONVERSATION is "${conversation}", which is not a conversation id`,
+    )
+  }
+  // The channel's home is read off the process's own environment the way its uid is — these are
+  // the operating system's variables, not this namespace's — and it is null only on a box that
+  // has neither, where a told path or the legacy walk are the only ways left to a secret.
+  const home = channelHome(env0.XDG_STATE_HOME, env0.HOME)
+
   // ── the secret ──────────────────────────────────────────────────────────────────────────────
   const tokenFile = named(env.KICKOFF_HUB_TOKEN_FILE)
+  // Two answers to one question. A told path is used verbatim (§5, the container answer) and a
+  // told conversation is read from the channel's home; with both set, one would have to outrank
+  // the other in silence, and silence about which secret a session presents is the one thing
+  // this reader exists to refuse.
+  if (tokenFile && conversation) {
+    return problem(
+      'This session was given both a path to its secret (KICKOFF_HUB_TOKEN_FILE) and a conversation to be (KICKOFF_HUB_CONVERSATION), which are two answers to one question. Whoever started it has to keep one and drop the other.',
+      'both KICKOFF_HUB_TOKEN_FILE and KICKOFF_HUB_CONVERSATION are set; keep one',
+    )
+  }
   // A path, not the secret. 64 hex characters is what a token IS, and a token in the variable that
   // names the token's file is the by-value credential wearing the path variable's name — caught
   // with its own sentence rather than the generic "not a full path" below, because the fix is
@@ -387,7 +468,8 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
   const hubSocket = named(env.KICKOFF_HUB_SOCKET) ?? `/run/user/${uid()}/kickoff/hub.sock`
   const relayDir = named(env.KICKOFF_HUB_RELAY_DIR) ?? `/run/user/${uid()}/kickoff/fanin`
   const toldSocket = named(env.KICKOFF_HUB_RELAY_SOCKET)
-  const relaySocket = toldSocket ?? (facts.mainTop ? relaySocketPath(relayDir, facts.mainTop, address) : null)
+  const conversationKey = conversationKeyFor(conversation, home, projectDir, facts)
+  const relaySocket = toldSocket ?? (conversationKey ? relaySocketPath(relayDir, conversationKey, address) : null)
 
   const relayFlag = env.KICKOFF_HUB_RELAY
   if (relayFlag !== undefined && relayFlag.length && relayFlag !== '1') {
@@ -401,8 +483,8 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
     // Falling back to the hub's own socket here would put this adapter and whatever else speaks for
     // this conversation in a race for one claim — the entire thing the claim exists to prevent.
     return problem(
-      'This session was told to reach him through a relay, and the bridge cannot work out where that relay is because this folder is not inside a repository. Name the relay with KICKOFF_HUB_RELAY_SOCKET, or start the session inside the project.',
-      'a relay was asked for, and neither KICKOFF_HUB_RELAY_SOCKET nor a repository says where it is',
+      'This session was told to reach him through a relay, and the bridge cannot work out where that relay is because this folder is not inside a repository and no conversation was named. Name the relay with KICKOFF_HUB_RELAY_SOCKET, name the conversation with KICKOFF_HUB_CONVERSATION, or start the session inside the project.',
+      'a relay was asked for, and neither KICKOFF_HUB_RELAY_SOCKET, KICKOFF_HUB_CONVERSATION nor a repository says where it is',
     )
   }
 
@@ -436,6 +518,9 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
       relaySocketWasGiven: toldSocket !== null,
       relayDir,
       tokenFile,
+      conversation,
+      channelHome: home,
+      conversationKey,
       relayGraceMs,
     },
   }
@@ -450,24 +535,80 @@ export function readConfig(env0: Record<string, string | undefined> = process.en
  * split-brain nobody would diagnose in under an hour — the prompts reach the phone and the agent's
  * own `reply` says "not said yet" for ever — so both `--check` and attach's own start-up ask this
  * one function, and cannot disagree about the answer.
+ *
+ * The conversation gets the same treatment, with one difference: under `--run` the child IS handed
+ * the conversation attach was told (§13.3 pins it, and the overlay of §2 never blanks it), so a
+ * tool server there derives from it; hand-started beside a bare attach it has only git, which
+ * names the folder's own conversation and never a room. The first version keyed this on the told
+ * conversation in both shapes, and so compared attach's door with itself.
  */
-export function doorDerivedFromGit(c: Attachment): string | null {
-  return c.facts.mainTop ? relaySocketPath(c.relayDir, c.facts.mainTop, c.facts.lane) : null
+export function doorDerivedFromGit(c: Attachment, childKeepsConversation: boolean): string | null {
+  const key = conversationKeyFor(childKeepsConversation ? c.conversation : null, c.channelHome, c.projectDir, c.facts)
+  return key ? relaySocketPath(c.relayDir, key, c.facts.lane) : null
 }
 
 /**
- * The enrolled project this adapter proves itself as — resolved AFRESH on every attempt.
+ * The conversation this adapter proves itself as — resolved AFRESH on every attempt.
  *
- * Never resolved once: the operator may run `herdr-tg enroll` while the adapter is running, and
- * that is the documented recovery from "this project is not enrolled". An adapter that cached the
- * absence of a secret would make that recovery a lie.
+ * Never resolved once: the operator may run `herdr-tg open` or `enroll` while the adapter is
+ * running, and that is the documented recovery from "this project is not enrolled". An adapter
+ * that cached the absence of a secret would make that recovery a lie.
+ *
+ * Four terms, strict order — the ladder of `docs/ATTACHING.md` §5:
+ *
+ *   1. **Told** — a path (`KICKOFF_HUB_TOKEN_FILE`), used verbatim with no search: the container
+ *      answer, and the only way to attach from a machine where git is not a fact; or a
+ *      conversation (`KICKOFF_HUB_CONVERSATION`), whose secret is read from the channel's home.
+ *      Both at once is refused as two answers to one question. Told and unreadable is a REFUSAL,
+ *      never a fall-through — the repo's link and the repo's token may both be right there, and
+ *      either would attach this session as a conversation nobody opened for it.
+ *   2. **Bound**: a link the channel wrote, `by-repo/<hash>`, names the conversation a folder
+ *      defaults to — looked for on exactly the walk term 3 takes, so it is found wherever a
+ *      token could have been. A lane worktree crosses to the same main tree, so a lane and its
+ *      main tree read one credential by construction rather than by a special case.
+ *   3. **Legacy**: the upward walk to `<repo>/.kickoff/hub.token`, kept for the whole migration so
+ *      a bridge from before conversations existed and one from after both work.
+ *   4. **Nothing.** The caller refuses, naming a verb and never a path (`notEnrolled`).
  */
 export function secretFor(c: Attachment): Project | null {
   if (c.tokenFile) {
-    // Told, and used verbatim with no search. This is the container answer, and it is also the only
-    // way to attach from a machine where git is not a fact.
     const token = readSecret(c.tokenFile)
-    return token ? { repo: c.projectDir, tokenFile: c.tokenFile, token } : null
+    return token ? { repo: c.projectDir, tokenFile: c.tokenFile, token, how: 'told' } : null
+  }
+  if (c.conversation) {
+    const found = c.channelHome ? conversationSecret(c.channelHome, c.conversation) : null
+    return found ? { repo: c.projectDir, ...found, conversation: c.conversation, how: 'named' } : null
+  }
+  if (c.channelHome) {
+    const bound = boundConversationFor(c.channelHome, c.projectDir, c.facts)
+    const found = bound ? conversationSecret(c.channelHome, bound.id) : null
+    if (bound && found) return { repo: bound.repo, ...found, conversation: bound.id, how: 'bound' }
   }
   return findProject(c.projectDir, c.facts)
+}
+
+/**
+ * What an agent, or a person, reads when `secretFor` found nothing — in the two registers every
+ * refusal here has. It names a VERB and never a path: the hint used to carry a folder, and in a
+ * lane worktree that folder was the worktree, so following it minted a second project for the
+ * same repository and moved a live conversation somewhere new on his phone. The person at the
+ * keyboard knows which folder; the agent does not get to guess.
+ */
+export function notEnrolled(c: Attachment): Unattachable {
+  if (c.tokenFile) {
+    return {
+      why: 'The secret this session was pointed at is not there or cannot be read, so the hub has no way to know which project it is. Mount the secret where KICKOFF_HUB_TOKEN_FILE says, or open the project at a terminal:  herdr-tg open',
+      note: `no secret at ${c.tokenFile} (KICKOFF_HUB_TOKEN_FILE); mount it there, or at a terminal: herdr-tg open`,
+    }
+  }
+  if (c.conversation) {
+    return {
+      why: `This session was told it is conversation ${c.conversation}, and the channel holds no secret for that conversation, so the hub has no way to know which conversation it is. Nothing here reaches him until that conversation is opened at a terminal — herdr-tg open for a project, herdr-tg grant for a room — or KICKOFF_HUB_CONVERSATION names one that is.`,
+      note: `no secret for conversation ${c.conversation}${c.channelHome ? '' : ', and no channel home on this box'}; open it at a terminal (herdr-tg open / herdr-tg grant), or fix KICKOFF_HUB_CONVERSATION`,
+    }
+  }
+  return {
+    why: 'This project is not enrolled, so the hub has no way to know which project it is. Open it at a terminal:  herdr-tg open <the project folder>',
+    note: 'no secret for this project; open it at a terminal with herdr-tg open',
+  }
 }

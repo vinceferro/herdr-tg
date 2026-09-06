@@ -1042,6 +1042,11 @@ pub(crate) async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) 
         }
         registry
             .all()
+            // A room nobody has started yet is a row and a secret and nothing he can see. A
+            // seed's book is minted whole, so without this his fleet list grows a row of nothing
+            // per vacant room; the moment a topic binds, the room appears on its own. The
+            // registry's own predicate, decided from facts no writer of the file can drop.
+            .filter(|p| !crate::registry::is_nothing_yet(p))
             .map(|p| {
                 // One set lookup per project rather than a walk per project: this list is read on a
                 // phone and it is meant to grow to fourteen rows.
@@ -1069,7 +1074,7 @@ pub(crate) async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) 
                 } else if project_is_connected.contains(&p.id) {
                     "connected"
                 } else if lanes.contains_key(&p.id) {
-                    "not connected itself — only its worktrees are"
+                    "not connected itself — only its other conversations are"
                 } else if p.topic_id.is_some() {
                     "not connected"
                 } else {
@@ -1090,7 +1095,7 @@ pub(crate) async fn digest_of<S: crate::hub::Surface>(hub: &crate::hub::Hub<S>) 
                 // carries nothing and costs width on the narrowest screen this is read on.
                 for lane in lanes.get(&p.id).into_iter().flatten() {
                     row.push_str(&format!(
-                        "\n   ↳ {} — a worktree of it",
+                        "\n   ↳ {} — a conversation of it",
                         escape_html(lane.as_str())
                     ));
                 }
@@ -2044,6 +2049,63 @@ mod tests {
             }
         }
         assert_eq!(refused_senders(&hub).len(), expected);
+    }
+
+    #[tokio::test]
+    async fn vacant_rooms_are_hidden_from_the_list_until_one_has_a_topic() {
+        // A seed's book is minted whole — eight rows for eight rooms nobody has started — and his
+        // fleet list must not grow eight rows of nothing. A room appears the moment a topic binds,
+        // and nothing else ever has to clear a flag for it. And the word is "conversation": a
+        // room and a dispatcher-named lane are both things the hub cannot call a worktree.
+        let dir = tempfile::tempdir().expect("tmp");
+        let file = dir.path().join("projects.json");
+        let mut registry = crate::registry::Registry::load(&file);
+        let org = dir.path().join("org");
+        std::fs::create_dir_all(&org).expect("dir");
+        let (seed, _) = registry.enrol(&org).expect("enrols");
+        let rooms = registry.grant(&org, 8).expect("grants");
+        registry
+            .bind_topic(&crate::hub::Addr::project_itself(rooms[0].id.clone()), 2001)
+            .expect("binds");
+        let hub = crate::hub::Hub::new(
+            Arc::new(NoSurface),
+            registry,
+            crate::hub::AskLedger::load(dir.path().join("asks.json")),
+            crate::hub::HubAudit::new(dir.path().join("hub.audit.log")),
+            vec![-1001],
+            vec![OPERATOR],
+            -1001,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        hub.claim(
+            crate::hub::Addr::lane_of(seed.id.clone(), hub_proto::LaneId::new("CEO-steering")),
+            std::process::id(),
+            "i1".into(),
+            tx,
+        )
+        .await
+        .expect("claims");
+
+        let said = digest_of(&hub).await;
+        assert!(
+            said.contains(&rooms[0].title),
+            "a room with a topic is missing from the list:\n{said}"
+        );
+        for room in &rooms[1..] {
+            assert!(
+                !said.contains(&room.title),
+                "a vacant room reached the phone as a row of nothing:\n{said}"
+            );
+        }
+        assert_eq!(
+            said.lines().filter(|l| l.contains("<b>")).count(),
+            2,
+            "the list has more rows than the seed and its one live room:\n{said}"
+        );
+        assert!(
+            said.contains("CEO-steering") && !said.contains("worktree"),
+            "the list calls an address a worktree:\n{said}"
+        );
     }
 
     #[tokio::test]

@@ -65,8 +65,10 @@ overrides `rust-toolchain.toml`. `TMPDIR` because an agent session inherits it a
 The same applies to `git commit`: the pre-commit hook runs six gates in your environment, so prefix
 the commit too, or it is refused with seven red tests you did not break.
 
-Seven tests are `#[ignore]`d — five need bun, one is a proxy-driven child, one runs the pre-change bridge against the new hub. `scripts/install-channel-plugin.sh` runs them, and
-refuses to install a bridge that disagrees with the hub:
+Twelve tests are `#[ignore]`d — ten need bun (one of those runs the plugin from before
+conversations existed against the new hub, one dispatches three rooms with the real adapter), one
+is a proxy-driven child, one runs the pre-change bridge against the new hub. `scripts/install-channel-plugin.sh` runs them, and refuses to install
+a bridge that disagrees with the hub:
 
 ```
 cargo test -p herdr-tg the_real_plugin -- --ignored
@@ -127,12 +129,31 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   bridge's half: a frame flushed whole on a connection that ends is handed back as unconfirmed
   (`onUnanswered`), never kept in silence and never re-sent. The bridge from before this change is
   run against the new hub by `a_bridge_from_before_this_change_still_works_against_the_new_hub`.
+- **A conversation is a row, and its secret lives outside every repo** (6 September;
+  `docs/CONVERSATIONS.md` built through step 6). `herdr-tg open <repo>` mints a project's
+  conversation writing nothing into the repo; `grant <repo> --rooms N` mints rooms — siblings of
+  the seed, in its repo, each its own secret and topic, sixteen vacant at once, taken by a
+  dispatcher renaming a slot in `<state>/grants/<seed>/` and setting `KICKOFF_HUB_CONVERSATION`;
+  `adopt-secrets --apply` copies the three enrolled projects' secrets across once, never writing
+  `projects.json`; `remove-repo-secret <repo>` is step 7's verb, per project, at his hand, and
+  has NOT been run on any real repo. **Before either runs on the real box, install this build
+  where the shell finds `herdr-tg` (`~/.cargo/bin` and `~/.local/bin` both hold an older one) and
+  restart the hub on it**: an older `enroll` rewrites the repo's copy alone and leaves the
+  channel's stale, and every new session then presents the stale one. The bridge answers "which
+  conversation am I" by a four-term ladder (`attach.ts`) — told, bound (a link looked for on the
+  legacy walk, so a folder with no git or a project below a repo's top is found), legacy, refuse
+  — and the relay's door is keyed on the conversation. A rotation rewrites the secret where it
+  already lives and puts no token back into an opened project's tree. `conversations.rs` owns the
+  home: 0700 re-asserted, ids shape-refused at every door, containment asserted before every
+  write.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
 - **The watchdog is live** and shares no code or process with the hub. It arms the first time
   something stamps `~/.local/state/herdr-tg/hub.heartbeat`.
-- **A project has an off switch, at the terminal only.** `herdr-tg disable <repo>` writes the flag;
+- **A project has an off switch, at the terminal only.** `herdr-tg disable <repo>` writes the flag
+  for the project's seed AND every room of it (a room's id in place of the folder switches that
+  one room);
   the hub watches the registry file and, within a second, drops a LIVE connection's claim and ends
   it — `refused{not_enabled}` first, then `no` for every frame it had queued, the one waiting for
   its turn included, then the close; only a message already mid-send is finished — and it does so

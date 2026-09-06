@@ -32,12 +32,24 @@ fn enrol_into(
     even_if_git_would_commit_it: bool,
     at_a_terminal: bool,
 ) -> anyhow::Result<()> {
+    let mut registry = Registry::load(registry_path);
     // ASKED FIRST, before a byte is minted or written, and that order is the whole of the guard.
     // Run afterwards — which is how it shipped — it produced a warning about a file that was
     // already on disk inside a tracked tree: a note about damage, not a door. This is the one
     // irreversible failure in this system, because a secret in a public git history cannot be
     // untracked, and the agent living in that tree commits and pushes with nobody watching.
-    let exposure = secret_exposure(repo);
+    //
+    // And asked ONLY when this enrolment would put a secret into the tree at all. A project that
+    // holds its secret where the channel keeps it and nowhere else — opened with `open`, or with
+    // its repo copy taken away — is rotated there and nowhere else; refusing that for what git
+    // would commit sent the operator to put the token back into the tree, on the day a leaked
+    // secret made rotating it matter.
+    let writes_repo_copy = registry.would_write_repo_copy(repo);
+    let exposure = if writes_repo_copy {
+        secret_exposure(repo)
+    } else {
+        SecretExposure::Silent
+    };
     if let SecretExposure::WouldCommit { said, remedy } = &exposure {
         // The override needs a PERSON, not just an argument. When a session's project is not
         // enrolled, the channel plugin hands the coding agent `Run:  herdr-tg enroll <dir>` as the
@@ -63,7 +75,6 @@ fn enrol_into(
         }
     }
 
-    let mut registry = Registry::load(registry_path);
     // The secret is returned so that a caller COULD show it. This one deliberately does not: the
     // bridge reads it from the file, and echoing it here would leave a second copy in a scrollback
     // buffer, a screen recording, or a session transcript that nobody chose to put it in.
@@ -72,7 +83,18 @@ fn enrol_into(
     println!("enrolled       {}", project.title);
     println!("project        {}", project.id);
     println!("repo           {}", project.repo.display());
-    println!("secret written {}", project.repo.join(TOKEN_FILE).display());
+    // Every place the secret went is said: the repo's copy, which a bridge from before
+    // conversations existed reads, and the channel's, which a newer one finds first — so a
+    // rotation that rewrote only one would have left the other presenting bytes the hub no longer
+    // knows. A project holding no repo copy gets none, and that is said too.
+    if writes_repo_copy {
+        println!(
+            "secret written {}, and where the channel keeps it",
+            project.repo.join(TOKEN_FILE).display()
+        );
+    } else {
+        println!("secret written where the channel keeps it, and nowhere in the repo");
+    }
     match project.topic_id {
         Some(id) => println!("topic          {id} (kept from the previous enrolment)"),
         None => println!("topic          created the first time its bridge connects"),
@@ -82,7 +104,16 @@ fn enrol_into(
     // holds only a hash of it. Printing it to a pipe or a log would put it somewhere nobody chose.
     if std::io::stdout().is_terminal() {
         println!();
-        println!("Its bridge reads the secret from the file above. You do not need to copy it.");
+        println!(
+            "Its bridge reads the secret from where it was written. You do not need to copy it."
+        );
+        // Two homes, one writer from now on. A build from before conversations existed rewrites
+        // the repo's copy alone and leaves the channel's behind, and every new session then
+        // presents the stale one and is turned away.
+        println!(
+            "Rotate it only with this build from now on: an older herdr-tg rewrites the repo's \
+             copy alone and leaves the channel's behind."
+        );
     }
 
     // Last, so it is the line still on the screen. `WouldCommit` only reaches here when the
@@ -104,16 +135,26 @@ fn enrol_into(
 /// a message that lands with an answer saying it did not.
 /// Nothing about the project is forgotten: its secret, its topic and its history all stay, and
 /// `enable` is the whole of the way back.
+///
+/// By repo it is the project: the seed and every room of it, and the rooms are said, because
+/// "off" that quietly left a room on the air is the one thing this switch must never mean. A
+/// room's own id switches that room alone.
 pub(crate) fn switch(repo: &Path, on: bool) -> anyhow::Result<()> {
-    let project = switch_in(&Registry::default_path(), repo, on)?;
+    let switched = switch_in(&Registry::default_path(), repo, on)?;
+    let project = &switched.named;
+    let rooms = match switched.rooms.len() {
+        0 => String::new(),
+        1 => ", and the one room of it".to_owned(),
+        n => format!(", and the {n} rooms of it"),
+    };
     if on {
-        println!("switched on    {}", project.title);
+        println!("switched on    {}{rooms}", project.title);
         println!(
             "               Its bridge is admitted the next time it dials. One that was turned \
              away tries again on its own, within a minute."
         );
     } else {
-        println!("switched off   {}", project.title);
+        println!("switched off   {}{rooms}", project.title);
         println!(
             "               Its bridge is turned away from now on, and one already connected is \
              dropped now — a message it was in the middle of sending may still land. Its topic \
@@ -121,7 +162,18 @@ pub(crate) fn switch(repo: &Path, on: bool) -> anyhow::Result<()> {
         );
         println!(
             "               Switch it back on with:  herdr-tg enable {}",
-            project.repo.display()
+            if crate::registry::is_room(&project.id) {
+                project.id.to_string()
+            } else {
+                project.repo.display().to_string()
+            }
+        );
+    }
+    for room in &switched.rooms {
+        println!(
+            "               {}   {}",
+            if on { "on " } else { "off" },
+            room.title
         );
     }
     Ok(())
@@ -132,9 +184,9 @@ fn switch_in(
     registry_path: &Path,
     repo: &Path,
     on: bool,
-) -> anyhow::Result<crate::registry::Project> {
+) -> anyhow::Result<crate::registry::Switched> {
     let mut registry = Registry::load(registry_path);
-    Ok(registry.set_enabled(repo, on)?)
+    Ok(registry.switch(repo, on)?)
 }
 
 /// `herdr-tg allow <repo> <user>` and `herdr-tg disallow <repo> <user>`: who may speak in a
@@ -143,7 +195,7 @@ fn switch_in(
 /// A registry write and nothing else, like the switch. The running hub watches the file and
 /// answers "may this person speak here" from the copy it holds, so the person is heard — or no
 /// longer heard — within about a second, in the project's own topic and in every one of its
-/// worktrees', with no restart. A person let into one project has no standing anywhere else: not
+/// other conversations', with no restart. A person let into one project has no standing anywhere else: not
 /// in another project, not in General, and not to give the bot a command. The people who may do
 /// those things are named in the configuration, never in this file.
 pub(crate) fn let_speak(repo: &Path, user: i64, may: bool) -> anyhow::Result<()> {
@@ -151,8 +203,8 @@ pub(crate) fn let_speak(repo: &Path, user: i64, may: bool) -> anyhow::Result<()>
     if may {
         println!("allowed        {user} may now speak in {}", project.title);
         println!(
-            "               In its topic and in its worktrees' topics; nowhere else, and not to \
-             give me commands. Heard within a second — no restart."
+            "               In its topic and in its other conversations' topics; nowhere else, \
+             and not to give me commands. Heard within a second — no restart."
         );
         println!(
             "               Take it back with:  herdr-tg disallow {} {user}",
@@ -367,7 +419,9 @@ mod tests {
             .enrol(&dir)
             .expect("enrols");
 
-        let off = switch_in(&registry, &dir, false).expect("switches off");
+        let off = switch_in(&registry, &dir, false)
+            .expect("switches off")
+            .named;
         assert!(!off.enabled);
         let on_disk = crate::registry::Registry::load(&registry);
         assert!(
@@ -375,7 +429,7 @@ mod tests {
             "the switch was not written where the hub reads it"
         );
 
-        let on = switch_in(&registry, &dir, true).expect("switches on");
+        let on = switch_in(&registry, &dir, true).expect("switches on").named;
         assert!(on.enabled);
         assert!(
             crate::registry::Registry::load(&registry)
@@ -645,6 +699,52 @@ mod tests {
             .expect("a deliberate rotation is still possible");
         assert!(d.path().join(TOKEN_FILE).exists());
         assert!(registry.exists());
+    }
+
+    #[test]
+    fn the_git_guard_does_not_fire_on_a_rotation_that_writes_nothing_into_the_repo() {
+        // `open` collects the prize — no file in the repo — and rotation is `enroll`. In a repo
+        // git would commit the token from, that rotation was refused outright by this guard, or
+        // went ahead under the override and put the file back; there was no way to rotate a
+        // leaked secret on an opened project without re-introducing the thing `open` removed.
+        // The guard is about a secret ENTERING the tree, so it asks first whether one would.
+        let d = repo_with(Some("target/\n"));
+        let state = tempfile::tempdir().expect("tmp");
+        let registry = state.path().join("projects.json");
+        crate::registry::Registry::load(&registry)
+            .open(d.path())
+            .expect("opens, writing nothing into the repo");
+        assert!(!d.path().join(".kickoff").exists());
+
+        enrol_into(&registry, d.path(), false, true)
+            .expect("a rotation that writes nothing into the repo must not be refused for what git would commit");
+        assert!(
+            !d.path().join(".kickoff").exists(),
+            "the rotation put the token back into the tree"
+        );
+
+        // A project whose repo copy is still there is still guarded, because the rotation would
+        // write it again.
+        let adopted = repo_with(Some("target/\n"));
+        std::fs::create_dir_all(adopted.path().join(".kickoff")).expect("dir");
+        std::fs::write(adopted.path().join(TOKEN_FILE), "old-bytes").expect("write");
+        let (p, s) = crate::registry::Registry::load(&registry)
+            .enrol(adopted.path())
+            .expect("enrolled (test fixture; the guard is the door's, not the registry's)");
+        assert_eq!(
+            std::fs::read_to_string(adopted.path().join(TOKEN_FILE)).expect("readable"),
+            s
+        );
+        let refused = enrol_into(&registry, adopted.path(), false, true).expect_err("refused");
+        assert!(refused.to_string().contains(TOKEN_FILE), "{refused}");
+        assert_eq!(
+            crate::registry::Registry::load(&registry)
+                .get(&p.id)
+                .expect("still enrolled")
+                .token_sha256,
+            p.token_sha256,
+            "a refused rotation rotated"
+        );
     }
 
     #[test]

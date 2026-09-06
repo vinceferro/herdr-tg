@@ -1031,7 +1031,7 @@ impl AskLedger {
     /// there costs 40 bytes and is only read on admission. This is the one to watch.
     fn save(&self) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
+            crate::conversations::private_state_dir(dir)?;
         }
         let tmp = self.path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(&self.records)?;
@@ -1166,7 +1166,7 @@ impl HubAudit {
 
     fn line(&self, body: &str) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
+            crate::conversations::private_state_dir(dir)?;
         }
         let mut f = fs::OpenOptions::new()
             .append(true)
@@ -1592,6 +1592,20 @@ pub enum Admission {
 pub struct Hub<S: Surface> {
     pub surface: Arc<S>,
     pub registry: Arc<Mutex<Registry>>,
+    /// Where the channel keeps each conversation's secret and its optional title. The hub reads
+    /// exactly one thing there — the title, once per run, the first time it composes the
+    /// conversation's name — and writes nothing.
+    conversations: crate::conversations::ChannelHome,
+    /// Each conversation's title as it was the FIRST time this hub composed its name, kept for
+    /// the life of the process and never re-read.
+    ///
+    /// "Read once, at topic creation" is the promise that keeps the title file a small widening:
+    /// display only, and whoever holds a room cannot change what the log's subject, the throttle
+    /// notice or a lane's topic call it after the topic exists. The first version read the file
+    /// afresh on every admission and every throttled message, so the topic and the notice could
+    /// disagree. A rename on his phone sticks for ever anyway, because the hub never renames a
+    /// topic; a title changed after the fact shows up, at most, after the hub restarts.
+    titles: std::sync::Mutex<BTreeMap<ProjectId, Option<String>>>,
     pub ledger: Arc<Mutex<AskLedger>>,
     pub audit: Arc<HubAudit>,
     /// One live connection per ADDRESS, not per project. Two worktrees of one repo are two agents
@@ -1733,9 +1747,16 @@ impl<S: Surface> Hub<S> {
         let outbox = crate::media::MediaStore::new(audit.path().with_file_name("outbox"));
         outbox.make_the_tree();
         outbox.sweep(std::time::SystemTime::now());
+        // The same directory every other state file lives in, derived from the one path this
+        // constructor is handed — so the hub and the terminal verbs cannot disagree about where a
+        // conversation's title is.
+        let conversations =
+            crate::conversations::ChannelHome::at(audit.path().parent().unwrap_or(Path::new(".")));
         Self {
             surface,
             registry: Arc::new(Mutex::new(registry)),
+            conversations,
+            titles: std::sync::Mutex::new(BTreeMap::new()),
             ledger: Arc::new(Mutex::new(ledger)),
             audit: Arc::new(audit),
             claims: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2663,17 +2684,14 @@ impl<S: Surface> Hub<S> {
             let p = registry
                 .get(&addr.project)
                 .ok_or_else(|| NoTopic::Failed("that project is not enrolled".to_owned()))?;
-            let title = match &addr.lane {
-                None => p.title.clone(),
-                Some(lane) => crate::registry::lane_title(&p.title, lane),
-            };
+            let title = self.display_title(p, addr.lane.as_ref());
             // The COLOUR stays the project's. Telegram gives six, and a project with its lanes
             // beneath it reads as one block in the list only if they share one.
             (
                 registry.topic_of(addr),
                 title,
                 p.icon_color,
-                p.title.clone(),
+                self.display_title(p, None),
             )
         };
         if let Some(id) = existing {
@@ -2766,15 +2784,15 @@ impl<S: Surface> Hub<S> {
         // that skipped the audit was a send with no record, which is the one thing the audit
         // discipline exists to make impossible.
         //
-        // A lane's greeting NAMES the worktree, because it is the first thing in a brand-new topic
+        // A lane's greeting NAMES the lane, because it is the first thing in a brand-new topic
         // and twelve of them arrive on a dispatch day. Identical, they are twelve notifications he
         // cannot tell apart, and the only thing left carrying which one is a topic title that a
         // phone row truncates. The name is the same string `/projects` and the title show him.
         let greeting = match &addr.lane {
             None => format!("{project_title} is connected."),
             Some(lane) => format!(
-                "{lane} is connected — a separate worktree of {project_title}. It talks here, not \
-                 in the project's own topic."
+                "{lane} is connected — a separate conversation of {project_title}. It talks here, \
+                 not in the project's own topic."
             ),
         };
         // The greeting's outcome is READ, not discarded. A topic that was made, written down, and
@@ -2795,6 +2813,30 @@ impl<S: Surface> Hub<S> {
             ),
         }
         Ok(id)
+    }
+
+    /// What a conversation is CALLED, wherever a person reads it: the topic's title, the greeting,
+    /// the log's subject, the throttle notice. One function, because three places composed it on
+    /// their own and would otherwise disagree about what a room is called.
+    ///
+    /// A conversation's own name is the title whoever holds it wrote — display only, read once
+    /// per run and then remembered (see `titles`), shape-refused — and the registry's when there
+    /// is none it can show. A lane's name hangs off that, clipped the way `lane_title` clips.
+    fn display_title(&self, p: &crate::registry::Project, lane: Option<&LaneId>) -> String {
+        let own = {
+            // A poisoned lock holds a map, not a half-written one: every write here is one
+            // insert, so what a panicked holder left behind is still what was read.
+            let mut titles = self.titles.lock().unwrap_or_else(|e| e.into_inner());
+            titles
+                .entry(p.id.clone())
+                .or_insert_with(|| self.conversations.title_of(&p.id))
+                .clone()
+        }
+        .unwrap_or_else(|| p.title.clone());
+        match lane {
+            None => own,
+            Some(lane) => crate::registry::lane_title(&own, lane),
+        }
     }
 
     /// The one place an agent's message actually goes out: budget, clip, audit, send, audit.
@@ -3248,10 +3290,9 @@ impl<S: Surface> Hub<S> {
         // to reason about the order of, and there is no reason to here.
         let named = {
             let registry = self.registry.lock().await;
-            registry.get(&addr.project).map(|p| match &addr.lane {
-                None => p.title.clone(),
-                Some(lane) => crate::registry::lane_title(&p.title, lane),
-            })
+            registry
+                .get(&addr.project)
+                .map(|p| self.display_title(p, addr.lane.as_ref()))
         };
 
         let deferred = {
@@ -3566,10 +3607,7 @@ impl<S: Surface> Hub<S> {
             let registry = self.registry.lock().await;
             registry
                 .get(&addr.project)
-                .map(|p| match &addr.lane {
-                    None => p.title.clone(),
-                    Some(lane) => crate::registry::lane_title(&p.title, lane),
-                })
+                .map(|p| self.display_title(p, addr.lane.as_ref()))
                 .unwrap_or_default()
         };
 

@@ -106,6 +106,18 @@ pub struct Project {
     pub allowed_users: BTreeSet<i64>,
 }
 
+/// A room minted at a terminal that nothing has connected as yet: a row and a secret and nothing
+/// he can see, hidden from every list until its first live connection binds it a topic.
+///
+/// Decided from two facts every writer keeps — the id's shape and the topic — and NOT from a
+/// flag. The first version carried a `vacant` field, and the hub running on the box was built
+/// before that field existed: it rewrites this file on every topic bind, serialising only the
+/// fields it knows, so the first lane `hello` anywhere on the box after a `grant` dropped the
+/// flag from every row and every room reached the phone as a row of nothing, for good.
+pub fn is_nothing_yet(p: &Project) -> bool {
+    is_room(&p.id) && p.topic_id.is_none()
+}
+
 /// What a lane's topic is called, so the operator can pick it out of a list on a phone.
 ///
 /// The PROJECT comes first, so a lane sorts and reads under the project it belongs to; he will have
@@ -143,6 +155,13 @@ pub fn lane_title(project_title: &str, lane: &LaneId) -> String {
     let keep = room.saturating_sub(1);
     let tail: String = lane_chars[lane_chars.len() - keep..].iter().collect();
     format!("{head}{SEP}…{tail}")
+}
+
+/// What a switch at the terminal changed: the row it named, and the rooms switched with it.
+#[derive(Debug)]
+pub struct Switched {
+    pub named: Project,
+    pub rooms: Vec<Project>,
 }
 
 /// Every enrolled project, and the file they live in.
@@ -194,6 +213,32 @@ pub enum EnrolError {
     /// secret and writes it into a tree, and a command that quietly did that when it was only asked
     /// to flip a switch is a second door with no guard on it.
     NotEnrolled { repo: PathBuf },
+    /// `open` on a repo enrolled the old way: a row and a repo token, but no copy of the secret
+    /// where the channel keeps one. `open` cannot make one — it holds only the hash, and minting a
+    /// fresh secret would take the live bridge off the air — so it names the verb that copies the
+    /// existing bytes across.
+    EnrolledTheOldWay { repo: PathBuf },
+    /// `open` on a project whose channel copy is not the secret the hub knows. Nothing presenting
+    /// it is admitted, so "already open" would be a lie; the verb that mends it depends on
+    /// whether the repo still holds the current bytes.
+    ChannelCopyStale {
+        repo: PathBuf,
+        repo_is_current: bool,
+    },
+    /// `open` wrote the secret and could not save the list of projects. Nothing is on the air yet,
+    /// so this is a leftover directory rather than a lockout; the verb to run again is named.
+    HalfOpened { repo: PathBuf, why: String },
+    /// The book has no room for what was asked.
+    BookFull {
+        title: String,
+        vacant: usize,
+        asked: usize,
+    },
+    /// The rooms' secrets and slots were written, the list of projects could not be saved, and
+    /// they were taken back again: nothing was granted.
+    HalfGranted { title: String, why: String },
+    /// Asked for rooms of something that is itself a room.
+    NotASeed { id: ProjectId },
     /// Asked to let something speak that is not a person: a group's id, a zero, a chat.
     ///
     /// Refused rather than stored, because a number on this list that can never match a sender
@@ -231,9 +276,9 @@ impl std::fmt::Display for EnrolError {
             ),
             Self::HalfWritten { repo, why } => write!(
                 f,
-                "the new secret was written into {}, but the list of projects could not be saved — \
-                 so that project's own copy no longer matches and its bridge will be turned away \
-                 until you run this again:\n\
+                "the new secret for {} was written, but the list of projects could not be saved — \
+                 so the copies no longer match what the hub knows and its bridge will be turned \
+                 away until you run this again:\n\
                  \n    herdr-tg enroll {}\n\nWhat went wrong saving the list: {why}",
                 repo.display(),
                 repo.display()
@@ -257,6 +302,67 @@ impl std::fmt::Display for EnrolError {
                 f,
                 "{}",
                 crate::config::not_a_person("the user to allow", *given)
+            ),
+            Self::EnrolledTheOldWay { repo } => write!(
+                f,
+                "{} is already enrolled, with its secret in the repo and no copy where the channel \
+                 keeps one. Opening it afresh would mint a new secret and turn its running bridge \
+                 away. Copy the secret it has across instead:\n\n    herdr-tg adopt-secrets --apply",
+                repo.display()
+            ),
+            Self::ChannelCopyStale {
+                repo,
+                repo_is_current: true,
+            } => write!(
+                f,
+                "{} was opened before, but the copy of its secret the channel keeps is not the one \
+                 the hub knows — a rotation by a build from before conversations existed rewrites \
+                 the repo's copy and leaves the channel's behind — so every new session here is \
+                 turned away. The repo still holds the current secret; copy it across:\n\n    \
+                 herdr-tg adopt-secrets --apply",
+                repo.display()
+            ),
+            Self::ChannelCopyStale {
+                repo,
+                repo_is_current: false,
+            } => write!(
+                f,
+                "{} was opened before, but neither the copy of its secret the channel keeps nor \
+                 the repo's is one the hub knows, so nothing can connect as it. Rotate its secret:\n\
+                 \n    herdr-tg enroll {}",
+                repo.display(),
+                repo.display()
+            ),
+            Self::HalfOpened { repo, why } => write!(
+                f,
+                "the secret for {} was written where the channel keeps it, but the list of \
+                 projects could not be saved, so nothing can connect as it yet. Run this again:\n\
+                 \n    herdr-tg open {}\n\nWhat went wrong saving the list: {why}",
+                repo.display(),
+                repo.display()
+            ),
+            Self::BookFull {
+                title,
+                vacant,
+                asked,
+            } => write!(
+                f,
+                "{title} already has {vacant} vacant room{} and its book holds {} at once, so {asked} \
+                 more cannot be granted. A room becomes taken when a dispatcher starts something as \
+                 it; grant again once the book has pages free.",
+                if *vacant == 1 { "" } else { "s" },
+                crate::conversations::BOOK
+            ),
+            Self::HalfGranted { title, why } => write!(
+                f,
+                "the rooms' secrets and slots were written for {title}, but the list of projects \
+                 could not be saved, so they were taken back again and nothing was granted. Grant \
+                 again once the list can be saved. What went wrong saving it: {why}"
+            ),
+            Self::NotASeed { id } => write!(
+                f,
+                "{id} is a room, and a room does not get rooms of its own. Grant them to the \
+                 project it belongs to, by that project's folder."
             ),
         }
     }
@@ -441,41 +547,83 @@ impl Registry {
         self.save()
     }
 
-    /// Switch a project off, or back on. Terminal-only, like everything else that changes who may
-    /// connect: no message and no frame reaches this.
+    /// Switch a project off, or back on, saying everything it switched. Terminal-only, like
+    /// everything else that changes who may connect: no message and no frame reaches this.
     ///
     /// The project is found by its repo path, canonicalised when the folder still exists and taken
     /// as written when it does not — a project whose tree has been deleted is exactly the one worth
     /// switching off, and refusing because the folder is gone would leave it the only project on
     /// the box that cannot be.
     ///
+    /// By repo path it is the SEED AND EVERY ROOM of it. Rooms live in their seed's repo, and
+    /// "I switched it off" has to mean the project: the version that reached the seed alone left
+    /// N rooms holding their claims and delivering, each switchable only by an id the lists hide
+    /// while it has no topic, and nothing he read said so. A room's own id switches that room
+    /// and nothing else — one function of the business, off, while the rest of the organisation
+    /// talks. Everything switched is returned so the terminal can say it.
+    ///
     /// Writing the flag is only half of what "off" means. The hub reads `enabled` at `hello`, so
     /// this alone turns away the NEXT connection and does nothing to one already on the socket. The
     /// other half — dropping a live connection — is the hub's, which watches this file for exactly
     /// that. See `Hub::drop_connections_of_switched_off_projects`.
-    pub fn set_enabled(&mut self, repo: &Path, enabled: bool) -> Result<Project, EnrolError> {
+    pub fn switch(&mut self, which: &Path, enabled: bool) -> Result<Switched, EnrolError> {
         let _held = self.hold()?;
         self.reread().map_err(|e| EnrolError::Unreadable {
             path: self.path.clone(),
             why: e.to_string(),
         })?;
-        let wanted = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-        let Some(p) = self.projects.values_mut().find(|p| p.repo == wanted) else {
+        let Some(id) = self.select(which) else {
             return Err(EnrolError::NotEnrolled {
-                repo: repo.to_path_buf(),
+                repo: which.to_path_buf(),
             });
         };
-        p.enabled = enabled;
-        let project = p.clone();
+        let named = {
+            let p = self.projects.get_mut(&id).expect("selected from this map");
+            p.enabled = enabled;
+            p.clone()
+        };
+        let mut rooms = Vec::new();
+        if !is_room(&named.id) {
+            for p in self.projects.values_mut() {
+                if is_room(&p.id) && p.repo == named.repo {
+                    p.enabled = enabled;
+                    rooms.push(p.clone());
+                }
+            }
+        }
         self.save()?;
-        Ok(project)
+        Ok(Switched { named, rooms })
+    }
+
+    /// Whether `enrol` would write the repo's own copy of the secret for this folder.
+    ///
+    /// A rotation rewrites the places the secret already lives and no new one. A folder nobody
+    /// has enrolled gets both — the repo's copy is what a bridge from before conversations
+    /// existed reads — and so does a project enrolled the older way whose repo still holds its
+    /// copy. A project opened with `open`, or one whose repo copy has been taken away, holds its
+    /// secret where the channel keeps it and nowhere else, and a rotation keeps it that way:
+    /// putting the file back into the tree would undo the one thing `open` is for, on the day a
+    /// leaked secret made rotating it matter. The git guard at the door asks this first, so a
+    /// rotation that writes nothing into the repo is not refused for what git would commit.
+    pub fn would_write_repo_copy(&self, repo: &Path) -> bool {
+        let Ok(canonical) = repo.canonicalize() else {
+            return true;
+        };
+        let Some(existing) = self.projects.values().find(|p| p.repo == canonical) else {
+            return true;
+        };
+        if existing.repo.join(TOKEN_FILE).exists() {
+            return true;
+        }
+        !matches!(self.home().read_secret(&existing.id), Ok(Some(_)))
     }
 
     /// Let a person speak in this project's conversations, or stop them. Terminal-only, like the
     /// switch: no message, no tap and no frame reaches this, and `nothing_inbound_can_add_a_person`
     /// fails the build if the bot or the hub ever names it.
     ///
-    /// The same read-modify-write as `set_enabled`, found by the same path rule, and live for the
+    /// The same read-modify-write as `switch`, found by the same path rule — the seed alone,
+    /// because a room's people are its own and never inherited — and live for the
     /// running hub within about a second — it watches this file and re-reads it on change, and it
     /// answers "may this person speak here" from the copy it holds. No restart.
     ///
@@ -494,12 +642,12 @@ impl Registry {
             path: self.path.clone(),
             why: e.to_string(),
         })?;
-        let wanted = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-        let Some(p) = self.projects.values_mut().find(|p| p.repo == wanted) else {
+        let Some(id) = self.select(repo) else {
             return Err(EnrolError::NotEnrolled {
                 repo: repo.to_path_buf(),
             });
         };
+        let p = self.projects.get_mut(&id).expect("selected from this map");
         if may {
             p.allowed_users.insert(user);
         } else {
@@ -515,10 +663,118 @@ impl Registry {
         &self.path
     }
 
+    /// Which row a terminal verb means by `which`.
+    ///
+    /// A conversation id names that row outright — it is how a room is reached, since a room has
+    /// no folder of its own. Anything else is a folder and names the SEED enrolled there, never
+    /// one of its rooms: rooms share their seed's repo, and the first row in id order is a `c-`
+    /// row whenever there is one, so `herdr-tg disable <repo>` matched by path alone would have
+    /// switched off a room and left the seed talking.
+    ///
+    /// Canonicalised when the folder still exists and taken as written when it does not — a project
+    /// whose tree has been deleted is exactly the one worth switching off. An id is read as an id
+    /// only when no folder of that name is there to be meant instead.
+    fn select(&self, which: &Path) -> Option<ProjectId> {
+        if let Some(s) = which.to_str()
+            && crate::conversations::is_conversation_id(s)
+            && !which.is_dir()
+        {
+            let id = ProjectId::new(s);
+            return self.projects.contains_key(&id).then_some(id);
+        }
+        let wanted = which.canonicalize().unwrap_or_else(|_| which.to_path_buf());
+        self.projects
+            .values()
+            .find(|p| p.repo == wanted && !is_room(&p.id))
+            .map(|p| p.id.clone())
+    }
+
+    /// The channel home beside this registry. One home: the state directory the registry lives in
+    /// is where every conversation's secret lives too.
+    fn home(&self) -> crate::conversations::ChannelHome {
+        crate::conversations::ChannelHome::at(self.path.parent().unwrap_or(Path::new(".")))
+    }
+
+    /// The canonical folder and the id a seed enrolled there has — or would have — after the one
+    /// check both doors make: a folder BELOW an enrolled one is refused.
+    ///
+    /// Both paths are canonical, so this is a real containment test and not a string prefix that
+    /// would call `/srv/app2` a child of `/srv/app`. Re-enrolling the same folder is a rotation
+    /// and stays allowed; only a folder below an enrolled one is refused.
+    fn seed_row_for(&self, repo: &Path) -> Result<(PathBuf, ProjectId), EnrolError> {
+        let repo = repo.canonicalize().map_err(|_| EnrolError::NoSuchRepo {
+            repo: repo.to_path_buf(),
+        })?;
+        if !repo.is_dir() {
+            return Err(EnrolError::NoSuchRepo { repo });
+        }
+        // Never a room: rooms share their seed's repo and a `c-` id sorts before a `p-` one, so
+        // the first match was a vacant room hidden from every list, and the refusal told him his
+        // folder was inside a project he had never seen. The seed is always there when its rooms
+        // are, so the check loses nothing.
+        if let Some(parent) = self
+            .projects
+            .values()
+            .find(|p| !is_room(&p.id) && repo != p.repo && repo.starts_with(&p.repo))
+        {
+            return Err(EnrolError::InsideAnotherProject {
+                repo,
+                parent: parent.repo.clone(),
+                title: parent.title.clone(),
+            });
+        }
+        // Minted from the canonical path, never from a counter. A recycled counter silently
+        // inheriting a dead agent's topic is a defect this repo has already shipped once.
+        let id = ProjectId::new(format!(
+            "p-{}",
+            &sha256_hex(repo.as_os_str().as_encoded_bytes())[..12]
+        ));
+        Ok((repo, id))
+    }
+
+    /// A seed's row for a fresh secret, carrying forward everything a re-enrolment keeps.
+    fn mint_seed(&self, repo: PathBuf, id: ProjectId, secret: &str) -> Project {
+        let title = self.unique_title(&repo, &id);
+        let icon_color = colour_of(&id);
+        let before = self.projects.get(&id);
+        Project {
+            id: id.clone(),
+            title,
+            repo,
+            token_sha256: sha256_hex(secret.as_bytes()),
+            // A re-enrolment keeps the switch where the operator left it. This was `true`
+            // outright, so rotating a leaked secret — the documented reason to re-run `enroll` —
+            // silently switched a project he had turned off back on, and nothing in the output
+            // said so.
+            enabled: before.is_none_or(|p| p.enabled),
+            // A re-enrolment keeps the topic. The whole point of a stable id is that history
+            // survives.
+            topic_id: before.and_then(|p| p.topic_id),
+            icon_color,
+            // And its lanes' topics, for the same reason it keeps its own: rotating a secret must
+            // not scatter a day's worktrees into a second set of topics beside the first.
+            lane_topics: before.map(|p| p.lane_topics.clone()).unwrap_or_default(),
+            // And the project's people: each of them was let in by a decision at a keyboard, and
+            // rotating a secret is not a decision about who may speak. Dropped here, a rotation
+            // would silently shut a room's own people out — and nothing in the output would say so.
+            allowed_users: before.map(|p| p.allowed_users.clone()).unwrap_or_default(),
+        }
+    }
+
     /// Enrol a repo, or rotate an already-enrolled one's secret.
     ///
     /// Terminal-only. Returns the secret exactly once, because it is never stored anywhere this
     /// process can read it back.
+    ///
+    /// The secret lands where the channel keeps it, always — and in the repo too, where a bridge
+    /// from before conversations existed still looks, whenever the repo already holds a copy or
+    /// nothing has enrolled this folder before. Both, because a bridge may read either — the
+    /// channel's copy is what the ladder finds first, the repo's is what the bridge in the
+    /// operator's own running session reads on every redial — and a rotation that rewrote only
+    /// one would leave the other presenting bytes the registry no longer knows: `bad_token`,
+    /// permanent, on an honest bridge. A project that holds no repo copy — opened with `open`, or
+    /// one whose copy was taken away — is rotated where the channel keeps it and nowhere else, so
+    /// a rotation never puts a token back into a tree (`would_write_repo_copy`).
     pub fn enrol(&mut self, repo: &Path) -> Result<(Project, String), EnrolError> {
         // Another process may have written since this handle was made — including the hub, which
         // binds topics while it runs. Enrolling must not undo that, and must not proceed at all if
@@ -529,92 +785,59 @@ impl Registry {
             path: self.path.clone(),
             why: e.to_string(),
         })?;
-        let repo = repo.canonicalize().map_err(|_| EnrolError::NoSuchRepo {
-            repo: repo.to_path_buf(),
-        })?;
-        if !repo.is_dir() {
-            return Err(EnrolError::NoSuchRepo { repo });
-        }
+        let (repo, id) = self.seed_row_for(repo)?;
+        let repo_copy_too = self.would_write_repo_copy(&repo);
+        let secret = fresh_secret()?;
+        let project = self.mint_seed(repo.clone(), id.clone(), &secret);
 
-        // Both paths are canonical, so this is a real containment test and not a string prefix that
-        // would call `/srv/app2` a child of `/srv/app`. Re-enrolling the same folder is a rotation
-        // and stays allowed; only a folder BELOW an enrolled one is refused.
-        if let Some(parent) = self
-            .projects
-            .values()
-            .find(|p| repo != p.repo && repo.starts_with(&p.repo))
-        {
-            return Err(EnrolError::InsideAnotherProject {
-                repo,
-                parent: parent.repo.clone(),
-                title: parent.title.clone(),
-            });
-        }
-
-        // Minted from the canonical path, never from a counter. A recycled counter silently
-        // inheriting a dead agent's topic is a defect this repo has already shipped once.
-        let id = ProjectId::new(format!(
-            "p-{}",
-            &sha256_hex(repo.as_os_str().as_encoded_bytes())[..12]
-        ));
-
-        let mut secret = [0u8; 32];
-        getrandom::fill(&mut secret).map_err(|_| EnrolError::NoRandomness)?;
-        let secret = hex(&secret);
-
-        let title = self.unique_title(&repo, &id);
-        let icon_color = (u8::from_str_radix(&sha256_hex(id.as_str().as_bytes())[..2], 16)
-            .unwrap_or(0))
-            % ICON_COLOURS;
-
-        // A re-enrolment keeps the topic. The whole point of a stable id is that history survives.
-        let topic_id = self.projects.get(&id).and_then(|p| p.topic_id);
-
-        // A re-enrolment keeps its lanes' topics for the same reason it keeps its own: rotating a
-        // secret must not scatter a day's worktrees into a second set of topics beside the first.
-        let lane_topics = self
-            .projects
-            .get(&id)
-            .map(|p| p.lane_topics.clone())
-            .unwrap_or_default();
-
-        // A re-enrolment keeps the switch where the operator left it. This was `true` outright, so
-        // rotating a leaked secret — the documented reason to re-run `enroll` — silently switched a
-        // project he had turned off back on, and nothing in the output said so.
-        let enabled = self.projects.get(&id).is_none_or(|p| p.enabled);
-
-        // A re-enrolment keeps the project's people, for the reason it keeps the switch: each of
-        // them was let in by a decision at a keyboard, and rotating a secret is not a decision
-        // about who may speak. Dropped here, a rotation would silently shut a room's own people
-        // out — and nothing in the output would say so.
-        let allowed_users = self
-            .projects
-            .get(&id)
-            .map(|p| p.allowed_users.clone())
-            .unwrap_or_default();
-
-        let project = Project {
-            id: id.clone(),
-            title,
-            repo: repo.clone(),
-            token_sha256: sha256_hex(secret.as_bytes()),
-            enabled,
-            topic_id,
-            icon_color,
-            lane_topics,
-            allowed_users,
-        };
-        // The SECRET GOES DOWN FIRST, and the list of projects second. The other order took a
+        // THE SECRET GOES DOWN FIRST, and the list of projects second. The other order took a
         // project off the air whenever the second step failed: the registry already held the hash
         // of a secret that had never been written, the repo still held the old one, and the old one
         // no longer resolved — so the bridge was refused on every reconnect and nothing on the box
-        // said why. What the operator had been told was "could not write the project's token file",
-        // which reads as a command that did nothing. A full disk, a read-only mount, or a
-        // `.kickoff` left root-owned by one sudo run is all it takes.
+        // said why. A full disk, a read-only mount, or a `.kickoff` left root-owned by one sudo
+        // run is all it takes.
         //
-        // This way round the same failure changes nothing at all: no hash is saved, and the secret
-        // already in the repo goes on working.
-        write_token_file(&repo, &secret)?;
+        // With two places, the same discipline needs one more step. The link goes first, because
+        // it names only the id and changes no secret. Then the channel's copy, then the repo's —
+        // and a repo write that fails puts the channel's copy BACK to what it was, so that the
+        // failure still changes nothing at all: no hash is saved, both files hold the bytes they
+        // held, and the secret already in use goes on working.
+        let home = self.home();
+        let channel = |what: &str| {
+            let what = format!("{what} where the channel keeps it");
+            move |source| EnrolError::Io {
+                what: what.clone(),
+                source,
+            }
+        };
+        home.link_repo(&repo, &id)
+            .map_err(channel("the project's link"))?;
+        let before = home
+            .read_secret(&id)
+            .map_err(channel("the project's secret"))?;
+        home.write_secret(&id, &secret)
+            .map_err(channel("the project's secret"))?;
+        if repo_copy_too && let Err(e) = write_token_file(&repo, &secret) {
+            let put_back = match &before {
+                Some(old) => home.write_secret(&id, old).map(|_| ()),
+                None => home.remove_secret(&id),
+            };
+            return Err(match put_back {
+                Ok(()) => e,
+                // The one shape that leaves the two places disagreeing. Said in as many words,
+                // because nothing else on the box would ever explain it.
+                Err(r) => EnrolError::Io {
+                    what: format!(
+                        "the project's token file — and the channel's copy of the secret could not \
+                         be put back afterwards ({r}), so the two copies now differ; run this again"
+                    ),
+                    source: match e {
+                        EnrolError::Io { source, .. } => source,
+                        other => std::io::Error::other(other.to_string()),
+                    },
+                },
+            });
+        }
         self.projects.insert(id, project.clone());
         // Reached only when the secret IS on disk, so this failure is the one direction that can
         // still leave a project unable to connect. It says so rather than reporting a write error,
@@ -624,6 +847,213 @@ impl Registry {
             why: e.to_string(),
         })?;
         Ok((project, secret))
+    }
+
+    /// Open a repo as a conversation, writing nothing into it.
+    ///
+    /// The row is the one `enrol` would mint — same id, from the same canonical path — so the two
+    /// doors agree about which project a repo is; only where the secret lands differs. Opening a
+    /// conversation that is already open changes nothing and says so: rotation is `enrol`'s job,
+    /// and a door that rotated on a second visit would take a live bridge off the air. A repo
+    /// enrolled the old way, with no copy of its secret in the channel, is refused and told the
+    /// verb that copies it across — and so is one whose channel copy is there but STALE, because
+    /// "already open" over bytes the hub would refuse is a lie every new session in that repo
+    /// pays for: it presents the stale copy and is turned away for good.
+    pub fn open(&mut self, repo: &Path) -> Result<(Project, bool), EnrolError> {
+        let _held = self.hold()?;
+        self.reread().map_err(|e| EnrolError::Unreadable {
+            path: self.path.clone(),
+            why: e.to_string(),
+        })?;
+        let (repo, id) = self.seed_row_for(repo)?;
+        let home = self.home();
+        let channel = |what: &str| {
+            let what = format!("{what} where the channel keeps it");
+            move |source| EnrolError::Io {
+                what: what.clone(),
+                source,
+            }
+        };
+        if let Some(existing) = self.projects.get(&id) {
+            let existing = existing.clone();
+            let Some(channel_copy) = home
+                .read_secret(&id)
+                .map_err(channel("the project's secret"))?
+            else {
+                return Err(EnrolError::EnrolledTheOldWay { repo });
+            };
+            // Hashed, not merely found. A rotation typed with a build from before conversations
+            // existed rewrites the repo's copy and the hash and knows nothing of the channel's,
+            // and the copy it leaves behind is the one every new bridge presents first.
+            if sha256_hex(channel_copy.trim().as_bytes()) != existing.token_sha256 {
+                let repo_is_current = fs::read_to_string(repo.join(TOKEN_FILE))
+                    .is_ok_and(|s| sha256_hex(s.trim().as_bytes()) == existing.token_sha256);
+                return Err(EnrolError::ChannelCopyStale {
+                    repo,
+                    repo_is_current,
+                });
+            }
+            // The link is re-asserted, so a home whose link went missing is mended by the one
+            // verb somebody would reach for.
+            home.link_repo(&repo, &id)
+                .map_err(channel("the project's link"))?;
+            return Ok((existing, false));
+        }
+        let secret = fresh_secret()?;
+        let project = self.mint_seed(repo.clone(), id.clone(), &secret);
+        // Secret before registry, the same order `enrol` keeps and for the same reason.
+        home.link_repo(&repo, &id)
+            .map_err(channel("the project's link"))?;
+        home.write_secret(&id, &secret)
+            .map_err(channel("the project's secret"))?;
+        self.projects.insert(id, project.clone());
+        self.save().map_err(|e| EnrolError::HalfOpened {
+            repo: repo.clone(),
+            why: e.to_string(),
+        })?;
+        Ok((project, true))
+    }
+
+    /// Mint `rooms` rooms for a seed: complete conversations, each with a row, a secret where the
+    /// channel keeps it, and a vacant slot in the seed's book. Nothing is written into any repo.
+    ///
+    /// A room is a sibling of its seed — its own claim, its own topic, its own people — in the
+    /// seed's repo, because it has no folder of its own. Its id is random: there is no path to
+    /// derive one from, and a counter is the shape that once recycled a dead agent's topic. The
+    /// book is bounded so that a leaked grant directory is worth a known number of rooms and no
+    /// more; a taken slot is spent, never recycled, and refilling mints fresh numbers.
+    pub fn grant(&mut self, seed: &Path, rooms: usize) -> Result<Vec<Project>, EnrolError> {
+        let _held = self.hold()?;
+        self.reread().map_err(|e| EnrolError::Unreadable {
+            path: self.path.clone(),
+            why: e.to_string(),
+        })?;
+        let seed = match self.select(seed) {
+            Some(id) if is_room(&id) => return Err(EnrolError::NotASeed { id }),
+            Some(id) => self
+                .projects
+                .get(&id)
+                .cloned()
+                .expect("selected from this map"),
+            None => {
+                return Err(EnrolError::NotEnrolled {
+                    repo: seed.to_path_buf(),
+                });
+            }
+        };
+        let home = self.home();
+        let channel = |what: &str| {
+            let what = format!("{what} where the channel keeps it");
+            move |source| EnrolError::Io {
+                what: what.clone(),
+                source,
+            }
+        };
+        // A vacant slot naming a room the list has never heard of is a page nothing can use: the
+        // hub admits on the hash, and there is none. Left by a grant whose save failed, it held a
+        // page of the book and could be TAKEN — a dispatcher then started an engine whose hello
+        // nobody would admit. Taken back here, under the lock, before the book is counted; a slot
+        // already taken is spent whatever became of its row, because its number may name a topic.
+        for slot in home
+            .slots(&seed.id)
+            .map_err(channel("the project's book"))?
+        {
+            if !slot.taken && !self.projects.contains_key(&slot.room) {
+                home.remove_slot(&seed.id, slot.number)
+                    .map_err(channel("the project's book"))?;
+                home.remove_conversation(&slot.room)
+                    .map_err(channel("the room's secret"))?;
+            }
+        }
+        let vacant = home
+            .slots(&seed.id)
+            .map_err(channel("the project's book"))?
+            .iter()
+            .filter(|s| !s.taken)
+            .count();
+        if vacant + rooms > crate::conversations::BOOK {
+            return Err(EnrolError::BookFull {
+                title: seed.title.clone(),
+                vacant,
+                asked: rooms,
+            });
+        }
+        let mut minted: Vec<Project> = Vec::with_capacity(rooms);
+        let mut slots: Vec<u32> = Vec::with_capacity(rooms);
+        // Everything this call put on disk, taken back again — for a save that fails, so the
+        // failure changes nothing: no row, no slot, no credential nobody minted a row for.
+        let unwind = |minted: &[Project], slots: &[u32]| -> Result<(), std::io::Error> {
+            for n in slots {
+                home.remove_slot(&seed.id, *n)?;
+            }
+            for p in minted {
+                home.remove_conversation(&p.id)?;
+            }
+            Ok(())
+        };
+        for _ in 0..rooms {
+            let id = loop {
+                let id = crate::conversations::mint_room_id().ok_or(EnrolError::NoRandomness)?;
+                if !self.projects.contains_key(&id) && !minted.iter().any(|p| p.id == id) {
+                    break id;
+                }
+            };
+            let secret = fresh_secret()?;
+            // Secret and slot first, row second — the same order as everywhere else. A slot is
+            // written only once the secret is, so a book never names a room nothing can be.
+            if let Err(e) = home.write_secret(&id, &secret) {
+                let _ = unwind(&minted, &slots);
+                return Err(channel("the room's secret")(e));
+            }
+            let slot = match home.add_slot(&seed.id, &id) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    let _ = home.remove_conversation(&id);
+                    let _ = unwind(&minted, &slots);
+                    return Err(channel("the project's book")(e));
+                }
+            };
+            slots.push(slot.number);
+            minted.push(Project {
+                id,
+                // Told from its seed by its slot number, until whoever takes it writes a title.
+                // Slot numbers are never reused, so this cannot collide with another room's.
+                title: room_title(&seed.title, slot.number),
+                repo: seed.repo.clone(),
+                token_sha256: sha256_hex(secret.as_bytes()),
+                enabled: true,
+                topic_id: None,
+                // The seed's colour, so an organisation's conversations read as one block in the
+                // forum list — the same reason a lane takes its project's.
+                icon_color: seed.icon_color,
+                lane_topics: BTreeMap::new(),
+                // A room's people are its own, let in one by one; the seed's are not inherited.
+                allowed_users: BTreeSet::new(),
+            });
+        }
+        for p in &minted {
+            self.projects.insert(p.id.clone(), p.clone());
+        }
+        if let Err(e) = self.save() {
+            for p in &minted {
+                self.projects.remove(&p.id);
+            }
+            let why = match unwind(&minted, &slots) {
+                Ok(()) => e.to_string(),
+                // The one shape that leaves something behind. Said in as many words, because a
+                // secret with no row is a credential nothing on the box would ever explain.
+                Err(r) => format!(
+                    "{e} — and taking the rooms' secrets and slots back failed too ({r}), so \
+                     some may still be on disk under the channel's home; the next grant takes \
+                     back any slot naming a room the list does not hold"
+                ),
+            };
+            return Err(EnrolError::HalfGranted {
+                title: seed.title.clone(),
+                why,
+            });
+        }
+        Ok(minted)
     }
 
     /// Repo basename, sanitised and clipped; a 6-hex suffix if another path already took it.
@@ -665,14 +1095,14 @@ impl Registry {
     ///
     /// Blocking, deliberately. The hold is one small read and one rename, and a lock that could
     /// fail would put the caller straight back into the race it was taken to prevent.
-    fn hold(&self) -> Result<fs::File, EnrolError> {
+    pub(crate) fn hold(&self) -> Result<fs::File, EnrolError> {
         let path = self.path.with_extension("lock");
         let io = |source| EnrolError::Io {
             what: "the registry lock".to_owned(),
             source,
         };
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(io)?;
+            crate::conversations::private_state_dir(dir).map_err(io)?;
         }
         let f = fs::OpenOptions::new()
             .read(true)
@@ -701,7 +1131,7 @@ impl Registry {
             }
         };
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).map_err(io("the state directory"))?;
+            crate::conversations::private_state_dir(dir).map_err(io("the state directory"))?;
         }
         // A temp name per process. Both writers — the running hub and `herdr-tg enroll` at a
         // terminal — used the SAME `projects.json.tmp`, so two saves could interleave inside one
@@ -726,6 +1156,34 @@ impl Registry {
         }
         fs::rename(&tmp, &self.path).map_err(io("the registry"))
     }
+}
+
+/// Thirty-two random bytes as hex. Fail closed: a predictable token is worse than no token, and
+/// quietly falling back to a weaker source is how that happens.
+fn fresh_secret() -> Result<String, EnrolError> {
+    let mut secret = [0u8; 32];
+    getrandom::fill(&mut secret).map_err(|_| EnrolError::NoRandomness)?;
+    Ok(hex(&secret))
+}
+
+/// One of Telegram's six topic colours, derived from the id so it is stable across restarts and
+/// across machines.
+fn colour_of(id: &ProjectId) -> u8 {
+    (u8::from_str_radix(&sha256_hex(id.as_str().as_bytes())[..2], 16).unwrap_or(0)) % ICON_COLOURS
+}
+
+/// A room, as opposed to a seed: minted at random, sharing its seed's repo.
+pub(crate) fn is_room(id: &ProjectId) -> bool {
+    id.as_str().starts_with("c-")
+}
+
+/// What a room is called until whoever takes it writes a title: its seed and its slot number,
+/// clipped to what a topic title takes.
+fn room_title(seed: &str, slot: u32) -> String {
+    let tail = format!("-room-{slot:03}");
+    let room = MAX_TITLE.saturating_sub(tail.len());
+    let head: String = seed.chars().take(room).collect();
+    format!("{head}{tail}")
 }
 
 /// Write the project's own copy of its secret, readable by nobody else.
@@ -771,7 +1229,7 @@ fn read_projects(path: &Path) -> std::io::Result<BTreeMap<ProjectId, Project>> {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
@@ -913,7 +1371,7 @@ mod tests {
         let mut r = reg(&d);
         let repo = repo(&d, "herdr-tg");
         r.enrol(&repo).expect("enrols");
-        let off = r.set_enabled(&repo, false).expect("switches off");
+        let off = r.switch(&repo, false).expect("switches off").named;
         assert!(!off.enabled, "the setter did not switch it off");
 
         let (rotated, _) = r.enrol(&repo).expect("re-enrols");
@@ -929,7 +1387,7 @@ mod tests {
         );
 
         // Switching it back on is its own deliberate act, and it holds too.
-        let on = r.set_enabled(&repo, true).expect("switches on");
+        let on = r.switch(&repo, true).expect("switches on").named;
         assert!(on.enabled);
     }
 
@@ -940,7 +1398,7 @@ mod tests {
         let d = tempfile::tempdir().expect("tmp");
         let mut r = reg(&d);
         let said = r
-            .set_enabled(&repo(&d, "never-enrolled"), true)
+            .switch(&repo(&d, "never-enrolled"), true)
             .expect_err("refused")
             .to_string();
         assert!(said.contains("nothing is enrolled"), "{said}");
@@ -964,8 +1422,9 @@ mod tests {
         let (p, _) = r.enrol(&repo).expect("enrols");
         fs::remove_dir_all(&repo).expect("delete the tree");
         let off = r
-            .set_enabled(&p.repo, false)
-            .expect("a deleted folder can still be switched off");
+            .switch(&p.repo, false)
+            .expect("a deleted folder can still be switched off")
+            .named;
         assert!(!off.enabled);
     }
 
@@ -1264,5 +1723,587 @@ mod tests {
             .to_string();
         assert!(said.contains("nothing is enrolled"), "{said}");
         assert_eq!(r.all().count(), 1, "letting someone in enrolled something");
+    }
+
+    /// The channel home beside the registry, which is where a secret lives now.
+    fn home(d: &tempfile::TempDir) -> crate::conversations::ChannelHome {
+        crate::conversations::ChannelHome::at(d.path())
+    }
+
+    #[test]
+    fn a_secret_minted_for_one_conversation_can_never_resolve_to_another() {
+        // The RED test the design says to write first. There is no two-source `resolve` here to
+        // get wrong — the channel holds bytes and the registry holds hashes — which is the point,
+        // and this is what proves it rather than asserting it. The only failure that matters in
+        // this area is the silent one: one agent's question in another agent's topic.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let seed_repo = repo(&d, "org");
+        let (seed, _) = r.open(&seed_repo).expect("opens");
+        let rooms = r.grant(&seed_repo, 3).expect("grants");
+        let home = home(&d);
+        let mut seen = std::collections::BTreeSet::new();
+        for p in std::iter::once(&seed).chain(rooms.iter()) {
+            let bytes = home.read_secret(&p.id).expect("reads").expect("a secret");
+            assert!(
+                seen.insert(bytes.clone()),
+                "two conversations share one secret"
+            );
+            let resolved = r.resolve(&bytes).expect("resolves");
+            assert_eq!(
+                resolved.id, p.id,
+                "{}'s secret resolved to {}",
+                p.id, resolved.id
+            );
+        }
+        // The repo's own link names the seed, never a room.
+        assert_eq!(
+            home.linked(&seed_repo).expect("reads"),
+            Some(seed.id.clone())
+        );
+        // And on disk, which is what the hub reads at hello.
+        let after = Registry::load(d.path().join("projects.json"));
+        for room in &rooms {
+            let bytes = home
+                .read_secret(&room.id)
+                .expect("reads")
+                .expect("a secret");
+            let resolved = after.resolve(&bytes).expect("resolves");
+            assert_eq!(resolved.id, room.id);
+            assert_ne!(resolved.id, seed.id, "a room's secret resolved to its seed");
+        }
+    }
+
+    #[test]
+    fn a_room_opened_at_a_terminal_gets_a_conversation_with_no_directory_of_its_own() {
+        // A room is a SIBLING of its seed: its own row, its own secret, its own claim and topic —
+        // and the seed's repo, because it has no directory of its own and needs none. Nothing is
+        // written into that repo for it: not a token, not a folder.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let seed_repo = repo(&d, "org");
+        let (seed, _) = r.open(&seed_repo).expect("opens");
+        let rooms = r.grant(&seed_repo, 2).expect("grants");
+        let home = home(&d);
+        assert_eq!(rooms.len(), 2);
+        for room in &rooms {
+            assert!(
+                crate::conversations::is_conversation_id(room.id.as_str())
+                    && room.id.as_str().starts_with("c-"),
+                "a room's id is not a conversation id: {}",
+                room.id
+            );
+            assert_eq!(room.repo, seed.repo, "a room lives in its seed's repo");
+            assert!(
+                is_nothing_yet(room),
+                "a room nobody has connected as is not nothing yet"
+            );
+            assert!(room.enabled && room.topic_id.is_none());
+            assert!(home.read_secret(&room.id).expect("reads").is_some());
+            assert_ne!(room.title, seed.title, "a room is named as its seed");
+        }
+        assert!(
+            fs::read_dir(&seed_repo).expect("readable").next().is_none(),
+            "granting rooms wrote something into the repo"
+        );
+        let slots = home.slots(&seed.id).expect("slots");
+        assert_eq!(
+            slots.iter().map(|s| s.room.clone()).collect::<Vec<_>>(),
+            rooms.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            "the book does not name the rooms in the order they were minted"
+        );
+        assert!(slots.iter().all(|s| !s.taken));
+        // The rows are on disk, where the hub reads them, and the seed is untouched.
+        let after = Registry::load(d.path().join("projects.json"));
+        assert_eq!(after.all().count(), 3);
+        assert_eq!(after.get(&seed.id).expect("the seed").title, seed.title);
+    }
+
+    #[test]
+    fn the_book_holds_sixteen_slots_and_only_a_terminal_can_refill_it() {
+        // Sixteen VACANT rooms at once, per seed: enough for a week of function proposals, and a
+        // bound on what a leaked grant directory is worth. A taken slot is spent, not recycled —
+        // its number is never reused, because the room it named may hold a topic and a history —
+        // so refilling mints new numbers. The terminal half of the property is pinned in `cmd`.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let seed_repo = repo(&d, "org");
+        let (seed, _) = r.open(&seed_repo).expect("opens");
+        let full = r.grant(&seed_repo, 16).expect("a full book");
+        assert_eq!(full.len(), 16);
+        let said = r
+            .grant(&seed_repo, 1)
+            .expect_err("a seventeenth vacant room")
+            .to_string();
+        assert!(said.contains("16"), "{said}");
+        for jargon in ["Err", "BOOK", "vacant:", "Option", "None"] {
+            assert!(
+                !said.contains(jargon),
+                "jargon reached the operator: {said}"
+            );
+        }
+        assert_eq!(
+            r.all().count(),
+            17,
+            "a refused grant still minted something"
+        );
+
+        // A dispatcher takes a slot; the book has a page free again, and the new room gets a
+        // number nobody has had.
+        let home = home(&d);
+        let book = home.grants().join(seed.id.as_str());
+        fs::rename(book.join("000.vacant"), book.join("000.taken")).expect("take");
+        let more = r.grant(&seed_repo, 1).expect("one page is free");
+        assert_eq!(more.len(), 1);
+        let slots = home.slots(&seed.id).expect("slots");
+        assert_eq!(slots.len(), 17);
+        assert_eq!(slots.last().expect("a slot").number, 16);
+        assert_eq!(slots.iter().filter(|s| !s.taken).count(), 16);
+
+        // Rooms are granted to a SEED. A path nobody enrolled is a refusal in plain words, and so
+        // is a room's own id: a room does not get rooms.
+        let said = r
+            .grant(&repo(&d, "nobody"), 1)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert!(
+            r.grant(Path::new(full[0].id.as_str()), 1).is_err(),
+            "a room was granted rooms of its own"
+        );
+    }
+
+    #[test]
+    fn rotating_a_seed_rewrites_both_places_its_secret_lives() {
+        // Once the channel holds a copy, a rotation that rewrote only the repo file would leave
+        // the channel presenting stale bytes — `bad_token`, permanent, on the honest bridge that
+        // reads the channel first. So `enrol` writes both places, and the link that lets a bridge
+        // find the channel's copy at all.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "herdr-tg");
+        let home = home(&d);
+        let (p1, s1) = r.enrol(&repo).expect("enrols");
+        assert_eq!(
+            home.read_secret(&p1.id).expect("reads").as_deref(),
+            Some(s1.as_str()),
+            "enrolling did not put the secret where the channel keeps it"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join(TOKEN_FILE)).expect("readable"),
+            s1
+        );
+        assert_eq!(home.linked(&repo).expect("reads"), Some(p1.id.clone()));
+
+        let (p2, s2) = r.enrol(&repo).expect("rotates");
+        assert_eq!(p1.id, p2.id);
+        assert_eq!(
+            home.read_secret(&p2.id).expect("reads").as_deref(),
+            Some(s2.as_str()),
+            "the rotation left the channel's copy holding the old bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join(TOKEN_FILE)).expect("readable"),
+            s2
+        );
+        assert!(r.resolve(&s2).is_some() && r.resolve(&s1).is_none());
+    }
+
+    #[test]
+    fn a_rotation_that_could_not_write_the_repo_copy_leaves_both_places_as_they_were() {
+        // The two-place write has two places to fail. The first copy written must be put back
+        // when the second cannot be, or the channel holds bytes nothing resolves while the repo
+        // holds bytes that do, and which one a bridge presents depends on which it reads first.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "herdr-tg");
+        let home = home(&d);
+        let (p, old) = r.enrol(&repo).expect("enrols");
+        let token = repo.join(TOKEN_FILE);
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o400)).expect("chmod");
+        r.enrol(&repo)
+            .expect_err("this test needs a rotation whose repo write fails");
+        assert_eq!(
+            home.read_secret(&p.id).expect("reads").as_deref(),
+            Some(old.as_str()),
+            "the failed rotation left the channel's copy holding bytes nothing resolves"
+        );
+        assert_eq!(fs::read_to_string(&token).expect("readable"), old);
+        assert!(
+            Registry::load(d.path().join("projects.json"))
+                .resolve(&old)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn switching_a_project_by_repo_switches_its_seed_and_every_room_of_it_and_a_room_by_id_only_itself()
+     {
+        // Rooms share their seed's repo, and every verb once selected a row by repo path — the
+        // first row in id order, which a `c-` id sorts BEFORE a `p-` one — so `herdr-tg disable
+        // <repo>` switched off one room and left the seed talking. The fix that followed made the
+        // path select the seed ALONE, and that narrowed "off" without saying so: N rooms in the
+        // same repo kept their claims and kept delivering, each switchable only by an id the
+        // lists hide while it has no topic. "I switched it off" has to mean the project: by repo,
+        // the seed and every room of it; a room's own id switches that room and nothing else.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let seed_repo = repo(&d, "org");
+        let (seed, _) = r.open(&seed_repo).expect("opens");
+        let rooms = r.grant(&seed_repo, 2).expect("grants");
+
+        let off = r.switch(&seed_repo, false).expect("switches off");
+        assert_eq!(off.named.id, seed.id, "the switch landed on a room");
+        assert!(!r.get(&seed.id).expect("the seed").enabled);
+        assert!(
+            rooms
+                .iter()
+                .all(|room| !r.get(&room.id).expect("the room").enabled),
+            "a room of a switched-off project is still on the air"
+        );
+        // As sets: the rooms come back in id order, and ids are random.
+        assert_eq!(
+            off.rooms
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            rooms
+                .iter()
+                .map(|p| p.id.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "what was switched with the seed is not said"
+        );
+        // On disk, which is what the hub reads.
+        let on_disk = Registry::load(d.path().join("projects.json"));
+        assert!(
+            on_disk.all().all(|p| !p.enabled),
+            "the file still has a room on"
+        );
+
+        // Back on by repo: the seed and its rooms.
+        let on = r.switch(&seed_repo, true).expect("switches on");
+        assert_eq!(on.rooms.len(), 2);
+        assert!(r.all().all(|p| p.enabled));
+
+        // A room by its own id: that room, and nothing else.
+        let off = r
+            .switch(Path::new(rooms[0].id.as_str()), false)
+            .expect("a room is switched by its id");
+        assert_eq!(off.named.id, rooms[0].id);
+        assert!(
+            off.rooms.is_empty(),
+            "switching a room switched something else"
+        );
+        assert!(r.get(&seed.id).expect("the seed").enabled);
+        assert!(r.get(&rooms[1].id).expect("the other room").enabled);
+        let off = r.switch(&seed_repo, false).expect("switches off");
+        assert_eq!(off.named.id, seed.id);
+        assert!(r.all().all(|p| !p.enabled));
+
+        // A room's PEOPLE are its own — let in one by one, never inherited — so by repo a guest
+        // reaches the seed alone.
+        r.switch(&seed_repo, true).expect("switches on");
+        const GUEST: i64 = 555_001;
+        let with = r.set_may_speak(&seed_repo, GUEST, true).expect("lets in");
+        assert_eq!(with.id, seed.id, "the guest was let into a room");
+        assert!(
+            rooms
+                .iter()
+                .all(|room| r.get(&room.id).expect("the room").allowed_users.is_empty())
+        );
+        let with = r
+            .set_may_speak(Path::new(rooms[1].id.as_str()), GUEST, true)
+            .expect("a room admits its own people");
+        assert_eq!(with.id, rooms[1].id);
+    }
+
+    #[test]
+    fn opening_a_repo_writes_nothing_into_it_and_opening_it_again_changes_nothing() {
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "herdr-tg");
+        let home = home(&d);
+        let (p, created) = r.open(&repo).expect("opens");
+        assert!(created);
+        assert!(
+            !repo.join(".kickoff").exists(),
+            "opening a repo wrote into it"
+        );
+        let first = home.read_secret(&p.id).expect("reads").expect("a secret");
+        assert_eq!(home.linked(&repo).expect("reads"), Some(p.id.clone()));
+        // The id is the one `enrol` mints for the same folder, so the two doors agree. Enrolled
+        // into a registry with a home of its OWN, or that enrolment's channel copy would land on
+        // this one's.
+        let elsewhere = d.path().join("another-box");
+        fs::create_dir_all(&elsewhere).expect("dir");
+        let (by_enrol, _) = Registry::load(elsewhere.join("projects.json"))
+            .enrol(&repo)
+            .expect("enrols");
+        assert_eq!(by_enrol.id, p.id);
+        fs::remove_dir_all(repo.join(".kickoff")).expect("undo what enrol wrote");
+
+        let (again, created) = r.open(&repo).expect("opens again");
+        assert!(!created, "opening an open conversation minted something");
+        assert_eq!(again.id, p.id);
+        assert_eq!(
+            home.read_secret(&p.id).expect("reads").as_deref(),
+            Some(first.as_str()),
+            "opening again rotated the secret under a live bridge"
+        );
+        assert_eq!(r.all().count(), 1);
+
+        // A repo enrolled the OLD way — a row and a repo token, no channel copy — is refused,
+        // and told the verb that copies its secret across, because `open` cannot: it holds only
+        // the hash, and minting a fresh secret would take the live bridge off the air.
+        let old = super::tests::repo(&d, "old-way");
+        let (old_p, _) = r.enrol(&old).expect("enrols");
+        home.remove_secret(&old_p.id)
+            .expect("as a box from before this change");
+        let said = r.open(&old).expect_err("refused").to_string();
+        assert!(said.contains("adopt-secrets"), "{said}");
+        for jargon in ["Err", "None", "Option", "canonical"] {
+            assert!(
+                !said.contains(jargon),
+                "jargon reached the operator: {said}"
+            );
+        }
+        assert!(
+            home.read_secret(&old_p.id).expect("reads").is_none(),
+            "a refusal still wrote a secret"
+        );
+    }
+
+    #[test]
+    fn enrolling_a_folder_below_a_seed_with_rooms_names_the_seed_and_never_a_room() {
+        // The containment check finds the first row in id order whose repo is a parent of the
+        // folder. Rooms share their seed's repo and a `c-` id sorts before a `p-` one, so the
+        // refusal named whichever room sorted first — a row that is vacant and hidden from every
+        // list, so he was told his folder was inside a project he had never seen.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let org = repo(&d, "org");
+        let (seed, _) = r.open(&org).expect("opens");
+        r.grant(&org, 2).expect("grants");
+        let inside = repo(&d, "org/sub");
+        let said = r.enrol(&inside).expect_err("refused").to_string();
+        assert!(
+            said.contains(&format!("\"{}\"", seed.title)),
+            "the refusal does not name the seed: {said}"
+        );
+        assert!(
+            !said.contains("room"),
+            "the refusal names a room he has never seen: {said}"
+        );
+        let said = r.open(&inside).expect_err("refused").to_string();
+        assert!(!said.contains("room"), "{said}");
+    }
+
+    #[test]
+    fn opening_a_project_whose_channel_copy_is_stale_says_so_and_names_the_verb_that_mends_it() {
+        // `open` on an existing row asked only whether a channel copy EXISTS, never whether it
+        // hashes to what the hub knows. A stale copy — bytes nobody can be admitted with — was
+        // reported as an open conversation, the link re-asserted, and "Nothing was changed",
+        // while every new session in that repo presented the stale bytes and was turned away for
+        // good. The likeliest way to get one: a rotation typed with the binary from before
+        // conversations existed, which rewrites the repo's copy and the hash and knows nothing of
+        // the channel's.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "rot");
+        let home = home(&d);
+        let (p, current) = r.enrol(&repo).expect("enrols");
+        home.write_secret(&p.id, &"0".repeat(64))
+            .expect("the channel's copy, gone stale");
+
+        // The repo still holds the current bytes: the migration verb copies them across.
+        let said = r.open(&repo).expect_err("refused").to_string();
+        assert!(
+            said.contains("adopt-secrets --apply"),
+            "the verb that mends it is not named: {said}"
+        );
+        assert!(
+            !said.contains("already open") && !said.contains("Nothing was changed"),
+            "a stale copy was reported as open: {said}"
+        );
+        for jargon in ["Err", "None", "Option", "sha256", "token_sha256"] {
+            assert!(
+                !said.contains(jargon),
+                "jargon reached the operator: {said}"
+            );
+        }
+        assert_eq!(
+            home.read_secret(&p.id).expect("reads").as_deref(),
+            Some("0".repeat(64).as_str()),
+            "a refusal rewrote the channel's copy"
+        );
+
+        // Neither copy is current: nothing on the box can connect, and only a rotation mends it.
+        fs::write(repo.join(TOKEN_FILE), "1".repeat(64)).expect("write");
+        let said = r.open(&repo).expect_err("refused").to_string();
+        assert!(
+            said.contains("herdr-tg enroll"),
+            "the rotation is not named: {said}"
+        );
+        assert!(!said.contains("adopt-secrets"), "{said}");
+
+        // And a channel copy that IS current is what "already open" means.
+        home.write_secret(&p.id, &current).expect("mended by hand");
+        let (again, created) = r.open(&repo).expect("opens");
+        assert!(!created);
+        assert_eq!(again.id, p.id);
+    }
+
+    #[test]
+    fn a_grant_whose_list_could_not_be_saved_leaves_no_slot_and_no_secret_behind() {
+        // `grant` wrote each room's secret and its vacant slot BEFORE saving the rows, and when
+        // the save failed it unwound nothing: N secrets and N slots with no row, which the book
+        // counted as vacant, so the ceiling was spent on rooms that did not exist and a
+        // dispatcher taking one got a hello nobody would admit. `enrol` puts its copy back when
+        // its second write fails; this is the same discipline.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let org = repo(&d, "org");
+        let (seed, _) = r.open(&org).expect("opens");
+        let home = home(&d);
+        let before = fs::read(d.path().join("projects.json")).expect("the registry");
+
+        // A directory where the registry's temporary file goes, so the save cannot open it. The
+        // temp name is per process, so this blocks exactly this process's next save.
+        let blocker = d
+            .path()
+            .join(format!("projects.json.tmp.{}", std::process::id()));
+        fs::create_dir_all(&blocker).expect("the blocker");
+        let said = r
+            .grant(&org, 2)
+            .expect_err("a grant whose list cannot be saved")
+            .to_string();
+        fs::remove_dir(&blocker).expect("unblock");
+
+        assert!(
+            said.contains("nothing was granted") || said.contains("taken back"),
+            "the refusal does not say the rooms were taken back: {said}"
+        );
+        assert_eq!(
+            fs::read(d.path().join("projects.json")).expect("the registry"),
+            before,
+            "the failed grant changed the list"
+        );
+        let slots = home.slots(&seed.id).expect("slots");
+        assert!(
+            slots.is_empty(),
+            "a failed grant left slots behind: {slots:?}"
+        );
+        let left: Vec<String> = fs::read_dir(home.conversations())
+            .expect("readable")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("c-"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "a failed grant left secrets behind: {left:?}"
+        );
+
+        // The book is whole: sixteen can still be granted.
+        let full = r.grant(&org, 16).expect("a full book after a failed grant");
+        assert_eq!(full.len(), 16);
+    }
+
+    #[test]
+    fn a_vacant_slot_whose_room_has_no_row_never_holds_a_page_of_the_book() {
+        // A slot naming a room the registry has never heard of — left by a crash between the
+        // slot and the save — is a page nothing can use: the hub admits on the hash, and there is
+        // none. It is taken back at the next grant rather than counted, so a phantom can neither
+        // fill the book nor be taken by a dispatcher and refused `unknown_project`.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let org = repo(&d, "org");
+        let (seed, _) = r.open(&org).expect("opens");
+        let home = home(&d);
+        let phantom = ProjectId::new("c-0000000000ff");
+        home.write_secret(&phantom, "a-secret-with-no-row")
+            .expect("the phantom's secret");
+        home.add_slot(&seed.id, &phantom)
+            .expect("the phantom's slot");
+        // A slot a dispatcher already TOOK is spent, whatever became of its row: its number is
+        // never reused, because the room it named may have a topic and a history.
+        let taken = ProjectId::new("c-0000000000ee");
+        home.add_slot(&seed.id, &taken).expect("a slot");
+        let book = home.grants().join(seed.id.as_str());
+        fs::rename(book.join("001.vacant"), book.join("001.taken")).expect("take");
+
+        let full = r.grant(&org, 16).expect("a phantom must not hold a page");
+        assert_eq!(full.len(), 16);
+        let slots = home.slots(&seed.id).expect("slots");
+        assert!(
+            !slots.iter().any(|s| s.room == phantom),
+            "the phantom is still in the book: {slots:?}"
+        );
+        assert!(
+            slots.iter().any(|s| s.room == taken && s.taken),
+            "a taken slot was swept: {slots:?}"
+        );
+        assert_eq!(slots.iter().filter(|s| !s.taken).count(), 16);
+        assert!(
+            home.read_secret(&phantom).expect("reads").is_none(),
+            "a credential nobody minted a row for is still on disk"
+        );
+        assert!(
+            slots.iter().all(|s| s.number != 1 || s.taken),
+            "a taken number was reused: {slots:?}"
+        );
+    }
+
+    #[test]
+    fn rotating_an_opened_project_writes_nothing_into_its_repo() {
+        // `open` collects the prize: no file in the repo. Rotation is `enrol`, and `enrol` wrote
+        // BOTH places, always — so rotating a leaked secret on an opened project put the token
+        // back into the tree, on the very day it mattered, and in a repo git would commit it from
+        // it was refused outright instead. A rotation rewrites the places the secret already
+        // lives and no new one: an opened project rotates where the channel keeps it, an adopted
+        // one rotates both until its repo copy is taken away.
+        let d = tempfile::tempdir().expect("tmp");
+        let mut r = reg(&d);
+        let repo = repo(&d, "org");
+        let home = home(&d);
+        let (p, _) = r.open(&repo).expect("opens");
+        let old = home.read_secret(&p.id).expect("reads").expect("a secret");
+        assert!(
+            !r.would_write_repo_copy(&repo),
+            "an opened project would get a token"
+        );
+
+        let (rotated, fresh) = r.enrol(&repo).expect("rotates");
+        assert_eq!(rotated.id, p.id);
+        assert!(
+            !repo.join(".kickoff").exists(),
+            "rotating an opened project wrote a token into its repo"
+        );
+        assert_eq!(
+            home.read_secret(&p.id).expect("reads").as_deref(),
+            Some(fresh.as_str())
+        );
+        assert!(r.resolve(&fresh).is_some() && r.resolve(&old).is_none());
+
+        // An adopted project — both copies present — rotates both.
+        let adopted = super::tests::repo(&d, "adopted");
+        let (a, _) = r.enrol(&adopted).expect("enrols the old way, both places");
+        assert!(r.would_write_repo_copy(&adopted));
+        let (_, s2) = r.enrol(&adopted).expect("rotates");
+        assert_eq!(
+            fs::read_to_string(adopted.join(TOKEN_FILE)).expect("readable"),
+            s2
+        );
+        assert_eq!(
+            home.read_secret(&a.id).expect("reads").as_deref(),
+            Some(s2.as_str())
+        );
+        // And once its repo copy is taken away, a rotation does not put one back.
+        fs::remove_dir_all(adopted.join(".kickoff")).expect("as remove-repo-secret leaves it");
+        assert!(!r.would_write_repo_copy(&adopted));
+        r.enrol(&adopted).expect("rotates channel-only");
+        assert!(!adopted.join(".kickoff").exists());
+        // A folder nobody enrolled gets both, as it always did.
+        assert!(r.would_write_repo_copy(&super::tests::repo(&d, "fresh")));
     }
 }

@@ -33,7 +33,7 @@
 import { statSync } from 'fs'
 import { join } from 'path'
 
-import { readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
+import { notEnrolled, readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
 import { HubLink } from '../../plugins/kickoff-channel/hub-link.ts'
 import { opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
 
@@ -99,12 +99,20 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
   }
 
   // ── the secret ────────────────────────────────────────────────────────────────────────────────
+  // Which term of the ladder found it is said, because "which conversation am I" has four answers
+  // now and a person debugging a silent worker needs to know which one was taken.
   const project = secretFor(CONFIG)
   if (!project) {
-    const at = CONFIG.tokenFile ?? `above ${facts.mainTop ?? CONFIG.projectDir}`
-    not(`no secret ${CONFIG.tokenFile ? `at ${at}` : at}; mount the project's .kickoff/hub.token there, or run: herdr-tg enroll ${facts.mainTop ?? CONFIG.projectDir}`)
+    not(notEnrolled(CONFIG).note)
   } else {
-    const how = CONFIG.tokenFile ? `told by KICKOFF_HUB_TOKEN_FILE` : `found above ${facts.mainTop ?? CONFIG.projectDir}`
+    const how =
+      project.how === 'told'
+        ? 'told by KICKOFF_HUB_TOKEN_FILE'
+        : project.how === 'named'
+          ? `conversation ${project.conversation}, named by KICKOFF_HUB_CONVERSATION`
+          : project.how === 'bound'
+            ? `conversation ${project.conversation}, the one this repository is bound to`
+            : `found above ${facts.mainTop ?? CONFIG.projectDir}, the older way`
     ok(`the secret: ${project.tokenFile} (${how})`)
   }
 
@@ -198,7 +206,7 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
             return
           }
           if (f.t === 'refused') {
-            not(refusalSentence(String(f.reason), CONFIG.address, facts.mainTop ?? CONFIG.projectDir))
+            not(refusalSentence(String(f.reason), CONFIG.address, project))
             finish()
           }
         },
@@ -300,12 +308,24 @@ async function isLive(path: string): Promise<boolean> {
   })
 }
 
-function refusalSentence(reason: string, address: string | null, enrollDir: string): string {
+function refusalSentence(reason: string, address: string | null, project: { how?: string; conversation?: string } | null): string {
   switch (reason) {
     case 'unknown_project':
-      return `the hub does not know this project; run: herdr-tg enroll ${enrollDir}`
-    case 'bad_token':
-      return `the secret is not one the hub knows; re-run: herdr-tg enroll ${enrollDir}`
+    case 'bad_token': {
+      // A secret the CHANNEL keeps that the hub refuses is most often a stale copy — a rotation
+      // typed with a herdr-tg from before conversations existed rewrites the repo's copy alone —
+      // and `open` on such a project says "already open", so the verb named is the one that
+      // copies the current bytes across. A room has no folder to enrol at all.
+      if (project?.how === 'named') {
+        return `the secret the channel keeps for conversation ${project.conversation} is not one the hub knows; grant it again at a terminal (herdr-tg grant), or name a conversation that is with KICKOFF_HUB_CONVERSATION`
+      }
+      if (project?.how === 'bound') {
+        return 'the secret the channel keeps for this project is not one the hub knows; at a terminal, copy the repo\'s current secret across: herdr-tg adopt-secrets --apply (or, if the repo holds none, enrol it again: herdr-tg enroll)'
+      }
+      return reason === 'unknown_project'
+        ? 'the hub does not know this project; open it at a terminal: herdr-tg open (or, if it was enrolled before, enrol it again: herdr-tg enroll)'
+        : 'the secret is not one the hub knows; enrol the project again at a terminal: herdr-tg enroll'
+    }
     case 'not_enabled':
       return 'this project is enrolled but switched off'
     case 'version_skew':

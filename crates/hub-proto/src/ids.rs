@@ -50,7 +50,8 @@ macro_rules! opaque_id {
 
 opaque_id!(
     ProjectId,
-    "A project, minted once at enrolment from its canonical repo path.
+    "A conversation the hub resolves a secret to: a project, minted once at enrolment from its
+canonical repo path, or a room, minted at random by a terminal verb. Opaque here either way.
 
 Never a counter. A recycled counter silently inheriting a dead agent's topic is a confirmed
 defect in this repo's history, not a hypothetical."
@@ -76,7 +77,8 @@ Position is how a button reading \"Reject\" once confirmed \"Allow always\"."
 opaque_id!(MsgId, "One Telegram message, as the hub knows it.");
 opaque_id!(
     LaneId,
-    "One worktree of a project, speaking for itself rather than as the project.
+    "One conversation of a project beside its own voice — a worktree, or whatever a dispatcher
+named — speaking for itself rather than as the project.
 
 Minted by whatever dispatched the lane and read off the machine by an adapter — never parsed here,
 and never resolved to anything. It is an ADDRESS, not a credential: the secret still proves only the

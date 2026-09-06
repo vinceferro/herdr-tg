@@ -72,9 +72,12 @@ export type RelayConfig = {
   carrier: string | null
   /**
    * The enrolled project, resolved AFRESH on every attempt — never once, because the operator may
-   * `herdr-tg enroll` while this is running and that is the documented recovery from unknown_project.
+   * `herdr-tg open` or `enroll` while this is running and that is the documented recovery from
+   * unknown_project.
    */
   secretOf: () => Project | null
+  /** What to say when `secretOf` finds nothing: a verb, never a path. */
+  whenNotEnrolled: { why: string; note: string }
   /** Say something in this process's own transcript. The operator cannot see it; a developer can. */
   note: (msg: string) => void
   /** Refuse to start and exit 2, naming what has to change. */
@@ -334,19 +337,9 @@ export function createRelay(cfg: RelayConfig): Relay {
     identify() {
       const project = cfg.secretOf()
       if (!project) {
-        return {
-          refuse: {
-            permanent: true,
-            // The main working tree when git says there is one, and the directory this relay was
-            // pointed at when it does not — a container has no git, and "enroll undefined" is an
-            // instruction nobody can carry out.
-            why: `This project is not enrolled, so the hub has no way to know which project it is. Run:  herdr-tg enroll ${FACTS.mainTop ?? PROJECT_DIR}`,
-            note: `no secret under ${FACTS.mainTop ?? PROJECT_DIR}. Run:  herdr-tg enroll ${FACTS.mainTop ?? PROJECT_DIR}`,
-            // Retried, because the operator may enrol the project while this is running and that is
-            // the recovery the message prescribes.
-            retryMs: 30_000,
-          },
-        }
+        // Retried, because the operator may open or enrol the project while this is running and
+        // that is the recovery the message prescribes. A verb, never a path: `attach.ts` says why.
+        return { refuse: { permanent: true, ...cfg.whenNotEnrolled, retryMs: 30_000 } }
       }
       secretHeld = project.token
       return {
@@ -458,7 +451,7 @@ export function createRelay(cfg: RelayConfig): Relay {
         // THE PROJECT — taking the project's claim and its topic while the project's own session is
         // turned away.
         if (OUR_LANE && f.lane !== OUR_LANE) {
-          note('the hub did not confirm this worktree; it is older than this relay')
+          note('the hub did not confirm this conversation; it is older than this relay')
           // The producers are told BEFORE the link is marked down, because marking it down ends
           // every greeted producer's socket — and a refusal written into a socket that is already
           // closing is a producer left waiting for a link that is never coming.
@@ -468,7 +461,7 @@ export function createRelay(cfg: RelayConfig): Relay {
           for (const p of producers) refuse(p, 'bad_lane')
           link.markDown(
             true,
-            `The hub on this machine is older than this relay and cannot give a worktree a place of its own (${OUR_LANE}).`,
+            `The hub on this machine is older than this relay and cannot give a conversation a place of its own (${OUR_LANE}).`,
           )
           link.end()
           break

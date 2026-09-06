@@ -52,7 +52,7 @@ import { randomBytes } from 'crypto'
 import { constants as fsConstants, copyFileSync, readFileSync, statSync } from 'fs'
 import { basename, extname, join } from 'path'
 
-import { readConfig, secretFor, type Attachment } from './attach.ts'
+import { notEnrolled, readConfig, secretFor, type Attachment } from './attach.ts'
 import { HubLink, type Delivery, type Identity, type Outbound, type Unanswered } from './hub-link.ts'
 import { type Project } from './where.ts'
 
@@ -72,21 +72,16 @@ const READ = readConfig()
 const CONFIG: Attachment | null = 'config' in READ ? READ.config : null
 const PROBLEM = 'problem' in READ ? READ.problem : null
 
-/** The top of the working tree, for the one message that has to name a folder to enrol. */
-const PROJECT_TOP = CONFIG?.facts.projectTop ?? null
-
 /** The conversation this session speaks for, or null when it speaks for the project itself. */
 const LANE = CONFIG?.address ?? null
 
 /**
  * What to call the thing this session speaks for, in a sentence a person reads.
  *
- * Three answers, because there are three things it can be and each takes a different action. It is
- * a worktree only when the name was DERIVED from one — a dispatcher that minted "CEO-steering"
- * would otherwise be told to go and remake a worktree that does not exist — and it is the project
- * itself when there is no name at all, which no session in a worktree can be.
+ * Two answers: the project itself when there is no name at all, and a conversation otherwise —
+ * a word the hub can stand behind whether the name came from git or from a dispatcher.
  */
-const WHAT_WE_ARE = !CONFIG?.address ? 'project' : CONFIG.addressWasGiven ? 'conversation' : 'worktree'
+const WHAT_WE_ARE = !CONFIG?.address ? 'project' : 'conversation'
 
 /**
  * Whether this server holds the hub connection itself, or hands its frames to a relay that holds it
@@ -682,26 +677,6 @@ function whyNoFile(why: unknown): string {
 }
 
 /**
- * What to tell the agent to run. Never a directory this process merely happens to be sitting in,
- * and never one BELOW the project either: `herdr-tg enroll` on a subfolder mints a second project
- * for the same repository, with its own chat, and writes a second secret into a tracked tree.
- */
-const enrolHint = () => {
-  // The top of the working tree first; failing that, the folder a secret was actually found in —
-  // which is the project, not a guess; failing both, the directory this session was TOLD it speaks
-  // for, which is a fact somebody wrote down rather than one this process inferred.
-  //
-  // That last term is the difference between an instruction and a blank. The first two are git's
-  // answer and a found secret, and this hint exists for exactly the case where there is no secret;
-  // in a container, or any directory git will not talk about, both are null and what an agent read
-  // — and then repeated to the operator — was the literal words "<the project folder>". Only when
-  // nothing at all named a directory does it still decline, and there it is the truth: this
-  // session never said which project it belongs to, and no folder here would be more than a guess.
-  const dir = PROJECT_TOP ?? project?.repo ?? CONFIG?.projectDir ?? null
-  return dir ? `Run:  herdr-tg enroll ${dir}` : 'Run:  herdr-tg enroll <the project folder>'
-}
-
-/**
  * Whether a process is right now listening on a Unix socket path — not merely whether a file is
  * sitting there.
  *
@@ -746,14 +721,9 @@ function identify(): Identity {
   }
   project = secretFor(CONFIG)
   if (!project) {
-    return {
-      refuse: {
-        permanent: true,
-        why: `This project is not enrolled, so the hub has no way to know which project it is. ${enrolHint()}`,
-        note: `no secret under ${PROJECT_TOP ?? CONFIG.projectDir}. ${enrolHint()}`,
-        retryMs: 30_000,
-      },
-    }
+    // A verb and never a path (`notEnrolled` says why), and retried: the documented recovery is
+    // to open or enrol the project while this is running.
+    return { refuse: { permanent: true, ...notEnrolled(CONFIG), retryMs: 30_000 } }
   }
   return {
     socket: CONFIG.dial,
@@ -878,9 +848,21 @@ function onFrame(frame: Record<string, any>): void {
       // A closed set, split by the only question the agent needs answered: will waiting help? The
       // first group cannot mend itself, so a tool result that promised the operator would see
       // something has to stop promising it and name what a person must do instead.
+      // A secret the CHANNEL keeps that the hub refuses is a different fault from a repo that
+      // was never enrolled, and it reaches here wearing the same name. Most often it is a stale
+      // copy — a rotation typed with a herdr-tg from before conversations existed, which rewrites
+      // the repo's copy alone — and the verb that mends it is the one that copies the current
+      // bytes across. Sending whoever reads this to `open` looped: `open` says "already open".
+      // For a room there is no folder to enrol at all.
+      const staleCopy =
+        project?.how === 'named'
+          ? `The secret the channel keeps for conversation ${project.conversation} is not one the hub knows, so nothing here reaches him. It has to be granted again at a terminal —  herdr-tg grant  — or KICKOFF_HUB_CONVERSATION has to name a conversation that is.`
+          : project?.how === 'bound'
+            ? 'The secret the channel keeps for this project is not one the hub knows — most often a rotation typed with a herdr-tg from before conversations existed, which rewrites the repo\'s copy alone. At a terminal, copy the repo\'s current secret across:  herdr-tg adopt-secrets --apply  — or, if the repo holds none, enrol the project again:  herdr-tg enroll <the project folder>'
+            : null
       const forGood: Record<string, string> = {
-        unknown_project: `The hub does not know this project. ${enrolHint()}`,
-        bad_token: `The secret at ${project?.tokenFile ?? '.kickoff/hub.token'} is not one the hub knows. Re-run:  ${enrolHint().replace('Run:  ', '')}`,
+        unknown_project: staleCopy ?? 'The hub does not know this project. Open it at a terminal:  herdr-tg open <the project folder>  — or, if it was enrolled before, enrol it again:  herdr-tg enroll <the project folder>',
+        bad_token: staleCopy ?? 'The secret this session presents is not one the hub knows. Enrol the project again at a terminal:  herdr-tg enroll <the project folder>',
         not_enabled: 'This project is enrolled with the hub but switched off, so nothing is delivered for it.',
         version_skew: 'The hub speaks a different version of this protocol than the bridge. Run:  kickoff pull',
         // Permanent, not temporary: the same name is refused on every attempt, so treating it as
@@ -906,7 +888,7 @@ function onFrame(frame: Record<string, any>): void {
             'This session speaks for the project as a whole, and the relay it was pointed at carries one conversation of that project, so it was turned away and nothing here reaches him. Whoever starts this session has to name the same conversation the relay carries, with KICKOFF_HUB_ADDRESS, or point it at the relay for the project itself.'
           : CONFIG?.addressWasGiven
             ? `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this is a name the hub will not address and nothing here reaches him until whoever started this session gives it a different one.`
-            : `The hub would not give this worktree (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this worktree's name is one the hub will not address and nothing here reaches him until it is remade under a plainer one.`,
+            : `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this name — git's own for the worktree the session runs in — is one the hub will not address, and nothing here reaches him until that worktree is remade under a plainer name.`,
       }
       // The claim is per CONVERSATION now, so a refusal reaching one means that conversation is
       // held — the project's own topic and every other conversation of it may be perfectly free.
