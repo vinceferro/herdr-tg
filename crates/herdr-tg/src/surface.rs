@@ -133,6 +133,29 @@ fn is_topic_gone(err: &teloxide::RequestError) -> bool {
     said.contains("message thread not found") || said.contains("topic_deleted")
 }
 
+/// Does this error mean the edit was already applied, as opposed to refused?
+///
+/// Telegram answers an edit whose text and keyboard are already exactly what it is asked to set
+/// with an error. For every edit in this file that is not a failure but the thing the caller
+/// wanted: the message already says that, and a retirement's keyboard is already off. Read as a
+/// failure, it journalled a line saying the keyboard would not come off while it was off, and kept
+/// a record of a question nobody can answer any more — which the next session then tries to retire
+/// all over again.
+///
+/// Both shapes, for the reason `flood_wait` takes both: the client library has a typed variant
+/// whose Display carries the whole sentence Telegram sends, and a refusal it does not recognise
+/// comes through as `Unknown` holding whatever wording arrived. "message is not modified" is the
+/// part the two share.
+///
+/// Deliberately narrow, for the reason `is_topic_gone` is. A broad match here would swallow the
+/// refusals that matter most — a body over the limit, a message this bot did not write — and call
+/// a keyboard that is still live on his phone done with.
+fn the_edit_was_already_applied(err: &teloxide::RequestError) -> bool {
+    err.to_string()
+        .to_lowercase()
+        .contains("message is not modified")
+}
+
 /// What to assume when Telegram refuses for flooding and does not say for how long.
 ///
 /// The measured shape of the refusal is a sixty-second window: twenty sends were accepted in the
@@ -289,11 +312,17 @@ impl Surface for Telegram {
         // Clipped for the same reason a retirement is: an edit whose body is over Telegram's limit
         // FAILS, and a failed edit here leaves the operator reading a stale count.
         let body = crate::queue::fit(&escape_html(text), crate::queue::MAX_TEXT).0;
-        self.bot
+        // An edit that changed nothing is the line already saying that, not a failure.
+        match self
+            .bot
             .edit_message_text(self.forum, MessageId(raw), body)
             .parse_mode(ParseMode::Html)
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if the_edit_was_already_applied(&e) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn retire_buttons(
@@ -325,10 +354,20 @@ impl Surface for Telegram {
         // Escaping happens after, and can lengthen — `&` becomes five characters — so the reserve
         // is measured on the escaped note and the escaped body is clipped again as a backstop.
         let body = retirement_body(original, note);
-        self.bot
+        // An edit that changed nothing means the keyboard is already off and the body already says
+        // this. That is the outcome this call exists for, so it is reported as one: read as a
+        // failure it wrote a false error line and kept a record of a question nobody can answer,
+        // and the caller then tried the same edit again on the next session.
+        match self
+            .bot
             .edit_message_text(self.forum, MessageId(raw), body)
             .parse_mode(ParseMode::Html)
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if the_edit_was_already_applied(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
         tracing::info!(
             topic = topic_id,
             message = raw,
@@ -649,6 +688,48 @@ mod tests {
             assert!(
                 !is_topic_gone(&e),
                 "{other} was mistaken for a deleted topic"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_telegram_calls_unchanged_is_a_keyboard_that_is_already_off() {
+        // Telegram refuses an edit whose content is already what it is asked to set. Read as a
+        // failure, a retirement that had already happened wrote an error line saying the keyboard
+        // would not come off — while it was off — and kept the record, so the menu stayed written
+        // down and the next session tried the same edit again.
+        //
+        // Both shapes: the long sentence Telegram actually sends, which the library types, and the
+        // short one it passes through when it has no variant for the wording.
+        let long: teloxide::ApiError = serde_json::from_value(serde_json::json!(
+            "Bad Request: message is not modified: specified new message content and reply markup \
+             are exactly the same as a current content and reply markup of the message"
+        ))
+        .expect("the library knows this one");
+        assert!(
+            the_edit_was_already_applied(&teloxide::RequestError::Api(long)),
+            "the sentence Telegram actually sends read as a failed edit"
+        );
+        let short = teloxide::RequestError::Api(teloxide::ApiError::Unknown(
+            "Bad Request: message is not modified".to_owned(),
+        ));
+        assert!(
+            the_edit_was_already_applied(&short),
+            "the wording the library does not type read as a failed edit"
+        );
+
+        // And nothing else. These are the refusals that leave a live keyboard on his phone, and
+        // calling one of them done is how a menu with nothing behind it survives.
+        for other in [
+            "Bad Request: message thread not found",
+            "Bad Request: message text is empty",
+            "Bad Request: message to edit not found",
+            "Too Many Requests: retry after 5",
+        ] {
+            let e = teloxide::RequestError::Api(teloxide::ApiError::Unknown(other.to_owned()));
+            assert!(
+                !the_edit_was_already_applied(&e),
+                "{other} was mistaken for an edit that changed nothing"
             );
         }
     }

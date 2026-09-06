@@ -55,8 +55,8 @@
 //! # Nothing is sent without a record of it first
 //!
 //! [`HubAudit`] writes `sent` before a send and the outcome after, so a dangling `sent` means the
-//! process died mid-write and nothing else. It deliberately mirrors `audit.rs` rather than
-//! extending it: that file's subject is a pane and a keystroke, and the hub has neither.
+//! process died mid-write and nothing else. It is the hub's own file: the `audit.rs` it was once
+//! modelled on had a pane and a keystroke for its subject, and went with the scraper.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -180,6 +180,16 @@ pub const QUESTION_SHELF_LIFE: Duration = Duration::from_secs(20);
 /// It is the shelf life of an ask record: past it, the edit that takes a keyboard off is refused,
 /// so the record can no longer do the only thing it is kept for.
 pub const EDIT_WINDOW_SECS: u64 = 48 * 60 * 60;
+
+/// The most of a retirement's note that is worth keeping and worth showing.
+///
+/// The note can be an adapter's own free text — the `outcome` it sends with `ask_resolved` — which
+/// the wire bounds only at a whole frame, 64 KiB. Two costs, and neither is chosen by anyone: the
+/// note is stored with the record in a file that is rewritten whole on every ask and every tap of
+/// every project on this box, and it is written onto the retired message, where the room it takes
+/// is taken off the QUESTION — past roughly this much, the operator watches his question get eaten
+/// to make space for a paragraph explaining why it went away.
+pub const RETIREMENT_NOTE_ROOM: usize = 500;
 
 /// How long a refused topic creation is remembered before Telegram is asked again.
 ///
@@ -553,9 +563,79 @@ pub struct AskRecord {
     /// So authorisation is this field, and the record's presence is only retirement bookkeeping.
     #[serde(default)]
     pub answered: Option<OptionId>,
+    /// That the question has stopped being asked, and the note its keyboard is retired with.
+    ///
+    /// The other half of `answered`. A question can stop being asked from two sides — a tap on
+    /// the phone, or the agent answering, withdrawing or timing it out at its own terminal and
+    /// saying so with `ask_resolved` — and each side has to be written down before anything is
+    /// done about it, or the other side lands in the gap. The phone's side always was. The
+    /// terminal's side used to be an edit followed by forgetting the record, with nothing marked
+    /// in between: a tap during that edit — a Telegram round trip on a menu he is looking at — or
+    /// after the edit had failed, resolved and delivered into an agent that had already answered.
+    ///
+    /// Two fields and not one enum, because they answer different questions: `answered` is WHAT
+    /// the phone sent, `closed` is that the question is over and how it must be signed off.
+    /// Together they are one predicate, [`Self::refusal_if_closed`], which is the only thing a
+    /// tap is judged against.
+    ///
+    /// It is also written by the phone's own side, and only there — when the retirement that
+    /// follows a tap is refused by Telegram. That record still says `answered`, which every sweep
+    /// deliberately leaves alone, so without this mark nothing in the hub was left looking at a
+    /// menu that is provably still live: it sat on his phone refusing every tap until the ledger
+    /// dropped it two days later.
+    ///
+    /// `#[serde(default)]` because the ledger on the operator's box holds records from before
+    /// this existed, and those are open questions or phone answers exactly as they were.
+    #[serde(default)]
+    pub closed: Option<Closed>,
+}
+
+/// That a question is over, and the note its keyboard is retired with.
+///
+/// The note is kept with the record rather than re-derived, because the retirement that writes
+/// it may not be the one that heard `ask_resolved`: an edit Telegram refused is tried again when
+/// the next session arrives, and that sweep only knows the question is not open. Without the
+/// note it wrote "the session that asked this restarted" over a question the agent had answered.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Closed {
+    pub how: hub_proto::AskEnd,
+    pub note: String,
 }
 
 impl AskRecord {
+    /// Why a tap on this question is refused, if it is — the one predicate both checks in
+    /// `resolve_tap` use, so the unlocked look and the locked one cannot disagree.
+    ///
+    /// An answer from either side reads as "already answered": the operator does not care which
+    /// side it was, and "at the terminal" is a place he cannot see. A question that was withdrawn
+    /// or timed out was never answered, and saying it was would be false; what is true is that
+    /// nobody is asking any more.
+    pub fn refusal_if_closed(&self) -> Option<TapRefusal> {
+        if self.answered.is_some() {
+            return Some(TapRefusal::AlreadyAnswered);
+        }
+        match self.closed.as_ref().map(|c| c.how) {
+            None => None,
+            Some(hub_proto::AskEnd::Answered) => Some(TapRefusal::AlreadyAnswered),
+            Some(hub_proto::AskEnd::Withdrawn | hub_proto::AskEnd::Timeout) => {
+                Some(TapRefusal::NoLongerAsked)
+            }
+        }
+    }
+
+    /// Is this a keyboard somebody still has to take off, and does the record know what to say?
+    ///
+    /// "It was never answered" was the whole test, in every sweep and in the terminal's own
+    /// retirement, and it was right while a phone answer meant the keyboard was already gone. It
+    /// stopped being right the moment a refused edit started keeping the record: an answered
+    /// record whose retirement Telegram refused is exactly the menu that most needs taking off,
+    /// and every one of those walked past it. What separates it from a tap whose retirement is
+    /// still in flight — which is not anybody else's to touch — is `closed`, which is written
+    /// only once something knows the question is over AND knows the words to sign it off with.
+    fn needs_retiring(&self) -> bool {
+        self.answered.is_none() || self.closed.is_some()
+    }
+
     /// Who asked this: the project speaking for itself, or one lane of it.
     pub fn addr(&self) -> Addr {
         Addr {
@@ -727,8 +807,11 @@ pub enum TapRefusal {
     /// It asked, then restarted. The question belongs to a process that no longer exists.
     Restarted,
     /// It has already been answered — from the phone or at the terminal — and the keyboard is only
-    /// still there because taking it away failed.
+    /// still there because taking it away has not happened yet: the edit failed, or is in flight.
     AlreadyAnswered,
+    /// The agent withdrew it or let it time out, so nobody is waiting for an answer; the keyboard
+    /// is only still there because taking it away has not happened yet.
+    NoLongerAsked,
     /// The tap came from a chat this bot does not answer, or from a person who may not speak
     /// there. Silence either way: a reply confirms something is listening.
     NotYours,
@@ -783,6 +866,9 @@ impl TapRefusal {
             }
             Self::AlreadyAnswered => {
                 "That one has already been answered. I have not sent anything."
+            }
+            Self::NoLongerAsked => {
+                "That question is no longer being asked, so I have not sent anything."
             }
             Self::NotYours => "",
         }
@@ -895,7 +981,86 @@ impl AskLedger {
     /// undone is the authorisation, not the record.
     pub fn mark_unanswered(&mut self, chat_id: i64, msg_id: &MsgId) -> std::io::Result<()> {
         if let Some(r) = self.records.get_mut(&ledger_key(chat_id, msg_id)) {
+            // Only the phone's mark comes off. A terminal close that landed in the meantime is a
+            // fact about the agent, not about this tap, and taking it back would reopen a question
+            // nobody is asking.
             r.answered = None;
+        }
+        self.save()
+    }
+
+    /// Write down that a question ended at the terminal, on every message that carries it, and
+    /// hand back the messages whose keyboards now need retiring.
+    ///
+    /// One lock, one write: the mark is what a tap is judged against, so it has to be there BEFORE
+    /// the first keyboard edit begins, and it has to be there for every message of the ask at
+    /// once — marking each as its edit came round would leave the later ones tappable while the
+    /// earlier ones were coming off.
+    ///
+    /// The mark goes on EVERY message of the ask, the phone's own answers included. It is not the
+    /// same fact as `answered` and cannot be folded into it: a tap that was written down and then
+    /// reached nobody has its authorisation taken back off (`mark_unanswered`), and if the
+    /// terminal's answer were not written down beside it that record came back fully open — a live
+    /// keyboard for a question the agent had already resolved, one tap from a contradicting choice
+    /// landing in its turn.
+    ///
+    /// What is handed back is narrower: a record the phone answered whose keyboard is still being
+    /// taken off is NOT a target. That retirement belongs to the tap, is already in flight, and
+    /// entering it twice means two edits of one message with the same words — the second of which
+    /// Telegram refuses as unchanged, which reads in the journal as a keyboard that would not come
+    /// off. Once that edit has actually failed it says so on the record (`closed`), and from then
+    /// on this is the retry that takes it off. A record already closed keeps its first note.
+    ///
+    /// The targets come back even when the write to disk fails: the mark is held in memory and a
+    /// tap is refused against that, so refusing to retire would leave a keyboard live for a
+    /// question the hub already knows is closed. The failed write is said in the journal.
+    pub fn close_all(
+        &mut self,
+        addr: &Addr,
+        instance: &str,
+        ask_id: &AskId,
+        closed: Closed,
+    ) -> Vec<(i64, MsgId)> {
+        let mine = |r: &AskRecord| r.addr_is(addr) && r.instance == instance && &r.ask_id == ask_id;
+        // Read before anything is written, because the write below is what would make every
+        // record look like one whose retirement had already been refused.
+        let targets = self.matching(|r| mine(r) && r.needs_retiring());
+        let mut changed = false;
+        for (chat, msg) in self.matching(mine) {
+            if let Some(r) = self.records.get_mut(&ledger_key(chat, &msg))
+                && r.closed.is_none()
+            {
+                r.closed = Some(closed.clone());
+                changed = true;
+            }
+        }
+        if changed && let Err(e) = self.save() {
+            tracing::error!(
+                error = %e, project = %addr.project, lane = addr.lane_field(),
+                "could not write down that a question ended at the terminal; it is closed until \
+                 the next restart, and open again after it"
+            );
+        }
+        targets
+    }
+
+    /// Write down that one message's question is over and how its keyboard must be signed off,
+    /// unless something already said so.
+    ///
+    /// The one-message twin of [`Self::close_all`], for the side that knows a message and not an
+    /// ask id: the retirement that follows a tap. Whoever wrote the mark first keeps it — a second
+    /// writer here is a later account of a question that already ended, and the words the operator
+    /// sees should be the ones from the moment it did.
+    pub fn mark_closed(
+        &mut self,
+        chat_id: i64,
+        msg_id: &MsgId,
+        closed: Closed,
+    ) -> std::io::Result<()> {
+        if let Some(r) = self.records.get_mut(&ledger_key(chat_id, msg_id))
+            && r.closed.is_none()
+        {
+            r.closed = Some(closed);
         }
         self.save()
     }
@@ -938,11 +1103,15 @@ impl AskLedger {
     /// with "the session that asked this restarted" — false, while each of those agents sat there
     /// still waiting for the answer it had taken away.
     ///
-    /// An already-answered record is left alone. Its keyboard is still live only because taking it
-    /// away failed, and the outcome written on it is the true one — replacing that with a note
-    /// about a restart would be the same misinformation from the other direction.
+    /// A record the operator answered from his phone IS collected, but only once the retirement
+    /// that belonged to that tap has been refused and said so on the record. It used to be left
+    /// alone outright, on the reasoning that its keyboard is live only because taking it away
+    /// failed and a note about a restart would be misinformation from the other direction — true
+    /// about the note, wrong about the keyboard, and nothing else was ever going to take it off.
+    /// The note is no longer the sweep's to invent: the record carries what he chose, and that is
+    /// what `retire_each` writes.
     pub fn open_for_other_instances(&self, addr: &Addr, instance: &str) -> Vec<(i64, MsgId)> {
-        self.matching(|r| r.addr_is(addr) && r.instance != instance && r.answered.is_none())
+        self.matching(|r| r.addr_is(addr) && r.instance != instance && r.needs_retiring())
     }
 
     /// Every question left open by a worktree of this project whose process is GONE.
@@ -969,7 +1138,7 @@ impl AskLedger {
     ) -> Vec<(i64, MsgId)> {
         self.matching(|r| {
             &r.project == project
-                && r.answered.is_none()
+                && r.needs_retiring()
                 && !live.contains(&r.addr())
                 && r.pid.is_some_and(|pid| !pid_is_alive(pid))
         })
@@ -1017,11 +1186,11 @@ impl AskLedger {
     /// Write the whole ledger, every time.
     ///
     /// **This is the state file that compounds, and it is the expensive one.** It is serialised
-    /// whole and renamed into place on every `record`, `mark_answered`, `mark_unanswered` and
-    /// `forget` — so every ask and every tap of every project on the box pays for whatever is in
-    /// it, on a blocking write with the ledger mutex held. Measured: a record holding a
-    /// worst-case-length question costs about 3.9 KB, and one further ask on top of a 360-record
-    /// backlog costs about 37 ms under that lock.
+    /// whole and renamed into place on every `record`, `mark_answered`, `mark_unanswered`,
+    /// `close_all` and `forget` — so every ask and every tap of every project on the box pays for
+    /// whatever is in it, on a blocking write with the ledger mutex held. Measured: a record
+    /// holding a worst-case-length question costs about 3.9 KB, and one further ask on top of a
+    /// 360-record backlog costs about 37 ms under that lock.
     ///
     /// Two things bound it, and both are here because a topic per lane made "the next session of
     /// this project will collect it" stop being true: [`Self::open_where_the_asker_is_gone`] takes
@@ -1966,8 +2135,8 @@ impl<S: Surface> Hub<S> {
         if !record.options.iter().any(|o| &o.option_id == option_id) {
             return Err(TapRefusal::NotAnOption);
         }
-        if record.answered.is_some() {
-            return Err(TapRefusal::AlreadyAnswered);
+        if let Some(why) = record.refusal_if_closed() {
+            return Err(why);
         }
 
         // The connection is checked BEFORE the record is marked, so a tap that could not be
@@ -1996,14 +2165,21 @@ impl<S: Surface> Hub<S> {
         // Marked HERE, under the ledger lock, as part of resolving. Doing it after the caller has
         // delivered would leave a window in which a second tap resolves too — and the window is
         // exactly as long as a Telegram round trip, on a keyboard the operator is still looking at.
+        //
+        // Judged AGAIN under the same lock, and against the same predicate as above. The record
+        // read at the top was a copy, and the lock was let go between then and now: a second tap,
+        // or the terminal's own `ask_resolved`, may have closed the question in between. That one
+        // closes under this same lock, so whatever it wrote is what this read sees, and there is
+        // no order of the two in which both go through.
         {
             let mut ledger = self.ledger.lock().await;
             match ledger.get(chat_id, msg_id) {
                 None => return Err(TapRefusal::NoRecord),
-                Some(fresh) if fresh.answered.is_some() => {
-                    return Err(TapRefusal::AlreadyAnswered);
+                Some(fresh) => {
+                    if let Some(why) = fresh.refusal_if_closed() {
+                        return Err(why);
+                    }
                 }
-                Some(_) => {}
             }
             if let Err(e) = ledger.mark_answered(chat_id, msg_id, option_id) {
                 // Fail closed: if the answer cannot be written down, it must not be sent. An
@@ -4356,6 +4532,7 @@ impl<S: Surface> Hub<S> {
                                 // have already been made.
                                 text: crate::queue::fit(&text, crate::queue::MAX_TEXT).0,
                                 answered: None,
+                                closed: None,
                             };
                             if let Err(e) =
                                 self.ledger
@@ -5004,14 +5181,10 @@ impl<S: Surface> Hub<S> {
             let _ = self.ledger.lock().await.forget(chat_id, msg_id);
             return;
         };
+        let note = format!("answered from your phone — {label}");
         let retired = self
             .surface
-            .retire_buttons(
-                record.topic_id,
-                msg_id,
-                &record.text,
-                &format!("answered from your phone — {label}"),
-            )
+            .retire_buttons(record.topic_id, msg_id, &record.text, &note)
             .await;
         // The record is forgotten only when the buttons are actually gone. Forgetting first left a
         // live keyboard with nothing behind it: still tappable, still offering a choice already
@@ -5021,11 +5194,28 @@ impl<S: Surface> Hub<S> {
             Ok(()) => {
                 let _ = self.ledger.lock().await.forget(chat_id, msg_id);
             }
-            Err(e) => tracing::error!(
-                error = %e, project = %record.project, lane = record.addr().lane_field(),
-                "answered from the phone but the keyboard is still there; leaving the record so it \
-                 can be retired later"
-            ),
+            Err(e) => {
+                // Written down, not merely logged. "Leaving the record so it can be retired later"
+                // was half a plan: the record says `answered`, and every sweep and the terminal's
+                // own `ask_resolved` step over an answered record on purpose — so nothing was ever
+                // coming, and the menu sat on his phone refusing every tap until the ledger dropped
+                // it two days on. This mark is the difference between a retirement in flight and
+                // one that failed, and it carries HIS words so whoever finally makes the edit signs
+                // it off with the button he pressed rather than a sweep's guess.
+                let _ = self.ledger.lock().await.mark_closed(
+                    chat_id,
+                    msg_id,
+                    Closed {
+                        how: hub_proto::AskEnd::Answered,
+                        note: note.clone(),
+                    },
+                );
+                tracing::error!(
+                    error = %e, project = %record.project, lane = record.addr().lane_field(),
+                    "answered from the phone but the keyboard is still there; it stays written down \
+                     so the next thing that can take it off does, with what he chose"
+                );
+            }
         }
     }
 
@@ -5112,12 +5302,53 @@ impl<S: Surface> Hub<S> {
             (hub_proto::AskEnd::Withdrawn, _) => "no longer being asked".to_owned(),
             (hub_proto::AskEnd::Timeout, _) => "timed out".to_owned(),
         };
+        // Clipped before it is kept, not just before it is shown. `outcome` is an adapter's free
+        // text and the wire bounds it only at a whole frame; stored whole it would put 64 KiB of
+        // someone's paragraph into a file that is rewritten on every ask and every tap of every
+        // project on this box, and onto a message where every character of it is one the QUESTION
+        // does not get.
+        let note = crate::queue::fit(&note, RETIREMENT_NOTE_ROOM).0;
+        // Written down BEFORE the first edit, and for every message of the ask at once. The edit
+        // is a Telegram round trip on a menu the operator is looking at; until this change nothing
+        // was marked before it came back, so a tap inside that window — or after an edit Telegram
+        // refused — resolved and delivered a phone answer into an agent that had already answered
+        // at its own terminal. `resolve_tap` reads this mark under the same lock it writes under.
         let targets = {
-            self.ledger
-                .lock()
-                .await
-                .messages_for(addr, instance, ask_id)
+            self.ledger.lock().await.close_all(
+                addr,
+                instance,
+                ask_id,
+                Closed {
+                    how,
+                    note: note.clone(),
+                },
+            )
         };
+        if targets.is_empty() {
+            // Two different things, and the wrong one sends whoever reads this looking for a bug
+            // that is not there. Usually the keyboard is long gone. But a question the operator
+            // answered from his phone a moment ago still has a record here with its menu coming
+            // off, and that retirement is the tap's — saying there was nothing left to take off
+            // would be plainly false about a message he is looking at.
+            let still_here = {
+                self.ledger
+                    .lock()
+                    .await
+                    .messages_for(addr, instance, ask_id)
+            };
+            if still_here.is_empty() {
+                tracing::debug!(
+                    project = %addr.project, lane = addr.lane_field(), ask = %ask_id,
+                    "a question ended at the terminal with no keyboard of its own left to take off"
+                );
+            } else {
+                tracing::debug!(
+                    project = %addr.project, lane = addr.lane_field(), ask = %ask_id,
+                    "a question ended at the terminal that the operator had already answered from \
+                     his phone; taking its keyboard off belongs to that tap"
+                );
+            }
+        }
         self.retire_each(addr, targets, &note).await;
     }
 
@@ -5129,8 +5360,24 @@ impl<S: Surface> Hub<S> {
             let record = { self.ledger.lock().await.get(chat, &msg).cloned() };
             let retired = match &record {
                 Some(record) => {
+                    // What HE did outranks everything, then the record's own note, then the
+                    // caller's. Both marks can sit on one record — he tapped, and the agent then
+                    // said the question was over — and only one of them is a thing he did; writing
+                    // "answered at the terminal" over a button he pressed is the two-truths defect
+                    // from the other side. Below that, the record's note beats the caller's,
+                    // because this retirement may be a sweep that only knows the question is not
+                    // open — and its sentence, "the session that asked this restarted", is true of
+                    // an abandoned question and false of one that was answered and then would not
+                    // let go of its keyboard.
+                    let note = record
+                        .answered
+                        .as_ref()
+                        .and_then(|chosen| record.options.iter().find(|o| &o.option_id == chosen))
+                        .map(|o| format!("answered from your phone — {}", o.label))
+                        .or_else(|| record.closed.as_ref().map(|c| c.note.clone()))
+                        .unwrap_or_else(|| note.to_owned());
                     self.surface
-                        .retire_buttons(record.topic_id, &msg, &record.text, note)
+                        .retire_buttons(record.topic_id, &msg, &record.text, &note)
                         .await
                 }
                 None => Ok(()),
@@ -5150,7 +5397,9 @@ impl<S: Surface> Hub<S> {
                         .map_or_else(|| addr.clone(), AskRecord::addr);
                     tracing::error!(
                         error = %e, project = %whose.project, lane = whose.lane_field(),
-                        "a question stopped being asked but its keyboard is still there"
+                        "a question stopped being asked but its keyboard is still there; it stays \
+                         written down as closed, so a tap on it is refused, and the next session's \
+                         arrival tries the edit again"
                     );
                 }
             }

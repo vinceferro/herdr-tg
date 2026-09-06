@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hub_proto::{
@@ -44,6 +44,17 @@ struct FakeTelegram {
     /// How long one keyboard edit takes. Zero everywhere except the one test that is about a real
     /// network round trip being on, or off, the path a bridge waits on.
     retire_takes: AsyncMutex<Duration>,
+    /// How many keyboard edits have BEGUN, counted before the edit's own delay. `retired` counts
+    /// the ones that finished; the race tests need the moment in between, when the terminal's
+    /// answer is on its way to the phone and a tap could still land.
+    retire_started: AtomicUsize,
+    /// Set to hold every keyboard edit open at the moment it has begun, until the test says go.
+    ///
+    /// A duration would only be a guess at how long the rest of the test takes; this is the same
+    /// moment held exactly. It is the moment the terminal/tap races live in — Telegram's round
+    /// trip on a menu the operator is still looking at — and a fake that answers instantly cannot
+    /// put anything inside it.
+    hold_retire: AsyncMutex<Option<Arc<tokio::sync::Notify>>>,
     /// Set to make every topic creation fail, which is what a flood wait or a 5xx does. The
     /// ATTEMPT is still counted, because the number of attempts is the property under test.
     create_fails: AsyncMutex<bool>,
@@ -210,6 +221,13 @@ impl Surface for FakeTelegram {
         original: &str,
         note: &str,
     ) -> anyhow::Result<()> {
+        self.retire_started.fetch_add(1, Ordering::SeqCst);
+        // Cloned out from under the lock before it is waited on: a test that holds the edit open
+        // holds it for as long as it likes, and the fake's own lock must not be part of that.
+        let held = self.hold_retire.lock().await.clone();
+        if let Some(held) = held {
+            held.notified().await;
+        }
         if *self.retire_fails.lock().await {
             anyhow::bail!("the edit was refused");
         }
@@ -4843,6 +4861,7 @@ async fn a_question_too_old_for_its_keyboard_ever_to_come_off_is_not_kept_for_ev
                         pid: None,
                         at,
                         answered: None,
+                        closed: None,
                     },
                 )
                 .expect("writes");
@@ -4899,6 +4918,65 @@ async fn a_ledger_written_before_worktrees_existed_still_answers_every_keyboard_
             .open_where_the_asker_is_gone(&ProjectId::new("p-old"), &live)
             .is_empty(),
         "a record whose pid nobody wrote down was swept as if the agent were provably gone"
+    );
+}
+
+#[tokio::test]
+async fn a_stuck_keyboard_is_swept_when_the_agent_that_asked_is_gone_and_an_unfinished_tap_is_not()
+{
+    // The sweep that runs when a project's asker is provably dead used to look only for questions
+    // nobody had answered, so the one keyboard that most needs taking off — the one his tap
+    // answered and Telegram refused to retire — walked past it, and the next session's arrival was
+    // the only thing left that could take it off. If that session never comes, because the process
+    // died rather than restarted, the menu sits on his phone until the ledger drops it two days on.
+    //
+    // The other half is what must NOT be swept: a tap whose retirement is still in flight is
+    // answered but not yet closed, and it belongs to the task that is retiring it. Touching it is
+    // how two writers end up editing one message, so `closed` — written only once something knows
+    // both that the question is over and what to sign it off with — is the whole distinction.
+    let dir = tempfile::tempdir().expect("tmp");
+    let mut ledger = AskLedger::load(dir.path().join("asks.json"));
+    let project = ProjectId::new("p-gone");
+    let dead = u32::MAX; // no such pid, so `pid_is_alive` is false without racing a real one
+
+    let record = |closed: Option<Closed>| AskRecord {
+        project: project.clone(),
+        lane: None,
+        ask_id: AskId::new("a1"),
+        topic_id: 7,
+        options: vec![AskOption {
+            option_id: OptionId::new("y"),
+            label: "Yes".into(),
+        }],
+        text: "ok?".into(),
+        instance: "i1".into(),
+        pid: Some(dead),
+        at: now_secs(),
+        answered: Some(OptionId::new("y")),
+        closed,
+    };
+
+    ledger
+        .record(
+            ALLOWED_CHAT,
+            &MsgId::new("stuck"),
+            record(Some(Closed {
+                how: hub_proto::AskEnd::Answered,
+                note: "answered from your phone — Yes".into(),
+            })),
+        )
+        .expect("writes");
+    ledger
+        .record(ALLOWED_CHAT, &MsgId::new("inflight"), record(None))
+        .expect("writes");
+
+    let live = std::collections::BTreeSet::new();
+    let swept = ledger.open_where_the_asker_is_gone(&project, &live);
+    assert_eq!(
+        swept,
+        vec![(ALLOWED_CHAT, MsgId::new("stuck"))],
+        "the keyboard his tap answered and Telegram would not take off was left on his phone, or \
+         the sweep reached into a retirement somebody else is still doing: {swept:?}"
     );
 }
 
@@ -5232,6 +5310,7 @@ async fn a_retirement_still_goes_out_when_every_send_token_is_spent() {
                 pid: None,
                 at: now_secs(),
                 answered: None,
+                closed: None,
             },
         )
         .expect("records");
@@ -9281,4 +9360,834 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
     for r in runs.iter_mut() {
         let _ = r.child.kill().await;
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The terminal-answer / phone-tap race.
+//
+// A question can stop being asked from two sides: a tap on the phone, or the agent answering at
+// its own terminal and saying so with `ask_resolved`. Before these, only the phone's side was
+// written down before anything else happened; the terminal's side edited the keyboard away and
+// forgot the record without ever marking it, so a tap that landed while the edit was in flight —
+// or after the edit had failed — was resolved and delivered into an agent that had already
+// answered.
+
+/// One open question from a live session, and the message it landed on.
+async fn one_open_question(h: &Harness, bridge: &mut FakeBridge, ask_id: &str) -> MsgId {
+    let before = h.fake.sends.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new(ask_id),
+            text: "Overwrite it?".into(),
+            options: Some(vec![
+                AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                },
+                AskOption {
+                    option_id: OptionId::new("n"),
+                    label: "No".into(),
+                },
+            ]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == before + 1).await;
+    MsgId::new(format!("m{}", before + 1))
+}
+
+/// The bridge says the question ended at the terminal, and waits to be told the hub heard it.
+async fn resolved_at_the_terminal(
+    bridge: &mut FakeBridge,
+    ask_id: &str,
+    how: AskEnd,
+    outcome: Option<&str>,
+) {
+    let id = bridge
+        .send(BridgeFrame::AskResolved {
+            ask_id: AskId::new(ask_id),
+            how,
+            outcome: outcome.map(str::to_owned),
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &id => Some(()),
+            _ => None,
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_question_answered_at_the_terminal_stays_answered_when_its_keyboard_will_not_come_off() {
+    // Telegram refuses the edit — a 429, a message past its edit window. The record has to stay
+    // so the keyboard can be retired later, and while it stays it must not authorise anything: the
+    // agent has already answered this at its own terminal, and a phone tap now is a second,
+    // contradicting answer into a live turn.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, Some("Yes")).await;
+
+    assert!(
+        h.hub.ledger.lock().await.get(ALLOWED_CHAT, &msg).is_some(),
+        "the record was forgotten even though the keyboard is still on the operator's phone"
+    );
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+        .await
+        .expect_err("a tap on a question the agent already answered at the terminal resolved");
+    assert_eq!(refused, TapRefusal::AlreadyAnswered);
+    assert!(
+        refused.say().contains("already been answered"),
+        "{}",
+        refused.say()
+    );
+}
+
+#[tokio::test]
+async fn a_question_closed_at_the_terminal_is_still_closed_after_the_hub_restarts() {
+    // The close is written to the ledger, not only held in memory: a hub that restarts with the
+    // keyboard still on his phone must refuse the same tap for the same reason.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+    *h.fake.retire_fails.lock().await = true;
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, None).await;
+
+    let (again, _, _) = restarted(&h).await;
+    let refused = again
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect_err("a restarted hub resolved a tap on a question closed before it started");
+    assert_eq!(refused, TapRefusal::AlreadyAnswered);
+}
+
+#[tokio::test]
+async fn a_tap_that_lands_while_the_terminal_answer_is_still_coming_off_the_phone_is_refused() {
+    // The window: the hub has heard `ask_resolved` and is editing the keyboard away, which is a
+    // Telegram round trip on a menu the operator is still looking at. A tap inside it used to
+    // resolve, because nothing was written down until the edit came back.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    *h.fake.retire_takes.lock().await = Duration::from_millis(400);
+    bridge
+        .send(BridgeFrame::AskResolved {
+            ask_id: AskId::new("a1"),
+            how: AskEnd::Answered,
+            outcome: Some("Yes".into()),
+        })
+        .await;
+    // Synchronised on the edit BEGINNING, not on the ack: the ack comes after the edit, and a tap
+    // after the ack proves nothing about the window.
+    until(async || h.fake.retire_started.load(Ordering::SeqCst) == 1).await;
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "the edit finished before the tap could land; the window was not measured"
+    );
+
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+        .await
+        .expect_err("a tap resolved while the terminal's answer was coming off the phone");
+    assert_eq!(refused, TapRefusal::AlreadyAnswered);
+
+    // And the edit that was in flight still finishes with the terminal's words, not the tap's.
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert!(
+        retired[0].2.contains("answered at the terminal — Yes"),
+        "{retired:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_question_withdrawn_at_the_terminal_refuses_a_tap_while_its_keyboard_is_still_there() {
+    // The other two ways a question ends at the terminal. Neither is an answer, so "already been
+    // answered" would be false; what is true is that nobody is asking any more.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let withdrawn = one_open_question(&h, &mut bridge, "a1").await;
+    let timed_out = one_open_question(&h, &mut bridge, "a2").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    resolved_at_the_terminal(
+        &mut bridge,
+        "a1",
+        AskEnd::Withdrawn,
+        Some("the session that asked has ended"),
+    )
+    .await;
+    resolved_at_the_terminal(&mut bridge, "a2", AskEnd::Timeout, None).await;
+
+    for msg in [&withdrawn, &timed_out] {
+        let refused = h
+            .hub
+            .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), msg, &OptionId::new("y"))
+            .await
+            .expect_err("a tap on a question nobody is asking any more resolved");
+        assert_eq!(refused, TapRefusal::NoLongerAsked, "{msg:?}");
+        assert_eq!(
+            refused.say(),
+            "That question is no longer being asked, so I have not sent anything."
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_retires_a_closed_keyboard_with_the_outcome_it_closed_with_not_a_restart() {
+    // A keyboard whose retirement Telegram refused is tried again when the next session arrives.
+    // That retry used to write "the session that asked this restarted" over a question the agent
+    // had answered — the sweep's own sentence, true of an abandoned question and false of this one.
+    // The record knows how it closed; the retry says that.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, Some("Yes")).await;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    *h.fake.retire_fails.lock().await = false;
+
+    let mut next = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    next.become_live().await;
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0].1, msg, "{retired:?}");
+    assert!(
+        retired[0].2.contains("answered at the terminal — Yes"),
+        "the retry lost the outcome the question closed with: {retired:?}"
+    );
+    assert!(
+        !retired[0].2.contains("restarted"),
+        "an answered question was relabelled as abandoned: {retired:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_that_won_the_race_is_not_undone_by_the_terminals_answer_arriving_after_it() {
+    // The phone answered first and the agent was told; the keyboard's edit failed, so the record
+    // is still there, marked. While it is there it authorises nothing. Then the agent says the
+    // question is resolved — which it is, by the phone's answer — and that is the second chance to
+    // take the menu off. What it must NOT do is rewrite the question as "answered at the terminal":
+    // the button he pressed is the truth of what happened, and it is what he has to be left
+    // looking at.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    let (addr, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &addr,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id,
+                    option_id: option,
+                }
+            )
+            .await
+    );
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+    *h.fake.retire_fails.lock().await = false;
+
+    // While the menu is still there, it answers nothing new.
+    let record = h.hub.ledger.lock().await.get(ALLOWED_CHAT, &msg).cloned();
+    assert_eq!(
+        record.as_ref().and_then(|r| r.answered.clone()),
+        Some(OptionId::new("y")),
+        "the phone's answer was lost from the record: {record:?}"
+    );
+    assert_eq!(
+        h.hub
+            .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+            .await
+            .expect_err("a second answer reached the agent"),
+        TapRefusal::AlreadyAnswered
+    );
+
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, Some("Yes")).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert!(
+        !retired
+            .iter()
+            .any(|(_, m, note)| m == &msg && note.contains("at the terminal")),
+        "the terminal's answer rewrote a question the phone had already answered: {retired:?}"
+    );
+    assert!(
+        retired
+            .iter()
+            .any(|(_, m, note)| m == &msg && note.contains("answered from your phone — Yes")),
+        "the menu he answered never came off: {retired:?}"
+    );
+    // The keyboard is gone, so the record has gone with it, and a tap on a menu that is no longer
+    // there is the stale view every stale view has always been.
+    assert!(h.hub.ledger.lock().await.get(ALLOWED_CHAT, &msg).is_none());
+    assert_eq!(
+        h.hub
+            .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+            .await
+            .expect_err("a second answer reached the agent"),
+        TapRefusal::NoRecord
+    );
+}
+
+#[tokio::test]
+async fn a_tap_that_won_the_race_and_then_could_not_take_its_menu_off_is_still_signed_off_with_his_button()
+ {
+    // The one interleaving in which BOTH marks sit on one record and the note that gets written is
+    // not the one that put it there. He taps and the agent is told, so the record says `answered`
+    // and the terminal's own retirement steps over it — but that retirement still stamps its note
+    // on the record on its way past. Telegram then refuses the tap's own edit, and the mark that
+    // would have carried his words is a no-op, because the terminal's note got there first. So the
+    // next session's sweep arrives at a record that says "answered at the terminal — done" over a
+    // button the operator pressed himself. The only thing standing between him and that sentence is
+    // that a retirement reads what he chose before it reads any note.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let (addr, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &addr,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id,
+                    option_id: option,
+                }
+            )
+            .await
+    );
+
+    // The terminal's close lands BEFORE the phone's keyboard edit is attempted, and must not
+    // retire a menu whose retirement already belongs to the tap.
+    *h.fake.retire_fails.lock().await = true;
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, Some("done")).await;
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "the terminal retired a menu the phone had already answered"
+    );
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+
+    // Both marks, and the note is the terminal's — this is the state the sweep has to survive.
+    let record = h
+        .hub
+        .ledger
+        .lock()
+        .await
+        .get(ALLOWED_CHAT, &msg)
+        .cloned()
+        .expect("the record is kept so the keyboard can be retired later");
+    assert!(
+        record.answered.is_some()
+            && record
+                .closed
+                .as_ref()
+                .is_some_and(|c| c.note.contains("at the terminal")),
+        "this test no longer sets up the state it exists for: {record:?}"
+    );
+
+    *h.fake.retire_fails.lock().await = false;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut next = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    next.become_live().await;
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0].1, msg, "{retired:?}");
+    assert!(
+        retired[0].2.contains("answered from your phone — Yes"),
+        "the sweep wrote the terminal's words over the button he pressed: {retired:?}"
+    );
+    assert!(
+        h.hub.ledger.lock().await.get(ALLOWED_CHAT, &msg).is_none(),
+        "the keyboard came off but the record stayed"
+    );
+}
+
+#[test]
+fn a_ledger_written_before_questions_could_be_closed_still_reads_and_its_questions_are_open() {
+    // The ledger on the operator's box holds records written by builds that did not know a
+    // question could close at the terminal. They must read, and read as what they were: open, or
+    // answered from the phone.
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("asks.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "-1001:m2": {
+    "project": "p-abc", "ask_id": "a1", "topic_id": 7,
+    "options": [{"option_id": "y", "label": "Yes"}],
+    "instance": "i1", "text": "Overwrite it?", "pid": 4242, "at": 1700000000
+  },
+  "-1001:m3": {
+    "project": "p-abc", "ask_id": "a2", "topic_id": 7,
+    "options": [{"option_id": "y", "label": "Yes"}],
+    "instance": "i1", "text": "Delete it?", "answered": "y"
+  }
+}"#,
+    )
+    .expect("write");
+    let ledger = AskLedger::load(&path);
+    let open = ledger
+        .get(-1001, &MsgId::new("m2"))
+        .expect("the open question reads");
+    assert_eq!(open.closed, None);
+    assert_eq!(open.refusal_if_closed(), None, "{open:?}");
+    let answered = ledger
+        .get(-1001, &MsgId::new("m3"))
+        .expect("the answered question reads");
+    assert_eq!(
+        answered.refusal_if_closed(),
+        Some(TapRefusal::AlreadyAnswered)
+    );
+}
+
+/// Poll a future exactly once from this task, and say whether it finished.
+///
+/// The races below need one operation stopped in the middle of itself — after the look it takes
+/// at the ledger without the lock, and before the lock it then takes to write. `tokio::join!`
+/// cannot stop it there: both futures run on one task, every lock in their way is free, and the
+/// fake Telegram answers without ever yielding, so the first runs to its end before the second is
+/// polled at all. That is why the two hundred joined runs this file used to do, in both orders,
+/// stayed green against a hub with the race fix taken back out of it. Polling by hand puts the
+/// test in charge of exactly how far the tap gets, and the waker registered is this task's, so
+/// awaiting the same future afterwards finishes it.
+async fn poll_once<F: std::future::Future>(
+    mut f: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(move |cx| {
+        std::task::Poll::Ready(std::future::Future::poll(f.as_mut(), cx))
+    })
+    .await
+}
+
+/// Every note the phone was left with over one message's keyboard, in the order they were written.
+async fn signed_off_with(h: &Harness, msg: &MsgId) -> Vec<String> {
+    h.fake
+        .retired
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, m, _)| m == msg)
+        .map(|(_, _, note)| note.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_terminal_answer_and_a_tap_in_the_same_instant_never_deliver_twice() {
+    // The two instants that really do overlap, each one driven rather than hoped for. A tap is not
+    // one indivisible act: it looks at the ledger, lets the lock go, asks whether the project is
+    // connected, and only then comes back to write down that the question is answered. The
+    // terminal's answer can land in that gap, and the tap's second look under the lock is the only
+    // thing between the agent and a phone answer for a question it has already answered itself.
+    //
+    // The gap is held open with the claims lock, which `resolve_tap` takes between its two looks
+    // for its own reasons. Nothing about the code under test is changed to make this happen.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let own = h.own();
+
+    // ─ His tap has looked, and the terminal's answer is written down while it is away; the tap
+    // comes back for the lock with the terminal's keyboard edit still on the wire, which is where
+    // this race has always lived. It must be refused in the words that are true — the question was
+    // answered, not unheard of — and the question signed off once, at the terminal.
+    let first = one_open_question(&h, &mut bridge, "a1").await;
+    // Scoped, because a half-run tap that outlives its half of the test would hold the ledger's
+    // message borrowed for the rest of it.
+    {
+        let hold_the_gap_open = h.hub.claims.lock().await;
+        let option = OptionId::new("y");
+        let taps = h
+            .hub
+            .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &first, &option);
+        let mut tap = std::pin::pin!(taps);
+        assert!(
+            poll_once(tap.as_mut()).await.is_pending(),
+            "the tap ran to its end without ever asking whether the project was connected, so \
+             there was no gap to land in and this test proves nothing"
+        );
+        assert!(
+            h.hub.ledger.try_lock().is_ok(),
+            "the tap is parked on the ledger, not past it: its unlocked look has not happened yet"
+        );
+        let let_the_edit_finish = Arc::new(tokio::sync::Notify::new());
+        *h.fake.hold_retire.lock().await = Some(Arc::clone(&let_the_edit_finish));
+        let ask = AskId::new("a1");
+        let retires = h
+            .hub
+            .retire(&own, "i1", &ask, AskEnd::Answered, Some("done"));
+        let mut terminal = std::pin::pin!(retires);
+        assert!(
+            poll_once(terminal.as_mut()).await.is_pending(),
+            "the terminal's whole retirement finished inside one poll; its keyboard edit was \
+             never in flight and the tap has nothing to come back into"
+        );
+        assert_eq!(
+            h.fake.retire_started.load(Ordering::SeqCst),
+            1,
+            "the terminal's keyboard edit never began"
+        );
+        drop(hold_the_gap_open);
+        assert_eq!(
+            tap.await.expect_err(
+                "a phone tap resolved into an agent that had already answered at its own terminal"
+            ),
+            TapRefusal::AlreadyAnswered
+        );
+        let_the_edit_finish.notify_waiters();
+        terminal.await;
+        *h.fake.hold_retire.lock().await = None;
+        let notes = signed_off_with(&h, &first).await;
+        assert_eq!(
+            notes.len(),
+            1,
+            "the question was signed off twice: {notes:?}"
+        );
+        assert!(
+            notes[0].contains("answered at the terminal — done"),
+            "{notes:?}"
+        );
+        assert!(
+            h.hub
+                .ledger
+                .lock()
+                .await
+                .get(ALLOWED_CHAT, &first)
+                .is_none(),
+            "the keyboard came off but the record stayed"
+        );
+    }
+
+    // ─ The other way round: his tap is written down and its own menu is halfway off the phone — a
+    // Telegram round trip — when the terminal's answer arrives. That menu belongs to the tap, and
+    // the words he is left looking at have to be the ones on the button he pressed.
+    let second = one_open_question(&h, &mut bridge, "a2").await;
+    let (addr, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &second, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &addr,
+                HubFrame::Choice {
+                    msg_id: second.clone(),
+                    ask_id,
+                    option_id: option,
+                }
+            )
+            .await
+    );
+    {
+        let let_the_edit_finish = Arc::new(tokio::sync::Notify::new());
+        *h.fake.hold_retire.lock().await = Some(Arc::clone(&let_the_edit_finish));
+        let edits_before = h.fake.retire_started.load(Ordering::SeqCst);
+        let mut phone = std::pin::pin!(h.hub.answered_from_phone(ALLOWED_CHAT, &second, "Yes"));
+        assert!(
+            poll_once(phone.as_mut()).await.is_pending(),
+            "the tap's own edit finished instantly; there is no round trip for anything to land \
+             inside"
+        );
+        assert_eq!(
+            h.fake.retire_started.load(Ordering::SeqCst),
+            edits_before + 1,
+            "the tap's own edit never began"
+        );
+        let ask = AskId::new("a2");
+        let retires = h
+            .hub
+            .retire(&own, "i1", &ask, AskEnd::Answered, Some("done"));
+        // Polled rather than awaited, because the failure this guards against is a retirement that
+        // goes to Telegram for a menu already on its way there: awaiting it would hang behind the
+        // edit this test is holding open, and a hang says nothing about which line is wrong.
+        assert!(
+            poll_once(std::pin::pin!(retires)).await.is_ready(),
+            "the terminal's answer went off to Telegram for a menu whose retirement was already \
+             on its way there"
+        );
+        assert_eq!(
+            h.fake.retire_started.load(Ordering::SeqCst),
+            edits_before + 1,
+            "the terminal's answer edited a menu whose retirement was already on its way to Telegram"
+        );
+        let_the_edit_finish.notify_waiters();
+        phone.await;
+    }
+    let notes = signed_off_with(&h, &second).await;
+    assert_eq!(
+        notes.len(),
+        1,
+        "the question was signed off twice: {notes:?}"
+    );
+    assert!(
+        notes[0].contains("answered from your phone — Yes"),
+        "the terminal's words were written over the button he pressed: {notes:?}"
+    );
+    assert!(
+        h.hub
+            .ledger
+            .lock()
+            .await
+            .get(ALLOWED_CHAT, &second)
+            .is_none(),
+        "the keyboard came off but the record stayed"
+    );
+
+    // One tap won, one lost, and exactly one choice reached the agent: the one he won.
+    let choices: Vec<MsgId> = bridge
+        .drain_for(Duration::from_millis(300))
+        .await
+        .into_iter()
+        .filter_map(|f| match f {
+            HubFrame::Choice { msg_id, .. } => Some(msg_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        choices,
+        vec![second],
+        "the choices that reached the agent are not the one tap that won"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_on_a_question_the_agent_resolved_is_still_refused_when_the_answer_it_carried_reached_nobody()
+ {
+    // The window `withdraw_undelivered` was written for: the bridge is LIVE with a full outbox, so
+    // the tap is written down, the frame never enters the outbox, and in that same instant the
+    // agent says it answered the question at its own terminal. Taking the tap's authorisation back
+    // must not take the TERMINAL's answer back with it — the agent's turn has moved on, and a
+    // second tap that delivered a choice into it would be the very thing this slice exists to stop.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    h.hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, Some("Yes")).await;
+
+    // The tap reached nobody and its keyboard will not come off, so the authorisation is taken back.
+    *h.fake.retire_fails.lock().await = true;
+    assert_eq!(
+        h.hub.withdraw_undelivered(ALLOWED_CHAT, &msg).await,
+        Withdrawal::StillOnHisPhone
+    );
+    *h.fake.retire_fails.lock().await = false;
+
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+        .await
+        .expect_err("a tap on a question the agent had already resolved at the terminal resolved");
+    assert_eq!(refused, TapRefusal::AlreadyAnswered);
+    let choices = bridge
+        .drain_for(Duration::from_millis(200))
+        .await
+        .into_iter()
+        .filter(|f| matches!(f, HubFrame::Choice { .. }))
+        .count();
+    assert_eq!(
+        choices, 0,
+        "a choice reached an agent that had already answered"
+    );
+}
+
+#[tokio::test]
+async fn a_keyboard_the_phone_answered_that_would_not_come_off_comes_off_when_the_terminal_says_so()
+{
+    // He tapped, the agent was told, and then Telegram refused the edit that takes the menu away —
+    // a 429, a 5xx. The record is kept precisely so somebody can retire it later. The agent, having
+    // acted on his choice, then says the question is over: that is the second chance, and it has to
+    // leave HIS words on the message, not the terminal's.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let (addr, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &addr,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id,
+                    option_id: option,
+                }
+            )
+            .await
+    );
+    *h.fake.retire_fails.lock().await = true;
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+    assert!(
+        h.fake.retired.lock().await.is_empty(),
+        "the test's own setup is wrong: the refused edit counted as a retirement"
+    );
+    *h.fake.retire_fails.lock().await = false;
+
+    resolved_at_the_terminal(&mut bridge, "a1", AskEnd::Answered, Some("Yes")).await;
+    let retired = h.fake.retired.lock().await.clone();
+    let mine: Vec<&String> = retired
+        .iter()
+        .filter(|(_, m, _)| m == &msg)
+        .map(|(_, _, note)| note)
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "the keyboard he answered is still on his phone after the agent said the question is over: \
+         {retired:?}"
+    );
+    assert!(
+        mine[0].contains("answered from your phone — Yes"),
+        "the retirement did not say what he chose: {mine:?}"
+    );
+    assert!(
+        h.hub.ledger.lock().await.get(ALLOWED_CHAT, &msg).is_none(),
+        "the keyboard came off but the record stayed"
+    );
+}
+
+#[tokio::test]
+async fn a_keyboard_the_phone_answered_that_would_not_come_off_comes_off_when_the_next_session_arrives()
+ {
+    // The same stuck keyboard, on the engine that sends no `ask_resolved` after a tap — which is
+    // most of them. Nothing else in the hub was looking at an answered record, so the menu sat on
+    // his phone answering "that has already been answered" until the ledger dropped it two days
+    // later. The next session's arrival sweep is what finally takes it off, in his own words.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let (addr, ask_id, option) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    assert!(
+        h.hub
+            .deliver(
+                &addr,
+                HubFrame::Choice {
+                    msg_id: msg.clone(),
+                    ask_id,
+                    option_id: option,
+                }
+            )
+            .await
+    );
+    *h.fake.retire_fails.lock().await = true;
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    *h.fake.retire_fails.lock().await = false;
+
+    let mut next = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    next.become_live().await;
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0].1, msg, "{retired:?}");
+    assert!(
+        retired[0].2.contains("answered from your phone — Yes"),
+        "the sweep lost what he chose: {retired:?}"
+    );
+    assert!(
+        !retired[0].2.contains("restarted"),
+        "a question he answered was relabelled as abandoned: {retired:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawal_reason_too_long_for_a_message_is_not_written_whole_into_the_ledger() {
+    // `outcome` is an adapter's free text, bounded only by the frame ceiling. It used to reach the
+    // retired message and nothing else, and that message clips. Keeping it means the ledger — one
+    // file rewritten whole on every ask and every tap of every project on the box — carries a
+    // paragraph nobody will ever read, on that path, for two days.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    let a_paragraph_and_then_some = "x".repeat(60_000);
+    resolved_at_the_terminal(
+        &mut bridge,
+        "a1",
+        AskEnd::Withdrawn,
+        Some(&a_paragraph_and_then_some),
+    )
+    .await;
+
+    let record = h
+        .hub
+        .ledger
+        .lock()
+        .await
+        .get(ALLOWED_CHAT, &msg)
+        .cloned()
+        .expect("the record is kept so the keyboard can be retired later");
+    let kept = record.closed.as_ref().map_or(0, |c| c.note.chars().count());
+    assert!(
+        kept <= RETIREMENT_NOTE_ROOM,
+        "the ledger holds {kept} characters of one adapter's free text for one question"
+    );
+    // And the question itself still survives beside it on his phone.
+    let retired = h.fake.retired.lock().await.clone();
+    assert!(
+        retired.is_empty(),
+        "the test's own setup is wrong: {retired:?}"
+    );
 }

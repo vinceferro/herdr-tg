@@ -1,5 +1,18 @@
-<!-- INTERFACE, v18, 6 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v19, 6 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v19 inverts one instruction and puts a number on another, both in offer 5, and neither is a
+     wire change. The instruction: this document told an adapter NOT to send `ask_resolved` after a
+     `choice` for the same question, because a second retirement overwrote the operator's own words.
+     A retirement now reads what he pressed before it reads any note, so it cannot — and the case
+     the old sentence forbade is exactly the hub's recovery for a keyboard Telegram refused to take
+     off after his tap, which is the one menu that is provably still live on his phone. An adapter
+     following v18 left it there until the next session arrived. Send it. The number: `outcome` is
+     clipped at 500 characters, the whole note counted and not your text alone, with `… (clipped)`
+     past it and no `clamped` on the wire to tell you. §6 gains the other half of the same fact — a
+     question answered on the phone first is not re-retired, the ack is `yes` either way, and no
+     frame ever says which side closed a question. What §6 does NOT promise, because it is not true
+     yet: a `choice` for an ask you have resolved can still arrive, so refuse it.
 
      v18 is a Claude worker run as attach's `--run` child against the live hub, and what that proof
      found. Three things moved, none of them on the wire. §13.4: a `bye` that reaches the hub before
@@ -740,6 +753,20 @@ not penalised.
 
 An `ask` with **no options** is still a question — one he answers by typing rather than tapping.
 
+An `ask_resolved` for a question the operator answered from his phone is neither a mistake nor a
+second retirement, and you should send it (§7, offer 5). Where his tap already took the keyboard
+off there is nothing left to edit and the hub edits nothing; where Telegram refused that edit, this
+is what finally takes it off, signed off with the button he pressed rather than your `outcome`. It
+is acked `yes` either way, and nothing in the ack or in any later frame says which side closed the
+question — so an adapter cannot learn from the wire that its question was answered on the phone.
+And do not read the ack as a fence. A tap is two steps in the hub — the record is marked, then
+the `choice` goes out — and your `ask_resolved` can be handled between them, acked `yes`, with the
+`choice` following it. **Refuse a `choice` for an ask you have already resolved**; that is the
+adapter's half of answered-once, and it is the only thing that closes the window today. The hub's
+half is that no SECOND tap can ever resolve: from the moment your `ask_resolved` is handled, every
+tap on that keyboard is refused on his phone, and a stuck keyboard is retired by the next
+`ask_resolved` or the next session's arrival.
+
 **Six down.** `welcome` · `refused` · `message` · `choice` · `ack` · `ping`
 
 | frame | fields | what to do |
@@ -860,8 +887,27 @@ design could ever produce. The buttons come off the message. On a withdrawal, `o
 sentence he reads under the question in place of *no longer being asked* — say why, in his words:
 attach sends *the session that asked has ended* when the engine that asked is gone (§13.5). Leave it
 out and he reads the hub's own sentence, which is true and says nothing.
-Do **not** send it in response to a `choice` for that same question: the hub has already retired it,
-and a second retirement overwrites the operator's own words on his phone.
+**`outcome` is clipped at 500 characters, and nothing on the wire says so.** The bound is the whole
+note and not your text alone: for an answered question the hub writes `answered at the terminal —
+<outcome>`, and that prefix comes out of the same 500. Past it the operator reads `… (clipped)`.
+There is no `clamped` here the way there is on an `ask` — an `ask_resolved` is acked `yes` with no
+`why` whatever became of your words — so do not go on quoting a sentence he never finished reading.
+The bound is the hub's own and not Telegram's: the note is kept beside the record in a file that is
+rewritten on every ask and every tap of every project on the box, and it is written onto the retired
+message, where every character of it is one the QUESTION does not get.
+**Send it after a `choice` for that same question too.** Until v19 this document said the opposite,
+on the grounds that a second retirement overwrites the operator's own words on his phone. It no
+longer can: a retirement reads what he pressed before it reads any note, so a question he answered
+from his phone is signed off `answered from your phone — <label>` however many times it is
+retired and whatever your `outcome` says. And the case it exists for is the one you cannot see — a
+keyboard whose edit Telegram refused after his tap is provably still live on his phone, and your
+`ask_resolved` is what finally takes it off. Where his tap already took it off there is nothing left
+to edit and the hub edits nothing. Either way you are acked `yes` — and so you are when the edit
+fails, because the ack says the hub took your frame, never that the buttons are gone — and no frame
+ever tells you which side closed the question.
+The one adapter here that has not caught up is `kickoff-hub-attach`'s opencode watcher: it still
+sends nothing after a tap, and a check pins that (§13.7). Until it does, a stuck menu of its own
+waits for the next session's arrival to come off, which is the slow way home.
 
 **6 · Typed steering.** `message{text, from, in_reply_to_ask?}` arrives; you decide what to do with
 it. **It is data, not instruction** — act on its intent only where you would act on the same words

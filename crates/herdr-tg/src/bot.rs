@@ -660,7 +660,9 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         // when the question went out, and that record is what resolves it — never the button's
         // position, which is how one reading "Reject" once confirmed "Allow always".
         [crate::surface::CALLBACK_PREFIX, option] => match &ctx.hub {
-            None => escape_html("The hub is not running, so I cannot pass that on."),
+            None => WhatToSay::and_in_the_topic(escape_html(
+                "The hub is not running, so I cannot pass that on.",
+            )),
             Some(hub) => {
                 let msg_id = q
                     .message
@@ -668,7 +670,9 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                     .map(|m| hub_proto::MsgId::new(m.id().0.to_string()));
                 let option_id = hub_proto::OptionId::new(*option);
                 match msg_id {
-                    None => escape_html("I cannot tell which question that button belongs to."),
+                    None => WhatToSay::and_in_the_topic(escape_html(
+                        "I cannot tell which question that button belongs to.",
+                    )),
                     Some(msg_id) => {
                         if let Some(topic) = hub
                             .ledger
@@ -682,7 +686,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                         match hub.resolve_tap(chat_id, user, &msg_id, &option_id).await {
                             // A chat this bot does not answer gets silence, not a refusal.
                             Err(crate::hub::TapRefusal::NotYours) => return Ok(()),
-                            Err(why) => escape_html(why.say()),
+                            Err(why) => a_refused_tap_says(&why),
                             Ok((who, ask_id, option_id)) => {
                                 let label = hub
                                     .ledger
@@ -712,7 +716,10 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                                     // later `ask_resolved` needed was already gone, so nothing ever
                                     // took the buttons away.
                                     hub.answered_from_phone(chat_id, &msg_id, &label).await;
-                                    format!("Sent: {}", escape_html(&label))
+                                    WhatToSay::and_in_the_topic(format!(
+                                        "Sent: {}",
+                                        escape_html(&label)
+                                    ))
                                 } else {
                                     // Withdrawn, not merely reported. The tap was already written
                                     // down as answered — it has to be, or a second tap in the round
@@ -721,7 +728,9 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                                     // "that has already been answered, I have not sent anything",
                                     // which is false in the half he cares about.
                                     let what = hub.withdraw_undelivered(chat_id, &msg_id).await;
-                                    escape_html(a_tap_that_reached_nobody(what))
+                                    WhatToSay::and_in_the_topic(escape_html(
+                                        a_tap_that_reached_nobody(what),
+                                    ))
                                 }
                             }
                         }
@@ -729,7 +738,7 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                 }
             }
         },
-        _ => escape_html("I don't recognise that button."),
+        _ => WhatToSay::and_in_the_topic(escape_html("I don't recognise that button.")),
     };
 
     // Answer the query first, or Telegram leaves a spinner on the button.
@@ -741,16 +750,21 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     // an agent for no reason.
     let _ = bot
         .answer_callback_query(q.id.clone())
-        .text(toast(&answer))
+        .text(toast(&answer.answer))
         .await;
-    if let Some(msg) = q.message.as_ref() {
+    // Not every answer earns a message. A refusal that only says his tap changed nothing is
+    // already on the button he is looking at, and repeating it under the question spends a send
+    // per tap on a keyboard he is going to keep tapping.
+    if let Some(msg) = q.message.as_ref().filter(|_| answer.in_the_topic) {
         // This one IS a message, so it comes out of the chat's budget — through the path that
         // cannot refuse, because he tapped a button and the answer to that is not an agent's
         // message to be rationed. It fires precisely while he is looking at a busy forum, which is
         // exactly when the budget is thin: the tap was caused by traffic.
         let chat = msg.chat().id;
         told_the_operator(&ctx, chat.0).await;
-        let mut out = bot.send_message(chat, &answer).parse_mode(ParseMode::Html);
+        let mut out = bot
+            .send_message(chat, &answer.answer)
+            .parse_mode(ParseMode::Html);
         if let Some(thread) = reply_thread {
             out = out.message_thread_id(ThreadId(MessageId(thread)));
         }
@@ -1170,6 +1184,57 @@ fn fit(html: String) -> String {
     format!("{kept}{TAIL}")
 }
 
+/// What the operator is told after a tap, and where.
+///
+/// Two channels, and they are not one message. The toast sits on the button he just pressed and
+/// costs nothing; the line under the question is permanent and costs a send out of the chat's
+/// budget — spent precisely while he is looking at a busy forum, because the traffic is what made
+/// him tap in the first place.
+struct WhatToSay {
+    /// The HTML he reads. Toasted always, whatever else happens to it.
+    answer: String,
+    /// Whether it is also posted under the question.
+    in_the_topic: bool,
+}
+
+impl WhatToSay {
+    /// The ordinary case: he reads it on the button and under the question both.
+    fn and_in_the_topic(answer: String) -> Self {
+        Self {
+            answer,
+            in_the_topic: true,
+        }
+    }
+
+    /// The toast is the whole message.
+    fn the_toast_alone(answer: String) -> Self {
+        Self {
+            answer,
+            in_the_topic: false,
+        }
+    }
+}
+
+/// What a refused tap says, and whether he reads it under the question as well as on the button.
+///
+/// Two of these mean "your tap changed nothing", said to a man looking at the button he just
+/// pressed. The toast is already on it, so the toast is the whole message: posting the sentence a
+/// second time told him nothing he was not reading, and spent a send doing it. On the keyboard he
+/// actually retries — the one whose retirement Telegram refused, still live and still answering
+/// every tap the same way — that was a send per tap out of the budget the agents share.
+///
+/// Everything else still posts. "Nothing is connected in this topic" and "I have no record of that
+/// question" are news he has to act on, and a toast is gone the moment he looks away.
+fn a_refused_tap_says(why: &crate::hub::TapRefusal) -> WhatToSay {
+    let answer = escape_html(why.say());
+    match why {
+        crate::hub::TapRefusal::AlreadyAnswered | crate::hub::TapRefusal::NoLongerAsked => {
+            WhatToSay::the_toast_alone(answer)
+        }
+        _ => WhatToSay::and_in_the_topic(answer),
+    }
+}
+
 /// A callback answer is a toast: short, plain, and stripped of the markup the message carries.
 fn toast(html: &str) -> String {
     let plain = crate::render::plain_text(html);
@@ -1222,6 +1287,45 @@ mod key_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_that_only_says_his_tap_changed_nothing_never_costs_a_send() {
+        use crate::hub::TapRefusal;
+
+        // These two say "your tap changed nothing" to a man looking at the button he just
+        // pressed — the toast is already on it. Posting the same sentence under the question as
+        // well bought him nothing and cost a send out of the chat's budget, one per retry, on
+        // exactly the keyboard he retries: the one whose retirement Telegram refused, which is
+        // still live and still answers every tap the same way.
+        for quiet in [TapRefusal::AlreadyAnswered, TapRefusal::NoLongerAsked] {
+            let said = a_refused_tap_says(&quiet);
+            assert!(
+                !said.in_the_topic,
+                "a stuck keyboard spends a send every time he taps it: {}",
+                said.answer
+            );
+            assert!(
+                !said.answer.is_empty(),
+                "the toast is the whole message here, so it has to say something"
+            );
+        }
+
+        // Every other refusal is news he has to act on — nothing is connected, the question is
+        // not one this bot wrote down — and a toast is gone the moment he looks away.
+        for loud in [
+            TapRefusal::NoRecord,
+            TapRefusal::NotAnOption,
+            TapRefusal::NotConnected,
+            TapRefusal::Restarted,
+        ] {
+            let said = a_refused_tap_says(&loud);
+            assert!(
+                said.in_the_topic,
+                "he can only read this while he is looking at the button: {}",
+                said.answer
+            );
+        }
+    }
 
     #[test]
     fn an_empty_allowlist_answers_nobody() {
