@@ -90,6 +90,11 @@ export type Relay = {
   bind(): Promise<void>
   /** Start dialling the hub. */
   start(): void
+  /**
+   * The engine behind this door has exited (under `--run`): take the buttons off every question it
+   * still holds, with a reason the operator can read. Call it before `goodbye`.
+   */
+  engineEnded(): void
   /** Write the ledger, say `bye`, unlink the door. Best effort, time-boxed. */
   goodbye(): void
   /** Where the door is — for the first-line output and for `--run` to hand to the child. */
@@ -242,6 +247,13 @@ export function createRelay(cfg: RelayConfig): Relay {
     handedOn: number
     /** Whether anybody took the words at all. */
     accepted: boolean
+    /**
+     * The one answer has gone up. Kept until every producer the words were handed to has answered
+     * or gone, because a late answer must be recognised as one — forgotten the moment it settled,
+     * the fold let a watcher's refusal landing after the tool server's accept go up as it was:
+     * two acks for one message, from the one thing on this wire that exists to keep it at one.
+     */
+    settled: boolean
   }
   const typedWords = new Map<string, TypedWords>()
   const TYPED_WORDS_KEPT = 64
@@ -261,7 +273,7 @@ export function createRelay(cfg: RelayConfig): Relay {
       const d = link.send(payload, _what, undefined, owner)
       if (d.delivered || !d.permanent) {
         rememberOurOwn(d.id)
-        return { ok: true }
+        return { ok: true, delivered: d.delivered }
       }
       return { ok: false, why: d.why }
     },
@@ -278,7 +290,13 @@ export function createRelay(cfg: RelayConfig): Relay {
     while (ourOwn.size > 256) ourOwn.delete(ourOwn.values().next().value!)
   }
 
-  /** Say something to the hub on this door's OWN behalf — an answer for a frame it received. */
+  /**
+   * Say something to the hub on this door's OWN behalf — an answer for a frame it received, or its
+   * goodbye. Through `send` and not the link's control lane, because `send` is what hands back the
+   * id: a frame minted for this door and not remembered as its own had its `ack` reported as one
+   * "no producer is waiting on" — a false alarm at the end of every single run, in the one log a
+   * developer reads to find the real ones.
+   */
   function answerHub(payload: Record<string, unknown>, what: string): void {
     const d = link.send(payload, what)
     if (d.delivered || !d.permanent) rememberOurOwn(d.id)
@@ -529,6 +547,9 @@ export function createRelay(cfg: RelayConfig): Relay {
         break
       }
       case 'ack': {
+        // Answered, so no longer owed: left in the link's in-flight set, every acked frame was
+        // counted among the "unanswered" the next time the hub connection ended.
+        link.forgetInFlight(String(f.ref))
         // A frame this relay sent on its own behalf — a withdrawal for a producer that never came
         // back. Nobody is waiting on it, and saying "no producer is waiting on this" below would be
         // a false alarm in the one log a developer reads to find the real ones.
@@ -618,6 +639,7 @@ export function createRelay(cfg: RelayConfig): Relay {
           files: Array.isArray(f.files) ? f.files.length : 0,
           handedOn: 0,
           accepted: false,
+          settled: false,
         })
         while (typedWords.size > TYPED_WORDS_KEPT) {
           const oldest = typedWords.keys().next()
@@ -728,14 +750,17 @@ export function createRelay(cfg: RelayConfig): Relay {
         p.down.endAfterFlush()
         return
       case 'ack': {
-        // An answer about his typed words is folded into the one answer the hub will hear; any
-        // other ack goes up as the frame it is.
+        // A producer's ack is always an answer about his typed words, and it is folded into the
+        // one answer the hub will hear. One that names words this door is not holding — handed
+        // out before the fold aged out, or never handed to this producer at all — is not sent up
+        // as it is: the hub would read a second answer for a message it was already answered for,
+        // or one for a frame it never sent.
         const about = typedWords.get(String(f.ref))
         if (about) {
           answerForTypedWords(String(f.ref), about, p, f)
           return
         }
-        relayUp(p, f)
+        note(`producer ${p.n} answered for typed words (${f.ref}) this door is not holding; it was dropped`)
         return
       }
       case 'say':
@@ -806,6 +831,11 @@ export function createRelay(cfg: RelayConfig): Relay {
     // A second answer from one producer, or one from a producer the words were never handed to,
     // says nothing the first did not.
     if (!about.waiting.delete(p.key)) return
+    // The hub has its answer already; this one is only the last of the voices being heard from.
+    if (about.settled) {
+      forgetWhenEveryoneHasAnswered(ref, about)
+      return
+    }
     if (f.status === 'accepted') {
       about.accepted = true
       // The count of his files this producer handed on — the one frame this door rebuilds rather
@@ -825,9 +855,15 @@ export function createRelay(cfg: RelayConfig): Relay {
     settleTypedWords(ref, about)
   }
 
+  /** Nothing more will come for it once nobody is left to answer; until then it names a fold. */
+  function forgetWhenEveryoneHasAnswered(ref: string, about: TypedWords): void {
+    if (!about.waiting.size) typedWords.delete(ref)
+  }
+
   /** Somebody took his words: one accepted answer goes up, with the count nobody can better. */
   function acceptTypedWords(ref: string, about: TypedWords): void {
-    typedWords.delete(ref)
+    about.settled = true
+    forgetWhenEveryoneHasAnswered(ref, about)
     answerHub(
       { t: 'ack', ref, status: 'accepted', ...(about.files > 0 ? { files: about.handedOn } : {}) },
       'an answer about typed words',
@@ -837,11 +873,17 @@ export function createRelay(cfg: RelayConfig): Relay {
   /** Nobody left to answer: one answer goes up, with the reason that matters most if it is no. */
   function settleTypedWords(ref: string, about: TypedWords): void {
     if (about.waiting.size) return
+    // Already answered for; the last voice going quiet changes nothing.
+    if (about.settled) {
+      typedWords.delete(ref)
+      return
+    }
     // Somebody did take them; a later producer's refusal does not unsay that.
     if (about.accepted) {
       acceptTypedWords(ref, about)
       return
     }
+    about.settled = true
     typedWords.delete(ref)
     const said = about.refusals.find(r => r.key === cfg.carrier) ?? about.refusals[0]
     const reason = said?.reason || 'everything attached to the worker went away before taking it'
@@ -956,13 +998,35 @@ export function createRelay(cfg: RelayConfig): Relay {
     }
   }
 
+  /**
+   * What the operator reads in place of the buttons. No engine's name and no id: he was asked a
+   * question, and the thing that asked it is gone.
+   */
+  const ENGINE_ENDED = 'the session that asked has ended'
+
+  function engineEnded(): void {
+    if (!ledger.openCount) return
+    // Only when the words can actually go. With the link down, `send` would queue them for a
+    // reconnect this process will not live to make, and the ledger would have forgotten questions
+    // whose buttons are still on his phone. Kept open and written down, the next run of this door
+    // takes them off at start.
+    if (!link.isUp) {
+      note(`the hub is out of reach; ${ledger.openCount} question(s) stay open for the next run to take off his phone`)
+      ledger.rememberNow()
+      return
+    }
+    const n = ledger.withdrawEverythingNow(ENGINE_ENDED)
+    if (n) note(`the engine has exited; taking the buttons off ${n} question(s) it left open`)
+  }
+
   function goodbye(): void {
     // First, and outside the try below: the questions open at this instant are exactly what the next
     // run has to route taps for, a quarter of a second of debounce is long enough to lose the last
     // one asked, and it must not be skipped because saying goodbye threw. It swallows its own errors.
     ledger.rememberNow()
     try {
-      if (link.isUp) link.sendControl({ t: 'bye', reason: 'stopping' })
+      // Through the same queue as the withdrawals above, so it can never overtake them on the wire.
+      if (link.isUp) answerHub({ t: 'bye', reason: 'stopping' }, 'this door\'s goodbye')
       // The door goes; what was written down beside it stays. That file is how the relay comes back
       // as the same voice the hub already has open questions under.
       unlinkSync(LISTEN)
@@ -974,6 +1038,7 @@ export function createRelay(cfg: RelayConfig): Relay {
   return {
     bind,
     start: () => link.start(),
+    engineEnded,
     goodbye,
     listenPath: LISTEN,
   }

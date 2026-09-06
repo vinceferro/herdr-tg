@@ -3730,6 +3730,18 @@ impl<S: Surface> Hub<S> {
                         {
                             return Settled::Live;
                         }
+                        // A goodbye is the end of what it has to say, not a frame to hold for a
+                        // pong that is not coming. `kickoff-hub-attach --check` connects, reads
+                        // the welcome and says `bye` on purpose, so that proving an environment can
+                        // reach the hub makes no topic; read as silence, every such check left
+                        // "never answered; probably not allowed to talk to me" in the audit, and a
+                        // wrapper that checks before trusting a wall looked like an intruder each
+                        // time. Kept with the others: it was read and has an id, so it is owed its
+                        // ack like the rest.
+                        if let BridgeFrame::Bye { .. } = &frame.payload {
+                            waiting.push(frame);
+                            return Settled::SaidGoodbye;
+                        }
                         waiting_bytes += frame_cost(&frame.payload);
                         // The frame that trips the bound is kept WITH the others, not dropped on
                         // the way out: it was read and it has an id, so it is owed an answer like
@@ -3764,19 +3776,43 @@ impl<S: Surface> Hub<S> {
             // too much before it has proved it is there; one that said nothing is probably a channel
             // plugin that is not allowlisted, which boots and exits in about a tenth of a second.
             // Reporting the first as the second sends the operator looking in the wrong place.
+            //
+            // A goodbye is not a failure at all, so it is not written to the audit as one: that file
+            // is where a person looks for bridges that were not allowed in, and a check that ran
+            // cleanly does not belong among them. It is said at info in the journal, and nothing
+            // else about the close changes — released, every queued frame answered `no`, no topic.
             let why = match settled {
-                Settled::Overflowed => "sent more before answering than the hub will hold for it",
-                Settled::Oversize => "a frame was over the size ceiling",
-                Settled::SwitchedOff => "its project was switched off at the terminal",
-                Settled::Gone | Settled::Live => {
-                    "connected but never answered; it is probably not allowed to talk to me"
+                Settled::Overflowed => {
+                    Some("sent more before answering than the hub will hold for it")
                 }
+                Settled::Oversize => Some("a frame was over the size ceiling"),
+                Settled::SwitchedOff => Some("its project was switched off at the terminal"),
+                Settled::Gone | Settled::Live => {
+                    Some("connected but never answered; it is probably not allowed to talk to me")
+                }
+                Settled::SaidGoodbye => None,
             };
-            tracing::warn!(
-                project = %addr.project, lane = addr.lane_field(), why,
-                "a bridge did not become live"
-            );
-            let _ = self.audit.refused(&addr, why);
+            match why {
+                Some(why) => {
+                    tracing::warn!(
+                        project = %addr.project, lane = addr.lane_field(), why,
+                        "a bridge did not become live"
+                    );
+                    let _ = self.audit.refused(&addr, why);
+                }
+                None => {
+                    // With the reason it gave, so a reader can tell `--check` ("just checking")
+                    // from an adapter that dialled and bailed. It is the last frame read.
+                    let reason = waiting.iter().find_map(|f| match &f.payload {
+                        BridgeFrame::Bye { reason } => Some(reason.as_str()),
+                        _ => None,
+                    });
+                    tracing::info!(
+                        project = %addr.project, lane = addr.lane_field(), reason,
+                        "a bridge said goodbye before it became live"
+                    );
+                }
+            }
             // Released FIRST, as the oversize path below does: what follows is writing, and a
             // bridge that redials in a second must not find its own dead connection still holding
             // the address.
@@ -5069,6 +5105,10 @@ impl<S: Surface> Hub<S> {
         let note = match (how, outcome) {
             (hub_proto::AskEnd::Answered, Some(o)) => format!("answered at the terminal — {o}"),
             (hub_proto::AskEnd::Answered, None) => "answered at the terminal".to_owned(),
+            // The bridge's own sentence for why the question went — "the session that asked has
+            // ended" from a door whose engine exited — is what he reads, in place of the hub's,
+            // which is true and says nothing. Unless it is blank: no words is not a sentence.
+            (hub_proto::AskEnd::Withdrawn, Some(o)) if !o.trim().is_empty() => o.to_owned(),
             (hub_proto::AskEnd::Withdrawn, _) => "no longer being asked".to_owned(),
             (hub_proto::AskEnd::Timeout, _) => "timed out".to_owned(),
         };
@@ -5123,9 +5163,9 @@ impl<S: Surface> Hub<S> {
 /// The text is the whole of it in practice; the rest is a fixed handful of bytes. Exact accounting
 /// would mean encoding a frame this side is about to hand straight to `handle`, which is a cost
 /// paid on every frame to make a bound slightly tighter.
-/// How the settling window ended: the one way in, and the three ways a connection is refused
-/// without ever having been live. Each of the three is said differently, and each answers for
-/// whatever was buffered before the socket goes.
+/// How the settling window ended: the one way in, the three ways a connection is refused without
+/// ever having been live, and the one way it leaves of its own accord. Each is said differently,
+/// and each answers for whatever was buffered before the socket goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Settled {
     /// The pong named the ping. The topic is made after this, and nothing before it.
@@ -5136,6 +5176,10 @@ enum Settled {
     Oversize,
     /// The window passed, or the socket ended, with no pong.
     Gone,
+    /// It said `bye` before its pong. Not a refusal: a bridge that only wanted to know the hub was
+    /// there — `kickoff-hub-attach --check` — ends this way on purpose, and is owed the same acks
+    /// as the others and no line in the audit.
+    SaidGoodbye,
     /// Its project was switched off at the terminal while it was still settling. Nothing is made
     /// for it: a topic created and greeted for a project he had just turned off would be the switch
     /// producing the one thing it exists to stop.

@@ -1958,6 +1958,61 @@ async fn a_frame_the_hub_cannot_hold_before_the_pong_is_refused_not_destroyed() 
 }
 
 #[tokio::test]
+async fn a_bridge_that_says_goodbye_before_the_pong_is_not_audited_as_one_that_never_answered() {
+    // `kickoff-hub-attach --check` connects, reads the welcome, says `bye` and closes — on purpose,
+    // so that proving an environment can reach the hub creates no topic. The hub's settling window
+    // used to know only the pong, so that close settled as "connected but never answered; it is
+    // probably not allowed to talk to me" and every check a wrapper ran before trusting a wall
+    // left an intruder's line in the audit. A bridge that said goodbye is not one that never
+    // answered.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    let welcome = bridge.next().await.expect("a welcome");
+    assert!(matches!(welcome.payload, HubFrame::Welcome { .. }));
+
+    // Something said before the goodbye is still owed its `no`: it was read, it has an id, and
+    // it is about to be destroyed with the connection.
+    let said = bridge
+        .send(BridgeFrame::Say {
+            text: "said before my goodbye".into(),
+            hint: None,
+            file: None,
+        })
+        .await;
+    let bye = bridge
+        .send(BridgeFrame::Bye {
+            reason: "just checking".into(),
+        })
+        .await;
+
+    let seen = bridge.drain_for(Duration::from_secs(3)).await;
+    let acks = acks_by_ref(&seen);
+    for id in [&said, &bye] {
+        assert_eq!(
+            acks.get(id).map(Vec::as_slice),
+            Some(&[(Delivered::No, None)][..]),
+            "frame {id} was destroyed without being answered for (acks: {acks:?})"
+        );
+    }
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Refused { .. })),
+        "a bridge that said goodbye was refused: {seen:?}"
+    );
+
+    // Nothing was made for it, and its address is free again.
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert!(
+        h.fake.topics.lock().await.is_empty(),
+        "a bridge that only said goodbye was given a topic"
+    );
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        !audit.contains("never answered") && !audit.contains("refused"),
+        "a goodbye was written down as a bridge that never answered:\n{audit}"
+    );
+}
+
+#[tokio::test]
 async fn every_frame_after_hello_is_acked_exactly_once_even_across_an_overflow() {
     // The invariant in the wire's own words, held across the one path that used to break it. A
     // frame acked twice is as wrong as one never acked — a bridge keys its in-flight map by the
@@ -3233,6 +3288,71 @@ async fn a_question_that_stops_being_asked_has_its_buttons_taken_away() {
         .await
         .expect_err("a retired question must not still answer");
     assert_eq!(refused, TapRefusal::NoRecord);
+}
+
+#[tokio::test]
+async fn a_withdrawal_that_says_why_puts_the_reason_on_the_phone() {
+    // When the engine behind `kickoff-hub-attach --run` exits, the door withdraws every question it
+    // still holds with an outcome the operator can read — "the session that asked has ended" — so
+    // that he knows why the buttons went. The hub used to throw that sentence away and write its
+    // own, "no longer being asked", which is true and says nothing: the words attach put on the
+    // wire never reached him, and the document promised they would.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("1~a1"),
+            text: "ship it?".into(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".into(),
+            }]),
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+
+    bridge
+        .send(BridgeFrame::AskResolved {
+            ask_id: AskId::new("1~a1"),
+            how: AskEnd::Withdrawn,
+            outcome: Some("the session that asked has ended".into()),
+        })
+        .await;
+
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired[0].1, MsgId::new("m2"));
+    assert!(
+        retired[0].2.contains("the session that asked has ended")
+            && !retired[0].2.contains("no longer being asked"),
+        "the outcome attach put on the wire is not what he reads: {retired:?}"
+    );
+
+    // An outcome with no words in it is not a sentence he can read; the hub's own stands in.
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("1~a2"),
+            text: "and this?".into(),
+            options: None,
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 3).await;
+    bridge
+        .send(BridgeFrame::AskResolved {
+            ask_id: AskId::new("1~a2"),
+            how: AskEnd::Withdrawn,
+            outcome: Some("   ".into()),
+        })
+        .await;
+    until(async || h.fake.retired.lock().await.len() == 2).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert!(
+        retired[1].2.contains("no longer being asked"),
+        "a blank outcome left him with no sentence at all: {retired:?}"
+    );
 }
 
 #[tokio::test]

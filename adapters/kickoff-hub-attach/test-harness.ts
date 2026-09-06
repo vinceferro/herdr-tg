@@ -128,7 +128,11 @@ export function claimingHub(path: string, outbox?: string) {
             })
             continue
           }
-          if (f.t === 'pong' || f.t === 'bye') continue
+          // The real hub answers every frame it reads after the pong, the door's own `bye` included
+          // (`hub.rs` acks it and lets the socket end) — and a fake that swallowed it could never
+          // show the door mistaking that ack for one nobody is waiting on. The settling pong is the
+          // one frame the real hub takes without an ack, so it stays unanswered here too.
+          if (f.t === 'pong') continue
           if (ackAs) write(s, { v: 1, id: `h-a${got.length}`, t: 'ack', ref: f.id, delivered: ackAs,
             ...(ackAs === 'no' ? { why: 'too-fast' } : {}) })
         }

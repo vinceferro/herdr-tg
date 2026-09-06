@@ -146,6 +146,14 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   already lives and puts no token back into an opened project's tree. `conversations.rs` owns the
   home: 0700 re-asserted, ids shape-refused at every door, containment asserted before every
   write.
+- **Claude as attach's `--run` child is proven to the phone** (6 September): door, claim, tool server
+  attached, a reply and a question delivered, clean exit — on the real hub, a throwaway project. The
+  tap back into that turn under attach's door awaits a tap. The proof found three defects, all fixed:
+  a `--check`'s `bye` before the pong is journaled as a goodbye, never audited as a refusal; when the
+  engine exits under `--run`, attach withdraws every question the door still holds and the phone
+  reads "the session that asked has ended" instead of dead buttons; the plugin starts from a
+  read-only mount without `bun install` (`start.ts`). ATTACHING §13.1 has the Claude worked
+  invocation: `--channels` last, prompt on stdin, trust pre-accepted, one ToolSearch turn.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.

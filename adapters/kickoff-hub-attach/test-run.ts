@@ -15,7 +15,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
-import { OPENCODE, SERVER, call, claimingHub, handshake, makeRepo, startServer, until } from './test-harness.ts'
+import { OPENCODE, SERVER, call, claimingHub, handshake, makeRepo, rawProducer, startServer, until } from './test-harness.ts'
 
 const ATTACH = join(import.meta.dir, 'main.ts')
 const STRANGER = join(import.meta.dir, '..', '..', 'docs', 'examples', 'attach-from-the-document.ts')
@@ -37,20 +37,44 @@ const { repo, laneDir } = makeRepo(dir, 'lane-0904-run')
 const shortTmp = join(dir, 't')
 mkdirSync(shortTmp, { recursive: true })
 
-/** Spawn attach with `--run`, capturing its child's stdout and attach's own exit code. */
-function startRun(env: Record<string, string>, runCmd: string[]) {
+/**
+ * Spawn attach with `--run`, capturing its child's stdout and attach's own exit code.
+ *
+ * attach's own stderr is captured when asked for, for the same reason `startAttach` captures it:
+ * a false alarm in the one log a developer reads to find real ones is reportable only there, and
+ * a test that could not read it would be asserting the absence of a crash instead of the absence
+ * of a line.
+ */
+function startRun(env: Record<string, string>, runCmd: string[], capture = false) {
   const child = Bun.spawn(['bun', ATTACH, '--run', ...runCmd], {
     cwd: repo,
     env: { ...process.env, TMPDIR: shortTmp, KICKOFF_HUB_PROJECT_DIR: repo, ...env },
     stdout: 'pipe',
-    stderr: 'inherit',
+    stderr: capture ? 'pipe' : 'inherit',
   })
   let out = ''
   ;(async () => {
     const dec = new TextDecoder()
     for await (const chunk of child.stdout as any) out += dec.decode(chunk)
   })()
-  return { child, out: () => out }
+  const said: string[] = []
+  if (capture) {
+    ;(async () => {
+      const dec = new TextDecoder()
+      let acc = ''
+      for await (const chunk of child.stderr as any) {
+        acc += dec.decode(chunk)
+        for (;;) {
+          const nl = acc.indexOf('\n')
+          if (nl < 0) break
+          const l = acc.slice(0, nl); acc = acc.slice(nl + 1)
+          said.push(l)
+          console.log(`    [attach] ${l}`)
+        }
+      }
+    })()
+  }
+  return { child, out: () => out, said }
 }
 
 // ── A. a child that dies takes attach down with its status, and a bye ─────────────────────────
@@ -61,6 +85,7 @@ console.log('\nwhen the child exits on its own:')
   const r = startRun(
     { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: join(dir, 'a-fanin') },
     ['sh', '-c', 'sleep 0.4; exit 7'],
+    true,
   )
   await until('attach to reach the hub', () => hub.got.some(f => f.t === 'hello'), 15000)
   const code = await r.child.exited
@@ -68,6 +93,65 @@ console.log('\nwhen the child exits on its own:')
   check('a_child_that_dies_takes_attach_down_with_its_status_and_a_bye',
     code === 7 && hub.got.some(f => f.t === 'bye'),
     `attach exit ${code}; hub saw ${JSON.stringify(hub.got.map(f => f.t))}`)
+  // The hub acks the `bye` like every other frame. The door minted that frame for itself, so the
+  // ack is its own to recognise — reported as "no producer is waiting on this", it is a false
+  // alarm in the one log a developer reads to find the real ones, at the end of every single run.
+  check('attachs_own_goodbye_is_acked_by_the_hub_and_attach_does_not_report_the_ack_as_lost',
+    !r.said.some(l => /an ack named .*no producer is waiting on/.test(l)),
+    JSON.stringify(r.said.filter(l => /an ack named/.test(l))))
+  hub.stop()
+}
+
+// ── A2. the engine's exit takes the buttons off every question the door still holds ──────────
+//
+// A producer that goes away gets a grace period before its questions are withdrawn, because it may
+// be a tool server restarting in place. Under `--run` the ENGINE's exit is a different fact: nothing
+// behind the door can answer any more, attach itself is about to exit, and the grace timer dies
+// with it — so the question kept its buttons on his phone with nothing behind them, and a tap
+// went to a lane that no longer existed.
+console.log('\nwhen the engine exits with a question still open:')
+{
+  const hubSock = join(dir, 'a2-hub.sock')
+  const hub = claimingHub(hubSock)
+  const door = join(shortTmp, 'a2-door.sock')
+  const flag = join(dir, 'a2-engine-may-exit')
+  const r = startRun(
+    { KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_SOCKET: door,
+      // Long enough that the ordinary grace timer cannot fire and fake a pass.
+      KICKOFF_HUB_RELAY_GRACE_MS: '30000' },
+    // An engine that exits ON ITS OWN, when told to, rather than on a signal from the test.
+    ['sh', '-c', `while [ ! -e "${flag}" ]; do sleep 0.05; done; exit 0`],
+    true,
+  )
+  await until('attach to reach the hub', () => hub.got.some(f => f.t === 'hello'), 15000)
+  const P = rawProducer(door)
+  await P.ready
+  P.send({ v: 1, id: 'h1', t: 'hello', project_id: 'p', token: 'a'.repeat(64), repo,
+    pid: process.pid, instance: 'the-engines-tool-server' })
+  P.send({ v: 1, id: 'p-ask', t: 'ask', ask_id: 'a1', text: 'ship it?',
+    options: [{ option_id: 'y', label: 'Yes' }] })
+  await until('the question at the hub', () => hub.got.some(f => f.t === 'ask'), 15000)
+  const atHub = hub.got.find(f => f.t === 'ask')!.ask_id as string
+  // The tool server goes first, as it does for real: the engine's MCP children end before the
+  // engine's own process does.
+  P.end()
+  await until('the door to notice it went', () => r.said.some(l => /went away/.test(l)), 10000)
+  writeFileSync(flag, '')
+  const code = await r.child.exited
+  await Bun.sleep(100)
+  const kinds = hub.got.map(f => f.t)
+  const withdrawn = hub.got.find(f => f.t === 'ask_resolved')
+  check('when_the_engine_exits_every_question_the_door_still_holds_is_withdrawn_before_the_bye',
+    code === 0 && withdrawn?.ask_id === atHub && withdrawn?.how === 'withdrawn' &&
+      withdrawn?.outcome === 'the session that asked has ended' &&
+      kinds.indexOf('ask_resolved') < kinds.indexOf('bye'),
+    `attach exit ${code}; hub saw ${JSON.stringify(hub.got.filter(f => f.t !== 'hello'))}`)
+  // What the door wrote down beside its socket is what the next attach routes and withdraws from.
+  // A question withdrawn here but still written there would have its buttons taken off twice.
+  let remembered: any = null
+  try { remembered = JSON.parse(readFileSync(`${door}.state`, 'utf8')) } catch { /* asserted below */ }
+  check('and the door does not write the withdrawn question down for the next run to withdraw again',
+    Array.isArray(remembered?.asks) && remembered.asks.length === 0, JSON.stringify(remembered))
   hub.stop()
 }
 

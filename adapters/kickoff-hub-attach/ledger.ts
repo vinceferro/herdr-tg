@@ -42,7 +42,8 @@ export type LedgerOptions = {
    * The caller sends it, because the caller owns the wire — and it is the caller that has to
    * recognise the `ack` for one of these as its own rather than as one nobody is waiting on.
    */
-  sendUp: (payload: Record<string, unknown>, what: string, owner: string) => { ok: boolean; why?: string }
+  /** `ok` is taken by the link; `delivered` is on the wire, as opposed to waiting in its queue. */
+  sendUp: (payload: Record<string, unknown>, what: string, owner: string) => { ok: boolean; delivered?: boolean; why?: string }
 }
 
 /**
@@ -267,6 +268,41 @@ export class Ledger {
         this.rememberNow()
       }, this.o.graceMs),
     )
+  }
+
+  /**
+   * Take the buttons off EVERY open question, now, with a reason he can read.
+   *
+   * For the moment the engine behind the door exits under `--run`. The grace above exists because
+   * a producer that went away may be a tool server restarting in place; an engine that has exited
+   * is a different fact — nothing behind the door can answer any more, and this process is about to
+   * exit with it, which is what kills the grace timer before it ever fires. That left a question
+   * with live buttons on his phone and nothing behind them, and his tap went to a lane that no
+   * longer existed.
+   *
+   * A withdrawal the link would not take stays open and is written down, so the next run of this
+   * door takes those buttons off at start rather than forgetting them — and so does one the link
+   * took but has not yet written, because this process exits before a queue gets a second chance
+   * and a question forgotten here with its buttons still on his phone is forgotten for good. A
+   * withdrawal sent twice costs the hub nothing; a keyboard nobody withdraws stays until it ages
+   * out. Returns how many were handed to the link.
+   */
+  withdrawEverythingNow(outcome: string): number {
+    for (const t of this.leaving.values()) clearTimeout(t)
+    this.leaving.clear()
+    let sent = 0
+    for (const [ns, a] of [...this.open]) {
+      const d = this.o.sendUp({ t: 'ask_resolved', ask_id: ns, how: 'withdrawn', outcome }, `taking the buttons off ${ns}`, a.key)
+      if (!d.ok) {
+        this.o.note(`the buttons on ${ns} could not be taken off: ${d.why}`)
+        continue
+      }
+      sent++
+      if (d.delivered) this.open.delete(ns)
+      else this.o.note(`the withdrawal of ${ns} is still waiting to go out; it stays written down for the next run`)
+    }
+    this.rememberNow()
+    return sent
   }
 
   private mine(key: string): string[] {

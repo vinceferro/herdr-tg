@@ -242,7 +242,14 @@ if (ARGS.run) {
     cwd: CONFIG.projectDir,
     env: { ...process.env, ...pinned },
     note,
-    onBeforeExit: goodbye,
+    // The ENGINE has exited, which is more than a producer going away: nothing behind the door can
+    // answer any more, so every question it still holds comes off his phone before the goodbye.
+    // The signal path below, with no child, keeps the grace — a relay restarting under a living
+    // opencode server must not withdraw questions its agents are still waiting on.
+    onBeforeExit: () => {
+      relay.engineEnded()
+      goodbye()
+    },
   })
 } else {
   // No child: attach is the relay (and, with --opencode, the watcher), supervised by whatever

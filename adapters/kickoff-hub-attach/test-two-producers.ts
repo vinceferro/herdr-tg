@@ -130,6 +130,32 @@ check('and the hub was told the worktree, once, by the relay itself',
   await Bun.sleep(200)
 }
 
+// The fold settles on the first answer that cannot be bettered, and the producers that had not
+// answered yet still do — a refusal from a watcher landing after the tool server's accept is the
+// ordinary shape whenever the box is busy. The door used to forget the fold the moment it settled,
+// so the late answer found nothing to fold into and went up as it was: two acks for one message,
+// from the one thing on this wire that exists to keep it at one.
+{
+  const socks = readdirSync(faninDir).filter(f => f.endsWith('.sock'))
+  const late = rawProducer(join(faninDir, socks[0]), (f, send) => {
+    if (f.t === 'message') setTimeout(() => send({ v: 1, id: `l-${f.id}`, t: 'ack', ref: f.id,
+      status: 'refused', reason: 'nothing on this engine reads a channel message' }), 300)
+  })
+  await late.ready
+  late.send({ v: 1, id: 'l1', t: 'hello', project_id: 'p', token: 'a'.repeat(64),
+    instance: 'answers-late', repo, pid: process.pid, lane: LANE })
+  await until('the late producer to be let in', () => late.got.some(f => f.t === 'welcome'))
+  hub.to({ v: 1, id: 'h-m1', t: 'message', msg_id: 'mm1', text: 'and the tests?', from: { chat_id: -1, user_id: 1 } })
+  await until('an answer about the words', () => hub.got.some(f => f.t === 'ack' && f.ref === 'h-m1'), 8000)
+    .catch(() => {})
+  await Bun.sleep(900)
+  const answers = hub.got.filter(f => f.t === 'ack' && f.ref === 'h-m1')
+  check('an_answer_that_lands_after_the_fold_has_settled_is_never_a_second_ack_for_the_same_words',
+    answers.length === 1 && answers[0].status === 'accepted', JSON.stringify(answers))
+  late.end()
+  await Bun.sleep(200)
+}
+
 // Both producers are the same build with the same counter, so their first question is the same
 // string on both. The hub resolves a tap BY ask id against a written record, so two questions
 // sharing one id is a tap delivered to whichever agent the map happened to hold.

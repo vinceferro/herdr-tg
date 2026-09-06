@@ -1,5 +1,19 @@
-<!-- INTERFACE, v17, 6 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v18, 6 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v18 is a Claude worker run as attach's `--run` child against the live hub, and what that proof
+     found. Three things moved, none of them on the wire. §13.4: a `bye` that reaches the hub before
+     the pong is a goodbye, not "connected but never answered" — `--check` leaves no refusal behind
+     it now, and §13.9's "a new frame" bullet is struck because the frame was already there. §13.5:
+     when the ENGINE exits under `--run`, every question the door still holds is withdrawn before
+     the `bye`, with an outcome he can read — *the session that asked has ended* — so no question
+     keeps its buttons with nothing behind them; a producer's own goodbye while the engine lives
+     keeps §9's grace clock, as before. §13.1: a third worked invocation, the Claude worker in a
+     wall — a trust dialog that defaults to "No, exit" and that `--check` cannot see, `--channels`
+     variadic and therefore last with the prompt on stdin, the plugin's tools deferred behind a
+     `ToolSearch` turn even in print mode, and a project directory that must be the real checkout.
+     Offer 5 says what `outcome` on a withdrawal is for: the hub shows it under the question, where
+     it used to show only "no longer being asked".
 
      v17 is `docs/CONVERSATIONS.md` built, steps 0–6. A conversation is a row minted at a
      terminal whose secret lives where the channel keeps it — the hub's own state directory,
@@ -765,12 +779,18 @@ real one, byte for byte:
 Send it, and wait for the kernel to take it before exiting — `process.exit()` on the same tick loses
 it to a short write.
 
-But do not believe the folklore, which this document is correcting: **on the current hub, `bye`
-changes nothing.** It is acked and otherwise ignored; the hub does not announce a departure to the
-operator at all, so there is no buzz for it to suppress and no 90-second quiet window. It is worth
-sending anyway for two real reasons: **a relay does act on it** (§9 — it detaches you and starts your
-grace clock), and it is the only clean end-of-connection signal the protocol has, so a hub that comes
-to need one will need it from you.
+But do not believe the folklore, which this document is correcting: **on the current hub, a `bye`
+after the pong changes nothing.** It is acked and otherwise ignored; the hub does not announce a
+departure to the operator at all, so there is no buzz for it to suppress and no 90-second quiet
+window. It is worth sending anyway for two real reasons: **a relay does act on it** (§9 — it detaches
+you and starts your grace clock), and it is the only clean end-of-connection signal the protocol
+has, so a hub that comes to need one will need it from you.
+
+Before the pong it changes one thing, and only for the record. A connection that says `bye` and
+closes without ever answering the `ping` is released as one that said goodbye — every frame the hub
+had read is still acked `no`, the `bye` included, no `refused` follows, no topic is made — and not
+as one that "never answered", which is the reading the hub used to give it. That is the difference
+`--check` (§13.4) rests on.
 
 ---
 
@@ -836,7 +856,10 @@ a question that never arrived is the failure this product exists to prevent.
 
 **5 · Retirement.** `ask_resolved{ask_id, how, outcome?}`. Send it whenever a question stops being
 open **for any reason** — including one answered at the terminal, which is the frame no screen-reading
-design could ever produce. The buttons come off the message.
+design could ever produce. The buttons come off the message. On a withdrawal, `outcome` is the
+sentence he reads under the question in place of *no longer being asked* — say why, in his words:
+attach sends *the session that asked has ended* when the engine that asked is gone (§13.5). Leave it
+out and he reads the hub's own sentence, which is true and says nothing.
 Do **not** send it in response to a `choice` for that same question: the hub has already retired it,
 and a second retirement overwrites the operator's own words on his phone.
 
@@ -1053,7 +1076,9 @@ a relay both are the relay's, for every producer, for ever. So:
   of your process; change it when you restart. A producer that reconnects under the same instance is
   the same voice and still gets the tap it is waiting on.
 * **When your socket goes and nothing comes back under your name within the grace window** (default
-  90 s), your open questions are withdrawn and their buttons come off.
+  90 s), your open questions are withdrawn and their buttons come off. The one thing that does not
+  wait for the window is the engine itself ending under `--run`: then every question the door holds
+  is withdrawn at once, with the reason he reads, because nothing is coming back (§13.5).
 
 ### Four things a relay does not inherit from the hub
 
@@ -1247,8 +1272,8 @@ whoever typed this vouches for it".
 | --- | --- | --- |
 | *(none)* | Hold the claim for `(project, address)` and open the door. This alone is what `adapters/fanin/` is today, and it is what a Claude worker in a wall needs. | — |
 | `--opencode <url>` | Also watch the opencode server at `<url>`: its questions and permission prompts go to the phone as `ask`, a tap goes back to the server's own reply endpoint. This is what `adapters/opencode-bridge/` is today, minus its process. The URL is the flag's value and nothing else; `OPENCODE_URL` retires with the bridge. | not watching |
-| `--run <command...>` | Start `<command...>` as this process's child, in the project directory, with the namespace pinned in its environment so that any adapter descending from it finds the door (§13.3). When the child exits, say `bye`, close the door, exit with the child's status (§13.5). Everything after `--run` is the command; nothing after it is read as a flag. | no child |
-| `--check` | Prove this environment can reach the hub, one plain line per fact, then exit 0 if every fact holds and 1 if any does not. Sends `hello` and `bye` and nothing else; creates no topic (§13.4). `--opencode` and `--run` may stay on the line — the check reads them for what it can verify and starts nothing — so a wrapper runs its real line with `--check` in front of it. | — |
+| `--run <command...>` | Start `<command...>` as this process's child, in the project directory, with the namespace pinned in its environment so that any adapter descending from it finds the door (§13.3). When the child exits, withdraw every question the door still holds — his phone loses the buttons and reads *the session that asked has ended* — then say `bye`, close the door, exit with the child's status (§13.5). Everything after `--run` is the command; nothing after it is read as a flag. | no child |
+| `--check` | Prove this environment can reach the hub, one plain line per fact, then exit 0 if every fact holds and 1 if any does not. Sends `hello` and `bye` and nothing else; creates no topic and leaves no refusal behind (§13.4). `--opencode` and `--run` may stay on the line — the check reads them for what it can verify and starts nothing — so a wrapper runs its real line with `--check` in front of it. | — |
 
 **Exit status.** `0` a clean end; `1` a `--check` that found something to fix; `2` a refusal to
 start, with the sentence naming the variable on stderr — the same `2` the relay and the bridge use
@@ -1349,6 +1374,76 @@ Line by line, each is one of §10's rules or one of the measurements in `docs/TA
   the tool server is a bun script the engine spawns, so bun is in the image whatever attach is. It
   holds **no** copy of the operator's `~/.config/opencode/opencode.json`: that file carries his
   provider keys, and its `environment` block is built for the host, not a wall (§13.3).
+
+#### Worked invocation 3 — a Claude worker in a wall
+
+The Claude path is one command already, and under attach it stays one: the tool server the engine
+spawns is `plugins/kickoff-channel/server.ts`, it reads the nine pinned variables of §13.3, and
+nothing in it changes. What a wall has to know is around it, and none of it is written anywhere
+else — a proof run on 6 September against the live hub found the four points below. The check
+first; it makes no topic and, since a `bye` before the pong is a goodbye to the hub (§13.4), leaves
+no refusal behind:
+
+```
+cd "$worktree"
+KICKOFF_HUB_PROJECT_DIR=. KICKOFF_HUB_ADDRESS="$address" \
+  kickoff-hub-attach --check --run claude -p --channels plugin:kickoff-channel@herdr-tg-local
+```
+
+Then the worker. Print mode is the **outbound leg only**: `reply`, `ask` and `done` reach the phone
+through the door, and nothing comes back, because print mode ends the turn and his tap arrives as
+a channel message that needs a turn to land in. A wall that needs his answer runs the engine
+interactively under a pty — tmux, or the wall's own — not `-p`.
+
+```
+cd "$worktree"
+printf '%s\n' "$prompt" | \
+KICKOFF_HUB_PROJECT_DIR=. KICKOFF_HUB_ADDRESS="$address" \
+  kickoff-hub-attach --run claude -p --output-format stream-json \
+    --allowedTools "$tools" --channels plugin:kickoff-channel@herdr-tg-local
+```
+
+`$tools` is the comma-separated list of the plugin's four tools as the engine names them —
+`mcp__plugin_kickoff-channel_kickoff-channel__reply`, and the same prefix for `ask`, `ask_resolved`
+and `done`. The marketplace name after the `@` is whatever the wall registered
+`plugins/kickoff-channel/` under; `herdr-tg-local` is this box's.
+
+* **`--channels` is variadic, so it goes last and the prompt goes on stdin.** It takes every word
+  after it as one more server name, and a prompt put after it is refused as an untagged channel
+  entry — *`--channels` entries must be tagged* — and the engine exits `1` before it looks for any
+  server. attach never reads stdin and the child inherits it (§13.5), so the pipe above reaches
+  the engine untouched.
+* **The trust dialog defaults to "No, exit", and `--check` cannot see it.** On a directory Claude
+  has never been trusted with, an interactive session asks first — *is this a project you created
+  or one you trust?* — and the default answer exits. Print mode skips the dialog. The two shapes
+  a wall can take, both measured on 2.1.259: **without a tty** there is no dialog at all — the
+  engine drops into print mode, and with nothing on stdin refuses *input must be provided either
+  through stdin or as a prompt argument* and exits `1`; **under a pty** — tmux, or the wall's own —
+  with nobody at the keyboard, the session sits at the dialog with *No, exit* selected, and a
+  wrapper that types its prompt and Enter into the pane confirms that default: the engine exits
+  `0`, attach prints `the engine exited (status 0)` and exits `0` itself, and the wall reads a
+  clean run that did nothing. Either launch once interactively and answer it, or mark the project
+  directory trusted in Claude's own per-project record before the wall starts
+  (`hasTrustDialogAccepted` in its user configuration, as of Claude Code 2.1.259; the key is
+  Claude's, not this interface's, and may move). The check proves the binary is on `PATH`; it
+  does not prove the engine will speak.
+* **The plugin's tools are deferred, in print mode too.** As of 2.1.259 the engine lists them as
+  deferred and spends a turn on a `ToolSearch` before the first `reply` — reply-then-done is four
+  turns, not two. A wall's turn or token budget must expect the extra turn, and a prompt that says
+  "call reply" must not assume the tool is already loaded.
+* **`KICKOFF_HUB_PROJECT_DIR` must be the real checkout or worktree, at the path the hub knows it
+  by.** The address (§4), the door (§9) and the secret (§5) are all worked out from that tree; a
+  copy of it at another path is a different project to all three and finds none of them. Where the
+  tree cannot answer — the linked worktree of invocation 2, whose `.git` file points outside the
+  wall — `KICKOFF_HUB_ADDRESS` and a told secret or conversation stand in, as that invocation shows.
+
+What a run that holds looks like, in attach's own lines: `a producer attached (1 now)` a few seconds
+after the engine starts; at the end `a producer said goodbye` · `a producer went away; 0 left` ·
+`the engine exited (status 0)`, and the door is gone. Measured 6 September: `reply` and `ask` both
+reached the phone through the door, teardown was clean, and the print run took thirteen seconds
+wall. The one leg that run did not see is his tap coming back down the door into a Claude child's
+turn — nobody tapped in the window; the direct path and the door's path with opencode are each
+proven on their own (§9).
 
 ### 13.2 What becomes of `adapters/fanin/` and `adapters/opencode-bridge/`
 
@@ -1523,18 +1618,23 @@ order is what makes this clean (`hub.rs`, `admit` and `serve_connection`): peer 
 socket, uid first — another uid is closed without a reply — then version, then secret to project,
 then enabled, then the address shape; then the claim is taken and **`welcome` is sent**; then
 `ping`; and **the topic is created only after the pong**, inside the `if live` branch. A connection
-that ends before the pong is released and audited, and nothing reaches Telegram. So `--check`
-connects, sends `hello`, treats the arrival of `welcome` as proof — socket reachable, uid admitted,
+that ends before the pong is released — and, unless it said `bye`, audited as a refusal — and
+nothing reaches Telegram. So `--check` connects, sends `hello`, treats the arrival of `welcome` as proof — socket reachable, uid admitted,
 secret resolved to an enabled project, address well-formed and echoed, claim free — sends `bye`,
 and closes **without ever ponging**. Confirmed in the code, not assumed.
 
-Two costs, so that nobody is surprised by them. The check **holds the claim for the length of one
+One cost, so that nobody is surprised by it. The check **holds the claim for the length of one
 round trip**; the hub releases it the instant the connection ends, so a wrapper that runs the check
-and then starts the worker is not refused. And it leaves one line in the hub's audit log —
-*"connected but never answered; it is probably not allowed to talk to me"* — which is the hub's
-honest reading of a deliberate check. Telling the hub the difference would be a new frame, which is
-`crates/`, which is out of this slice; the line is noted here so that whoever reads that log knows
-what a check looks like.
+and then starts the worker is not refused. It leaves **no refusal** behind: the hub reads a `bye`
+that arrives before the pong as a goodbye — the connection is released, every frame it had read is
+acked `no` (the `bye` included), no `refused` frame is sent, no topic is made, and what the hub
+records is a bridge that said goodbye before it became live, not a refusal — one line in its
+journal at `info`, carrying the reason the `bye` gave (*just checking*, for the check), where the
+unit runs it at that level and a hub started by hand at the default `warn` writes nothing. Until 6 September it
+did not: the pre-pong loop knew only the pong, the close settled as *"connected but never answered;
+it is probably not allowed to talk to me"*, and every check a wrapper ran before trusting a wall
+looked like an intruder in the hub's record. The new frame this paragraph once said would be needed
+to tell the hub the difference turned out to be one the check was already sending.
 
 **What it prints.** One line per fact, in the order the facts are established, each beginning `ok`
 or `NOT`; a `NOT` line carries the sentence that says what to do. The last line is the count. Exit
@@ -1617,12 +1717,22 @@ with attach at PID 1 signalable by its host pid and orphans dying with it — co
 life of the wall, since attach does not reap, and an agent's shell spawns constantly; attach keeps
 refusing `--run` at PID 1. The wrapper is kickoff's (§13.9); these four bullets are what it copies.
 
-**When the child exits**, for any reason: the ledger is written down first (the questions open at
-this instant are what the next run has to route taps for); `bye` goes on the hub link if it is up,
-and attach waits for the kernel to take it — the same 200 ms both processes use today, because
-`process.exit()` on the same tick loses the frame to a short write; the door is unlinked, and a
-private door's folder with it; and attach exits **with the child's status** — its exit code, or
-`128 + n` for a signal. A child that could not be started at all is `127` and one line saying so.
+**When the child exits**, for any reason: every question the door still holds is withdrawn first —
+`ask_resolved{how: withdrawn}` for each, with the outcome *the session that asked has ended* — so
+the hub takes the buttons off his phone and puts that sentence under the question, instead of
+leaving a keyboard that a tap an hour later would send to nothing; the ledger is then written down
+empty, so the next run of the same address has no stale question to route a late tap for. This is
+the **engine's** exit and nothing less — and it is every question at the door, not only those from
+producers that descend from the child: the door is the engine's descendants' (§13.3), and a
+producer pointed at it by hand from outside the engine has its open question retired with the same
+sentence. A producer that says goodbye while the engine lives — a tool
+server ending with its turn, a watcher reconnecting — keeps §9's grace clock, because the voice
+that asked may come back under its own instance and still wants its tap; only when the process
+those producers descend from is gone is there nothing to wait for. Then `bye` goes on the hub link
+if it is up, and attach waits, bounded, for the kernel to take the frames — `process.exit()` on
+the same tick loses them to a short write; a link that is down cannot carry the withdrawals, and
+attach says so once and does not wait on it; the door is unlinked, and a private door's folder with
+it; and attach exits **with the child's status** — its exit code, or `128 + n` for a signal. A child that could not be started at all is `127` and one line saying so.
 attach's own exit takes the door with it, so the next start of the same address finds either
 nothing or a leftover file, never a live socket with nobody behind it.
 
@@ -1709,8 +1819,8 @@ journalctl --user -u kickoff-hub-attach@oc-dogfood -f
 
 The unit is the **opencode** worker. A Claude worker on a desk is the operator's own interactive
 session with the channel plugin, which is not a service and is not this unit's business; a Claude
-worker in a wall is `--run claude …` under the entrypoint of §13.1, which the unit does not need
-either.
+worker in a wall is `--run claude …` under the entrypoint of §13.1 — worked invocation 3 there, with
+the four things a wall has to know about that engine — which the unit does not need either.
 
 ### 13.7 The tests
 
@@ -1837,7 +1947,9 @@ Listed so that nobody discovers it in a diff.
   start and `--check` both say so.
 * **`session.idle` as `beat`.** Still acked and dropped by the hub, as `docs/TAXONOMY.md` §7 records.
 * **Reaping at PID 1.** Declined, §13.5, and the wall's init does it.
-* **Telling the hub a check from a real connection.** A new frame, `crates/`, another slice.
+* ~~**Telling the hub a check from a real connection.** A new frame, `crates/`, another slice.~~
+  Not needed after all, 6 September: the `bye` the check was already sending is the difference,
+  and the hub now reads a `bye` before the pong as a goodbye (§13.4).
 
 ## 14. Files
 

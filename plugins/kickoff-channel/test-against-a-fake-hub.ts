@@ -15,9 +15,9 @@
  */
 
 import { createHash } from 'crypto'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, realpathSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync, realpathSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 
 import { readConfig } from './attach.ts'
 
@@ -54,14 +54,24 @@ const until = async (what: string, cond: () => boolean, ms = 8000) => {
  * One bridge, started as the plugin manifest starts it: `cwd` is the plugin directory, never the
  * project. Anything the bridge needs to know about the project it has to get from the environment.
  */
-function startBridge(env: Record<string, string>, cwd = import.meta.dir) {
-  const child = Bun.spawn(['bun', join(import.meta.dir, 'server.ts')], {
+function startBridge(env: Record<string, string>, cwd = import.meta.dir,
+  cmd: string[] = ['bun', join(import.meta.dir, 'server.ts')], captureStderr = false) {
+  const child = Bun.spawn(cmd, {
     cwd,
     env: { ...process.env, ...env },
     stdin: 'pipe',
     stdout: 'pipe',
-    stderr: 'inherit',
+    // Stderr is where a bridge that never answers says why; the checks that run the manifest's own
+    // `start` command need to quote it, the rest just let it through to the terminal.
+    stderr: captureStderr ? 'pipe' : 'inherit',
   })
+  let err = ''
+  if (captureStderr) {
+    ;(async () => {
+      const dec = new TextDecoder()
+      for await (const chunk of child.stderr as any) err += dec.decode(chunk)
+    })()
+  }
   const out: Record<string, any>[] = []
   ;(async () => {
     const dec = new TextDecoder()
@@ -78,7 +88,7 @@ function startBridge(env: Record<string, string>, cwd = import.meta.dir) {
     }
   })()
   const to = (o: unknown) => child.stdin.write(JSON.stringify(o) + '\n')
-  return { child, out, to }
+  return { child, out, to, err: () => err }
 }
 
 /**
@@ -1635,6 +1645,106 @@ for (const bad of ['../../etc', 'p-0123456789AB', 'c-0123456789a', 'p-0123456789
     staleRoomSaid.text)
   staleRoom.child.kill()
   staleRoomHub.stop()
+}
+
+// ── The `start` command, the way the plugin manifest runs it ──────────────────────────────────
+//
+// Every bridge above is spawned as `bun server.ts`. Claude Code does not do that: `.mcp.json` runs
+// `bun run --cwd <plugin> --shell=bun --silent start`, and `start` is a line in package.json that
+// nothing here had ever executed. That line ran `bun install` before every server start, which was
+// harmless on a developer's checkout and fatal in a wall: a plugin mounted read-only cannot take
+// bun re-linking `node_modules/.bin`, so `bun install` died on EEXIST and `server.ts` never ran —
+// the engine reported the channel as failed, and the agent had no way to reach the phone.
+//
+// So the command is run here for real — the one in `.mcp.json`, read from the manifest rather than
+// retyped, with the engine's placeholder filled in — from a copy that has its `node_modules` and
+// no write bit anywhere, and the server must still answer the MCP handshake. Twice: once with
+// this box's `PATH`, and once with a `PATH` holding nothing but bun, because a wall's image is not
+// obliged to carry coreutils and the first fix decided with `test`, which bun's shell does not
+// have of its own — "command not found: test" fell through to the install, and the mount was back
+// to failing. And the other halves are held too: a copy WITHOUT `node_modules` must still install
+// and answer, or a fresh clone would never start; and a WRITABLE copy whose `node_modules` is
+// present but no longer whole — a pull that bumped a dependency — must be brought up to date
+// rather than started against what is there, which "skip the install when the directory is
+// present" would silently do.
+console.log('\nthe start command, run the way the manifest runs it:')
+{
+  const manifest = JSON.parse(readFileSync(join(import.meta.dir, '.mcp.json'), 'utf8')).mcpServers['kickoff-channel']
+  const START = (cwd: string) => [manifest.command, ...manifest.args.map((a: string) => a.replaceAll('${CLAUDE_PLUGIN_ROOT}', cwd))]
+  const noHub = { CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: join(dir, 'no-hub-for-start.sock') }
+  const firstLines = (err: string) => err.split('\n').filter(l => l.trim()).slice(0, 3).join(' | ')
+  const onlyBun = { ...noHub, PATH: dirname(process.execPath) }
+
+  const mount = join(dir, 'read-only-mount')
+  const copied = Bun.spawnSync(['cp', '-a', import.meta.dir, mount], { stdout: 'ignore', stderr: 'pipe' })
+  if (copied.exitCode !== 0) { console.log(`copying the plugin failed: ${new TextDecoder().decode(copied.stderr)}`); process.exit(1) }
+  // The write bit comes off every file and every directory, because that is what a read-only
+  // mount looks like to the process: not "the files are owned by root" but "nothing here can be
+  // written, linked or unlinked". It goes back on in `finally`, or the cleanup at the end of this
+  // file could not remove the directory it made.
+  Bun.spawnSync(['chmod', '-R', 'a-w', mount])
+  try {
+    const onMount = startBridge(noHub, mount, START(mount), true)
+    let answered = false
+    try { await handshake(onMount); answered = true } catch { /* the failure is in stderr */ }
+    onMount.child.kill()
+    await Bun.sleep(100)
+    check('the_start_command_runs_the_server_from_a_read_only_plugin_directory_when_node_modules_is_present',
+      answered, firstLines(onMount.err()))
+
+    const bare = startBridge(onlyBun, mount, START(mount), true)
+    let bareAnswered = false
+    try { await handshake(bare); bareAnswered = true } catch { /* the failure is in stderr */ }
+    bare.child.kill()
+    await Bun.sleep(100)
+    check('and_needs_nothing_on_the_path_but_bun_to_do_it', bareAnswered, firstLines(bare.err()))
+  } finally {
+    Bun.spawnSync(['chmod', '-R', 'u+w', mount])
+  }
+
+  // A clone that has never been installed: the same command has to fetch the dependency before it
+  // can serve. That needs the package to be reachable — the registry, or bun's own cache — so a
+  // failure that is plainly the network's is reported as skipped rather than as the plugin's.
+  const fresh = join(dir, 'fresh-clone')
+  mkdirSync(fresh, { recursive: true })
+  for (const f of readdirSync(import.meta.dir)) {
+    if (f === 'node_modules') continue
+    Bun.spawnSync(['cp', '-a', join(import.meta.dir, f), join(fresh, f)])
+  }
+  const onFresh = startBridge(noHub, fresh, START(fresh), true)
+  let freshAnswered = false
+  try { await handshake(onFresh); freshAnswered = true } catch { /* the failure is in stderr */ }
+  onFresh.child.kill()
+  await Bun.sleep(100)
+  const freshErr = onFresh.err()
+  if (!freshAnswered && /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ConnectionRefused|FailedToResolve|getaddrinfo|network/i.test(freshErr)) {
+    console.log('  skip the_start_command_still_installs_when_node_modules_is_absent (no registry reachable)')
+  } else {
+    check('the_start_command_still_installs_when_node_modules_is_absent',
+      freshAnswered && existsSync(join(fresh, 'node_modules', '@modelcontextprotocol', 'sdk')),
+      firstLines(freshErr))
+  }
+
+  // A checkout whose `node_modules` is present but no longer whole: `zod` is what the SDK is built
+  // on, and without it the server cannot load. The directory is writable, so the start command
+  // has every means to put it back — and must, or a developer's next session runs the plugin
+  // against whatever a pull left behind. Same skip as above when nothing can be fetched.
+  const stale = join(dir, 'stale-checkout')
+  const copiedStale = Bun.spawnSync(['cp', '-a', import.meta.dir, stale], { stdout: 'ignore', stderr: 'pipe' })
+  if (copiedStale.exitCode !== 0) { console.log(`copying the plugin failed: ${new TextDecoder().decode(copiedStale.stderr)}`); process.exit(1) }
+  rmSync(join(stale, 'node_modules', 'zod'), { recursive: true, force: true })
+  const onStale = startBridge(noHub, stale, START(stale), true)
+  let staleAnswered = false
+  try { await handshake(onStale); staleAnswered = true } catch { /* the failure is in stderr */ }
+  onStale.child.kill()
+  await Bun.sleep(100)
+  const staleErr = onStale.err()
+  if (!staleAnswered && /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ConnectionRefused|FailedToResolve|getaddrinfo|network/i.test(staleErr)) {
+    console.log('  skip a_writable_checkout_whose_node_modules_is_no_longer_whole_is_brought_up_to_date_before_the_server_starts (no registry reachable)')
+  } else {
+    check('a_writable_checkout_whose_node_modules_is_no_longer_whole_is_brought_up_to_date_before_the_server_starts',
+      staleAnswered && existsSync(join(stale, 'node_modules', 'zod')), firstLines(staleErr))
+  }
 }
 
 rmSync(dir, { recursive: true, force: true })

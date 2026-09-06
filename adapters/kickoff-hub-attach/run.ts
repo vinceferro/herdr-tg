@@ -42,8 +42,9 @@ export type RunOptions = {
   /** Say something in this process's own transcript, prefixed as attach's own line. */
   note: (msg: string) => void
   /**
-   * Run just before attach exits, after the child is gone: write the ledger, say `bye` on the hub
-   * link, unlink the door. `main.ts` hands `relay.goodbye` here.
+   * Run just before attach exits, after the child is gone: take the buttons off every question the
+   * door still holds (the engine that asked them is gone), write the ledger, say `bye` on the hub
+   * link, unlink the door. `main.ts` hands `relay.engineEnded` then `relay.goodbye` here.
    */
   onBeforeExit: () => void
 }
