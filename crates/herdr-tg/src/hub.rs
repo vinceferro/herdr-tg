@@ -1568,7 +1568,27 @@ fn throttle_cleared_line(lost: u32, whose: &str) -> String {
 #[derive(Debug)]
 struct Claim {
     pid: u32,
+    /// Which run of this address this connection is. Minted here, handed to the bridge on the
+    /// welcome's own envelope, and the number every later frame of this connection is judged
+    /// against. Never zero: a zero is how a peer says it holds none.
+    generation: u64,
     instance: String,
+    /// Does this run stamp a generation on what it sends?
+    ///
+    /// Shared with the connection's own read loop, which sets it the first time a frame arrives
+    /// carrying one — the redial's `hello` cannot, because a run that has never been welcomed
+    /// holds no number yet. It gates one thing and one thing only: whether this connection may be
+    /// told `stale_generation`. A bridge that does not know the word treats an unknown refusal as
+    /// temporary, by a deliberate default in its own table, and redials for ever with nothing on
+    /// the operator's phone to say why.
+    speaks_generations: Arc<AtomicBool>,
+    /// Did its `hello` promise to say what became of every choice it is handed?
+    ///
+    /// Read through `hub_proto::promises_to_confirm` and never by asking whether the field was
+    /// present: an adapter that builds the list by filtering sends an empty one when it promises
+    /// nothing, and a hub that read presence would tell the operator a tap "has not been
+    /// confirmed" by a bridge that never said it would.
+    confirms_choices: bool,
     tx: mpsc::Sender<Envelope<HubFrame>>,
     /// The one way to end this connection from OUTSIDE its own read loop, and why.
     ///
@@ -1577,7 +1597,41 @@ struct Claim {
     /// connection whose claim was taken away kept posting into its topic and spending the chat's
     /// budget until its bridge happened to hang up. Switching a project off has to end the
     /// connection, not merely forget it.
-    kick: mpsc::Sender<RefusedReason>,
+    kick: mpsc::Sender<Kick>,
+}
+
+/// What an arriving run said about itself at `hello`, and what its claim has to remember of it.
+///
+/// One value rather than three arguments, because all three are the same fact — what this run
+/// claims to be — and a caller that got their order wrong would silently promise a confirmation on
+/// behalf of a bridge that made none.
+struct Arriving {
+    /// The generation it believes it holds, read off its `hello`'s own envelope. `None` for a run
+    /// that has never been welcomed, and for every bridge from before the field existed.
+    generation: Option<u64>,
+    /// Whether its `hello` promised to say what became of every choice it is handed.
+    confirms_choices: bool,
+    /// Set by its read loop the first time one of its frames carries a generation. See
+    /// [`Claim::speaks_generations`].
+    speaks_generations: Arc<AtomicBool>,
+}
+
+/// Why a connection is being ended from outside its own read loop, and what is said about it.
+///
+/// Two things and not one, because the two ways a connection is ended from here differ in exactly
+/// this: a project switched off at the terminal is told `not_enabled`, and a run evicted because a
+/// later one took the address is told `stale_generation` — but only if it stamped a generation, and
+/// otherwise told nothing at all, which is what an evicted corpse has always been told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Kick {
+    /// What goes on the wire ahead of the close. `None` closes without a word: there is either
+    /// nobody behind the socket to tell, or no word in the closed set this peer could read.
+    reason: Option<RefusedReason>,
+    /// What the journal and the audit say happened. Never operator-facing.
+    sentence: &'static str,
+    /// What the frames this connection has already said are acked with. `None` where the closed
+    /// set has no word for it, which is what a bridge is owed rather than a wrong one.
+    why: Option<AckWhy>,
 }
 
 /// How often the hub looks at the registry file for a project switched off at the terminal.
@@ -1589,25 +1643,308 @@ struct Claim {
 /// says it changed.
 pub const REGISTRY_WATCH_EVERY: Duration = Duration::from_secs(1);
 
-/// One of his typed messages on its way to a bridge: the envelope id it went down under — the id
-/// the bridge's `ack` for it names — and which of his messages, in which conversation, it was.
+/// Where the highest generation this hub has handed out for each address is written down.
+///
+/// Beside the audit log, like every other state file here, so a test's hub writes into its own
+/// temp directory rather than into the operator's.
+pub const GENERATIONS_FILE: &str = "hub.generations.json";
+
+/// The highest generation this hub has handed out for each address.
+///
+/// # Why it is on disk at all
+///
+/// The mint is `max(highest + 1, the clock in milliseconds)`, and the clock alone would do for an
+/// ordinary restart: the next hub starts numbering from a moment later than the last one stopped.
+/// It does not do for a clock that steps BACKWARDS — an NTP correction, a laptop that came back
+/// from suspend with a bad RTC, a container started with the wrong date — and a hub that re-hands a
+/// number it has already given is a hub whose fence points the wrong way: the run it fences off is
+/// the live one.
+///
+/// # What it is NOT
+///
+/// It is not [`crate::presence`]. That file says who is connected NOW, so a reader must disbelieve
+/// it unless the hub that wrote it is still alive; this one says what has already been handed out,
+/// which stays true precisely BECAUSE the hub that wrote it is gone. The only reader is the next
+/// hub, and believing a number that is too high costs nothing — every live bridge is welcomed with
+/// a fresh one — while believing one that is too low is the whole failure. So it is read as a
+/// floor and nothing else, and a file that cannot be read leaves the clock to hold the line.
+///
+/// The writing discipline IS presence's, and for presence's reason: whole, temp-and-rename, 0600,
+/// stamped with the pid that wrote it, so a reader never sees half a list and a person reading the
+/// file can tell which hub put it there.
 #[derive(Debug)]
-struct WordsDown {
-    frame: FrameId,
-    addr: Addr,
-    /// The chat he typed in, so the mark on his message can find it. A message id is only half
-    /// an address on Telegram: every chat numbers its own.
-    chat_id: i64,
-    msg_id: MsgId,
-    /// How many of the files on that message actually reached the hub's disk and went down as
-    /// paths. The bridge's `ack` says how many it handed on; fewer than this is a file the agent
-    /// never saw, and he is told.
-    files_on_disk: u32,
+struct Generations {
+    path: PathBuf,
+    highest: BTreeMap<Addr, u64>,
 }
 
-/// How many of his messages the hub keeps waiting for an answer about, before the oldest is
-/// forgotten. A bridge that never answers must not turn a record nobody will read into a leak.
-const WORDS_DOWN_KEPT: usize = 256;
+/// What the file holds. `hub_pid` and `at` are for a person reading it; nothing decides on them.
+#[derive(Debug, Serialize, Deserialize)]
+struct HandedOut {
+    hub_pid: u32,
+    at: u64,
+    addresses: Vec<AddressGeneration>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AddressGeneration {
+    project: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    lane: Option<LaneId>,
+    generation: u64,
+}
+
+impl Generations {
+    fn load(path: PathBuf) -> Self {
+        let highest = match fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => {
+                // Not fatal, and not silent. The clock floor still climbs, so the fence still
+                // works for every ordinary restart; what is lost is the belt for a clock that
+                // went backwards, and a person has to know that before it matters.
+                tracing::error!(
+                    error = %e, path = %path.display(),
+                    "could not read which run numbers this hub has already handed out; the clock \
+                     alone will keep them climbing"
+                );
+                BTreeMap::new()
+            }
+            Ok(raw) => match serde_json::from_slice::<HandedOut>(&raw) {
+                Err(e) => {
+                    tracing::error!(
+                        error = %e, path = %path.display(),
+                        "the run numbers this hub had handed out are not readable; the clock alone \
+                         will keep them climbing"
+                    );
+                    BTreeMap::new()
+                }
+                Ok(file) => file
+                    .addresses
+                    .into_iter()
+                    .map(|a| {
+                        (
+                            Addr {
+                                project: a.project,
+                                lane: a.lane,
+                            },
+                            // Repaired on the way IN, not only on the way out. The one thing a
+                            // hand-edited or corrupted file could do that the clock cannot undo is
+                            // put the floor past what a bridge can read back, which fences every
+                            // run of that address for ever with no wrong-looking number anywhere.
+                            //
+                            // And it is put back to the CLOCK rather than clamped to the ceiling,
+                            // because a floor sitting exactly on the ceiling is worse than a high
+                            // one: the mint cannot climb past it, so two runs are handed the same
+                            // number, the reclaim fence stops refusing and the delivery fence
+                            // stops firing — the double-admit the fence exists to prevent, again
+                            // with nothing anywhere that looks wrong. No clock this hub can read
+                            // is anywhere near the ceiling, so a number that is says the file is
+                            // corrupt, not that the address has had that many runs.
+                            if a.generation >= hub_proto::MAX_GENERATION {
+                                now_millis()
+                            } else {
+                                a.generation
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+        };
+        Self { path, highest }
+    }
+
+    /// The number for the run that is taking this address now.
+    ///
+    /// Past both floors: one more than anything this hub has handed out for the address, and never
+    /// behind the clock. The clock is what makes the number climb across a restart whose file was
+    /// lost; the counter is what makes it climb when the clock does not.
+    fn mint(&mut self, addr: &Addr, held_by_the_arriving_run: u64) -> u64 {
+        let next = self
+            .highest
+            .get(addr)
+            .copied()
+            .unwrap_or(0)
+            // Past the number the ARRIVING run already holds, too. The fence admits a run whose
+            // number is ahead of this hub's floor on purpose — a state file lost, a clock that
+            // came back wrong — and minting it something LOWER then had the wire fence refuse the
+            // backlog it carried in as a later generation's, permanently, with nothing on his
+            // phone. Admitting it and then fencing its own words is the one outcome neither
+            // branch wants.
+            .max(held_by_the_arriving_run)
+            .saturating_add(1)
+            .max(now_millis())
+            // Every bridge reads frames with `JSON.parse`, which has no integers. A number past
+            // this comes back as the nearest one a double can hold, and the bridge then stamps a
+            // generation this hub never minted — fenced for ever, with nothing anywhere that looks
+            // wrong. Milliseconds since the epoch are a quarter of a million years short of it.
+            .min(hub_proto::MAX_GENERATION);
+        // And the floor stays BELOW the ceiling, never on it. Sitting on it, the clamp above hands
+        // every later run of the address the same number: the reclaim fence stops refusing and the
+        // delivery fence stops firing, with nothing anywhere that looks wrong. Reachable now that
+        // the number a bridge sends is believed — an adapter a stranger wrote to the document has
+        // only to say its lease is the highest there is — so it gets the repair `load` already
+        // makes for a corrupt file: put back to the clock, which no address's run count is within
+        // a quarter of a million years of. That run's own backlog is then behind the number it
+        // claimed and is refused, which is the right answer for a lease this hub never minted.
+        let next = if next >= hub_proto::MAX_GENERATION {
+            now_millis()
+        } else {
+            next
+        };
+        self.highest.insert(addr.clone(), next);
+        self.write();
+        next
+    }
+
+    /// Give a number back, because the run it was minted for never took the address.
+    ///
+    /// Only when nothing has been handed out since: if a later run has already been given a
+    /// number, this one is history and putting the floor back would let a run the later one
+    /// replaced come back. A connection that never became live — `kickoff-hub-attach --check`
+    /// says `bye` before the pong on purpose — otherwise moves the address on and fences a
+    /// session that was merely redialling, permanently, from a command that makes nothing.
+    fn give_back(&mut self, addr: &Addr, minted: u64, was: u64) {
+        if self.highest.get(addr).copied() != Some(minted) {
+            return;
+        }
+        self.highest.insert(addr.clone(), was);
+        self.write();
+    }
+
+    fn highest_for(&self, addr: &Addr) -> u64 {
+        self.highest.get(addr).copied().unwrap_or(0)
+    }
+
+    fn write(&self) {
+        if let Err(e) = self.write_whole() {
+            // Logged and nothing else: the map in memory is the truth for this hub's own life, and
+            // what is lost is only the belt against a clock that steps backwards after a restart.
+            tracing::error!(
+                error = %e, path = %self.path.display(),
+                "could not write down the run number just handed out; a restart after the clock \
+                 steps backwards could hand it out again"
+            );
+        }
+    }
+
+    fn write_whole(&self) -> std::io::Result<()> {
+        let file = HandedOut {
+            hub_pid: std::process::id(),
+            at: now_secs(),
+            addresses: self
+                .highest
+                .iter()
+                .map(|(addr, generation)| AddressGeneration {
+                    project: addr.project.clone(),
+                    lane: addr.lane.clone(),
+                    generation: *generation,
+                })
+                .collect(),
+        };
+        if let Some(dir) = self.path.parent() {
+            crate::conversations::private_state_dir(dir)?;
+        }
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
+        let body = serde_json::to_vec_pretty(&file)?;
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&body)?;
+            f.flush()?;
+        }
+        fs::rename(&tmp, &self.path)
+    }
+}
+
+/// The wall clock in milliseconds, as the generation's floor reads it.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Something of HIS on its way to a bridge: the envelope id it went down under — the id the
+/// bridge's `ack` for it names — and which of his messages, in which conversation, it was about.
+///
+/// It held only his typed words until taps joined them, and the two are one record on purpose: a
+/// bridge answers both with the same `ack{ref}`, one id counter mints both, and the hub has to be
+/// able to find whichever the id belongs to from the same place. Two lists keyed the same way is
+/// two places for the same id to be looked up and one of them to win.
+#[derive(Debug)]
+struct Down {
+    frame: FrameId,
+    addr: Addr,
+    /// The chat he typed or tapped in, so the mark on his message can find it. A message id is
+    /// only half an address on Telegram: every chat numbers its own.
+    chat_id: i64,
+    /// His message: the line he typed, or the question whose button he pressed.
+    msg_id: MsgId,
+    what: His,
+}
+
+/// Which of his the record is about, and what has to be known to answer for it.
+#[derive(Debug)]
+enum His {
+    Words {
+        /// How many of the files on that message actually reached the hub's disk and went down as
+        /// paths. The bridge's `ack` says how many it handed on; fewer than this is a file the
+        /// agent never saw, and he is told.
+        files_on_disk: u32,
+    },
+    Tap(HisTap),
+}
+
+/// One tap of his, handed down and not yet answered for.
+#[derive(Debug)]
+struct HisTap {
+    /// What the button said, because every line the hub writes about it names what he chose.
+    label: String,
+    /// Which message his receipt — `Sent: <label>` — is, once the bot has sent it and been told
+    /// which message Telegram made of it.
+    ///
+    /// `None` for the moment in between, and that moment is real: the receipt is a Telegram round
+    /// trip that starts AFTER the answer is on the wire, and a tool server acks a choice within a
+    /// millisecond of reading it. So an answer can arrive before there is any line to change, which
+    /// is what `said` is for.
+    receipt: Option<MsgId>,
+    /// What the bridge said became of it, when that arrived before the receipt did.
+    said: Option<WhatBecameOfTheTap>,
+    /// Did the bridge promise, at `hello`, to say what became of every choice? Only a bridge that
+    /// promised is ever said to have gone silent.
+    promised: bool,
+    /// Did the window run out before there was any line to change? The window starts when the
+    /// answer goes down and his receipt is a Telegram round trip that starts after it, so the two
+    /// can cross — and when they do, the window has already run and nothing runs it again. Written
+    /// here so the receipt, when it finally arrives, says what the window could not.
+    overdue: bool,
+}
+
+/// What a bridge said became of one of his taps.
+#[derive(Clone, Debug)]
+enum WhatBecameOfTheTap {
+    Took,
+    /// Not taken, and the bridge's own words for why.
+    Refused(String),
+}
+
+/// How many of his messages and taps the hub keeps waiting for an answer about, before the oldest
+/// is forgotten. A bridge that never answers must not turn a record nobody will read into a leak.
+const DOWN_KEPT: usize = 256;
+
+/// How long a bridge that promised to confirm a choice has to say what became of it before the
+/// operator is told it has not.
+///
+/// Twenty seconds, which is the question's own shelf life on his phone: past that he is looking at
+/// a line that says his answer was sent and nothing has agreed. Shorter would call a slow worker a
+/// broken one; longer and the line he is reading is wrong for the whole time he is reading it.
+pub const TAP_CONFIRM_WINDOW: Duration = Duration::from_secs(20);
 
 /// The longest lane name the hub will address a conversation by.
 ///
@@ -1782,13 +2119,26 @@ pub struct Hub<S: Surface> {
     ///
     /// One call site, agent to operator, never the reverse.
     gist: Option<Arc<crate::summarize::Summarizer>>,
-    /// His typed words that went down to a bridge and may still be answered for.
+    /// What of HIS went down to a bridge and may still be answered for: his typed words, and his
+    /// taps.
     ///
     /// The wire lets a bridge answer a `message` with `ack{status, reason}`, and until this
     /// existed the hub read the status of no ack at all — so an adapter with nothing to hand the
-    /// words to could say so, honestly, on the wire, and he was told nothing. Bounded at
-    /// [`WORDS_DOWN_KEPT`], oldest first out.
-    words_down: Arc<Mutex<VecDeque<WordsDown>>>,
+    /// words to could say so, honestly, on the wire, and he was told nothing. His taps joined them
+    /// for the same reason from the other side: "Sent" is what the queue knows, and a tap the
+    /// bridge could not act on read "Sent" on his phone for ever. Bounded at [`DOWN_KEPT`], oldest
+    /// first out.
+    down: Arc<Mutex<VecDeque<Down>>>,
+    /// The highest run number handed out for each address, and the file it survives a restart in.
+    ///
+    /// A `std::sync::Mutex` and not an async one, deliberately: it is taken INSIDE the claims lock
+    /// at the mint and never held across an await, so there is one lock order and no way to build a
+    /// cycle out of it.
+    generations: Arc<std::sync::Mutex<Generations>>,
+    /// How long a promising bridge has to confirm a tap. [`TAP_CONFIRM_WINDOW`], except under the
+    /// tests that have to watch the window bite — waiting the real twenty seconds out is twenty
+    /// seconds of a suite doing nothing, which is the reason `settle` is a field too.
+    tap_confirm_window: AtomicU64,
     /// The order the marks on his messages land in.
     ///
     /// A tool server acks a `message` within a millisecond of reading it, while the eyes are an
@@ -1799,6 +2149,19 @@ pub struct Hub<S: Surface> {
     /// when they have; the ack's mark waits its turn. Marks are one per line he types, so a permit
     /// costs nobody anything.
     mark_permit: Arc<Mutex<()>>,
+    /// The order the edits of his receipt for a tap land in.
+    ///
+    /// `mark_permit`'s problem again, on a line of text instead of a reaction. Two things edit one
+    /// receipt and neither can see the other: the silence window, and the session's own answer.
+    /// Each read the record, let the lock go, and only then reached Telegram — so an answer
+    /// arriving while the window's edit was in flight decided second and landed FIRST, and he was
+    /// left reading "the session has not confirmed it took your answer" about a tap the agent had
+    /// taken, for good, since nothing edits it again. The window is twenty seconds and a worker
+    /// that takes about twenty seconds is the calibration point, not a corner.
+    ///
+    /// Held across the read AND the edit, so decision order is landing order. A tap is one thumb
+    /// on one phone, so a permit costs nobody anything.
+    tap_edits: Arc<Mutex<()>>,
     /// What may still be spent on reactions this minute — their own ledger, never the send budget.
     ///
     /// Measured 5 September (`docs/RATE-PROBE.md` §3): twenty reactions in a trailing minute, the
@@ -1857,6 +2220,7 @@ impl<S: Surface> Hub<S> {
         // a hub that has just started has nothing connected, and until it says so the file on disk
         // is the last hub's, naming that hub's pid — which a reader rightly refuses to believe, and
         // reports as unknown for as long as it is left there.
+        let audit_path = audit.path().to_path_buf();
         let presence =
             crate::presence::Presence::new(audit.path().with_file_name(crate::presence::FILE));
         if let Err(e) = presence.write(std::iter::empty()) {
@@ -1897,8 +2261,13 @@ impl<S: Surface> Hub<S> {
             throttle: Arc::new(Mutex::new(Throttle::default())),
             topic_refused: Arc::new(Mutex::new(BTreeMap::new())),
             gist: crate::summarize::Summarizer::from_env().map(Arc::new),
-            words_down: Arc::new(Mutex::new(VecDeque::new())),
+            down: Arc::new(Mutex::new(VecDeque::new())),
+            generations: Arc::new(std::sync::Mutex::new(Generations::load(
+                audit_path.with_file_name(GENERATIONS_FILE),
+            ))),
+            tap_confirm_window: AtomicU64::new(TAP_CONFIRM_WINDOW.as_millis() as u64),
             mark_permit: Arc::new(Mutex::new(())),
+            tap_edits: Arc::new(Mutex::new(())),
             reactions: Arc::new(Mutex::new(crate::queue::ReactionBudget::default())),
             reaction_refusal_said: Arc::new(AtomicBool::new(false)),
             allowed_chats: Arc::new(allowed_chats),
@@ -2165,6 +2534,11 @@ impl<S: Surface> Hub<S> {
     /// `try_send` rather than `send`, for the same reason from the other direction: a full outbox
     /// means that bridge is not keeping up, and the honest answer is "not delivered" now rather
     /// than an await that might never finish.
+    /// Test-only since the tap grew a record of its own: `deliver_tap` is what `bot.rs` uses, and
+    /// it mints the id BEFORE the frame goes down so a bridge's answer for it has something to
+    /// find. This is the plain form, kept for the round-trip test that only wants a frame to
+    /// arrive.
+    #[cfg(test)]
     pub async fn deliver(&self, addr: &Addr, frame: HubFrame) -> bool {
         self.deliver_under(addr, Self::mint_frame_id(), frame).await
     }
@@ -2177,15 +2551,21 @@ impl<S: Surface> Hub<S> {
     }
 
     /// Send one frame down under an id the caller already holds.
+    ///
+    /// Stamped with the lease of the run it is going to, like every other frame the hub sends —
+    /// and these are the two the product exists for. Leaving `Message` and `Choice` the only
+    /// unstamped frames on the wire made the rule the adapters are written to ("everything after
+    /// the welcome carries the lease") false exactly where it matters: a bridge that judges what
+    /// it is handed by the stamp would drop his typed words and his taps and keep the acks.
     async fn deliver_under(&self, addr: &Addr, id: FrameId, frame: HubFrame) -> bool {
-        let tx = {
+        let (tx, generation) = {
             let claims = self.claims.lock().await;
             match claims.get(addr) {
                 None => return false,
-                Some(claim) => claim.tx.clone(),
+                Some(claim) => (claim.tx.clone(), claim.generation),
             }
         };
-        match tx.try_send(Envelope::new(id, frame)) {
+        match tx.try_send(Envelope::new(id, frame).with_generation(generation)) {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!(
@@ -2197,37 +2577,113 @@ impl<S: Surface> Hub<S> {
         }
     }
 
-    /// Take the project, or refuse — the check and the reservation in ONE critical section.
+    /// Take the address for a run that says nothing about itself.
     ///
-    /// This used to be two: `admit` looked for a live incumbent, dropped the lock, and `claim`
-    /// inserted unconditionally some awaits later. Two bridges arriving inside that window were
-    /// both admitted and the second silently replaced the first — measured at roughly one round in
-    /// three when the two `hello`s land within about 100 µs on a multi-thread runtime, which is the
-    /// runtime this binary builds. The consequence is the exact failure gate 4 exists to prevent:
-    /// two bridges live on one project, both posting into one topic, and a tap on the incumbent's
-    /// still-open question refused with "that session has since restarted" while it is sitting
-    /// there waiting for the answer.
-    ///
-    /// A dead incumbent is evicted rather than honoured: a worker that crashed must not lock its
-    /// own project out until someone finds a keyboard.
-    ///
-    /// Returns the receiver the connection must listen on for a [`Claim::kick`]: the one way this
-    /// connection can be ended by something other than its own socket.
+    /// Test-only, and it is the shape of a bridge from before either field existed: it names no
+    /// generation and promises to confirm nothing. `serve_connection` goes through
+    /// [`Self::claim_the_address`], which is handed what the arriving `hello` actually said.
+    #[cfg(test)]
     pub async fn claim(
         &self,
         addr: Addr,
         pid: u32,
         instance: String,
         tx: mpsc::Sender<Envelope<HubFrame>>,
-    ) -> Result<mpsc::Receiver<RefusedReason>, RefusedReason> {
+    ) -> Result<mpsc::Receiver<Kick>, RefusedReason> {
+        // A run that names no generation and promises to confirm nothing — which is every bridge
+        // shipped before either field existed, and the shape the room-map tests hold a claim with.
+        self.claim_the_address(
+            addr,
+            pid,
+            instance,
+            tx,
+            Arriving {
+                generation: None,
+                confirms_choices: false,
+                speaks_generations: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .await
+        .map(|(_, _, kicked)| kicked)
+    }
+
+    /// Take the address, or refuse — the fence, the check and the reservation in ONE critical
+    /// section.
+    ///
+    /// The check and the reservation used to be two: `admit` looked for a live incumbent, dropped
+    /// the lock, and `claim` inserted unconditionally some awaits later. Two bridges arriving
+    /// inside that window were both admitted and the second silently replaced the first — measured
+    /// at roughly one round in three when the two `hello`s land within about 100 µs on a
+    /// multi-thread runtime, which is the runtime this binary builds. The consequence is the exact
+    /// failure gate 4 exists to prevent: two bridges live on one project, both posting into one
+    /// topic, and a tap on the incumbent's still-open question refused with "that session has since
+    /// restarted" while it is sitting there waiting for the answer.
+    ///
+    /// A dead incumbent is evicted rather than honoured: a worker that crashed must not lock its
+    /// own project out until someone finds a keyboard. The mint is in here for the same reason the
+    /// reservation is — a number handed out beside a claim taken under a different lock is a number
+    /// two runs can be given.
+    ///
+    /// Hands back the generation minted for this run — the number its `welcome` carries and the
+    /// number every later frame of that connection is judged against — and the receiver the
+    /// connection must listen on for a [`Claim::kick`], which is the one way it can be ended by
+    /// something other than its own socket.
+    async fn claim_the_address(
+        &self,
+        addr: Addr,
+        pid: u32,
+        instance: String,
+        tx: mpsc::Sender<Envelope<HubFrame>>,
+        said: Arriving,
+    ) -> Result<(u64, u64, mpsc::Receiver<Kick>), RefusedReason> {
+        let Arriving {
+            generation: arriving,
+            confirms_choices,
+            speaks_generations,
+        } = said;
         let (kick, kicked) = mpsc::channel(1);
+        let generation;
+        let highest_was;
         {
             let mut claims = self.claims.lock().await;
+            let highest = self
+                .generations
+                .lock()
+                .expect("the generations are not held across an await")
+                .highest_for(&addr);
+            highest_was = highest;
+            // THE RECLAIM FENCE, and it is read BEFORE the incumbent is.
+            //
+            // A run whose generation has been replaced is not a rival for the address — it is over.
+            // Told "already claimed" it would redial for ever, because that refusal is the one a
+            // bridge is supposed to wait out; and with nothing holding the address it would simply
+            // be let back in, which is a second voice in a conversation that has moved on.
+            //
+            // Only a number BEHIND the highest is refused. One ahead of it is a run holding a
+            // number this hub never minted — a state directory restored from elsewhere, a file
+            // lost — and refusing that would lock a project out of its own hub with no way back
+            // from a phone.
+            if let Some(arriving) = arriving
+                && arriving < highest
+            {
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(),
+                    generation = arriving, latest = highest,
+                    "refused: a run from an earlier generation tried to come back after a later \
+                     one had been admitted"
+                );
+                return Err(RefusedReason::StaleGeneration);
+            }
             // Exclusive per ADDRESS. Widening it to the project was the refusal that made a second
             // worktree of one repo unreachable; widening it to nothing would be the takeover this
             // whole gate exists to refuse, so within one lane the rule is untouched.
-            if let Some(old) = claims.get(&addr) {
-                if fence_is_alive(old.pid) {
+            //
+            // A dead incumbent is evicted rather than honoured — and evicting it is a KICK, not the
+            // silent overwrite it used to be. Replacing the map entry alone told the old connection
+            // nothing: it went on holding a writer task and draining whatever it had queued into a
+            // topic a live successor now owns, until its own socket happened to end.
+            let evicted = match claims.get(&addr) {
+                Some(old) if fence_is_alive(old.pid) => {
                     tracing::warn!(
                         project = %addr.project, lane = addr.lane_field(),
                         incumbent = old.pid, arriving = pid,
@@ -2235,23 +2691,68 @@ impl<S: Surface> Hub<S> {
                     );
                     return Err(RefusedReason::AlreadyClaimed);
                 }
+                Some(old) => Some((
+                    old.kick.clone(),
+                    old.pid,
+                    old.generation,
+                    old.speaks_generations.load(Ordering::Acquire),
+                )),
+                None => None,
+            };
+            generation = self
+                .generations
+                .lock()
+                .expect("the generations are not held across an await")
+                .mint(&addr, arriving.unwrap_or(0));
+            if let Some((kick, dead, was, speaks)) = evicted {
                 tracing::info!(
-                    project = %addr.project, lane = addr.lane_field(), dead = old.pid,
-                    "evicting a bridge that is no longer running"
+                    project = %addr.project, lane = addr.lane_field(), dead,
+                    generation = was, takes = generation,
+                    "evicted a run whose process is gone; a later generation takes the address"
                 );
+                // Told only if it can read the word. A bridge from before generations renders an
+                // unknown refusal as temporary and would redial for ever; and there is nobody
+                // behind a corpse's socket to tell anyway, which is what it was told before.
+                let _ = kick.try_send(Kick {
+                    reason: speaks.then_some(RefusedReason::StaleGeneration),
+                    sentence: "a later run took the address while its own process was gone",
+                    why: speaks.then_some(AckWhy::StaleGeneration),
+                });
             }
+            tracing::info!(
+                project = %addr.project, lane = addr.lane_field(), pid, generation,
+                "claimed"
+            );
             claims.insert(
                 addr,
                 Claim {
                     pid,
+                    generation,
                     instance,
+                    speaks_generations,
+                    confirms_choices,
                     tx,
                     kick,
                 },
             );
             self.note_who_is_connected(&claims);
         }
-        Ok(kicked)
+        Ok((generation, highest_was, kicked))
+    }
+
+    /// Has a later run taken this address than the one asking?
+    ///
+    /// Reads the generations under their own lock and never the claims map, because the two
+    /// answer different questions: the claims map says who is connected NOW, and after a release
+    /// it is empty — which is exactly the moment a run that is already over is still draining what
+    /// it said into a conversation somebody else has taken.
+    fn a_newer_run_holds(&self, addr: &Addr, mine: u64) -> Option<u64> {
+        let highest = self
+            .generations
+            .lock()
+            .expect("the generations are not held across an await")
+            .highest_for(addr);
+        (highest > mine).then_some(highest)
     }
 
     /// Write the claims map down for `projects --json`, which runs in another process.
@@ -2314,7 +2815,13 @@ impl<S: Surface> Hub<S> {
                 // One that cannot be told — nothing listening on the far end of the kick — is
                 // forgotten here instead, so a switched-off project is never shown as connected
                 // and never handed his words; that shape is only ever a test's own claim.
-                match claim.kick.try_send(RefusedReason::NotEnabled) {
+                match claim.kick.try_send(Kick {
+                    reason: Some(RefusedReason::NotEnabled),
+                    sentence: "its project was switched off at the terminal",
+                    // The closed set has no word for it, and a wrong one sends the agent the wrong
+                    // way. The refusal above is what says why; each frame is simply not delivered.
+                    why: None,
+                }) {
                     Ok(()) => {
                         kicked.push(addr.clone());
                         true
@@ -2441,6 +2948,24 @@ impl<S: Surface> Hub<S> {
     ///
     /// The guard matters: a bridge that was evicted and then finished shutting down would otherwise
     /// remove its successor's claim on the way out, leaving a live worker unreachable.
+    /// Guarded on the generation as well as the pid, because the pid is not enough on its own: a
+    /// run that was evicted and redialled is the same process, so its own shutdown would otherwise
+    /// take its successor's claim away and leave a live worker unreachable.
+    pub async fn release_this_run(&self, addr: &Addr, pid: u32, generation: u64) {
+        let mut claims = self.claims.lock().await;
+        if claims
+            .get(addr)
+            .is_some_and(|c| c.pid == pid && c.generation == generation)
+        {
+            claims.remove(addr);
+            self.note_who_is_connected(&claims);
+        }
+    }
+
+    /// The same by pid alone — for a claim taken through the four-argument [`Self::claim`], whose
+    /// caller was never handed a generation to give back. Test-only, like that form is: every
+    /// connection the hub really serves knows its own run number.
+    #[cfg(test)]
     pub async fn release(&self, addr: &Addr, pid: u32) {
         let mut claims = self.claims.lock().await;
         if claims.get(addr).is_some_and(|c| c.pid == pid) {
@@ -2505,7 +3030,329 @@ impl<S: Surface> Hub<S> {
     /// that has to know every ack it sent has been handled, without sending anything to find out.
     #[cfg(test)]
     pub async fn words_awaiting_an_answer(&self) -> usize {
-        self.words_down.lock().await.len()
+        self.down
+            .lock()
+            .await
+            .iter()
+            .filter(|d| matches!(d.what, His::Words { .. }))
+            .count()
+    }
+
+    /// Hand one of his taps to the project's live connection, and write it down first.
+    ///
+    /// The record has to exist BEFORE the frame is on the wire, for the reason his typed words'
+    /// does: a tool server acks a choice within a millisecond of reading it, and an ack that
+    /// arrives before the record does names a frame the hub holds nothing for and is dropped on the
+    /// floor. That is what "Sent" meant until now — the outbox took the frame — and it stayed on
+    /// his phone whatever the agent then did with the answer.
+    ///
+    /// Hands back the id it went down under, which is the id an `ack` for it names, or `None` when
+    /// nothing took it. Taken back on that path, so a record never waits for an answer to a frame
+    /// nothing received.
+    pub async fn deliver_tap(
+        self: &Arc<Self>,
+        addr: &Addr,
+        chat_id: i64,
+        msg_id: &MsgId,
+        ask_id: AskId,
+        option_id: OptionId,
+        label: &str,
+    ) -> Option<FrameId> {
+        // Read from the claim rather than remembered anywhere else: the promise belongs to the
+        // connection that made it, and a run that has since been replaced cannot have its
+        // successor nagged for it.
+        let promised = {
+            self.claims
+                .lock()
+                .await
+                .get(addr)
+                .is_some_and(|c| c.confirms_choices)
+        };
+        let frame = Self::mint_frame_id();
+        {
+            let mut down = self.down.lock().await;
+            down.push_back(Down {
+                frame: frame.clone(),
+                addr: addr.clone(),
+                chat_id,
+                msg_id: msg_id.clone(),
+                what: His::Tap(HisTap {
+                    label: label.to_owned(),
+                    receipt: None,
+                    said: None,
+                    promised,
+                    overdue: false,
+                }),
+            });
+            while down.len() > DOWN_KEPT {
+                down.pop_front();
+            }
+        }
+        let went = self
+            .deliver_under(
+                addr,
+                frame.clone(),
+                HubFrame::Choice {
+                    msg_id: msg_id.clone(),
+                    ask_id,
+                    option_id,
+                },
+            )
+            .await;
+        if !went {
+            self.down.lock().await.retain(|d| d.frame != frame);
+            return None;
+        }
+        // The window, in a task of its own. It cannot be awaited here: this runs inside Telegram's
+        // per-chat dispatcher, which handles one update at a time, so waiting out the window here
+        // would hold every later tap and every line he types behind it.
+        {
+            let hub = Arc::clone(self);
+            let frame = frame.clone();
+            let window = Duration::from_millis(self.tap_confirm_window.load(Ordering::Relaxed));
+            tokio::spawn(async move {
+                tokio::time::sleep(window).await;
+                hub.the_session_never_confirmed(&frame).await;
+            });
+        }
+        Some(frame)
+    }
+
+    /// Which message his receipt for a tap is — the line that says what he chose.
+    ///
+    /// `bot.rs` is the only place that can ever know it: the hub did not send it, and Telegram only
+    /// says which message it made once the send has come back. That is a round trip AFTER the
+    /// answer went down, so an ack can be here first — and when it is, this is where what the
+    /// bridge said finally reaches the line it is about.
+    pub async fn his_receipt_for_a_tap(&self, frame: &FrameId, receipt: &MsgId) {
+        // Its turn among the things that edit this receipt. See `tap_edits`.
+        let _in_order = self.tap_edits.lock().await;
+        let now = {
+            let mut down = self.down.lock().await;
+            let Some(at) = down.iter().position(|d| &d.frame == frame) else {
+                return;
+            };
+            let Some(Down {
+                addr,
+                chat_id,
+                msg_id,
+                what: His::Tap(tap),
+                ..
+            }) = down.get_mut(at)
+            else {
+                return;
+            };
+            tap.receipt = Some(receipt.clone());
+            // The window ran out before there was a line to change. Said now, on the line that has
+            // just come into existence — the alternative is the window silently doing nothing
+            // whenever Telegram is slower over his receipt than the bridge is over its answer.
+            if tap.said.is_none() && tap.overdue {
+                let label = tap.label.clone();
+                drop(down);
+                let text =
+                    format!("Sent: {label}. The session has not confirmed it took your answer.");
+                if let Err(e) = self.surface.rewrite(receipt, &text).await {
+                    tracing::warn!(error = %e, "could not tell him a tap has not been confirmed");
+                }
+                return;
+            }
+            match tap.said.take() {
+                None => None,
+                Some(said) => {
+                    let it = (
+                        addr.clone(),
+                        *chat_id,
+                        msg_id.clone(),
+                        tap.label.clone(),
+                        said,
+                    );
+                    down.remove(at);
+                    Some(it)
+                }
+            }
+        };
+        if let Some((addr, chat_id, question, label, said)) = now {
+            self.say_what_became_of_his_tap(&addr, chat_id, &question, receipt, &label, said)
+                .await;
+        }
+    }
+
+    /// The window on a tap ran out. Say so, but only where saying it is true and useful.
+    ///
+    /// Three ways this ends in silence, and each is a case where the sentence would be a worry with
+    /// nothing behind it: a bridge that never promised to confirm anything (every bridge shipped so
+    /// far), a receipt Telegram refused to send so there is no line to change, and an answer that
+    /// got here first.
+    ///
+    /// The record is LEFT where it is, exactly as an unanswered record of his words is: a session
+    /// that finally says it took the answer, a minute late, then corrects the line rather than
+    /// leaving him reading "has not confirmed" about something that was confirmed. What bounds it
+    /// is [`DOWN_KEPT`], the same bound that has always bounded the other half.
+    async fn the_session_never_confirmed(&self, frame: &FrameId) {
+        // Held across the read AND the edit below. Without it an answer arriving while this edit
+        // was in flight took the record away, made its own edit, and landed first — leaving him
+        // reading that a tap the agent took was never confirmed. See `tap_edits`.
+        let _in_order = self.tap_edits.lock().await;
+        let waiting = {
+            let mut down = self.down.lock().await;
+            let Some(at) = down.iter().position(|d| &d.frame == frame) else {
+                return;
+            };
+            let addr = down[at].addr.clone();
+            let His::Tap(tap) = &mut down[at].what else {
+                return;
+            };
+            if tap.said.is_some() {
+                return;
+            }
+            match (tap.receipt.clone(), tap.promised) {
+                (Some(receipt), true) => (addr, receipt, tap.label.clone()),
+                (receipt, promised) => {
+                    // No line to change YET is not the same as nothing to say. Remembered, so the
+                    // receipt says it the moment Telegram tells the bot which message it is.
+                    tap.overdue = receipt.is_none() && promised;
+                    tracing::debug!(
+                        project = %addr.project, lane = addr.lane_field(),
+                        promised, receipt = receipt.is_some(),
+                        "nothing said about a tap that was never confirmed"
+                    );
+                    return;
+                }
+            }
+        };
+        let (addr, receipt, label) = waiting;
+        let text = format!("Sent: {label}. The session has not confirmed it took your answer.");
+        if let Err(e) = self.surface.rewrite(&receipt, &text).await {
+            tracing::warn!(
+                error = %e, project = %addr.project, lane = addr.lane_field(),
+                "could not tell him a tap has not been confirmed"
+            );
+        }
+    }
+
+    /// What the operator reads on the line he is already looking at, once the session has said what
+    /// became of his answer.
+    ///
+    /// An EDIT, never a send. Telegram charges a chat twenty messages a minute and charges nothing
+    /// for editing one it already has, and a tap is made precisely while he is looking at a busy
+    /// forum — so a second message per tap would come out of the budget an agent's questions need.
+    async fn say_what_became_of_his_tap(
+        &self,
+        addr: &Addr,
+        chat_id: i64,
+        question: &MsgId,
+        receipt: &MsgId,
+        label: &str,
+        said: WhatBecameOfTheTap,
+    ) {
+        let text = match &said {
+            WhatBecameOfTheTap::Took => {
+                let _ = self
+                    .audit
+                    .outcome(addr, &SendOutcome::Sent(question.clone()));
+                format!("Taken: {label}")
+            }
+            WhatBecameOfTheTap::Refused(why) => {
+                let _ = self.audit.refused(
+                    addr,
+                    &format!("his answer to question {question} was not taken: {why}"),
+                );
+                // Taken back BEFORE the line that says so, so the two arrive in the order he reads
+                // them. Usually there is nothing left to take back — the keyboard came off the
+                // moment he tapped — and that is why it says the answer did not reach the agent
+                // rather than inviting him to tap a menu that is not there any more.
+                //
+                // NOT by the path a delivery that never left takes: that one writes "nothing here
+                // could be reached" onto the question, and on this path something WAS reached and
+                // said no.
+                self.take_the_question_back(
+                    chat_id,
+                    question,
+                    "not taken — the agent could not act on your answer",
+                )
+                .await;
+                format!("Not taken: {label} — {why}. The agent has not got your answer.")
+            }
+        };
+        if let Err(e) = self.surface.rewrite(receipt, &text).await {
+            tracing::warn!(
+                error = %e, project = %addr.project, lane = addr.lane_field(),
+                "could not tell him what became of his answer"
+            );
+            // A refusal is the one of the two he must not miss: "Sent" is not false about a tap
+            // the agent took, and it IS false about one the agent said no to. The free edit is
+            // always tried first and this runs only when Telegram refused it, so the ordinary tap
+            // still costs nothing — and a send that keeps him from acting on an answer nobody has
+            // is worth one of the twenty.
+            if matches!(said, WhatBecameOfTheTap::Refused(_)) {
+                let outcome = self.say_under(addr, &text, question).await;
+                if !matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
+                    tracing::error!(
+                        project = %addr.project, lane = addr.lane_field(), outcome = ?outcome,
+                        "his answer was refused by the agent and there is no way left to tell him"
+                    );
+                }
+            }
+        }
+    }
+
+    /// How many of his taps are still waiting for a bridge's answer. A fence for a test that has to
+    /// know a tap was written down, without sending anything to find out.
+    #[cfg(test)]
+    pub async fn taps_awaiting_an_answer(&self) -> usize {
+        self.down
+            .lock()
+            .await
+            .iter()
+            .filter(|d| matches!(d.what, His::Tap(_)))
+            .count()
+    }
+
+    /// Is a tap written down under exactly this id — the id it went down the wire under?
+    #[cfg(test)]
+    pub async fn a_tap_is_awaited_under(&self, frame: &FrameId) -> bool {
+        self.down
+            .lock()
+            .await
+            .iter()
+            .any(|d| &d.frame == frame && matches!(d.what, His::Tap(_)))
+    }
+
+    /// Which line the hub believes his receipt for that tap is.
+    #[cfg(test)]
+    pub async fn the_receipt_written_down_for(&self, frame: &FrameId) -> Option<MsgId> {
+        self.down
+            .lock()
+            .await
+            .iter()
+            .find(|d| &d.frame == frame)
+            .and_then(|d| match &d.what {
+                His::Tap(tap) => tap.receipt.clone(),
+                His::Words { .. } => None,
+            })
+    }
+
+    /// Give a promising bridge less than [`TAP_CONFIRM_WINDOW`] to confirm a tap. Test-only, for
+    /// the reason `with_settle` is: the only way to see a bound bite is to move it, and waiting the
+    /// real twenty seconds out is twenty seconds of a suite doing nothing.
+    #[cfg(test)]
+    pub fn confirm_taps_within(&self, how_long: Duration) {
+        self.tap_confirm_window
+            .store(how_long.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Move an address on to a later run without touching the claim. Test-only.
+    ///
+    /// It is the state a connection is really in for the instant between a successor taking the
+    /// address and the kick reaching it — and the state a released connection's drain is in for as
+    /// long as it takes to finish. Over a socket that instant is microseconds and cannot be held
+    /// open, and it is exactly the window the delivery fence exists for.
+    #[cfg(test)]
+    pub fn a_newer_run_has_taken(&self, addr: &Addr) -> u64 {
+        self.generations
+            .lock()
+            .expect("the generations are not held across an await")
+            .mint(addr, 0)
     }
 
     /// Test-only, and it stays that way. The DELIVERY path must never ask this: it asks by trying
@@ -2659,15 +3506,15 @@ impl<S: Surface> Hub<S> {
         // record never waits for an answer to a frame nothing received.
         let frame = Self::mint_frame_id();
         {
-            let mut down = self.words_down.lock().await;
-            down.push_back(WordsDown {
+            let mut down = self.down.lock().await;
+            down.push_back(Down {
                 frame: frame.clone(),
                 addr: addr.clone(),
                 chat_id,
                 msg_id: msg_id.clone(),
-                files_on_disk,
+                what: His::Words { files_on_disk },
             });
-            while down.len() > WORDS_DOWN_KEPT {
+            while down.len() > DOWN_KEPT {
                 down.pop_front();
             }
         }
@@ -2691,7 +3538,7 @@ impl<S: Surface> Hub<S> {
             )
             .await;
         if !delivered {
-            self.words_down.lock().await.retain(|w| w.frame != frame);
+            self.down.lock().await.retain(|w| w.frame != frame);
         }
         let _ = if delivered {
             self.audit.outcome(addr, &SendOutcome::Sent(msg_id.clone()))
@@ -3722,11 +4569,24 @@ impl<S: Surface> Hub<S> {
         let BridgeFrame::Hello {
             instance,
             pid: claimed_pid,
+            confirms,
             ..
         } = first.payload.clone()
         else {
             unreachable!("admit only admits a hello");
         };
+        // The generation is on the ENVELOPE, in both directions, and there is no payload field
+        // carrying it — `flatten` puts a payload field of that name under the same key, so a peer
+        // that set both would emit a duplicate key serde refuses to read, and one that set only
+        // the payload's would have it swallowed. See `Envelope::generation`.
+        let arriving = first.generation;
+        // Whether this connection may ever be told `stale_generation`. A run that has never been
+        // welcomed holds no number to stamp on its first `hello`, so this starts false for a brand
+        // new bridge and is set by the read loop the first time a frame carries one.
+        let speaks_generations = Arc::new(AtomicBool::new(arriving.is_some()));
+        // Read through the crate's own helper and never as "was the field there": an adapter that
+        // builds the list by filtering sends an empty one when it promises nothing.
+        let confirms_choices = hub_proto::promises_to_confirm(&confirms, "choice");
         if claimed_pid != who.fence() {
             // Not fatal — a bridge behind a wrapper legitimately does not know its own outermost
             // pid. It IS worth a line, because the audit trail should record which number was
@@ -3761,11 +4621,21 @@ impl<S: Surface> Hub<S> {
             }
         });
 
-        let mut kicked = match self
-            .claim(addr.clone(), pid, instance.clone(), tx.clone())
+        let (generation, highest_was, mut kicked) = match self
+            .claim_the_address(
+                addr.clone(),
+                pid,
+                instance.clone(),
+                tx.clone(),
+                Arriving {
+                    generation: arriving,
+                    confirms_choices,
+                    speaks_generations: Arc::clone(&speaks_generations),
+                },
+            )
             .await
         {
-            Ok(kicked) => kicked,
+            Ok(both) => both,
             Err(reason) => {
                 let env = Envelope::new(FrameId::new("h-refused"), HubFrame::Refused { reason });
                 let _ = tx.send(env).await;
@@ -3774,9 +4644,21 @@ impl<S: Surface> Hub<S> {
                 // replaced.
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 writer.abort();
-                let _ = self
-                    .audit
-                    .refused(&addr, "another bridge already holds this conversation");
+                // The sentence has to match the refusal. A run turned away because its generation
+                // is over is turned away with NOTHING holding the address — that is the whole
+                // point of the fence — so writing every refusal down as a rival sent whoever
+                // reads an incident out of this file looking for a second bridge that does not
+                // exist.
+                let _ = self.audit.refused(
+                    &addr,
+                    match reason {
+                        RefusedReason::StaleGeneration => {
+                            "a run from an earlier generation tried to come back after a later \
+                             one had been admitted"
+                        }
+                        _ => "another bridge already holds this conversation",
+                    },
+                );
                 return Ok(());
             }
         };
@@ -3824,27 +4706,34 @@ impl<S: Surface> Hub<S> {
             );
         }
         // Admitted, with no topic yet. See `HubFrame::Welcome` for why that is not an omission.
+        //
+        // The lease is on this envelope and on every envelope this hub sends the connection after
+        // it. There is no payload field carrying it and there cannot be: `flatten` puts one under
+        // the same key as this, so a hub that set both would emit a word serde refuses to read.
         let _ = tx
-            .send(Envelope::new(
-                FrameId::new(format!("h{}", next_frame_seq())),
-                HubFrame::Welcome {
-                    project: title,
-                    // Echoed from the ADMITTED address, never from the wire. It is the only thing
-                    // that tells a bridge which named a lane that this hub understood it, rather
-                    // than ignoring the word and handing the worktree the project's own place.
-                    lane: addr.lane.clone(),
-                    topic_id: None,
-                    limits: LIMITS,
-                    outbox,
-                },
-            ))
+            .send(
+                Envelope::new(
+                    FrameId::new(format!("h{}", next_frame_seq())),
+                    HubFrame::Welcome {
+                        project: title,
+                        // Echoed from the ADMITTED address, never from the wire. It is the only thing
+                        // that tells a bridge which named a lane that this hub understood it, rather
+                        // than ignoring the word and handing the worktree the project's own place.
+                        lane: addr.lane.clone(),
+                        topic_id: None,
+                        limits: LIMITS,
+                        outbox,
+                    },
+                )
+                .with_generation(generation),
+            )
             .await;
 
         // Prove the far end is really there before anything is created for it. The ping's own
         // envelope id is the nonce; a pong naming it is the proof.
         let ping_id = FrameId::new(format!("h{}", next_frame_seq()));
         let _ = tx
-            .send(Envelope::new(ping_id.clone(), HubFrame::Ping))
+            .send(Envelope::new(ping_id.clone(), HubFrame::Ping).with_generation(generation))
             .await;
 
         // Anything the bridge says before its pong is KEPT, not dropped on the floor.
@@ -3871,7 +4760,7 @@ impl<S: Surface> Hub<S> {
                 let next = tokio::select! {
                     next = reader.next::<BridgeFrame>() => next,
                     kick = kicked.recv() => return match kick {
-                        Some(_) => Settled::SwitchedOff,
+                        Some(kick) => Settled::Kicked(kick),
                         // The claim was taken from under this connection: its process is gone
                         // from /proc and a successor evicted it. Nobody is behind the socket to
                         // tell, and "switched off" would be untrue — it went the way a dead
@@ -3881,6 +4770,11 @@ impl<S: Surface> Hub<S> {
                 };
                 match next {
                     Ok(Some(frame)) => {
+                        // The first frame carrying a generation is the proof that this bridge knows
+                        // the word — its `hello` could not carry one if it had never been welcomed.
+                        if frame.generation.is_some() {
+                            speaks_generations.store(true, Ordering::Release);
+                        }
                         if let BridgeFrame::Pong { r#ref } = &frame.payload
                             && r#ref == &ping_id
                         {
@@ -3942,7 +4836,7 @@ impl<S: Surface> Hub<S> {
                     Some("sent more before answering than the hub will hold for it")
                 }
                 Settled::Oversize => Some("a frame was over the size ceiling"),
-                Settled::SwitchedOff => Some("its project was switched off at the terminal"),
+                Settled::Kicked(kick) => Some(kick.sentence),
                 Settled::Gone | Settled::Live => {
                     Some("connected but never answered; it is probably not allowed to talk to me")
                 }
@@ -3972,7 +4866,16 @@ impl<S: Surface> Hub<S> {
             // Released FIRST, as the oversize path below does: what follows is writing, and a
             // bridge that redials in a second must not find its own dead connection still holding
             // the address.
-            self.release(&addr, pid).await;
+            self.release_this_run(&addr, pid, generation).await;
+            // And the number goes back with the address. A connection that never became live
+            // never held the conversation, and leaving the floor where its claim put it refuses a
+            // run that was only redialling — for ever, with the one word its own table treats as
+            // permanent. `--check` is the everyday shape of it: it is run precisely when a wall
+            // looks broken, which is when a session is most likely to be between sockets.
+            self.generations
+                .lock()
+                .expect("the generations are not held across an await")
+                .give_back(&addr, generation, highest_was);
             // Every frame it said is answered for BEFORE the socket goes. Each was read and has an
             // id, and each is about to be destroyed; the wire's rule is one ack per frame, and a
             // bridge keys "which of mine reached him" by exactly these ids. `writer.abort()` used
@@ -3983,6 +4886,9 @@ impl<S: Surface> Hub<S> {
             // and a wrong one sends the agent the wrong way.
             let ack_why = match settled {
                 Settled::Overflowed => Some(AckWhy::TooFast),
+                // Whatever ended it says what its frames are answered with — `stale-generation`
+                // for a run a later one replaced, and only where that run can read the word.
+                Settled::Kicked(kick) => kick.why,
                 _ => None,
             };
             let goodbye = async {
@@ -3994,7 +4900,8 @@ impl<S: Surface> Hub<S> {
                             delivered: Delivered::No,
                             why: ack_why,
                         },
-                    );
+                    )
+                    .with_generation(generation);
                     if tx.send(env).await.is_err() {
                         break;
                     }
@@ -4003,15 +4910,18 @@ impl<S: Surface> Hub<S> {
                 // closed set has none for "never answered", so that one stays a close.
                 let reason = match settled {
                     Settled::Oversize => Some(RefusedReason::FrameTooLarge),
-                    Settled::SwitchedOff => Some(RefusedReason::NotEnabled),
+                    Settled::Kicked(kick) => kick.reason,
                     _ => None,
                 };
                 if let Some(reason) = reason {
                     let _ = tx
-                        .send(Envelope::new(
-                            FrameId::new(format!("h{}", next_frame_seq())),
-                            HubFrame::Refused { reason },
-                        ))
+                        .send(
+                            Envelope::new(
+                                FrameId::new(format!("h{}", next_frame_seq())),
+                                HubFrame::Refused { reason },
+                            )
+                            .with_generation(generation),
+                        )
                         .await;
                 }
             };
@@ -4085,10 +4995,65 @@ impl<S: Surface> Hub<S> {
             let instance = instance.clone();
             let tx = tx.clone();
             let switch = Arc::clone(&switch);
+            let speaks = Arc::clone(&speaks_generations);
+            // Once per connection, not once per frame. A run that has been replaced usually has a
+            // backlog, and a journal that says the same sentence sixty-four times is one nobody
+            // reads to the end of.
+            let said_once = AtomicBool::new(false);
             tokio::spawn(async move {
                 while let Some(frame) = frames_rx.recv().await {
                     let ack_ref = frame.id.clone();
-                    let (delivered, why) = if switch.is_off() {
+                    // THE DELIVERY FENCE, and it is here rather than inside `handle` on purpose:
+                    // this loop is the one place every frame of a connection passes through, and
+                    // it goes on running AFTER the claim has been released — draining what was
+                    // queued behind a send that was in flight. That drain is where a run which is
+                    // already over finishes its backlog into a conversation a later run now holds,
+                    // and the claims map cannot see it because by then the map is empty. So the
+                    // question asked is "has a later generation taken this address", which stays
+                    // answerable when nothing is connected at all.
+                    //
+                    // The second half is a frame stamped with a number this hub never granted this
+                    // connection and could only have granted a LATER one — a bridge that muddled
+                    // two connections, or a relay forwarding a producer that has moved on. Its own
+                    // stamp says it is ahead of us, so it is not ours.
+                    //
+                    // Greater than, never "different from". A bridge that lost its socket redials
+                    // holding the number it had, is admitted, and flushes the backlog it kept —
+                    // and it wrote those bytes before it could possibly have read the new welcome,
+                    // so every one of them carries the OLD number and none can be re-stamped. On
+                    // "different from" a live, conforming run had its whole backlog refused with
+                    // the one word its own table treats as permanent: the redial loop, with
+                    // nothing on his phone. An older number is left to `a_newer_run_holds`, which
+                    // is the authoritative "this run is over" question and already covers it.
+                    let superseded = hub
+                        .a_newer_run_holds(&addr, generation)
+                        .map(|took| (generation, took))
+                        .or_else(|| {
+                            frame
+                                .generation
+                                .filter(|stamped| *stamped > generation)
+                                .map(|stamped| (stamped, generation))
+                        });
+                    let (delivered, why) = if let Some((from, took)) = superseded {
+                        if !said_once.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                project = %addr.project, lane = addr.lane_field(),
+                                generation = from, latest = took,
+                                "a run kept talking after a later generation took the address; \
+                                 refusing what it says"
+                            );
+                        }
+                        // The word only where it can be read. A bridge that stamped no generation
+                        // renders an unknown `why` as "his phone did not take it", which would tell
+                        // an agent that the operator's messaging app refused a frame his phone
+                        // never saw.
+                        (
+                            Delivered::No,
+                            speaks
+                                .load(Ordering::Acquire)
+                                .then_some(AckWhy::StaleGeneration),
+                        )
+                    } else if switch.is_off() {
                         (Delivered::No, None)
                     } else {
                         SWITCH
@@ -4099,14 +5064,17 @@ impl<S: Surface> Hub<S> {
                             .await
                     };
                     let _ = tx
-                        .send(Envelope::new(
-                            FrameId::new(format!("h{}", next_frame_seq())),
-                            HubFrame::Ack {
-                                r#ref: ack_ref,
-                                delivered,
-                                why,
-                            },
-                        ))
+                        .send(
+                            Envelope::new(
+                                FrameId::new(format!("h{}", next_frame_seq())),
+                                HubFrame::Ack {
+                                    r#ref: ack_ref,
+                                    delivered,
+                                    why,
+                                },
+                            )
+                            .with_generation(generation),
+                        )
                         .await;
                 }
             })
@@ -4126,14 +5094,15 @@ impl<S: Surface> Hub<S> {
                 },
                 kick = kicked.recv() => match kick {
                     None => break,
-                    Some(reason) => Some(reason),
+                    Some(kick) => Some(kick),
                 },
             };
-            if let Some(reason) = kicked_with {
-                self.end_switched_off(
+            if let Some(kick) = kicked_with {
+                self.end_from_outside(
                     &addr,
                     pid,
-                    reason,
+                    generation,
+                    kick,
                     waiting.into(),
                     &switch,
                     tx,
@@ -4166,11 +5135,12 @@ impl<S: Surface> Hub<S> {
                     // found its process dead. Nothing is behind the socket, and the successor
                     // holds the address now, so this ends the way EOF does: the release below is
                     // pid-guarded and leaves the successor's claim alone.
-                    let Some(reason) = kick else { break };
-                    self.end_switched_off(
+                    let Some(kick) = kick else { break };
+                    self.end_from_outside(
                         &addr,
                         pid,
-                        reason,
+                        generation,
+                        kick,
                         Vec::new(),
                         &switch,
                         tx,
@@ -4201,12 +5171,15 @@ impl<S: Surface> Hub<S> {
                         "a frame over the ceiling; refusing it"
                     );
                     let _ = tx
-                        .send(Envelope::new(
-                            FrameId::new(format!("h{}", next_frame_seq())),
-                            HubFrame::Refused {
-                                reason: RefusedReason::FrameTooLarge,
-                            },
-                        ))
+                        .send(
+                            Envelope::new(
+                                FrameId::new(format!("h{}", next_frame_seq())),
+                                HubFrame::Refused {
+                                    reason: RefusedReason::FrameTooLarge,
+                                },
+                            )
+                            .with_generation(generation),
+                        )
                         .await;
                     let _ = self
                         .audit
@@ -4222,7 +5195,7 @@ impl<S: Surface> Hub<S> {
                     // `already_claimed` for two seconds by the connection it had just been told to
                     // abandon. And releasing drops the claim's own `Sender`, so the writer's channel
                     // really closes and it ends at once rather than at the timeout.
-                    self.release(&addr, pid).await;
+                    self.release_this_run(&addr, pid, generation).await;
                     drop(frames_tx);
                     let _ = tokio::time::timeout(PROSE_SHELF_LIFE, &mut handler).await;
                     handler.abort();
@@ -4238,6 +5211,9 @@ impl<S: Surface> Hub<S> {
                     break;
                 }
                 Ok(Some(frame)) => {
+                    if frame.generation.is_some() {
+                        speaks_generations.store(true, Ordering::Release);
+                    }
                     // The kick is listened for HERE too, not only between frames. With the queue
                     // full — a loud bridge whose minute is spent, which is the bridge the switch
                     // exists for — this send parks the loop for as long as the pacer holds the
@@ -4254,14 +5230,15 @@ impl<S: Surface> Hub<S> {
                         },
                         kick = kicked.recv() => match kick {
                             None => break,
-                            Some(reason) => Some((reason, frame)),
+                            Some(kick) => Some((kick, frame)),
                         },
                     };
-                    if let Some((reason, frame)) = kicked_with {
-                        self.end_switched_off(
+                    if let Some((kick, frame)) = kicked_with {
+                        self.end_from_outside(
                             &addr,
                             pid,
-                            reason,
+                            generation,
+                            kick,
                             vec![frame],
                             &switch,
                             tx,
@@ -4279,7 +5256,7 @@ impl<S: Surface> Hub<S> {
         // Released the instant the socket ends, and BEFORE waiting on anything in flight. That
         // ordering is the whole of the fix above: liveness is a fact about the socket, not about
         // how long the last thing said is worth holding.
-        self.release(&addr, pid).await;
+        self.release_this_run(&addr, pid, generation).await;
         drop(frames_tx);
         // Bounded, and not aborted outright. What is usually in flight when a bridge goes away is
         // the session's own last `done`, and dropping that mid-send loses a message for nothing —
@@ -4295,22 +5272,28 @@ impl<S: Surface> Hub<S> {
         Ok(())
     }
 
-    /// End a live connection whose project was switched off at the terminal.
+    /// End a live connection from outside its own read loop: its project switched off at the
+    /// terminal, or a later run of the address taking it over.
     ///
-    /// Everything read from the bridge is answered for before the socket ends, in this order:
-    /// `refused{not_enabled}` first, so the bridge reads every `no` after it in that light and
-    /// stops promising its agent anything; then `no` for each frame in hand — read off the socket
-    /// and not yet queued; then, from the handler, `no` for everything queued behind the frame it
-    /// was inside, and for that frame too if it was still waiting for its turn (see
-    /// `ConnectionSwitch`). A frame already inside a send is finished, because cancelling a
-    /// Telegram call mid-flight lands a message whose ack says it did not land. Then the close,
-    /// bounded like every other goodbye.
+    /// Everything read from the bridge is answered for before the socket ends, in this order: the
+    /// refusal first, so the bridge reads every `no` after it in that light and stops promising its
+    /// agent anything; then `no` for each frame in hand — read off the socket and not yet queued;
+    /// then, from the handler, `no` for everything queued behind the frame it was inside, and for
+    /// that frame too if it was still waiting for its turn (see `ConnectionSwitch`). A frame
+    /// already inside a send is finished, because cancelling a Telegram call mid-flight lands a
+    /// message whose ack says it did not land. Then the close, bounded like every other goodbye.
+    ///
+    /// Both the refusal and the sentence come from the [`Kick`], because the two callers differ in
+    /// exactly those: a project switched off is told `not_enabled` and every run of it is told the
+    /// same, while a run a later generation replaced is told `stale_generation` — and told nothing
+    /// at all if it is old enough to read an unknown refusal as one worth redialling on.
     #[allow(clippy::too_many_arguments)]
-    async fn end_switched_off(
+    async fn end_from_outside(
         &self,
         addr: &Addr,
         pid: u32,
-        reason: RefusedReason,
+        generation: u64,
+        kick: Kick,
         in_hand: Vec<Envelope<BridgeFrame>>,
         switch: &ConnectionSwitch,
         tx: mpsc::Sender<Envelope<HubFrame>>,
@@ -4319,36 +5302,43 @@ impl<S: Surface> Hub<S> {
         mut writer: tokio::task::JoinHandle<()>,
     ) {
         tracing::info!(
-            project = %addr.project, lane = addr.lane_field(), ?reason,
-            "ending a live connection: its project was switched off at the terminal"
+            project = %addr.project, lane = addr.lane_field(), generation,
+            why = kick.sentence,
+            "ending a live connection"
         );
         // Released FIRST, so `/projects` stops calling it connected and his typed words stop
-        // reaching it the instant the switch is thrown, before any goodbye.
-        self.release(addr, pid).await;
+        // reaching it the instant the switch is thrown, before any goodbye. Guarded on this
+        // connection's own generation, so a run that has ALREADY been evicted cannot take its
+        // successor's claim away on the way out.
+        self.release_this_run(addr, pid, generation).await;
         // Told why BEFORE the switch is thrown inside this connection, so the refusal is on the
         // wire ahead of every `no` the switch causes. Bounded: a bridge that has stopped reading
         // has a full outbox, and the handler is already parked on it — nothing more can post.
-        let _ = tokio::time::timeout(
-            GOODBYE_SHELF_LIFE,
-            tx.send(Envelope::new(
-                FrameId::new(format!("h{}", next_frame_seq())),
-                HubFrame::Refused { reason },
-            )),
-        )
-        .await;
+        if let Some(reason) = kick.reason {
+            let _ = tokio::time::timeout(
+                GOODBYE_SHELF_LIFE,
+                tx.send(
+                    Envelope::new(
+                        FrameId::new(format!("h{}", next_frame_seq())),
+                        HubFrame::Refused { reason },
+                    )
+                    .with_generation(generation),
+                ),
+            )
+            .await;
+        }
         switch.throw();
-        let _ = self
-            .audit
-            .refused(addr, "its project was switched off at the terminal");
+        let _ = self.audit.refused(addr, kick.sentence);
         for frame in in_hand {
             let env = Envelope::new(
                 FrameId::new(format!("h{}", next_frame_seq())),
                 HubFrame::Ack {
                     r#ref: frame.id,
                     delivered: Delivered::No,
-                    why: None,
+                    why: kick.why,
                 },
-            );
+            )
+            .with_generation(generation);
             if tokio::time::timeout(GOODBYE_SHELF_LIFE, tx.send(env))
                 .await
                 .is_err()
@@ -4543,15 +5533,15 @@ impl<S: Surface> Hub<S> {
                 (Delivered::Yes, None)
             }
             // The bridge saying what became of a frame the hub sent it. The only frames anybody
-            // is waiting on an answer for are his typed words; everything else about it is
-            // bookkeeping. Acked like any frame, so "every frame gets exactly one" stays true.
+            // is waiting on an answer for are his typed words and his taps; everything else about
+            // it is bookkeeping. Acked like any frame, so "every frame gets exactly one" stays true.
             BridgeFrame::Ack {
                 r#ref,
                 status,
                 reason,
                 files,
             } => {
-                self.what_became_of_his_words(addr, &r#ref, status, reason.as_deref(), files)
+                self.what_became_of_it(addr, &r#ref, status, reason.as_deref(), files)
                     .await;
                 (Delivered::Yes, None)
             }
@@ -4585,7 +5575,7 @@ impl<S: Surface> Hub<S> {
     /// second line. Behind attach's door several producers may answer one message, and the door
     /// folds them into one before this hub hears it; the Claude tool server answers `accepted`
     /// the moment it has handed the words into the agent's turn.
-    async fn what_became_of_his_words(
+    async fn what_became_of_it(
         &self,
         addr: &Addr,
         frame: &FrameId,
@@ -4593,8 +5583,65 @@ impl<S: Surface> Hub<S> {
         reason: Option<&str>,
         files: Option<u32>,
     ) {
+        // A tap is answered for differently from a line he typed, and the answer may have to WAIT:
+        // his receipt is a message the bot sends after the answer is already on the wire, so there
+        // may be no line to change yet. That branch keeps the record; the words branch below takes
+        // it, because nothing about a line he typed is still to be learned.
+        //
+        // The permit is a TAP's, and is not taken until the record is known to be one. Taken
+        // first, it was taken by every ack of every project on the box — and it is held across
+        // Telegram round trips — so one refused tap in one topic parked every other connection's
+        // handler for the length of two network calls. The peek below cannot go stale: nothing
+        // removes a tap record while its receipt is still unknown. See `tap_edits`.
+        let it_is_a_tap = {
+            let down = self.down.lock().await;
+            down.iter()
+                .any(|d| &d.frame == frame && &d.addr == addr && matches!(d.what, His::Tap(_)))
+        };
+        if it_is_a_tap {
+            let _in_order = self.tap_edits.lock().await;
+            let mut down = self.down.lock().await;
+            if let Some(at) = down
+                .iter()
+                .position(|d| &d.frame == frame && &d.addr == addr)
+                && matches!(down[at].what, His::Tap(_))
+            {
+                let said = match status {
+                    AckStatus::Accepted => WhatBecameOfTheTap::Took,
+                    AckStatus::Refused => WhatBecameOfTheTap::Refused(plain_reason(reason)),
+                };
+                let Some(Down {
+                    chat_id,
+                    msg_id,
+                    what: His::Tap(tap),
+                    ..
+                }) = down.get_mut(at)
+                else {
+                    return;
+                };
+                if tap.said.is_some() {
+                    // A second answer for one tap. The first is the one he reads, exactly as it is
+                    // for a line he typed: there the record goes with the first answer so a second
+                    // finds nothing, and here the record has to stay until his receipt exists, so
+                    // the rule has to be said out loud instead.
+                    return;
+                }
+                let Some(receipt) = tap.receipt.clone() else {
+                    // Nowhere to say it yet. Kept beside the tap, and said the moment `bot.rs`
+                    // hands over which message his receipt is.
+                    tap.said = Some(said);
+                    return;
+                };
+                let (chat_id, question, label) = (*chat_id, msg_id.clone(), tap.label.clone());
+                down.remove(at);
+                drop(down);
+                self.say_what_became_of_his_tap(addr, chat_id, &question, &receipt, &label, said)
+                    .await;
+                return;
+            }
+        }
         let his = {
-            let mut down = self.words_down.lock().await;
+            let mut down = self.down.lock().await;
             let Some(at) = down
                 .iter()
                 .position(|w| &w.frame == frame && &w.addr == addr)
@@ -4604,6 +5651,9 @@ impl<S: Surface> Hub<S> {
             down.remove(at)
         };
         let Some(his) = his else { return };
+        let His::Words { files_on_disk } = his.what else {
+            return;
+        };
         // The tick, or the cross, in place of the eyes. Marked BEFORE the line for a refusal, so
         // the two arrive in the order he reads them: the glance, then the sentence.
         let mark = match status {
@@ -4621,12 +5671,12 @@ impl<S: Surface> Hub<S> {
             // bridge that ignored the entry. The thumb stays: his words did reach the agent. The
             // line says what did not.
             let handed_on = files.unwrap_or(0);
-            if handed_on < his.files_on_disk {
+            if handed_on < files_on_disk {
                 let _ = self.audit.refused(
                     addr,
                     &format!(
                         "the worker took his words (message {}) and {} of {} files",
-                        his.msg_id, handed_on, his.files_on_disk
+                        his.msg_id, handed_on, files_on_disk
                     ),
                 );
                 // What this line may NOT say is why. A short count means the worker is older
@@ -5226,21 +6276,29 @@ impl<S: Surface> Hub<S> {
     /// a timeout, not the next session. What is undone instead is the authorisation, so the
     /// still-live keyboard can be tapped again rather than answering "that was already answered".
     pub async fn withdraw_undelivered(&self, chat_id: i64, msg_id: &MsgId) -> Withdrawal {
+        // Written into the message he is looking at, in whichever topic that is. A worktree's
+        // topic and its project's sit side by side, and the project may be perfectly reachable
+        // while the thing that asked this is not.
+        self.take_the_question_back(chat_id, msg_id, "not sent — nothing here could be reached")
+            .await
+    }
+
+    /// Take a question back with the sentence that is TRUE of the path taking it back.
+    ///
+    /// Two paths take a question back and only one of them reached nobody. A tap the session
+    /// answered `refused` DID reach something — it read the answer off the wire and said no — so
+    /// telling him nothing could be reached is a plain untruth about the one thing he is looking
+    /// at. Usually there is no record left and this does nothing at all; the case it is not a
+    /// no-op is a keyboard edit Telegram refused, which is exactly the network trouble that causes
+    /// the refusal too, so the two co-occur rather than being independent.
+    async fn take_the_question_back(&self, chat_id: i64, msg_id: &MsgId, note: &str) -> Withdrawal {
         let record = { self.ledger.lock().await.get(chat_id, msg_id).cloned() };
         let Some(record) = record else {
             return Withdrawal::NothingLeftToTakeBack;
         };
         match self
             .surface
-            .retire_buttons(
-                record.topic_id,
-                msg_id,
-                &record.text,
-                // Written into the message he is looking at, in whichever topic that is. A
-                // worktree's topic and its project's sit side by side, and the project may be
-                // perfectly reachable while the thing that asked this is not.
-                "not sent — nothing here could be reached",
-            )
+            .retire_buttons(record.topic_id, msg_id, &record.text, note)
             .await
         {
             Ok(()) => {
@@ -5250,7 +6308,7 @@ impl<S: Surface> Hub<S> {
             Err(e) => {
                 tracing::error!(
                     error = %e, project = %record.project, lane = record.addr().lane_field(),
-                    "a tap reached nobody and its keyboard is still on his phone"
+                    "a question could not be taken back and its keyboard is still on his phone"
                 );
                 let _ = self.ledger.lock().await.mark_unanswered(chat_id, msg_id);
                 Withdrawal::StillOnHisPhone
@@ -5409,10 +6467,11 @@ enum Settled {
     /// there — `kickoff-hub-attach --check` — ends this way on purpose, and is owed the same acks
     /// as the others and no line in the audit.
     SaidGoodbye,
-    /// Its project was switched off at the terminal while it was still settling. Nothing is made
-    /// for it: a topic created and greeted for a project he had just turned off would be the switch
-    /// producing the one thing it exists to stop.
-    SwitchedOff,
+    /// It was ended from outside its own read loop before it ever became live — its project
+    /// switched off at the terminal, or a later run taking the address. Nothing is made for it: a
+    /// topic created and greeted for a project he had just turned off would be the switch producing
+    /// the one thing it exists to stop.
+    Kicked(Kick),
 }
 
 /// What a frame costs against the pre-pong hold: its text plus an allowance for the envelope, and

@@ -34,7 +34,8 @@
      Four more landed in v21 the same evening, from a second round on the same build. The flag is
      `--opencode-binding-file` and not a session file, because what the launcher writes is a BINDING
      — the session, the project it is for, the agent it should be running, and which writing of it
-     this is — of which the id is one field. There is now ONE shape, a JSON object stamped `"v": 1`:
+     this is — of which the id is one field. There is now ONE shape, a JSON object stamped
+     `"version": 1`:
      the bare id on a line is gone, and a launcher still writing one is told that in its own
      sentence rather than told its perfectly good file is unreadable rubbish. The fence gained the
      half that a restart cannot destroy — `--opencode-binding-generation <n>`, the floor the wall was
@@ -45,6 +46,36 @@
      proved before a byte of it is believed — the directories it sits under, the link it might be,
      who owns it, who else can write it — because each of those is a way for somebody who is not the
      launcher to choose which session the operator is steering.
+
+     Amended 7 September, before anything ran — and the version does NOT move, because this is
+     v21's own shape corrected rather than a new interface for anyone to migrate to. §13.10's binding
+     was specified here in names of this project's own — `v`, `session`, `directory` — while kickoff,
+     which is the program that WRITES the file, had already shipped an object spelling them
+     `version`, `session_id` and `canonical_project_dir`, and carrying a `conversation` and a
+     `verified_at` this document had no place for. Two shapes sharing no key at all: every binding a
+     launcher wrote would have been refused key by key, and every line the operator typed in that
+     room refused with it, in the room, at the worst possible moment. It was caught before a room
+     ran and before any such file existed on this box, so nothing has to be migrated and nothing that
+     ran is invalidated. The launcher's names are the ones kept, verbatim rather than aliased: it
+     shipped first, this repo does not carry two spellings of one thing, and `conversation` is the id
+     this architecture already treats as the stable one. Only the version key was asked for in
+     return, because a shape nobody has written yet must refuse rather than be half-obeyed. What the
+     richer shape buys is a check the old one could not make at all: the conversation the binding
+     names is compared with the conversation this attach is attached as, so a wall pointed at a
+     sibling room's session is refused by the binding's own words, whatever its directory and agent
+     say. `docs/CAPABILITIES.md` v17 is amended the same day and for the same reason.
+
+     Four more corrections the same day, from an adversarial round on that amendment, and the
+     version still does not move. A binding naming a conversation this attach cannot yet check is a
+     transient refusal and not a settled one, so a question asked in that window is KEPT and offered
+     again rather than destroyed — deciding it once cost an agent its whole turn on a keyboard that
+     was never drawn. The way out that refusal names is now one the wall could take: a wall pointed
+     at its secret by path is told `KICKOFF_HUB_CONVERSATION` in place of `KICKOFF_HUB_TOKEN_FILE`,
+     never beside it, because §5 refuses the two together. Every refusal about what is WRITTEN now
+     names the part that stopped it — the key it did not know, the value that was the wrong shape,
+     and, for a note still written with `v`/`session`/`directory`, the whole rename in one line
+     instead of a key at a time. And §13.10's recipe no longer writes `"conversation": ""` on a
+     launcher that has no room, which refused the whole binding it had just written.
 
      v20 says what the pid of §3 is FOR, which this document left to be inferred. It is a local fence
      and nothing else: the hub evicts a dead claim by looking for `/proc/<pid>`, and it accepts a
@@ -1780,7 +1811,7 @@ or `NOT`; a `NOT` line carries the sentence that says what to do. The last line 
 | the door | `ok   the door: <path> (worked out from git), free` — or `(named by KICKOFF_HUB_RELAY_SOCKET), free`, or under `--run` with no git `ok   the door: will be made in a private folder under <TMPDIR> when the worker starts, and handed to its engine` | `NOT  another attach already holds the door at <path>; this conversation has a worker already` · no git, no `--run`: `NOT  this folder is not inside a repository and nothing named a door; set KICKOFF_HUB_RELAY_SOCKET` · under `--run` with no git: `NOT  TMPDIR is "%h/.cache/tmp", which is not an absolute path, so a private door cannot be made under it; set TMPDIR to a real directory` (or "does not exist", or "past the 108-byte socket limit") — the start's own refusal, made here without making the folder |
 | the tool server | `ok   a tool server that works out its door from git here finds this one` — or, with no git, `ok   a tool server here must be told the door, and a worker started with --run tells it` / `ok   a tool server here cannot work out a door from git, so it must be given the same KICKOFF_HUB_RELAY_SOCKET=<door>` — or, when attach's door is not git's: under `--run`, `ok   the tool server the engine spawns is told this door by --run; a config that overlays KICKOFF_HUB_RELAY_SOCKET with - would look for <other> instead and never find this one`; told without `--run`, `ok   the door was named by KICKOFF_HUB_RELAY_SOCKET, so a tool server that works one out from git would look for <other>; give the engine the same KICKOFF_HUB_RELAY_SOCKET=<door>` | derived from a minted address, without `--run`: `NOT  a tool server that works out its door from git here would look for <other>; either use the worktree's own name as the address, or give the engine a config that names KICKOFF_HUB_RELAY_SOCKET=<door>`. Whichever line prints, attach prints the same sentence as a warning when it starts, from the same function. |
 | the engine's address, with `--opencode` | `ok   the engine's address: http://127.0.0.1:9711` | `NOT  --opencode http://127.0.0.1: names no port; the watcher would dial the wrong server. Give it the port opencode serve was given, e.g. --opencode http://127.0.0.1:9711` — the start refuses the same URL; the unit's `${OPENCODE_PORT}` unset is how it arrives |
-| the binding naming the worker's session, with `--opencode-binding-file` | `ok   the worker's session: <path> names a session, and every line the operator types goes to that one or is refused` — or, before whatever starts the engine has written it, `ok   the worker's session: <path> is not written yet; until whatever starts the engine writes it, every line the operator types is refused out loud rather than guessed at`; and, when the directory the file goes in does not exist yet, `warn the worker's session: nothing has made <dir>/ yet, so whatever starts the engine must make it before it can write there` — for a directory that is missing and for no other reason, since one that is there and cannot be looked into is already named by the `NOT` above it | `NOT  --opencode-binding-file <path> is not an absolute path; give the full path of the file whatever starts the engine writes the worker's binding into` · `NOT  --opencode-binding-file was given without --opencode; the binding names a session on an opencode server, and without --opencode there is no server being watched` · `NOT  --opencode-binding-generation <n> is not a whole number; give the number of the binding this worker was started for, e.g. --opencode-binding-generation 7` · `NOT  --opencode-binding-generation was given without --opencode-binding-file; the number is the oldest binding that file may name, and without the file there is no binding for it to hold` — all four of them refusals the start makes too · `NOT  the worker's session: <path> is not safe to read, so nothing it says is trusted — <which of §13.10's checks it failed>; it must be a plain file this user owns that nobody else can read or write, in directories nobody else can write` · `NOT  the worker's session: <path> is there and could not be read; attach must be able to read it, and it is written by whatever starts the engine` · `NOT  the worker's session: <path> is written in a form attach does not know; it holds one JSON object, saying "v": 1 and naming the session as "session"` · `NOT  the worker's session: <path> is not one attach can read; it holds one JSON object, saying "v": 1 and naming the session as "session"` · and the two of the binding's own claims that are decided with no server at all, exactly as the start decides them: `NOT  the worker's session: <path> is older than the one this worker was started for; it is binding <n> and the number given is <n>, so every line the operator types would be refused` · `NOT  the worker's session: <path> does not say how new it is, and this worker would be started for binding <n>; whatever writes it must number every writing` · `NOT  the worker's session: <path> is written for a different project than the one this is run in, so every line the operator types would be refused`. Never a `NOT` for a binding that is not there yet — the order a wall is started in is check, start, write the binding — and whether the session is OPEN is not asked here at all: that is the server's answer, and it is asked afresh on every line he types (§13.10). |
+| the binding naming the worker's session, with `--opencode-binding-file` | `ok   the worker's session: <path> names a session, and every line the operator types goes to that one or is refused` — or, before whatever starts the engine has written it, `ok   the worker's session: <path> is not written yet; until whatever starts the engine writes it, every line the operator types is refused out loud rather than guessed at`; and, when the directory the file goes in does not exist yet, `warn the worker's session: nothing has made <dir>/ yet, so whatever starts the engine must make it before it can write there` — for a directory that is missing and for no other reason, since one that is there and cannot be looked into is already named by the `NOT` above it | `NOT  --opencode-binding-file <path> is not an absolute path; give the full path of the file whatever starts the engine writes the worker's binding into` · `NOT  --opencode-binding-file was given without --opencode; the binding names a session on an opencode server, and without --opencode there is no server being watched` · `NOT  --opencode-binding-generation <n> is not a whole number; give the number of the binding this worker was started for, e.g. --opencode-binding-generation 7` · `NOT  --opencode-binding-generation was given without --opencode-binding-file; the number is the oldest binding that file may name, and without the file there is no binding for it to hold` — all four of them refusals the start makes too · `NOT  the worker's session: <path> is not safe to read, so nothing it says is trusted — <which of §13.10's checks it failed>; it must be a plain file this user owns that nobody else can read or write, in directories nobody else can write` · `NOT  the worker's session: <path> is there and could not be read; attach must be able to read it, and it is written by whatever starts the engine` · `NOT  the worker's session: <path> is written in a form attach does not know — <the key or the value that stopped it, named>; it holds one JSON object, saying "version": 1 and naming the session as "session_id"` · `NOT  the worker's session: <path> is not one attach can read — <the key or the value that stopped it, named>; it holds one JSON object, saying "version": 1 and naming the session as "session_id"` · `NOT  the worker's session: <path> does not say which form it is written in; whatever writes it must add "version": 1 to the object it writes, or every line the operator types is refused` · and the three of the binding's own claims that are decided with no server at all, exactly as the start decides them: `NOT  the worker's session: <path> is older than the one this worker was started for; it is binding <n> and the number given is <n>, so every line the operator types would be refused` · `NOT  the worker's session: <path> does not say how new it is, and this worker would be started for binding <n>; whatever writes it must number every writing` · `NOT  the worker's session: <path> is written for a different project than the one this is run in, so every line the operator types would be refused` · `NOT  the worker's session: <path> is written for conversation <the one it names> and this worker speaks for <the one it is>, so every line the operator types would be refused` · `NOT  the worker's session: <path> is written for conversation <the one it names>, and nothing here says which conversation this worker is, so the claim cannot be checked and every line the operator types would be refused; start it with KICKOFF_HUB_CONVERSATION, or whatever writes the note must leave "conversation" out` · and, on a wall pointed at its secret by path, the way out that wall could actually take instead — `KICKOFF_HUB_TOKEN_FILE` and `KICKOFF_HUB_CONVERSATION` are refused together (§5), so it is never told to add one to the other: `NOT  the worker's session: <path> is written for conversation <the one it names>, and this worker was pointed at its secret by path (KICKOFF_HUB_TOKEN_FILE), which does not say which conversation that secret is for, so the claim cannot be checked and every line the operator types would be refused; start it with KICKOFF_HUB_CONVERSATION in place of KICKOFF_HUB_TOKEN_FILE, or whatever writes the note must leave "conversation" out`. Never a `NOT` for a binding that is not there yet — the order a wall is started in is check, start, write the binding — and whether the session is OPEN is not asked here at all: that is the server's answer, and it is asked afresh on every line he types (§13.10). |
 | the engine, with `--run` | `ok   the engine: opencode, found at <path>` | `NOT  the engine: opencode is not on PATH` |
 | PID 1, with `--run` | `ok   not PID 1` | `NOT  this process is PID 1 and nothing reaps for it; put the wall's own init in front (docker run --init; bwrap without --as-pid-1, which reaps and forwards nothing — stop a bwrap wall by signalling attach itself)` |
 | the count | `everything a worker here needs is in place` | `<n> thing(s) to fix before a worker here can reach him` |
@@ -2227,28 +2258,81 @@ with the sentence on stderr, as every other refusal to start is:
 The **file** is not checked then, because at that moment it is usually not there.
 
 **The binding.** One small file, and **one shape** in it: a JSON object that says which shape it is.
+**The names in it are the launcher's**, not this project's. kickoff writes this file, and it had
+already shipped the object below; this section had specified one of its own, spelling the same things
+`v`, `session` and `directory`, and the two shapes shared **no key at all**. A launcher's binding
+would have been refused key by key and every line the operator typed in that room refused with it —
+in the room, at the worst possible moment, for a reason neither side could see. It was caught before
+a room ran and before any such file existed on this box, so nothing had to be migrated; the
+launcher's spellings were then taken verbatim rather than aliased, because it shipped first, because
+this repo does not carry two names for one thing, and because `conversation` is the id this
+architecture already treats as the stable one. The one thing asked for in return is the version key,
+which is what makes a shape nobody has written yet refuse instead of being half-obeyed.
+
+This is the exact object to write:
 
 ```json
-{"v": 1, "session": "ses_00000000000000000000theOne", "directory": "/srv/rooms/steering",
- "agent": "kickoff-room-steering", "generation": 7}
+{"version": 1, "conversation": "c-0123456789ab", "session_id": "ses_00000000000000000000theOne",
+ "canonical_project_dir": "/srv/rooms/steering", "agent": "kickoff-room-steering",
+ "generation": 7, "verified_at": "2026-09-07T08:00:00Z"}
 ```
 
-* **`v`** is the form the object is written in, and today `1` is the only one there is. It is read
-  before anything else in the object, so a launcher writing a form this attach does not know is told
-  *that* rather than told its perfectly good binding is unreadable rubbish. **The bare session id on
-  a line is gone**: it was the form this flag was born with, it could say which session and nothing
-  else, and a launcher that learned to narrow the binding had no way to say so that an older reader
-  would not silently ignore. A file still holding one is told apart from nonsense and gets its own
-  sentence — the launcher is one to upgrade, not one that has written rubbish.
-* **`session`** is the only other field that must be there. It is opencode's own session id — `ses_`
-  and then up to sixty of `A–Z a–z 0–9`, which is what 1.18.25 mints and what attach will accept.
-* **`directory`** is the directory the launcher says that session is canonically for, as an absolute
-  path. Give it when the launcher knows it: it is compared with the directory attach speaks for
-  *before anything is asked of the server*, so a binding that has drifted onto another worker's
-  session is refused by its own words, at once, and without a request going out. Trailing slashes are
-  ignored, and when the two names differ they are compared again with both sides resolved through
-  symlinks — opencode stores and reports the directory it resolved, while attach was handed a path
-  on its command line, so a project reached through a link would otherwise be refused as another
+| key | required? | what it says |
+| --- | --- | --- |
+| `version` | required | which form the object is written in — `1` is the only one there is |
+| `conversation` | optional | which conversation the binding was written for; where it is there it is checked against the conversation this attach is attached as |
+| `session_id` | required | which session of that engine this conversation is |
+| `canonical_project_dir` | optional | the directory the launcher says that session is canonically for, absolute |
+| `agent` | optional | the agent that session is supposed to be running |
+| `generation` | optional | which writing of this binding it is, counting up |
+| `verified_at` | optional | the launcher's own record of when it last confirmed the session |
+
+* **`version`** is the form the object is written in, and today `1` is the only one there is. It is
+  read before anything else in the object, so a launcher writing a form this attach does not know is
+  told *that* rather than told its perfectly good binding is unreadable rubbish — and a binding that
+  says nothing about its form is told the one key to add and what to set it to, because the person
+  reading that sentence is the one who can add it. **The bare session id on a line is gone**: it was
+  the form this flag was born with, it could say which session and nothing else, and a launcher that
+  learned to narrow the binding had no way to say so that an older reader would not silently ignore.
+  A file still holding one is told apart from nonsense and gets its own sentence — the launcher is
+  one to upgrade, not one that has written rubbish. **A note written with the names this reader
+  wanted before the launcher's own were taken** — `v`, `session`, `directory` — is told apart the
+  same way, and given the whole rename in one line rather than a key at a time: it has no version
+  key either, so "add a version" was true and useless, and adding it left two more names this side
+  had never accepted, each refused with nothing to act on.
+* **Every refusal about what is WRITTEN names the part that stopped it** — the key it did not know,
+  the key that must be renamed, the value that was not the shape that key takes — in the journal
+  and in `--check`, where whoever wrote the launcher looks. The operator's own sentence never
+  carries it: he has never been told the note exists, and he is not the person who can mend it. The
+  two refusals that name nothing say all they have: the note is not there, or the operating system
+  would not hand it over.
+* **`conversation`** is the conversation this binding was written for — `p-` or `c-` and twelve hex
+  characters, the id §5 spells. Where the binding names one it is compared with **the conversation
+  this attach is attached as**, before a request goes anywhere, and a binding naming another one is
+  refused whole. That is the check the old shape could not make at all: two rooms of one wall are two
+  conversations, and a binding written for the room next door can name a directory that resolves
+  perfectly well here and an agent that matches, and still be this wall pointed at a sibling's
+  session. What attach is attached as is the conversation a dispatcher named in
+  `KICKOFF_HUB_CONVERSATION` (§2), else the one the credential it found belongs to — and two of §5's
+  four ways of finding a credential cannot say which conversation they are at all. Where this side
+  cannot say, a binding that names one is **refused** rather than passed over: a claim nobody can
+  check is not a check, and the line whoever runs the wall reads names a way out that wall could
+  actually take — for a wall pointed at its secret by path that is *not* `KICKOFF_HUB_CONVERSATION`
+  beside the path, which §5 refuses, but that variable **in place of** it, or the key left out.
+  Leaving the key out is allowed, and is how a launcher that does not deal in conversations writes:
+  then there is nothing to compare, and the directory, the agent and the generation are all there
+  is. Left out means ABSENT: `"conversation": ""` is not a conversation id and refuses the whole
+  binding, so a recipe that interpolates a room name unconditionally breaks every project that has
+  no room.
+* **`session_id`** is opencode's own session id — `ses_` and then up to sixty of `A–Z a–z 0–9`,
+  which is what 1.18.25 mints and what attach will accept.
+* **`canonical_project_dir`** is the directory the launcher says that session is canonically for, as
+  an absolute path. Give it when the launcher knows it: it is compared with the directory attach
+  speaks for *before anything is asked of the server*, so a binding that has drifted onto another
+  worker's session is refused by its own words, at once, and without a request going out. Trailing
+  slashes are ignored, and when the two names differ they are compared again with both sides resolved
+  through symlinks — opencode stores and reports the directory it resolved, while attach was handed a
+  path on its command line, so a project reached through a link would otherwise be refused as another
   project's for ever. Resolving can only make two names for one directory agree; it can never make
   two different directories match, and a path that cannot be resolved is compared as written.
 * **`agent`** is the agent that session is *supposed* to be running. Measured against opencode
@@ -2262,12 +2346,19 @@ The **file** is not checked then, because at that moment it is usually not there
   believe they own the conversation would otherwise take turns retargeting it, and the one that
   wrote *last* — the loser of the race — would win. The rule for a launcher is one line: number
   every writing, and only ever count up.
+* **`verified_at`** is the launcher's own record of when it last confirmed that session was there.
+  attach reads it and **nothing is decided by it**: no line is refused for what it says, nothing
+  waits on it, and it is compared with nothing. It is named here because the key set is closed — an
+  object carrying a field this reader had never heard of is refused whole, which is the wrong answer
+  to a launcher keeping its own record — and it stays the launcher's field, in the launcher's format.
+  What attach believes about the session it asks the server, on the line the operator typed, and
+  never from a time somebody wrote down.
 
 The key set is **closed** — a key this attach does not know may be a *narrowing* of which session
 may be spoken to, and obeying the rest of the binding while quietly dropping it would deliver his
 words on a rule nobody checked — and a key that appears **twice** is refused with it. JSON keeps the
-last of two keys of one name and every reader sees one, so a file whose first `session` line is the
-one a person reads would deliver to the second; on the one file this whole flag treats as
+last of two keys of one name and every reader sees one, so a file whose first `session_id` line is
+the one a person reads would deliver to the second; on the one file this whole flag treats as
 authoritative, *what it says is not what it does* is a property that must not exist. Write each key
 once.
 
@@ -2297,17 +2388,17 @@ one this cannot place.
   fence refuses is said in full in the journal, where whoever wrote the launcher looks, because the
   one sentence the operator can be given cannot carry "raise the number".
 
-A field of the wrong kind — a relative `directory`, an empty `agent`, a `generation` that is not a
-whole number — makes the whole binding one attach cannot read, rather than a binding with one field
-quietly dropped. **The key set is closed**, and a key attach does not know refuses the whole
-binding: a launcher's own bookkeeping does not belong here, because the next key anyone adds is as
-likely to *narrow* which session may be spoken to as to be decoration, and obeying the rest of the
-binding while quietly dropping it would deliver his words on a rule nobody checked. A launcher that
-needs a new key upgrades the attach that reads it; they are two halves of one wall — and `v` is how
-they find that out, instead of meeting in the middle on his typed words. Whitespace around the
-object is trimmed; anything that does not begin with `{` is not this form at all, and a bare session
-id — the form this flag was born with — is told apart from nonsense so that the launcher gets the
-sentence about upgrading rather than the one about rubbish.
+A field of the wrong kind — a relative `canonical_project_dir`, an empty `agent`, a `generation`
+that is not a whole number — makes the whole binding one attach cannot read, rather than a binding
+with one field quietly dropped. **The key set is closed**, and a key attach does not know refuses
+the whole binding: a launcher's own bookkeeping does not belong here, because the next key anyone
+adds is as likely to *narrow* which session may be spoken to as to be decoration, and obeying the
+rest of the binding while quietly dropping it would deliver his words on a rule nobody checked. A
+launcher that needs a new key upgrades the attach that reads it; they are two halves of one wall —
+and `version` is how they find that out, instead of meeting in the middle on his typed words.
+Whitespace around the object is trimmed; anything that does not begin with `{` is not this form at
+all, and a bare session id — the form this flag was born with — is told apart from nonsense so that
+the launcher gets the sentence about upgrading rather than the one about rubbish.
 
 **The file itself is proved before a byte of it is believed**, because each of these is a way for
 somebody who is not the launcher to choose which session the operator is steering, and none of them
@@ -2371,8 +2462,12 @@ Written out, with nothing in it that is not in this section:
 ```sh
 umask 077
 binding=$state/opencode.binding   # the same path that was given to --opencode-binding-file
-printf '{"v":1,"session":"%s","directory":"%s","agent":"%s","generation":%s}\n' \
-  "$session" "$project_dir" "$agent" "$n" > "$binding.new"
+# The conversation only where the wall was started for one. An empty string is not a conversation
+# id and refuses the whole binding, and this recipe is copied for plain projects as often as for
+# rooms — so the key is left out rather than written empty.
+if [ -n "${room:-}" ]; then names_a_room=$(printf '"conversation":"%s",' "$room"); else names_a_room=; fi
+printf '{"version":1,%s"session_id":"%s","canonical_project_dir":"%s","agent":"%s","generation":%s,"verified_at":"%s"}\n' \
+  "$names_a_room" "$session" "$project_dir" "$agent" "$n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$binding.new"
 mv "$binding.new" "$binding"      # whole, or not at all
 ```
 
@@ -2393,24 +2488,41 @@ fallback: with the flag set, no branch below reaches the most-recent rule at all
    it sits, the link it might be, its owner, its mode); there and unreadable; written in a form
    attach does not know; or a shape it cannot read: refused, each with its own sentence.
 
-   **One exception, and only one.** When the file cannot be read *at all* — it is not there, it
-   could not be opened, it holds something this cannot make sense of — and he is **replying to a
-   question this watcher itself drew and still holds open**, his reply goes to the session that
-   asked it and the rest of this list is not run. That session was proved against the binding when
+   **One exception, and only one.** When nothing has been *found out* — the file is not there, it
+   could not be opened, it holds something this cannot make sense of, or (step 2) it names a
+   conversation nothing here can yet check — and he is **replying to a question this watcher itself
+   drew and still holds open**, his reply goes to the session that asked it and the rest of this
+   list is not run. That session was proved against the binding when
    the keyboard went up, the question is his, and the only thing missing is the file; refusing him
    there told him to *try again in a moment* about a thing no moment of his would mend. A binding
    that reads perfectly well and names a **different** session is not this case: it has moved on,
-   and step 5 refuses the reply, as it always did.
-2. **Not older than the floor, and not older than what this run has already acted on.** The
+   and the step below that asks whether he is replying to a question this conversation still holds
+   open refuses the reply, as it always did.
+2. **Whose binding it is**, when it says: the `conversation` it was written for against the
+   conversation this attach is attached as. Before the fence, before the directory and before any
+   request goes out, because a binding written for the room next door is right in every other
+   particular — and a claim this attach cannot check, because nothing told it which conversation it
+   is, is refused rather than passed over. Where the binding names no conversation there is nothing
+   to compare and the rest of the list is all there is.
+
+   The two refusals are not the same kind. *Written for another conversation* is the note's settled
+   word and is final: the question is dropped, and a reply under an open question is refused with
+   the rest. *Cannot tell whose it is* is nothing found out — the operator may grant, or the
+   launcher may rewrite the note, while the wall runs — so it is held with the transient refusals of
+   step 1: the question is kept and offered again, and a reply under a question this watcher itself
+   drew still reaches the session that asked it. The way out it names is one the wall could take:
+   a wall pointed at its secret by path is told `KICKOFF_HUB_CONVERSATION` **in place of**
+   `KICKOFF_HUB_TOKEN_FILE`, never beside it, because §5 refuses the two together.
+3. **Not older than the floor, and not older than what this run has already acted on.** The
    generation fence above — the floor first, because that is the half a restart cannot forget.
-3. **The binding's own `directory`, when it gives one**, against the directory attach speaks for —
-   before anything is asked of the server, because a binding written for another worker must not
-   steer this conversation even if that session would resolve perfectly well here.
-4. **The server is asked about the session**, with the same measured listing the guess used —
+4. **The binding's own `canonical_project_dir`, when it gives one**, against the directory attach
+   speaks for — before anything is asked of the server, because a binding written for another worker
+   must not steer this conversation even if that session would resolve perfectly well here.
+5. **The server is asked about the session**, with the same measured listing the guess used —
    `GET /session?directory=<the project directory>&roots=true`, one request. This step *fetches*;
-   what it fetched is judged in step 6, after step 5, and the order matters: a rollover that lands
+   what it fetched is judged in step 7, after step 6, and the order matters: a rollover that lands
    during the round trip must read as a rollover and not as a session that has gone.
-5. **The binding again, now the server has been waited on.** A listing is a round trip, and on a
+6. **The binding again, now the server has been waited on.** A listing is a round trip, and on a
    loaded server it may be the deadline's ten seconds wide. Delivering on the id read *before* that
    wait puts his words in the session a launcher's rollover has just replaced, acked as though they
    went where he meant. When the binding now names a different session the line is refused rather
@@ -2418,7 +2530,7 @@ fallback: with the flag set, no branch below reaches the most-recent rule at all
    new. *Send it again* is the true instruction after a rollover, and it is why this is tested
    before membership: with the two the other way round, a rewrite racing a slow listing read as
    "not open on its server", which is a sentence about the wrong thing.
-6. **In the listing at all**, and then: **not archived, not a subagent's, and not another
+7. **In the listing at all**, and then: **not archived, not a subagent's, and not another
    project's by the session's own word.** When the named session is not in the listing, a second,
    *unfiltered* listing is made **to choose the sentence only, never to widen what is accepted**: it
    is what tells "not open on its server" from "a helper's session" from "another project's". A
@@ -2427,16 +2539,16 @@ fallback: with the flag set, no branch below reaches the most-recent rule at all
    is the operator steering a session nobody is reading; the session's own `directory` is checked
    for the same reason, so acceptance never rests on the server having obeyed the `directory=` the
    listing asked for.
-7. **Running the agent the binding named**, when it named one. A session that names no agent at
+8. **Running the agent the binding named**, when it named one. A session that names no agent at
    all is not a match either: "no agent" is not "the agent you asked for".
-8. **Is he replying to a question this conversation is still holding open?** Then the words go to
+9. **Is he replying to a question this conversation is still holding open?** Then the words go to
    the session that asked it — which, after every check above, is the bound session — and the
    question stays open for his tap, exactly as it does without the flag. A question asked *before*
    the binding was rewritten is refused instead: carrying his reply into the old session would steer a
    worker nobody is bound to, and carrying it into the new one would answer a question that session
    never asked.
-9. **Only then** are his words posted, to that session and to no other, and the fence closes behind
-   the binding that got them there.
+10. **Only then** are his words posted, to that session and to no other, and the fence closes
+    behind the binding that got them there.
 
 **What he reads when one of them refuses.** The reason travels as `ack{status: refused, reason}`
 (§7, offer 6) and the hub puts it in the topic he typed in, threaded under the line it refuses:
@@ -2449,7 +2561,10 @@ code, and no word for a thing he has never been told exists.
 | the binding is not there yet, or is empty | the worker has not yet said which session to speak to; try again in a moment |
 | the file is there and unreadable, or is not one it is safe to read at all | the note naming the worker's session could not be read |
 | it holds something that is not one of these bindings | the note naming the worker's session is not one it can read |
-| it is a form this attach does not read — a bare session id, or a `v` it does not know | the note naming the worker's session is written in a form this worker does not know |
+| it is a form this attach does not read — a bare session id, or a `version` it does not know | the note naming the worker's session is written in a form this worker does not know |
+| it does not say which form it is written in at all | the note naming the worker's session does not say which form it is written in |
+| it was written for another conversation than the one this attach is attached as | the session named for this worker belongs to a different conversation |
+| it names a conversation, and nothing told this attach which conversation it is | the note naming this worker's session says which conversation it belongs to, and this worker cannot tell whether that is this one |
 | the binding went backwards, or is under the floor this worker was started for | the note naming this worker's session is older than the one already in use |
 | the worker was started for a numbered binding and this one names no generation | the note naming this worker's session does not say how new it is |
 | the note, or the session, is another project's | the session named for this worker belongs to a different project |
@@ -2491,8 +2606,13 @@ appear, with no record to retire and nothing to try again. So the two reasons a 
 drawn are held apart. The note saying **this is not the session** — the fence, another project,
 another agent, a session the server does not list — drops it, and that is another wall's business.
 The machine **not saying** — the file is not written yet because the launcher is a beat behind its
-engine, the server stalled, the server answered something unreadable — **keeps** it, and offers it
-again on a timer until it can be shown. Bounded three ways, because a wall whose server never
+engine, nothing on this box can yet say which conversation this wall is so a note that names one
+cannot be checked, the server stalled, the server answered something unreadable — **keeps** it, and
+offers it again on a timer until it can be shown. The conversation is in that list and not the other
+one because both ways out of it land while the wall is running: the operator grants, or the launcher
+rewrites the note. Deciding it once, at the moment the question arrived, spent an agent's whole turn
+on a keyboard that was never drawn and told the operator so once for however many questions were
+lost. Bounded three ways, because a wall whose server never
 returns must not grow a queue: eight questions at most, a minute each, and one offered again per
 pass, since every attempt costs a request with a ten-second deadline and events are handled strictly
 in order.
@@ -2510,8 +2630,10 @@ has already put "Sent: X" on his phone, and leaving him with that and nothing el
 keyboard this adapter exists to end.
 
 **What `--check` can and cannot tell you.** It reads the binding for the things knowable without
-the engine running — that the path and the number are ones attach can use, and that whatever is
-written there is safe to read and a shape it can read — and it prints the line §13.4's table gives.
+the engine running — that the path and the number are ones attach can use, that whatever is written
+there is safe to read and a shape it can read, and the three claims the binding makes that are
+settled with no server at all: the generation, the project, and the conversation it was written for
+— and it prints the line §13.4's table gives.
 This is the one place the safety half is spelled out, naming the directory, the link or the owner
 that failed it, because whoever runs the check is the person who can put it right. It does **not**
 ask the server whether the session is open, because the ordinary order of starting a wall is *check,
@@ -2540,8 +2662,9 @@ file works only because the launcher and the adapter are two processes on one bo
 filesystem, exactly as files are a capability of the local transport and not of the wire
 (`docs/CAPABILITIES.md` offer 9, REQUIRES 3). It is a **local implementation detail of this
 adapter**, and neither org should harden against the file. The durable thing is the **typed binding
-it carries** — the session, the agent it is meant to be running, the generation, and the floor the
-worker was started at, which is a fact about this start rather than about the file — which a
+it carries** — the conversation it is for, the session, the agent it is meant to be running, the
+generation, and the floor the worker was started at, which is a fact about this start rather than
+about the file — which a
 transport that is not this machine (`docs/CAPABILITIES.md` OPEN 4) would have to carry with no
 filesystem under it, and which an engine able to hold a tag of its own could answer for itself with
 nobody writing a file at all. `docs/CAPABILITIES.md` OPEN 5 is where that stays open.

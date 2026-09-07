@@ -76,7 +76,9 @@ say "    KICKOFF_HUB_PROJECT_DIR=. kickoff-hub-attach --check --opencode http://
 say "    KICKOFF_HUB_PROJECT_DIR=. kickoff-hub-attach         --opencode http://127.0.0.1:9711 --run opencode serve --port 9711"
 say
 say "Or supervised, per worker — write ~/.config/kickoff-hub-attach/<label>.env with"
-say "KICKOFF_HUB_PROJECT_DIR and OPENCODE_PORT, then:"
+say "KICKOFF_HUB_PROJECT_DIR and OPENCODE_PORT — and, where a launcher writes the file naming"
+say "which session of that server the worker is, OPENCODE_BINDING_FILE and OPENCODE_BINDING_GENERATION"
+say "beside them — then:"
 say
 say "    systemctl --user enable --now kickoff-hub-attach@<label>"
 say "    journalctl --user -u kickoff-hub-attach@<label> -f"

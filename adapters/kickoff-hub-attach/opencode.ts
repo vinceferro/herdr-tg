@@ -66,6 +66,23 @@ export type WatcherConfig = {
    */
   bindingFile: string | null
   /**
+   * Which conversation attach is attached AS, asked afresh — null when nothing on this box says.
+   *
+   * A thunk and not a value because the operator may enrol or grant while the wall is running, and
+   * because the binding's own claim to a conversation is checked on every line, like the rest of it.
+   */
+  attachedAs: () => string | null
+  /**
+   * The path the wall was pointed at its secret by, or null when it was not pointed at one.
+   *
+   * Only ever read to choose the WAY OUT a refusal offers: a wall started this way cannot also be
+   * told which conversation it is, so the sentence that sends every other wall to
+   * `KICKOFF_HUB_CONVERSATION` would send this one to a start attach refuses outright. Not a thunk
+   * because, unlike the secret and the conversation, this is what the wall was STARTED with and
+   * nothing on the box can change it under a running process.
+   */
+  tokenFile: string | null
+  /**
    * The oldest binding this run may obey, or null when the wall named none.
    *
    * The floor of the fence, and the only part of it that survives this process being restarted.
@@ -178,8 +195,52 @@ export function startWatcher(cfg: WatcherConfig): void {
       if (read.why) note(`the note naming the worker's session was not read: ${read.why}`)
       return { refused: read.refused, couldNotFindOut: true }
     }
-    const { generation, sessionID } = read.binding
-    // The floor first, because it is the only half of the fence a restart cannot forget. A binding
+    const { conversation, generation, sessionID } = read.binding
+    // WHOSE note this is, before anything else it says is weighed.
+    //
+    // A launcher that points this wall at a sibling room's session writes a note that is right in
+    // every other particular: the id resolves, the directory is a room tree that may well match,
+    // the agent is the one this worker expects. The conversation is the only thing that tells the
+    // two apart, and steering another room's worker with this operator's words — while telling him
+    // they were delivered — is the failure this whole binding exists to refuse.
+    //
+    // Refused, never ignored, when this side cannot say which conversation it is: a claim nobody
+    // can check is not a check, and a wall started so that it cannot be checked is a wall to start
+    // differently. The half only whoever runs it can act on goes to the journal, as ever.
+    if (conversation !== null) {
+      const here = cfg.attachedAs()
+      if (here === null) {
+        // The way out has to be one this wall could actually take. A wall pointed at its secret BY
+        // PATH cannot also be told which conversation it is — attach refuses the two variables
+        // together — so sending that one to KICKOFF_HUB_CONVERSATION was advice this same program
+        // refuses to start on, and the only advice it could act on is the other half: the note must
+        // not make a claim the wall it was written for has no way to check.
+        note(
+          cfg.tokenFile !== null
+            ? 'the note names the conversation the worker\'s session belongs to, and this wall was pointed at ' +
+              'its secret by path (KICKOFF_HUB_TOKEN_FILE), which does not say which conversation that secret ' +
+              'is for; start the wall with KICKOFF_HUB_CONVERSATION in place of the path, or whatever writes ' +
+              'the note must leave the conversation out'
+            : 'the note names the conversation the worker\'s session belongs to, and nothing told this ' +
+              'wall which conversation it is; start it with KICKOFF_HUB_CONVERSATION so the two can be ' +
+              'compared, or whatever writes the note must leave the conversation out',
+        )
+        // Nothing was FOUND OUT — as against the note saying plainly that this is not the session.
+        // Both halves of the way out land while the wall is running: the operator grants, or the
+        // launcher rewrites the note, which is why this is re-asked on every line rather than
+        // decided once at boot. Deciding it here spent an agent's whole turn on a keyboard that was
+        // never drawn, and told the operator so once for however many questions were lost.
+        return { refused: CANNOT_TELL_WHOSE_CONVERSATION_IT_IS, couldNotFindOut: true }
+      }
+      if (conversation !== here) {
+        note(
+          `the note is written for conversation ${conversation}, and this wall speaks for ${here}; ` +
+            'whatever writes the note must write it for the conversation the worker was started for',
+        )
+        return { refused: BELONGS_TO_ANOTHER_CONVERSATION }
+      }
+    }
+    // The floor next, because it is the only half of the fence a restart cannot forget. A binding
     // under it is refused for the life of this process however many times it is rewritten.
     if (FLOOR !== null) {
       if (generation === null) {
@@ -741,6 +802,9 @@ export function startWatcher(cfg: WatcherConfig): void {
   const OLDER_THAN_THE_ONE_IN_USE = "the note naming this worker's session is older than the one already in use"
   const DOES_NOT_SAY_HOW_NEW_IT_IS = "the note naming this worker's session does not say how new it is"
   const BELONGS_TO_ANOTHER_PROJECT = 'the session named for this worker belongs to a different project'
+  const BELONGS_TO_ANOTHER_CONVERSATION = 'the session named for this worker belongs to a different conversation'
+  const CANNOT_TELL_WHOSE_CONVERSATION_IT_IS =
+    "the note naming this worker's session says which conversation it belongs to, and this worker cannot tell whether that is this one"
   const HAS_BEEN_ARCHIVED = 'the session named for this worker has been archived'
   const IS_A_HELPERS_SESSION = "the session named for this worker is a helper's session, not the one to speak to"
   const IS_NOT_OPEN = 'the session named for this worker is not open on its server'
@@ -835,7 +899,7 @@ export function startWatcher(cfg: WatcherConfig): void {
     // The launcher's own claim about which project the session is for, checked against the project
     // attach speaks for before anything is asked of the server: a note written for another worker
     // must not steer this conversation even if that session is somehow listed here.
-    if (want.directory !== null && !sameDirectory(want.directory, cfg.projectDir)) {
+    if (want.canonicalProjectDir !== null && !sameDirectory(want.canonicalProjectDir, cfg.projectDir)) {
       return { refused: BELONGS_TO_ANOTHER_PROJECT }
     }
     const listed = await rootSessionsHere()

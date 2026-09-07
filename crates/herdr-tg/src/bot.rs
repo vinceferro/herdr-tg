@@ -712,6 +712,11 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         .and_then(|m| m.thread_id)
         .map(|t| t.0.0);
 
+    // The id his answer went down the wire under, once it has. Kept here because the two halves of
+    // one tap are decided in two places: the frame goes down while the answer is being worked out,
+    // and which message his receipt IS can only be known after Telegram has made it.
+    let mut tap_went_down: Option<hub_proto::FrameId> = None;
+
     let answer = match data.split('|').collect::<Vec<_>>().as_slice() {
         // The option id is opaque. What it MEANS was written down in the ledger beside the message
         // when the question went out, and that record is what resolves it — never the button's
@@ -757,17 +762,19 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
                                             .map(|o| o.label.clone())
                                     })
                                     .unwrap_or_default();
-                                let sent = hub
-                                    .deliver(
-                                        &who,
-                                        hub_proto::HubFrame::Choice {
-                                            msg_id: msg_id.clone(),
-                                            ask_id,
-                                            option_id,
-                                        },
-                                    )
+                                // Down under an id the hub has already written the tap down
+                                // beside. Sending it with `deliver` minted that id inside the send
+                                // and threw it away, and the `true` that came back meant only that
+                                // the outbox took the frame — so a bridge that said on the wire it
+                                // could not act on the answer named a frame the hub held no record
+                                // of, its ack was dropped, and the receipt below stayed "Sent"
+                                // whatever became of the tap. The record has to exist before the
+                                // frame is on the wire: an ack can arrive the moment it is.
+                                let went_down = hub
+                                    .deliver_tap(&who, chat_id, &msg_id, ask_id, option_id, &label)
                                     .await;
-                                if sent {
+                                if let Some(frame) = went_down {
+                                    tap_went_down = Some(frame);
                                     // Retire the keyboard rather than only forgetting the record.
                                     // Forgetting alone left the menu live forever: the record the
                                     // later `ask_resolved` needed was already gone, so nothing ever
@@ -829,7 +836,18 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         // one message that must never be lost left him having tapped a button and been told
         // nothing — while the ledger already said the question was answered — and the budget never
         // heard about the refusal either.
-        what_telegram_said(&ctx, chat.0, out.await).await;
+        let answered = out.await;
+        // Which message his receipt is — the line that says what he chose — written down beside
+        // the tap it belongs to. This is the only place that can ever know it: the hub did not
+        // send it. Without it, what the bridge says became of the answer has no line to change,
+        // and correcting a tap would cost a send per tap on a keyboard he is still looking at.
+        // Nothing is handed over when Telegram refused the send: an id invented here would be an
+        // edit of somebody else's message.
+        if let (Some(hub), Some(frame), Ok(receipt)) = (&ctx.hub, &tap_went_down, &answered) {
+            hub.his_receipt_for_a_tap(frame, &hub_proto::MsgId::new(receipt.id.0.to_string()))
+                .await;
+        }
+        what_telegram_said(&ctx, chat.0, answered).await;
     }
     tracing::info!(chat_id, "handled a button");
     Ok(())
@@ -2801,5 +2819,168 @@ mod tests {
             .await
             .expect("handled");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a location was answered");
+    }
+
+    /// The message the question is asked in. [`tapped`] builds its taps under a message with this
+    /// id, so the ledger record a tap is judged against has to be written down beside it.
+    const THE_QUESTION: i64 = 5;
+    /// The message Telegram makes when the bot says what he tapped — his receipt.
+    const THE_RECEIPT: i64 = 991;
+
+    /// What Telegram answers a `sendMessage` with: the message it made, under the id the test
+    /// chose. The bot can only learn where his receipt is from this answer.
+    fn a_sent_message(id: i64, text: &str) -> Vec<u8> {
+        let mut made = message_json(
+            THE_FORUM,
+            Some(TOPIC),
+            a_bot(1),
+            serde_json::json!({ "text": text }),
+        );
+        made["message_id"] = id.into();
+        serde_json::json!({"ok": true, "result": made})
+            .to_string()
+            .into_bytes()
+    }
+
+    /// A Telegram that answers everything one tap makes the bot do: the toast, the edit that takes
+    /// the keyboard off, and the line that says what he chose.
+    async fn a_telegram_that_answers_a_tap() -> (Bot, Arc<std::sync::Mutex<Vec<String>>>) {
+        a_telegram_that_answers(|path| {
+            let p = path.to_lowercase();
+            if p.contains("/answercallbackquery") {
+                (200, br#"{"ok":true,"result":true}"#.to_vec())
+            } else if p.contains("/sendmessage") {
+                (200, a_sent_message(THE_RECEIPT, "Sent: Overwrite it"))
+            } else if p.contains("/edit") {
+                (200, a_sent_message(THE_QUESTION, "Overwrite it?"))
+            } else {
+                not_here()
+            }
+        })
+        .await
+    }
+
+    /// One open question on his phone, asked by a bridge that is on the socket. Hands back that
+    /// bridge's end of the wire, so a test can read what the tap sends down it.
+    async fn a_question_a_bridge_is_waiting_on(
+        hub: &Arc<crate::hub::Hub<crate::surface::Telegram>>,
+    ) -> tokio::sync::mpsc::Receiver<hub_proto::Envelope<hub_proto::HubFrame>> {
+        let addr = hub
+            .addr_for_topic(TOPIC)
+            .await
+            .expect("the project's own topic is bound");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // The instance on the claim and the instance on the record are the same run, or the tap is
+        // refused as one aimed at a session that has since restarted.
+        let _kick = hub
+            .claim(addr.clone(), std::process::id(), "i1".into(), tx)
+            .await
+            .expect("the bridge claims the project");
+        hub.ledger
+            .lock()
+            .await
+            .record(
+                THE_FORUM,
+                &hub_proto::MsgId::new(THE_QUESTION.to_string()),
+                crate::hub::AskRecord {
+                    project: addr.project.clone(),
+                    lane: None,
+                    ask_id: hub_proto::AskId::new("a1"),
+                    topic_id: TOPIC,
+                    options: vec![hub_proto::AskOption {
+                        option_id: hub_proto::OptionId::new("y"),
+                        label: "Overwrite it".into(),
+                    }],
+                    text: "Overwrite it?".into(),
+                    instance: "i1".into(),
+                    pid: Some(std::process::id()),
+                    at: crate::hub::now_secs(),
+                    answered: None,
+                    closed: None,
+                },
+            )
+            .expect("the question is written down");
+        rx
+    }
+
+    #[tokio::test]
+    async fn a_tap_goes_down_under_an_id_the_hub_is_waiting_to_hear_about() {
+        // A tap went down under an id minted inside the send and thrown away there, and the `true`
+        // that came back meant only that the outbox took it. So a bridge that said on the wire it
+        // could not act on the answer — the reply endpoint refused, the session had closed — named
+        // a frame the hub held no record of, and the ack was dropped on the floor: his receipt read
+        // "Sent" whatever became of the tap. The id it goes down under is now written down BEFORE
+        // the frame is on the wire, which is the only thing an ack can be matched against.
+        let (bot, _asked) = a_telegram_that_answers_a_tap().await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, _repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+        let mut wire = a_question_a_bridge_is_waiting_on(&hub).await;
+
+        on_callback(
+            bot.clone(),
+            tapped(THE_FORUM, Some(TOPIC), a_person(OPERATOR), "h|y"),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+
+        let went = wire
+            .try_recv()
+            .expect("his answer never reached the bridge");
+        assert!(
+            matches!(went.payload, hub_proto::HubFrame::Choice { .. }),
+            "what went down the wire was not his answer: {:?}",
+            went.payload
+        );
+        assert_eq!(
+            hub.taps_awaiting_an_answer().await,
+            1,
+            "the tap went down and nothing was written down about it, so a bridge's answer for it \
+             has nothing to find and his receipt can never be corrected"
+        );
+        assert!(
+            hub.a_tap_is_awaited_under(&went.id).await,
+            "the tap was written down under an id that is not the one it went down under, so the \
+             bridge's ack for it can never be matched to it"
+        );
+    }
+
+    #[tokio::test]
+    async fn his_receipt_is_written_down_beside_the_tap_so_the_answer_can_edit_it() {
+        // "Sent: <label>" is the line he is looking at after a tap, and it is the line that has to
+        // change when the bridge says what became of the answer — an edit costs no send, and a
+        // second message under the question would spend one of the twenty a minute per tap. Which
+        // message it is can only be known here, a Telegram round trip after the frame went down, so
+        // it is handed to the hub the moment Telegram says which message it made.
+        let (bot, asked) = a_telegram_that_answers_a_tap().await;
+        let d = tempfile::tempdir().expect("tmp");
+        let (ctx, _repo, hub) = a_forum_with_one_project(d.path(), &bot).await;
+        let mut wire = a_question_a_bridge_is_waiting_on(&hub).await;
+
+        on_callback(
+            bot.clone(),
+            tapped(THE_FORUM, Some(TOPIC), a_person(OPERATOR), "h|y"),
+            ctx.clone(),
+        )
+        .await
+        .expect("handled");
+
+        let went = wire
+            .try_recv()
+            .expect("his answer never reached the bridge");
+        // He was told what he chose. That line stays — it is his receipt, and it is one line.
+        let asked = asked.lock().expect("not poisoned").clone();
+        assert!(
+            asked
+                .iter()
+                .any(|p| p.to_lowercase().contains("sendmessage")),
+            "he was told nothing about the tap he made: {asked:?}"
+        );
+        assert_eq!(
+            hub.the_receipt_written_down_for(&went.id).await,
+            Some(hub_proto::MsgId::new(THE_RECEIPT.to_string())),
+            "the hub does not know which line his receipt is, so the answer to the tap can only be \
+             said in a new message — or not at all"
+        );
     }
 }

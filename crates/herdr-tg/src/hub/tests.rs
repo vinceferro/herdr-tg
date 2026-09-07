@@ -70,6 +70,11 @@ struct FakeTelegram {
     general: AsyncMutex<Vec<String>>,
     /// Every in-place rewrite, in order: which message, and what it now says.
     rewrites: AsyncMutex<Vec<(MsgId, String)>>,
+    /// Sceptic 2's probe: hold the FIRST rewrite open this long, and no other.
+    slow_first_rewrite: AsyncMutex<Option<Duration>>,
+    /// Sceptic 2's probe: make every in-place rewrite fail, which is what an edit of a message
+    /// over forty-eight hours old, or a transient 5xx, actually does.
+    rewrite_fails: AsyncMutex<bool>,
     /// Every send threaded under one of the OPERATOR's messages: where, what, and under which.
     replies: AsyncMutex<Vec<(i32, String, MsgId)>>,
     /// Set to make the next topic creation come back the way Telegram answers a bot that has
@@ -208,6 +213,17 @@ impl Surface for FakeTelegram {
     }
 
     async fn rewrite(&self, msg_id: &MsgId, text: &str) -> anyhow::Result<()> {
+        // Sceptic 2's probe: one edit takes longer than the next. A real edit is an HTTPS round
+        // trip whose latency nothing bounds, and two of them in flight at once land in whatever
+        // order the network gives them — which is the same fact `slow_eyes` exists to model for
+        // reactions.
+        let slow = self.slow_first_rewrite.lock().await.take();
+        if let Some(slow) = slow {
+            tokio::time::sleep(slow).await;
+        }
+        if *self.rewrite_fails.lock().await {
+            anyhow::bail!("Bad Request: message can't be edited");
+        }
         self.rewrites
             .lock()
             .await
@@ -558,6 +574,16 @@ struct FakeBridge {
     reader: FrameReader<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     writer: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
     seq: u64,
+    /// Does this bridge know about generations at all?
+    ///
+    /// FALSE by default, and that default is load-bearing: every other test in this file is then a
+    /// bridge from before the field existed, so the whole suite goes on proving that a bridge which
+    /// stamps nothing is admitted, fenced and told exactly what it always was. The three tests
+    /// about the fence say so for themselves.
+    stamps: bool,
+    /// The number the hub welcomed it with — what a bridge that knows about generations puts on
+    /// every frame it sends afterwards, its redial's `hello` included.
+    generation: Option<u64>,
 }
 
 impl FakeBridge {
@@ -594,7 +620,85 @@ impl FakeBridge {
         let stream = UnixStream::connect(sock).await.expect("connect");
         let (r, w) = stream.into_split();
         let mut me = Self::over_halves(Box::new(r), Box::new(w));
-        me.say_hello(secret, instance, claimed_id, lane, pid).await;
+        me.say_hello(secret, instance, claimed_id, lane, pid, None)
+            .await;
+        me
+    }
+
+    /// A bridge from AFTER this change: it remembers the number the hub welcomes it with and
+    /// stamps every frame it sends afterwards with it.
+    async fn connect_remembering_its_lease(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+    ) -> Self {
+        Self::connect_shaped(sock, secret, instance, claimed_id, None, None, true).await
+    }
+
+    /// A bridge redialling with a lease it already holds — which is what a run that lost its socket
+    /// does, and the only way a generation that has been replaced can come back.
+    async fn connect_stamping(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+        generation: u64,
+    ) -> Self {
+        Self::connect_shaped(
+            sock,
+            secret,
+            instance,
+            claimed_id,
+            None,
+            Some(generation),
+            true,
+        )
+        .await
+    }
+
+    /// A bridge that promises to say what became of every choice it is handed.
+    async fn connect_confirming_choices(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+    ) -> Self {
+        Self::connect_shaped(
+            sock,
+            secret,
+            instance,
+            claimed_id,
+            Some(vec!["choice".to_owned()]),
+            None,
+            false,
+        )
+        .await
+    }
+
+    async fn connect_shaped(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+        confirms: Option<Vec<String>>,
+        generation: Option<u64>,
+        stamps: bool,
+    ) -> Self {
+        let stream = UnixStream::connect(sock).await.expect("connect");
+        let (r, w) = stream.into_split();
+        let mut me = Self::over_halves(Box::new(r), Box::new(w));
+        me.stamps = stamps;
+        me.generation = generation;
+        me.say_hello(
+            secret,
+            instance,
+            claimed_id,
+            None,
+            std::process::id(),
+            confirms,
+        )
+        .await;
         me
     }
 
@@ -612,6 +716,30 @@ impl FakeBridge {
         instance: &str,
         claimed_id: &str,
     ) -> Self {
+        Self::over_shaped(hub, who, secret, instance, claimed_id, false).await
+    }
+
+    /// The same, for a bridge that knows about generations. Separate because the two facts the
+    /// in-memory harness exists for — a peer that is another user, and a peer whose process is
+    /// gone — are also the only way to put a LIVE connection behind a claim a successor has taken.
+    async fn over_remembering_its_lease(
+        hub: &Arc<Hub<FakeTelegram>>,
+        who: ConnectionIdentity,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+    ) -> Self {
+        Self::over_shaped(hub, who, secret, instance, claimed_id, true).await
+    }
+
+    async fn over_shaped(
+        hub: &Arc<Hub<FakeTelegram>>,
+        who: ConnectionIdentity,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+        stamps: bool,
+    ) -> Self {
         let (mine, hubs) = tokio::io::duplex(DUPLEX_BUFFER);
         {
             let hub = Arc::clone(hub);
@@ -621,7 +749,8 @@ impl FakeBridge {
         }
         let (r, w) = tokio::io::split(mine);
         let mut me = Self::over_halves(Box::new(r), Box::new(w));
-        me.say_hello(secret, instance, claimed_id, None, std::process::id())
+        me.stamps = stamps;
+        me.say_hello(secret, instance, claimed_id, None, std::process::id(), None)
             .await;
         me
     }
@@ -634,6 +763,8 @@ impl FakeBridge {
             reader: FrameReader::new(r),
             writer: w,
             seq: 0,
+            stamps: false,
+            generation: None,
         }
     }
 
@@ -645,6 +776,9 @@ impl FakeBridge {
         claimed_id: &str,
         lane: Option<&str>,
         pid: u32,
+        // The harness bridge answers no down-frame by default, which is what every bridge shipped
+        // so far does. The tests that need a promising bridge say so themselves.
+        confirms: Option<Vec<String>>,
     ) {
         self.send(BridgeFrame::Hello {
             project_id: ProjectId::new(claimed_id),
@@ -653,9 +787,7 @@ impl FakeBridge {
             repo: "/wherever".into(),
             pid,
             lane: lane.map(hub_proto::LaneId::new),
-            // The harness bridge answers no down-frame, which is what every bridge shipped so far
-            // does. The tests that need a promising bridge say so themselves.
-            confirms: None,
+            confirms,
         })
         .await;
     }
@@ -685,9 +817,14 @@ impl FakeBridge {
     async fn send(&mut self, f: BridgeFrame) -> FrameId {
         self.seq += 1;
         let id = FrameId::new(format!("b{}", self.seq));
-        write_frame(&mut self.writer, &Envelope::new(id.clone(), f))
-            .await
-            .expect("write");
+        let mut env = Envelope::new(id.clone(), f);
+        // Stamped on EVERY frame, never on one kind of frame, because that is what the field's own
+        // documentation says a bridge does — and because the redial's `hello` is then the same
+        // line of code as everything else, which is the only reason the two cannot drift.
+        if let Some(g) = self.generation.filter(|_| self.stamps) {
+            env = env.with_generation(g);
+        }
+        write_frame(&mut self.writer, &env).await.expect("write");
         id
     }
 
@@ -729,6 +866,25 @@ impl FakeBridge {
         panic!("the hub never sent the frame this test was waiting for");
     }
 
+    /// The next choice the hub sends, and the envelope id it went down under.
+    ///
+    /// The id is the half a bridge cannot make up: an `ack` for a choice has to name it, and the
+    /// hub matches on it, so a test that acks a tap has to read it off the wire exactly as a real
+    /// bridge does.
+    async fn next_choice(&mut self) -> (FrameId, OptionId) {
+        for _ in 0..20 {
+            let Some(env) = self.next().await else { break };
+            match env.payload {
+                HubFrame::Choice { option_id, .. } => return (env.id, option_id),
+                HubFrame::Ping => {
+                    self.send(BridgeFrame::Pong { r#ref: env.id }).await;
+                }
+                _ => {}
+            }
+        }
+        panic!("the hub never sent the tap this test was waiting for");
+    }
+
     async fn become_live(&mut self) {
         self.become_live_with_welcome().await;
     }
@@ -736,10 +892,17 @@ impl FakeBridge {
     /// The same, handing back the welcome — for the tests about what it names.
     async fn become_live_with_welcome(&mut self) -> Option<HubFrame> {
         let first = self.next().await.expect("a welcome or a ping");
+        // The lease is on the welcome's OWN envelope; there is no payload field carrying it, and
+        // there cannot be one — `flatten` would put both under the same key. Read before the
+        // payload is matched on, because matching moves it.
+        let lease = first.generation;
         let (welcome, ping) = match first.payload {
             HubFrame::Welcome { .. } => (Some(first.payload), self.next().await.expect("a ping")),
             _ => (None, first),
         };
+        if welcome.is_some() {
+            self.generation = lease;
+        }
         assert!(
             matches!(ping.payload, HubFrame::Ping),
             "expected a ping, got {:?}",
@@ -10511,5 +10674,1414 @@ async fn a_withdrawal_reason_too_long_for_a_message_is_not_written_whole_into_th
     assert!(
         retired.is_empty(),
         "the test's own setup is wrong: {retired:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Slice C — the tap that must be answered, and the generation fence.
+
+/// What `bot.rs::on_callback` does with a tap, in the order it does it: resolve it, hand the answer
+/// down under an id an `ack` can name, take the keyboard off, and then say where the receipt he is
+/// now looking at ended up.
+///
+/// Written here rather than reached for through `deliver`, because the ORDER is the property under
+/// test: the receipt is a message the bot sends after the answer is already on the wire, so an ack
+/// that comes back within a millisecond arrives before the hub knows where his receipt is.
+async fn tap_as_the_bot_does(
+    h: &Harness,
+    msg: &MsgId,
+    option: &str,
+    label: &str,
+    receipt: &MsgId,
+) -> FrameId {
+    let (addr, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), msg, &OptionId::new(option))
+        .await
+        .expect("the tap resolves");
+    let went = h
+        .hub
+        .deliver_tap(&addr, ALLOWED_CHAT, msg, ask_id, option_id, label)
+        .await
+        .expect("his answer went down to the bridge");
+    h.hub.answered_from_phone(ALLOWED_CHAT, msg, label).await;
+    h.hub.his_receipt_for_a_tap(&went, receipt).await;
+    went
+}
+
+/// Every in-place rewrite of one message, in order.
+async fn rewrites_of(fake: &Arc<FakeTelegram>, msg: &MsgId) -> Vec<String> {
+    fake.rewrites
+        .lock()
+        .await
+        .iter()
+        .filter(|(m, _)| m == msg)
+        .map(|(_, t)| t.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_tap_the_bridge_took_is_confirmed_by_an_edit_and_never_by_a_send() {
+    // "Sent" is what the queue knows. Whether the agent actually took the answer is what he wants,
+    // and it costs nothing to tell him: the line he is already looking at is edited, and an edit is
+    // not charged against the chat's per-minute ceiling.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9001");
+    let written_down = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let (frame, option) = bridge.next_choice().await;
+    assert_eq!(option, OptionId::new("y"));
+    assert_eq!(
+        frame, written_down,
+        "the tap was written down under an id that is not the one it went down under, so a \
+         bridge's answer for it can never be matched to it"
+    );
+
+    let sends_before = h.fake.sends.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+
+    until(async || !rewrites_of(&h.fake, &receipt).await.is_empty()).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert_eq!(
+        said.len(),
+        1,
+        "his receipt was rewritten more than once: {said:?}"
+    );
+    assert!(
+        said[0].contains("Taken") && said[0].contains("Yes"),
+        "the line he is looking at does not say the agent took his answer: {said:?}"
+    );
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        sends_before,
+        "confirming a tap spent a send out of the chat's budget"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_the_bridge_could_not_act_on_is_taken_back_on_the_phone_with_the_bridges_reason() {
+    // The whole reason a choice is acked at all. An opencode worker whose session has closed, or a
+    // tool server whose turn ended, refuses the answer on the wire — and until this existed the
+    // operator went on looking at "Sent" for an answer nothing ever took.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9002");
+    let frame = tap_as_the_bot_does(&h, &msg, "n", "No", &receipt).await;
+    let _ = bridge.next_choice().await;
+
+    let sends_before = h.fake.sends.lock().await.len();
+    let retired_before = h.fake.retired.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the session that asked has ended".into()),
+            files: None,
+        })
+        .await;
+
+    until(async || !rewrites_of(&h.fake, &receipt).await.is_empty()).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert_eq!(
+        said.len(),
+        1,
+        "his receipt was rewritten more than once: {said:?}"
+    );
+    assert!(
+        said[0].contains("Not taken") && said[0].contains("the session that asked has ended"),
+        "the line he is looking at does not say his answer was refused, or does not say why: {said:?}"
+    );
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        sends_before,
+        "taking a tap back spent a send out of the chat's budget"
+    );
+    assert_eq!(
+        h.fake.retired.lock().await.len(),
+        retired_before,
+        "the keyboard was taken off twice for one tap"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_never_promised_to_confirm_a_choice_is_not_nagged_about_it() {
+    // Green today, and it must stay green. Every bridge shipped so far acks no choice at all, and
+    // telling the operator that a session "has not confirmed" a tap it was never going to confirm
+    // is a worry with nothing behind it, on every tap he makes, for ever.
+    let h = harness().await;
+    h.hub.confirm_taps_within(Duration::from_millis(200));
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9003");
+    let _ = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let _ = bridge.next_choice().await;
+
+    // Well past the window, and nothing said.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert!(
+        said.is_empty(),
+        "a bridge that promised nothing was nagged about it: {said:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_promised_to_confirm_and_went_silent_is_said_so_once() {
+    // The other half: a bridge that said it would answer and did not is a real fault, and the
+    // operator is the only one who can act on it. Once, though — a line that rewrites itself every
+    // few seconds is a line nobody reads.
+    let h = harness().await;
+    h.hub.confirm_taps_within(Duration::from_millis(200));
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9004");
+    let sends_before = h.fake.sends.lock().await.len();
+    let _ = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let _ = bridge.next_choice().await;
+
+    until(async || !rewrites_of(&h.fake, &receipt).await.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert_eq!(
+        said.len(),
+        1,
+        "the operator was told about one unconfirmed tap more than once: {said:?}"
+    );
+    assert!(
+        said[0].contains("has not confirmed"),
+        "the line does not say what actually happened: {said:?}"
+    );
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        sends_before,
+        "saying a tap was not confirmed spent a send out of the chat's budget"
+    );
+}
+
+#[tokio::test]
+async fn the_lease_the_hub_grants_is_a_number_a_bridge_can_read() {
+    // Every bridge that exists reads frames with `JSON.parse`, which has no integers. Past
+    // `MAX_GENERATION` a number comes back as the nearest one a double can hold and the bridge
+    // stamps a generation the hub never minted — a run fenced for ever with no wrong-looking value
+    // anywhere in it.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    bridge.become_live().await;
+    let g = bridge
+        .generation
+        .expect("the hub grants a lease on the welcome's own envelope");
+    assert!(g > 0, "a zero is how a peer says it holds no generation");
+    assert!(
+        g <= hub_proto::MAX_GENERATION,
+        "the hub minted {g}, which is past what a bridge can read back"
+    );
+}
+
+#[tokio::test]
+async fn welcome_carries_the_generation_and_an_old_bridge_ignores_it() {
+    // The hub's half of the compatibility claim. A bridge from before the field exists reads the
+    // welcome, ignores a key it does not know, and goes on to ask a question and be answered —
+    // which is what every other test in this file also proves, said here on purpose.
+    let h = harness().await;
+    let mut old = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    let welcome = old.become_live_with_welcome().await.expect("a welcome");
+    assert!(matches!(welcome, HubFrame::Welcome { .. }));
+    assert!(
+        old.generation.is_some(),
+        "the welcome carried no lease, so a bridge that wanted one could not hold it"
+    );
+    assert!(
+        !old.stamps,
+        "the harness bridge must stay the shape of a bridge that knows nothing about generations"
+    );
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut old, "a1").await;
+    let (_, _, _) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("a bridge that ignored the lease is still answered");
+}
+
+#[tokio::test]
+async fn a_stale_generation_cannot_reclaim_after_a_newer_one_is_live() {
+    // The fence is read BEFORE the incumbent is. A run that has been replaced and comes back is
+    // not a rival for the address — it is over — and telling it "already claimed" sends it round
+    // the redial loop for ever against a hub that will never take it.
+    let h = harness().await;
+    let mut first =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    first.become_live().await;
+    let g1 = first.generation.expect("a lease");
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    let mut second =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i2", h.project.as_str())
+            .await;
+    second.become_live().await;
+    let g2 = second.generation.expect("a lease");
+    assert!(
+        g2 > g1,
+        "the later run was handed {g2}, which is not past {g1}"
+    );
+
+    let mut ghost =
+        FakeBridge::connect_stamping(&h.sock, &h.secret, "i1", h.project.as_str(), g1).await;
+    let refused = ghost
+        .wait_for(|f| match f {
+            HubFrame::Refused { reason } => Some(*reason),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        refused,
+        RefusedReason::StaleGeneration,
+        "a run whose generation has been replaced was turned away as a rival rather than as what \
+         it is"
+    );
+}
+
+#[tokio::test]
+async fn a_partitioned_run_that_returns_is_told_its_generation_is_over() {
+    // The same fence with NOTHING holding the address: a run that lost its socket for long enough
+    // for another to take the conversation and leave is still over, and admitting it would put a
+    // second voice in a topic that has moved on.
+    let h = harness().await;
+    let mut partitioned =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    partitioned.become_live().await;
+    let g1 = partitioned.generation.expect("a lease");
+
+    // The run that took the address while it was away, and then went away itself.
+    let later =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i2", h.project.as_str())
+            .await;
+    // The first one is still holding the claim until its socket goes, so the second waits for it.
+    drop(partitioned);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    drop(later);
+    let mut later =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i2", h.project.as_str())
+            .await;
+    later.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+    drop(later);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    let mut returning =
+        FakeBridge::connect_stamping(&h.sock, &h.secret, "i1", h.project.as_str(), g1).await;
+    let heard = returning.drain_for(Duration::from_millis(500)).await;
+    assert!(
+        heard.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration
+            }
+        )),
+        "a run whose generation is over was not told so: {heard:?}"
+    );
+    assert!(
+        !heard.iter().any(|f| matches!(f, HubFrame::Welcome { .. })),
+        "a run whose generation is over was welcomed back: {heard:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_frame_from_a_stale_generation_is_refused_not_delivered() {
+    // Both halves of the delivery fence, because they fail differently. While the connection is
+    // live the fence is what stops two voices in one topic; after the claim has gone the drain is
+    // what stops a run that is already over finishing its backlog into a conversation somebody
+    // else now holds.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // ── while it is still live ────────────────────────────────────────────────────────────────
+    h.hub.a_newer_run_has_taken(&h.own());
+    let sends_before = h.fake.sends.lock().await.len();
+    let id = bridge
+        .send(BridgeFrame::Say {
+            text: "from a run that has been replaced".into(),
+            file: None,
+            hint: None,
+        })
+        .await;
+    let why = bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref,
+                delivered,
+                why,
+            } if r#ref == &id => Some((*delivered, *why)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        why,
+        (Delivered::No, Some(hub_proto::AckWhy::StaleGeneration)),
+        "a superseded run was told its words landed"
+    );
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        sends_before,
+        "a run whose address has moved on still said something in the topic"
+    );
+    drop(bridge);
+
+    // ── and after the claim has gone, in the drain ────────────────────────────────────────────
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    // One send in flight, so the second frame is still queued behind it when the socket goes.
+    *h.fake.send_takes.lock().await = Duration::from_millis(1200);
+    bridge
+        .send(BridgeFrame::Say {
+            text: "the last thing it said".into(),
+            file: None,
+            hint: None,
+        })
+        .await;
+    bridge
+        .send(BridgeFrame::Say {
+            text: "and the one behind it".into(),
+            file: None,
+            hint: None,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    h.hub.a_newer_run_has_taken(&h.own());
+
+    until(async || {
+        h.fake
+            .sends
+            .lock()
+            .await
+            .iter()
+            .any(|(_, t, _)| t == "the last thing it said")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !h.fake
+            .sends
+            .lock()
+            .await
+            .iter()
+            .any(|(_, t, _)| t == "and the one behind it"),
+        "a run whose claim was gone finished its backlog into a conversation that had moved on"
+    );
+}
+
+#[tokio::test]
+async fn an_evicted_incumbent_is_told_and_stops_rather_than_being_forgotten() {
+    // Eviction used to be a silent overwrite: the map entry was replaced and the old connection
+    // found out only when its own socket happened to end. Everything it had queued went into the
+    // topic in the meantime, under the address a live successor now holds.
+    let h = harness_in_memory().await;
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+
+    let mut corpse = FakeBridge::over_remembering_its_lease(
+        &h.hub,
+        ConnectionIdentity::this_user_behind_a_dead_process(dead_pid),
+        &h.secret,
+        "i1",
+        h.project.as_str(),
+    )
+    .await;
+    corpse.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    let mut successor = FakeBridge::over_remembering_its_lease(
+        &h.hub,
+        ConnectionIdentity::this_process(),
+        &h.secret,
+        "i2",
+        h.project.as_str(),
+    )
+    .await;
+    successor.become_live().await;
+
+    let last = corpse.drain_for(Duration::from_millis(600)).await;
+    assert!(
+        last.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration
+            }
+        )),
+        "an evicted run that knows about generations was not told its address had moved on: {last:?}"
+    );
+    assert!(
+        corpse.is_closed_within(Duration::from_secs(2)).await,
+        "the evicted connection was left open"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_stamped_no_generation_is_never_sent_stale_generation() {
+    // The duty the wire types cannot enforce. Both TS refusal tables treat an unknown reason as
+    // temporary ON PURPOSE, so a bridge that does not know this word redials for ever the first
+    // time it is fenced — with nothing on his phone to say why. And an unknown `why` on an ack
+    // renders as "his phone did not take it", which would tell an agent that the operator's
+    // messaging app refused a frame his phone never saw.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    h.hub.a_newer_run_has_taken(&h.own());
+    let id = bridge
+        .send(BridgeFrame::Say {
+            text: "from a run that has been replaced".into(),
+            file: None,
+            hint: None,
+        })
+        .await;
+    let answer = bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref,
+                delivered,
+                why,
+            } if r#ref == &id => Some((*delivered, *why)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        answer,
+        (Delivered::No, None),
+        "a bridge that stamped no generation was told a word it cannot read"
+    );
+
+    // And the same on the refusal half: an evicted run that stamped nothing is told nothing.
+    let h = harness_in_memory().await;
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+    let mut corpse = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_user_behind_a_dead_process(dead_pid),
+        &h.secret,
+        "i1",
+        h.project.as_str(),
+    )
+    .await;
+    corpse.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+    let mut successor = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_process(),
+        &h.secret,
+        "i2",
+        h.project.as_str(),
+    )
+    .await;
+    successor.become_live().await;
+    let last = corpse.drain_for(Duration::from_millis(600)).await;
+    assert!(
+        !last.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration
+            }
+        )),
+        "a run that stamped no generation was sent a word it cannot read: {last:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_sends_no_generation_is_fenced_only_by_its_socket_and_its_pid() {
+    // Green today and pinned: the hole this slice does not close. Two bridges that both stamp
+    // nothing are separated by the claim and the pid exactly as they were before the field existed.
+    let h = harness().await;
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    first.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    let mut rival = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    let refused = rival
+        .wait_for(|f| match f {
+            HubFrame::Refused { reason } => Some(*reason),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        refused,
+        RefusedReason::AlreadyClaimed,
+        "a bridge that names no generation must be fenced by the claim, as it always was"
+    );
+
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut back = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    back.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+}
+
+#[tokio::test]
+async fn a_hub_restart_never_hands_out_a_generation_it_already_gave() {
+    // Two things hold this, and both are needed. The clock floor holds it across an ordinary
+    // restart; the file holds it when the clock steps backwards, which is the case a floor cannot
+    // see. So the number must climb AND the file must be on disk beside the other state.
+    let h = harness().await;
+    let mut before =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    before.become_live().await;
+    let g1 = before.generation.expect("a lease");
+    drop(before);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert!(
+        h.dir.path().join(crate::hub::GENERATIONS_FILE).exists(),
+        "the numbers the hub has handed out are not written down anywhere"
+    );
+
+    let (_hub, _fake, sock) = restarted(&h).await;
+    let mut after =
+        FakeBridge::connect_remembering_its_lease(&sock, &h.secret, "i2", h.project.as_str()).await;
+    after.become_live().await;
+    let g2 = after.generation.expect("a lease");
+    assert!(
+        g2 > g1,
+        "a hub that restarted handed out {g2} after it had already given {g1}"
+    );
+}
+
+#[tokio::test]
+async fn a_choice_ack_from_a_superseded_connection_never_touches_his_receipt() {
+    // The two halves of this slice meeting. A run whose address has moved on can still have a
+    // choice's id in hand — it was handed one a moment before — and an ack it sends for that id
+    // must never reach the line the operator is looking at. The fence refuses the frame before
+    // anything reads what it says about a tap.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9005");
+    let frame = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let _ = bridge.next_choice().await;
+
+    // The address moves on while the answer is in its hands.
+    h.hub.a_newer_run_has_taken(&h.own());
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert!(
+        said.is_empty(),
+        "a run that had been replaced rewrote the line he is looking at: {said:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_confirms_late_corrects_the_line_it_was_said_to_have_left_unanswered() {
+    // The window is not the end of the story. A worker that was wedged and comes back a minute
+    // later did take the answer, and leaving him reading "the session has not confirmed it" about
+    // something that was confirmed is the same wrong receipt this slice exists to stop — one
+    // sentence further on. The record stays for exactly the reason an unanswered record of his
+    // words stays, and is bounded by the same bound.
+    let h = harness().await;
+    h.hub.confirm_taps_within(Duration::from_millis(200));
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9006");
+    let frame = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let _ = bridge.next_choice().await;
+    until(async || !rewrites_of(&h.fake, &receipt).await.is_empty()).await;
+
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    until(async || rewrites_of(&h.fake, &receipt).await.len() == 2).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert!(
+        said[1].contains("Taken"),
+        "the line still says the session never confirmed an answer it did take: {said:?}"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// Sceptic 2, round 1 — probes.
+
+#[tokio::test]
+async fn every_frame_the_hub_sends_a_live_bridge_carries_the_lease_it_granted() {
+    // The handoff this slice hands to the plugin and the adapter says the lease is on the welcome's
+    // envelope "and on every frame the hub sends that connection afterwards". A bridge written to
+    // that sentence — one that checks the stamp before it acts, or a relay that strips and
+    // re-stamps what it forwards — is about to meet a `choice` with no stamp at all.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect_shaped(
+        &h.sock,
+        &h.secret,
+        "i1",
+        h.project.as_str(),
+        Some(vec!["choice".to_owned()]),
+        None,
+        true,
+    )
+    .await;
+    bridge.become_live().await;
+    let lease = bridge.generation.expect("the hub granted a lease");
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9101");
+    let _ = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let mut choice = None;
+    for _ in 0..20 {
+        let Some(env) = bridge.next().await else {
+            break;
+        };
+        match env.payload {
+            HubFrame::Choice { .. } => {
+                choice = Some(env);
+                break;
+            }
+            HubFrame::Ping => {
+                bridge.send(BridgeFrame::Pong { r#ref: env.id }).await;
+            }
+            _ => {}
+        };
+    }
+    let choice = choice.expect("the hub sent the tap down");
+    assert_eq!(
+        choice.generation,
+        Some(lease),
+        "his answer went down to the bridge with no lease on it, so a bridge that judges what it \
+         is handed by the stamp cannot tell whether the run it belongs to is still the live one"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_the_bridge_refused_is_never_reported_as_having_reached_nobody() {
+    // The refusal path takes the question back by the same call a delivery that never left uses,
+    // and that call writes "not sent — nothing here could be reached" onto the question. On this
+    // path something WAS reached: it took the answer off the wire and said no. Ordinarily the
+    // record is already gone and the call does nothing — but a keyboard edit Telegram refused (a
+    // message past 48 hours, a flood wait) is exactly the case the record is KEPT for, and then it
+    // is not a no-op and he reads a sentence that is not true.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    // The keyboard edit fails, which is what leaves the record on the ledger with his answer
+    // written on it, waiting for the next thing that can take the buttons off.
+    *h.fake.retire_fails.lock().await = true;
+    let receipt = MsgId::new("9102");
+    let frame = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let _ = bridge.next_choice().await;
+    *h.fake.retire_fails.lock().await = false;
+
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the session that asked has ended".into()),
+            files: None,
+        })
+        .await;
+    until(async || !rewrites_of(&h.fake, &receipt).await.is_empty()).await;
+
+    let notes: Vec<String> = h
+        .fake
+        .retired
+        .lock()
+        .await
+        .iter()
+        .filter(|(_, m, _)| m == &msg)
+        .map(|(_, _, note)| note.clone())
+        .collect();
+    assert!(
+        !notes
+            .iter()
+            .any(|n| n.contains("nothing here could be reached")),
+        "the question he is looking at says his answer reached nobody, when it reached the agent \
+         and the agent said no: {notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_the_bridge_confirmed_is_never_left_reading_that_it_was_not() {
+    // Two writers edit one line and neither can see the other. The window's task reads the record,
+    // lets the lock go, and only then makes its edit; the ack that arrives while that edit is in
+    // flight takes the record away and makes its own. Whichever Telegram call lands second is what
+    // he is left reading, and nothing comes after it to correct it. The repo already knows this
+    // shape — `mark_permit` exists because two reactions on one message raced the same way.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    h.hub.confirm_taps_within(Duration::from_millis(50));
+    let receipt = MsgId::new("9601");
+    let frame = tap_as_the_bot_does(&h, &msg, "y", "Yes", &receipt).await;
+    let _ = bridge.next_choice().await;
+
+    // The window's edit goes out and is slow; the ack arrives while it is still in flight.
+    *h.fake.slow_first_rewrite.lock().await = Some(Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert!(
+        !said.last().is_some_and(|t| t.contains("has not confirmed")),
+        "the last thing he is left reading about a tap the agent took is that it was never \
+         confirmed: {said:?}"
+    );
+}
+
+// ── sceptic 1, review round 1: attacks on the claim critical section and the fence ────────────
+
+#[tokio::test]
+async fn a_run_that_redials_with_the_lease_it_held_is_not_fenced_on_what_it_queued_before_the_welcome()
+ {
+    // A bridge that lost its socket redials with the number it is holding and flushes the backlog
+    // it kept — and it WROTE those frames before it could possibly have read the new welcome, so
+    // they carry the old number. The wire half of the fence compares every frame's stamp against
+    // the lease just minted, so a live, conforming run has its whole backlog refused with the one
+    // word its own table treats as permanent.
+    let h = harness().await;
+    let mut first =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    first.become_live().await;
+    let g1 = first.generation.expect("a lease");
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    let mut back =
+        FakeBridge::connect_stamping(&h.sock, &h.secret, "i1", h.project.as_str(), g1).await;
+    let id = back
+        .send(BridgeFrame::Say {
+            text: "what it queued while it was away".into(),
+            file: None,
+            hint: None,
+        })
+        .await;
+    back.become_live().await;
+
+    let answer = back
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref,
+                delivered,
+                why,
+            } if r#ref == &id => Some((*delivered, *why)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        answer,
+        (Delivered::Yes, None),
+        "a run that redialled with the lease it held had the backlog it carried in refused as \
+         though it belonged to somebody else"
+    );
+}
+
+#[tokio::test]
+async fn a_run_whose_generation_is_over_is_not_written_down_as_a_second_bridge() {
+    // The audit is where an incident is read from. A run turned away because its generation has
+    // been replaced is turned away with NOTHING holding the address, so writing it down as a
+    // rival sends the reader looking for a second bridge that does not exist.
+    let h = harness().await;
+    let mut first =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    first.become_live().await;
+    let g1 = first.generation.expect("a lease");
+    drop(first);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut second =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i2", h.project.as_str())
+            .await;
+    second.become_live().await;
+    drop(second);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    let mut ghost =
+        FakeBridge::connect_stamping(&h.sock, &h.secret, "i1", h.project.as_str(), g1).await;
+    let refused = ghost
+        .wait_for(|f| match f {
+            HubFrame::Refused { reason } => Some(*reason),
+            _ => None,
+        })
+        .await;
+    assert_eq!(refused, RefusedReason::StaleGeneration);
+    // The audit line is written after the refusal is on the wire, so wait for the connection to
+    // finish rather than reading a file the hub has not got to yet.
+    until(async || {
+        !std::fs::read_to_string(h.hub.audit.path())
+            .unwrap_or_default()
+            .is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let audit = std::fs::read_to_string(h.hub.audit.path()).unwrap_or_default();
+    assert!(
+        !audit.contains("another bridge already holds this conversation"),
+        "a run whose generation was over was written down as a rival for an address nobody \
+         holds:\n{audit}"
+    );
+}
+
+#[test]
+fn a_run_number_file_that_says_an_address_has_reached_the_ceiling_is_repaired_not_believed() {
+    // The floor for the next run comes off disk, and the one value it must never come back as is
+    // the ceiling: the mint clamps there, so two runs of the same address are handed the SAME
+    // number — and then the reclaim fence stops refusing and the delivery fence stops firing, with
+    // no wrong-looking value anywhere for a person to notice. Only a hand-edited or corrupted file
+    // can put it there; no clock this hub reads is within a quarter of a million years of it.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join(GENERATIONS_FILE);
+    let addr = Addr {
+        project: ProjectId::new("p-000000000000"),
+        lane: None,
+    };
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&HandedOut {
+            hub_pid: 1,
+            at: 0,
+            addresses: vec![AddressGeneration {
+                project: addr.project.clone(),
+                lane: None,
+                generation: hub_proto::MAX_GENERATION,
+            }],
+        })
+        .expect("the file this hub writes is writable"),
+    )
+    .expect("a temp dir is writable");
+
+    let mut handed_out = Generations::load(path);
+    let first = handed_out.mint(&addr, 0);
+    let second = handed_out.mint(&addr, 0);
+    assert!(
+        second > first,
+        "two runs of one address were handed the same number ({first}), so nothing can tell them \
+         apart and the fence between them points nowhere"
+    );
+}
+
+#[test]
+fn a_lease_a_bridge_made_up_can_never_put_the_run_numbers_on_the_ceiling() {
+    // The arriving run's own number is believed on purpose: a hub whose file was lost and whose
+    // clock came back wrong must not welcome a live run with a number behind the one it already
+    // holds and then refuse its own backlog. But that number comes off the WIRE, from an adapter a
+    // stranger wrote to a document, and the one value it must never be allowed to be is the
+    // ceiling — the mint clamps there, so every run of the address is handed the SAME number, the
+    // reclaim fence stops refusing and the delivery fence stops firing, with nothing anywhere that
+    // looks wrong. A corrupt file gets exactly this repair on the way in; a corrupt hello is no
+    // more trustworthy than a hand-edited file.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join(GENERATIONS_FILE);
+    let addr = Addr {
+        project: ProjectId::new("p-000000000000"),
+        lane: None,
+    };
+
+    let mut handed_out = Generations::load(path);
+    let first = handed_out.mint(&addr, hub_proto::MAX_GENERATION);
+    let second = handed_out.mint(&addr, 0);
+    assert!(
+        first < hub_proto::MAX_GENERATION,
+        "a number a bridge sent put the floor on the ceiling ({first}), where nothing can climb \
+         past it"
+    );
+    assert!(
+        second > first,
+        "two runs of one address were handed the same number ({first}) because one of them said \
+         its own was the highest there is, so nothing can tell them apart"
+    );
+}
+
+// ═══ sceptic 1, round 2 — probes ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn a_run_holding_a_lease_this_hub_has_forgotten_is_not_fenced_on_the_backlog_it_carries() {
+    // The floor went backwards under a run that is still alive: the file that remembers what was
+    // handed out could not be read, and the clock came back wrong. The run redials with the number
+    // it legitimately holds, is ADMITTED (the fence deliberately does not refuse a number ahead of
+    // the floor), and is welcomed with a LOWER one — and then every frame it queued before the
+    // welcome carries the higher number and is refused as somebody else's.
+    let h = harness().await;
+    let ahead = super::now_millis() + 10_000_000;
+    let mut bridge =
+        FakeBridge::connect_stamping(&h.sock, &h.secret, "i1", h.project.as_str(), ahead).await;
+    bridge.become_live().await;
+    let granted = bridge.generation.expect("a lease");
+    assert!(
+        granted > ahead,
+        "a run was welcomed with {granted}, behind the {ahead} it already holds, so its own \
+         backlog is a later generation's to the wire fence"
+    );
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // What it wrote before it could possibly have read the new welcome.
+    bridge.generation = Some(ahead);
+    let id = bridge
+        .send(BridgeFrame::Say {
+            text: "queued before the welcome".into(),
+            file: None,
+            hint: None,
+        })
+        .await;
+    let answer = bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref,
+                delivered,
+                why,
+            } if r#ref == &id => Some((*delivered, *why)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        answer,
+        (Delivered::Yes, None),
+        "a live run's own backlog was refused as a later generation's, with the one word its \
+         table treats as permanent"
+    );
+}
+
+#[tokio::test]
+async fn a_check_that_makes_no_topic_does_not_end_a_live_run_that_is_only_redialling() {
+    // `--check` connects, reads the welcome and says `bye` on purpose so that proving an
+    // environment can reach the hub makes no topic. It also CLAIMS, so it mints — and a session
+    // whose socket happened to be down for a second is then refused for ever, by a command
+    // advertised as making nothing.
+    let h = harness().await;
+    let mut live =
+        FakeBridge::connect_remembering_its_lease(&h.sock, &h.secret, "i1", h.project.as_str())
+            .await;
+    live.become_live().await;
+    let g1 = live.generation.expect("a lease");
+    // Its socket flaps.
+    drop(live);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    // The operator proves the wall can reach the hub.
+    let mut check = FakeBridge::connect(&h.sock, &h.secret, "check", h.project.as_str()).await;
+    check
+        .wait_for(|f| matches!(f, HubFrame::Welcome { .. }).then_some(()))
+        .await;
+    check
+        .send(BridgeFrame::Bye {
+            reason: "just checking".into(),
+        })
+        .await;
+    drop(check);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    // The session comes back with the lease it holds.
+    let mut back =
+        FakeBridge::connect_stamping(&h.sock, &h.secret, "i1", h.project.as_str(), g1).await;
+    let heard = back.drain_for(Duration::from_millis(600)).await;
+    assert!(
+        !heard.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration
+            }
+        )),
+        "a check that made no topic ended a live session for ever: {heard:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_old_bridge_evicted_before_it_ever_answered_the_ping_is_told_no_word_it_cannot_read() {
+    // The pre-pong half of the same duty. A bridge that stamps nothing can be evicted while it is
+    // still in the settling window, and there the kick's reason and its acks come from a different
+    // line of code than the live loop's.
+    let h = harness_in_memory().await;
+    let mut child = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn");
+    let dead_pid = child.id();
+    child.wait().expect("reap");
+    let mut corpse = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_user_behind_a_dead_process(dead_pid),
+        &h.secret,
+        "i1",
+        h.project.as_str(),
+    )
+    .await;
+    // Read the welcome and the ping but NEVER pong: it stays in the settling window.
+    let _ = corpse.next().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+    let mut successor = FakeBridge::over(
+        &h.hub,
+        ConnectionIdentity::this_process(),
+        &h.secret,
+        "i2",
+        h.project.as_str(),
+    )
+    .await;
+    successor.become_live().await;
+    let last = corpse.drain_for(Duration::from_millis(600)).await;
+    assert!(
+        !last.iter().any(|f| matches!(
+            f,
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration
+            } | HubFrame::Ack {
+                why: Some(hub_proto::AckWhy::StaleGeneration),
+                ..
+            }
+        )),
+        "a run that stamped no generation was sent a word it cannot read: {last:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_two_runs_of_one_address_are_ever_handed_the_same_number() {
+    // The mint is inside the claim's own critical section for exactly this. Twenty runs of one
+    // address, one after another as fast as the socket allows, and two of them sharing a number
+    // would leave the fence between them pointing nowhere.
+    let h = harness().await;
+    let mut seen: Vec<u64> = Vec::new();
+    for n in 0..20 {
+        let mut b = FakeBridge::connect_remembering_its_lease(
+            &h.sock,
+            &h.secret,
+            &format!("i{n}"),
+            h.project.as_str(),
+        )
+        .await;
+        b.become_live().await;
+        seen.push(b.generation.expect("a lease"));
+        drop(b);
+        until(async || !h.hub.is_claimed(&h.own()).await).await;
+    }
+    let mut sorted = seen.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        seen.len(),
+        "two runs of one address were handed the same number: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[1] > w[0]),
+        "the numbers handed out for one address did not climb: {seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------- sceptic 2, round 2 probes
+
+#[tokio::test]
+async fn the_first_thing_a_session_says_about_a_tap_is_what_he_reads() {
+    // The hub's own rule for his typed words: the first answer counts, and the record goes with it
+    // so a second cannot write a second line. A tap has a window where that rule is not held —
+    // between the answer going down and Telegram saying which message his receipt is — and in that
+    // window a second `ack` simply overwrites the first.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let (addr, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    let frame = h
+        .hub
+        .deliver_tap(&addr, ALLOWED_CHAT, &msg, ask_id, option_id, "Yes")
+        .await
+        .expect("his answer went down");
+    let _ = bridge.next_choice().await;
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+
+    // Two answers for one tap, both while Telegram is still making his receipt.
+    let first = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame.clone(),
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &first => Some(()),
+            _ => None,
+        })
+        .await;
+    let second = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame.clone(),
+            status: AckStatus::Refused,
+            reason: Some("on second thoughts".into()),
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &second => Some(()),
+            _ => None,
+        })
+        .await;
+
+    let receipt = MsgId::new("9101");
+    h.hub.his_receipt_for_a_tap(&frame, &receipt).await;
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert_eq!(said.len(), 1, "his receipt was rewritten twice: {said:?}");
+    assert!(
+        said[0].contains("Taken") && !said[0].contains("Not taken"),
+        "a session said it took his answer and then said something else, and the second word is \
+         the one he reads: {said:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_promised_and_went_silent_is_said_so_even_when_his_receipt_was_slow() {
+    // The window starts when the answer goes down, and the line it would edit does not exist until
+    // Telegram has made his receipt — a round trip that starts afterwards. When that round trip
+    // outlasts the window, nothing is ever said: the window has already run and there is nothing
+    // left to run it again.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    h.hub.confirm_taps_within(Duration::from_millis(50));
+    let (addr, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    let frame = h
+        .hub
+        .deliver_tap(&addr, ALLOWED_CHAT, &msg, ask_id, option_id, "Yes")
+        .await
+        .expect("his answer went down");
+    let _ = bridge.next_choice().await;
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+
+    // Telegram takes longer over his receipt than the bridge has to confirm.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let receipt = MsgId::new("9102");
+    h.hub.his_receipt_for_a_tap(&frame, &receipt).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let said = rewrites_of(&h.fake, &receipt).await;
+    assert_eq!(
+        said.len(),
+        1,
+        "a session that promised to confirm said nothing, and the line he is looking at still \
+         says only that his answer was sent: {said:?}"
+    );
+    assert!(
+        said[0].contains("has not confirmed"),
+        "the line does not say the session never confirmed: {said:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_conversations_tap_does_not_hold_up_what_another_conversation_says() {
+    // Every `ack` of every project takes the same permit before it has even looked at what the ack
+    // is about, and the tap branch holds that permit across Telegram round trips. One refused tap
+    // in one topic therefore parks the handler of every other connection on this box.
+    let h = harness().await;
+    let mut mine =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    mine.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut mine, "a1").await;
+
+    let receipt = MsgId::new("9103");
+    let tap = tap_as_the_bot_does(&h, &msg, "n", "No", &receipt).await;
+    let _ = mine.next_choice().await;
+    let (other, mut theirs) = a_second_project(&h, "llm-gateway", "i2").await;
+
+    // His words to the OTHER project, and the id they went down under.
+    assert!(
+        h.hub
+            .relay(
+                &other,
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &MsgId::new("m77"),
+                "carry on",
+                None
+            )
+            .await
+    );
+    // The envelope id is what an ack names; read it off the wire the way a bridge does.
+    let mut words_id = None;
+    for _ in 0..20 {
+        let Some(env) = theirs.next().await else {
+            break;
+        };
+        match env.payload {
+            HubFrame::Message { .. } => {
+                words_id = Some(env.id);
+                break;
+            }
+            HubFrame::Ping => {
+                theirs.send(BridgeFrame::Pong { r#ref: env.id }).await;
+            }
+            _ => {}
+        }
+    }
+    let words_id = words_id.expect("his words went down to the other project");
+
+    // The tap's confirming edit is a Telegram round trip, and it is slow.
+    *h.fake.slow_first_rewrite.lock().await = Some(Duration::from_millis(1500));
+    let marks_before = h.fake.marks.lock().await.len();
+    mine.send(BridgeFrame::Ack {
+        r#ref: tap,
+        status: AckStatus::Refused,
+        reason: Some("the session that asked has ended".into()),
+        files: None,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let began = std::time::Instant::now();
+    theirs
+        .send(BridgeFrame::Ack {
+            r#ref: words_id,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    until(async || h.fake.marks.lock().await.len() > marks_before).await;
+    let waited = began.elapsed();
+    assert!(
+        waited < Duration::from_millis(600),
+        "a second conversation's answer waited {waited:?} on a Telegram round trip belonging to a \
+         tap in a topic it has nothing to do with"
+    );
+}
+
+#[tokio::test]
+async fn a_tap_the_agent_refused_is_not_left_looking_sent_because_one_edit_failed() {
+    // The line he is looking at is the only place a refusal is ever said, the record goes before
+    // the edit is attempted, and nothing tries again. One refused edit — a message Telegram will
+    // not touch, a transient 5xx — and he goes on acting on an answer the agent said no to, with
+    // the journal the only place it is written down.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let receipt = MsgId::new("9104");
+    let frame = tap_as_the_bot_does(&h, &msg, "n", "No", &receipt).await;
+    let _ = bridge.next_choice().await;
+
+    *h.fake.rewrite_fails.lock().await = true;
+    let said = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame.clone(),
+            status: AckStatus::Refused,
+            reason: Some("the session that asked has ended".into()),
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &said => Some(()),
+            _ => None,
+        })
+        .await;
+    *h.fake.rewrite_fails.lock().await = false;
+
+    // Anything at all that reaches him: the line corrected on a second try, or a sentence under
+    // the question. What there must not be is silence.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let corrected = !rewrites_of(&h.fake, &receipt).await.is_empty();
+    let under_the_question = h
+        .fake
+        .replies
+        .lock()
+        .await
+        .iter()
+        .any(|(_, t, _)| t.contains("not taken") || t.contains("Not taken"));
+    assert!(
+        corrected || under_the_question,
+        "the agent refused his answer, the one edit that says so was refused by Telegram, and \
+         nothing else ever tells him: he is still reading that it was sent"
     );
 }

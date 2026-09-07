@@ -31,7 +31,7 @@ import { createRelay } from './relay.ts'
 import { runCheck } from './check.ts'
 import { runChild } from './run.ts'
 import { startWatcher } from './opencode.ts'
-import { PRIVATE_DOOR_PREFIX, bindingFileProblem, bindingGenerationProblem, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
+import { PRIVATE_DOOR_PREFIX, attachedAs, bindingFileProblem, bindingGenerationProblem, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, toolServerFact, typedWordsFact } from './plan.ts'
 
 /** Say something in this process's own transcript, prefixed so a journal tells it from the child's. */
 function note(msg: string): void {
@@ -311,6 +311,14 @@ function watcherConfig(url: string) {
     instance: WATCHER_INSTANCE!,
     opencodeUrl: url,
     bindingFile: ARGS.bindingFile,
+    // Which conversation this wall speaks for, so a binding written for a SIBLING room is refused
+    // rather than obeyed. Asked afresh, like the secret beside it: the operator may grant while the
+    // wall is running, and that is the recovery a refusal sends him to.
+    attachedAs: () => attachedAs(CONFIG),
+    // Which way the wall was started, so a refusal about the conversation offers a way out this
+    // wall could actually take: a secret handed by path and a conversation told are two answers to
+    // one question, and attach refuses to start on both.
+    tokenFile: CONFIG.tokenFile,
     // Proved a whole number above, so the fence is held at what the wall said and never at NaN.
     bindingGeneration: ARGS.bindingGeneration === null ? null : Number(ARGS.bindingGeneration),
     secretOf: () => secretFor(CONFIG),

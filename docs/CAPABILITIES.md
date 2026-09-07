@@ -26,6 +26,16 @@
      binding it had reached is destroyed by the restart that a stale writer's file outlives — which
      is why OPEN 5's durable form names the floor beside the generation: whoever launches is the
      only party that can say either.
+     Amended 7 September, before anything ran, keeping v17: the local mechanism OPEN 5 names had
+     been written down in this project's own names, and the launcher — another org's program, and the
+     one that writes the file — had already shipped the object in its own. Two shapes with no key in
+     common, which would have refused every binding and with it every line the operator typed in a
+     room. The launcher's names are kept, and the one thing the durable form gains is the
+     **conversation**: the conversation the binding names is checked against the conversation the
+     adapter is attached as, which is the only field that catches a binding written for a sibling
+     room whose directory and agent would both pass. Nothing on the wire moved, no offer changed, and
+     the hub still learns nothing about a session.
+
      v16 says what CARRIES the frames, which this file had never
      separated from the frames themselves. `AF_UNIX` appeared once, inside REQUIRES 3, as though the
      socket were part of hub-proto. It is not: the frames are one thing and the transport under them
@@ -328,15 +338,19 @@ Each is a line, not an omission. Several were paid for.
    is a small file the launcher writes and the adapter reads (`docs/ATTACHING.md` §13.10), which
    works only because both are processes on one box with one filesystem; it is a local
    implementation detail and **not the contract between the two orgs**, and neither side should
-   build on the file. The durable form is the **typed binding itself** — the session, the directory
-   it is canonically for, the agent it is supposed to be, a number saying which generation of it
-   this is, so a stale writer cannot retarget a newer conversation, and the **floor** that number is
-   held at for one run of the adapter, because the adapter's own memory of how far it had got is
-   exactly what a restart destroys and a stale writer's file survives. Both numbers come from
-   whoever launches; an adapter can enforce them and can mint neither. That is what a transport
-   which is not this machine (OPEN 4) would have to carry with no filesystem under it, and what an
-   engine that can hold a tag of its own could answer for itself instead of anyone writing a file at
-   all.
+   build on the file. The durable form is the **typed binding itself** — the **conversation** it is
+   for, the session, the directory it is canonically for, the agent it is supposed to be, a number
+   saying which generation of it this is, so a stale writer cannot retarget a newer conversation,
+   and the **floor** that number is held at for one run of the adapter, because the adapter's own
+   memory of how far it had got is exactly what a restart destroys and a stale writer's file
+   survives. Both numbers come from whoever launches; an adapter can enforce them and can mint
+   neither. The conversation is the field that makes the binding self-describing rather than
+   positional: **the conversation the binding names is checked against the conversation the adapter
+   is attached as**, and a binding written for a sibling room is refused by its own words — the one
+   failure a directory and an agent can both pass, since two rooms of one wall can share both. That
+   is what a transport which is not this machine (OPEN 4) would have to carry with no filesystem
+   under it, and what an engine that can hold a tag of its own could answer for itself instead of
+   anyone writing a file at all.
 
 ## Two measurements that bind both of us
 

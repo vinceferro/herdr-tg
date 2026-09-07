@@ -40,10 +40,12 @@ producer at its own door); and with `--run` it starts the engine as its child so
 entrypoint (`run.ts`). The tool server (what the agent chose to say) and the watcher both attach to
 the door over a local socket speaking hub-proto unchanged, so **the hub never learns there were
 several**. **Which** session of that server it speaks to is not a guess: `--opencode-binding-file`
-names the file a launcher writes — one JSON object, stamped `"v": 1`, carrying the session, the
-project it is for, the agent it should be running and which writing of it this is — and attach
-speaks to that session and to no other in both directions, refusing his line out loud rather than
-falling back to the most recently active one, with the file proved before a byte of it is believed
+names the file a launcher writes — one JSON object, stamped `"version": 1`, carrying the
+conversation it was written for, the session, the project it is for, the agent it should be running
+and which writing of it this is, in the launcher's own key names — and attach
+speaks to that session and to no other in both directions, refusing his line out loud (a binding
+written for a sibling room's conversation among them) rather than falling back to the most recently
+active one, with the file proved before a byte of it is believed
 (where it sits, the link it might be, its owner, its mode). `--opencode-binding-generation` is the
 floor that survives a restart, because what the process remembers about how far the launcher had got
 is exactly what a restart destroys and a stale launcher's file outlives — the unit carries it in the

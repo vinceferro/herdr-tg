@@ -35,7 +35,7 @@ import { join } from 'path'
 
 import { notEnrolled, readConfig, secretFor } from '../../plugins/kickoff-channel/attach.ts'
 import { HubLink } from '../../plugins/kickoff-channel/hub-link.ts'
-import { bindingFileProblem, bindingGenerationProblem, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, readBindingFile, sameDirectory, toolServerFact, typedWordsFact } from './plan.ts'
+import { THE_VERSION_LINE, attachedAs, bindingFileProblem, bindingGenerationProblem, opencodeUrlProblem, privateDoorPlan, producerFlagProblem, readBindingFile, sameDirectory, toolServerFact, typedWordsFact } from './plan.ts'
 
 export type CheckOptions = {
   /** The opencode URL, if `--opencode` was on the line — checked for a port, as the start does. */
@@ -288,12 +288,32 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
         // and no question is ever shown; the likeliest by hand is a launcher copying the wrong
         // project into the binding. Whether the session is OPEN stays the server's answer and is
         // still not asked here.
-        const { directory, generation } = binding.binding
-        if (opts.bindingGeneration !== null && generation === null) {
+        const { canonicalProjectDir, conversation, generation } = binding.binding
+        // Which conversation the note was written for is the third such claim, and the one no
+        // server could ever settle: a sibling room's session resolves, sits in a room tree, and
+        // runs the expected agent. Checked here for the same reason as the other two — what this
+        // command blesses, the worker can do.
+        const here = attachedAs(CONFIG)
+        // Weighed in the order the WORKER weighs them (`bindingNow`), and the conversation is first
+        // there. One note can carry two faults at once, and what this command names first is the
+        // fault somebody mends: naming a different one from the worker's sends them to fix the
+        // thing the worker was never going to reach, and every typed line still refused after it.
+        if (conversation !== null && here === null && CONFIG.tokenFile !== null) {
+          // A wall pointed at its secret BY PATH cannot also be told which conversation it is —
+          // this same program refuses the two variables together — so the way out has to name the
+          // path it would be replacing, not a variable that would stop the wall starting at all.
+          // Written out whole rather than assembled from a condition: the sentence a person acts on
+          // is the thing to read in one piece, here and in the document that quotes it.
+          not(`the worker's session: ${opts.bindingFile} is written for conversation ${conversation}, and this worker was pointed at its secret by path (KICKOFF_HUB_TOKEN_FILE), which does not say which conversation that secret is for, so the claim cannot be checked and every line the operator types would be refused; start it with KICKOFF_HUB_CONVERSATION in place of KICKOFF_HUB_TOKEN_FILE, or whatever writes the note must leave "conversation" out`)
+        } else if (conversation !== null && here === null) {
+          not(`the worker's session: ${opts.bindingFile} is written for conversation ${conversation}, and nothing here says which conversation this worker is, so the claim cannot be checked and every line the operator types would be refused; start it with KICKOFF_HUB_CONVERSATION, or whatever writes the note must leave "conversation" out`)
+        } else if (conversation !== null && conversation !== here) {
+          not(`the worker's session: ${opts.bindingFile} is written for conversation ${conversation} and this worker speaks for ${here}, so every line the operator types would be refused`)
+        } else if (opts.bindingGeneration !== null && generation === null) {
           not(`the worker's session: ${opts.bindingFile} does not say how new it is, and this worker would be started for binding ${opts.bindingGeneration}; whatever writes it must number every writing`)
         } else if (opts.bindingGeneration !== null && generation !== null && generation < Number(opts.bindingGeneration)) {
           not(`the worker's session: ${opts.bindingFile} is older than the one this worker was started for; it is binding ${generation} and the number given is ${opts.bindingGeneration}, so every line the operator types would be refused`)
-        } else if (directory !== null && !sameDirectory(directory, CONFIG.projectDir)) {
+        } else if (canonicalProjectDir !== null && !sameDirectory(canonicalProjectDir, CONFIG.projectDir)) {
           not(`the worker's session: ${opts.bindingFile} is written for a different project than the one this is run in, so every line the operator types would be refused`)
         } else {
           ok(`the worker's session: ${opts.bindingFile} names a session, and every line the operator types goes to that one or is refused`)
@@ -306,10 +326,18 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
         not(`the worker's session: ${opts.bindingFile} is not safe to read, so nothing it says is trusted — ${binding.why}; it must be a plain file this user owns that nobody else can read or write, in directories nobody else can write`)
       } else if (binding.state === 'unreadable') {
         not(`the worker's session: ${opts.bindingFile} is there and could not be read; attach must be able to read it, and it is written by whatever starts the engine`)
+      } else if (binding.state === 'says no version') {
+        // The one key this side asked the launcher for, and the whole of the fix: named with its
+        // value, because whoever wrote the launcher cannot act on "add a version".
+        not(`the worker's session: ${opts.bindingFile} does not say which form it is written in; whatever writes it must add ${THE_VERSION_LINE} to the object it writes, or every line the operator types is refused`)
       } else if (binding.state === 'a form it does not know') {
-        not(`the worker's session: ${opts.bindingFile} is written in a form attach does not know; it holds one JSON object, saying "v": 1 and naming the session as "session"`)
+        // What was wrong with it, in the same line. "It holds one JSON object, saying …" describes
+        // the shape and names nothing about THIS note, and a person handed only that about a file
+        // they cannot see mends it a key at a time — which is four edits for the one note a
+        // launcher from before the two halves agreed on a spelling actually writes.
+        not(`the worker's session: ${opts.bindingFile} is written in a form attach does not know — ${binding.why}; it holds one JSON object, saying ${THE_VERSION_LINE} and naming the session as "session_id"`)
       } else {
-        not(`the worker's session: ${opts.bindingFile} is not one attach can read; it holds one JSON object, saying "v": 1 and naming the session as "session"`)
+        not(`the worker's session: ${opts.bindingFile} is not one attach can read — ${binding.why}; it holds one JSON object, saying ${THE_VERSION_LINE} and naming the session as "session_id"`)
       }
       // Only absence. A directory that is there and cannot be looked into has already been named
       // above, in the line that says what is wrong with it; saying "nothing has made it yet" in the

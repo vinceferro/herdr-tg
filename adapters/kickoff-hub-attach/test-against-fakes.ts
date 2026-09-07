@@ -906,6 +906,15 @@ try {
       renameSync(`${notePath}.new`, notePath)
     }
 
+    // The rig is attached AS a conversation, because the launcher's note says which conversation
+    // the session belongs to and the whole point of that key is that it is compared with this one.
+    // Written the way the channel keeps it: the hub's own state directory, one secret per room.
+    const ROOM = 'c-0d0d0d0d0d0d'
+    const ANOTHER_ROOM = 'c-0e0e0e0e0e0e'
+    const noteXdg = join(noteDir, 'xdg')
+    mkdirSync(join(noteXdg, 'herdr-tg', 'conversations', ROOM), { recursive: true, mode: 0o700 })
+    writeFileSync(join(noteXdg, 'herdr-tg', 'conversations', ROOM, 'secret'), SECRET, { mode: 0o600 })
+
     const BOUND = 'ses_theBoundOne00000000000'
     const NEWER = 'ses_theNewerOne00000000000'
     const OTHER = 'ses_theOtherOne00000000000'
@@ -919,6 +928,8 @@ try {
         env: {
           ...process.env,
           KICKOFF_HUB_PROJECT_DIR: noteRepo,
+          KICKOFF_HUB_CONVERSATION: ROOM,
+          XDG_STATE_HOME: noteXdg,
           KICKOFF_HUB_SOCKET: join(noteDir, 'hub.sock'),
           KICKOFF_HUB_RELAY_SOCKET: join(noteDir, 'door.sock'),
         },
@@ -971,7 +982,7 @@ try {
       // The last of these is a note from a launcher that knows something this attach does not: a
       // key it cannot read may be a NARROWING of what the session must be, and obeying the rest of
       // the note while dropping it would be delivering his words on a rule nobody checked.
-      for (const bad of ['the coordinator', '{"v":1,"session":"ses_theBou', '{"v":1,"directory":"/somewhere"}', 'ses_the one\nses_two', '{"v":1,"session":"ses_theBoundOne00000000000","must_be_titled":"the room"}']) {
+      for (const bad of ['the coordinator', '{"version":1,"session_id":"ses_theBou', '{"version":1,"canonical_project_dir":"/somewhere"}', 'ses_the one\nses_two', '{"version":1,"session_id":"ses_theBoundOne00000000000","must_be_titled":"the room"}']) {
         writeNote(bad)
         malformed.push(await reasonFor(typeAt('take this')))
       }
@@ -983,7 +994,7 @@ try {
 
       // The whole point: two root sessions in one directory, the note names the OLDER, and the
       // most-recent rule must lose.
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       const beforeBound = prompts().length
       const boundId = typeAt('try it with --dry-run first')
       check(
@@ -1003,7 +1014,7 @@ try {
       )
 
       // A note left behind by a previous run of the wall.
-      writeNote(JSON.stringify({ v: 1, session: 'ses_theGoneOne0000000000000' }))
+      writeNote(JSON.stringify({ version: 1, session_id: 'ses_theGoneOne0000000000000' }))
       const beforeStale = prompts().length
       const stale = await reasonFor(typeAt('are you there'))
       check(
@@ -1014,7 +1025,7 @@ try {
 
       // Archived: the session exists, and speaking to it is not the same as speaking to the worker.
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115, { time: { created: 1, updated: 1788607585115, archived: 1788607586000 } }), listedSession(NEWER, noteRepo, 1788607590000)]
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       const beforeArchived = prompts().length
       const archived = await reasonFor(typeAt('still there?'))
       check(
@@ -1048,7 +1059,7 @@ try {
       // unrestricted coordinator, and the room's own session was a different one. A note that names
       // the agent it expects refuses the coordinator instead of steering it.
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115, { agent: 'coordinator' })]
-      writeNote(JSON.stringify({ v: 1, session: BOUND, agent: 'kickoff-room-steering' }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, agent: 'kickoff-room-steering' }))
       const beforeAgent = prompts().length
       const wrongAgent = await reasonFor(typeAt('do the thing'))
       check(
@@ -1077,12 +1088,12 @@ try {
       // Read at delivery time, never cached: the launcher rewrites the note and the NEXT line goes
       // to the new session with nothing restarted.
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115), listedSession(OTHER, noteRepo, 1788607580000)]
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       const beforeFirst = prompts().length
       typeAt('first line')
       await until('the first line', () => prompts().length > beforeFirst, 8000)
       const firstPath = prompts().at(-1)?.path
-      writeNote(JSON.stringify({ v: 1, session: OTHER }))
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER }))
       const beforeSecond = prompts().length
       typeAt('second line')
       check(
@@ -1095,12 +1106,12 @@ try {
 
       // A generation is how a launcher says which note is newer. A wall that lost a race and
       // rewrites the note with an older one must not take the conversation back.
-      writeNote(JSON.stringify({ v: 1, session: BOUND, generation: 7 }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 7 }))
       const beforeFenced = prompts().length
       typeAt('under the seventh')
       await until('the fenced line', () => prompts().length > beforeFenced, 8000)
       const atSeven = prompts().at(-1)?.path
-      writeNote(JSON.stringify({ v: 1, session: OTHER, generation: 6 }))
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 6 }))
       const beforeStaleGen = prompts().length
       const wentBack = await reasonFor(typeAt('under the sixth'))
       check(
@@ -1110,7 +1121,7 @@ try {
           prompts().length === beforeStaleGen,
         `${atSeven} · ${wentBack} · ${prompts().length - beforeStaleGen} prompt(s)`,
       )
-      writeNote(JSON.stringify({ v: 1, session: OTHER, generation: 8 }))
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 8 }))
       const beforeEight = prompts().length
       typeAt('under the eighth')
       check(
@@ -1122,7 +1133,7 @@ try {
 
       // A question from the bound session, and a reply typed under it: the words still go to the
       // session that asked, which is the bound one, and the question stays open for his tap.
-      writeNote(JSON.stringify({ v: 1, session: BOUND, generation: 9 }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 9 }))
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115), listedSession(NEWER, noteRepo, 1788607590000)]
       const asksBefore = nFrames('ask').length
       nOc.push({
@@ -1184,7 +1195,7 @@ try {
 
       // And a tap for a question the bound session asked before a rollover must not be answered
       // into the session that is bound now, nor into the one that has stopped being bound.
-      writeNote(JSON.stringify({ v: 1, session: OTHER, generation: 10 }))
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 10 }))
       const postedBeforeTap = nOc.posted.length
       nHub.to({ v: 1, id: 'n-tap', t: 'choice', msg_id: 'mn-tap', ask_id: boundAsk.ask_id, option_id: boundAsk.options[0].option_id })
       await new Promise(r => setTimeout(r, 600))
@@ -1201,7 +1212,7 @@ try {
       // posted into a session the very next typed line is refused for. Both directions ask the
       // same question of the server, so a note the delivery rule refuses is a note the drawing
       // rule refuses too.
-      writeNote(JSON.stringify({ v: 1, session: BOUND, generation: 11 }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 11 }))
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
       const asksBeforeBoth = nFrames('ask').length
       nOc.push({
@@ -1251,13 +1262,13 @@ try {
       // the server is asked, and the answer comes back to a note that has since changed: carrying
       // the words on the id read before the wait puts them in the session he has stopped talking
       // to, and acks it `accepted`.
-      writeNote(JSON.stringify({ v: 1, session: BOUND, generation: 12 }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 12 }))
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115), listedSession(OTHER, noteRepo, 1788607580000)]
       const beforeRace = prompts().length
       nOc.delayNextListingMs = 900
       const racedId = typeAt('deploy it')
       await new Promise(r => setTimeout(r, 300))
-      writeNote(JSON.stringify({ v: 1, session: OTHER, generation: 13 }))
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 13 }))
       const raced = await reasonFor(racedId)
       check(
         'a_note_replaced_while_a_line_is_being_checked_does_not_land_it_in_the_session_it_named_first',
@@ -1270,7 +1281,7 @@ try {
       // as older muted the wall for the life of the process, with a sentence naming a note the
       // operator has never been told exists.
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       const beforePlain = prompts().length
       const plainAgain = typeAt('back to the plain note')
       check(
@@ -1284,9 +1295,9 @@ try {
       // A launcher writes the note a beat before the server lists the session, sees the line
       // refused, and corrects it. It has no reason to raise the number — nothing ever took the
       // first one — so the fence must only close behind a note the server actually confirmed.
-      writeNote(JSON.stringify({ v: 1, session: 'ses_notYetListed0000000000', generation: 20 }))
+      writeNote(JSON.stringify({ version: 1, session_id: 'ses_notYetListed0000000000', generation: 20 }))
       const tooEarly = await reasonFor(typeAt('are you up'))
-      writeNote(JSON.stringify({ v: 1, session: BOUND, generation: 20 }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 20 }))
       const beforeCorrected = prompts().length
       const correctedId = typeAt('now then')
       check(
@@ -1332,7 +1343,7 @@ try {
       // An older event shape that names no session at all cannot be matched against the note. It
       // must not vanish: the agent that asked is blocked, and a stderr line is not somewhere he
       // looks.
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
       const shown = await until('the kept questions to be shown', () => nFrames('ask').some(f => String(f.ask_id).endsWith('pper_unreadable')), 20000)
       check(
@@ -1389,21 +1400,21 @@ try {
         /form this worker does not know/.test(oldForm) && prompts().length === beforeOldForm,
         `${oldForm} · ${prompts().length - beforeOldForm} prompt(s)`,
       )
-      writeNote(JSON.stringify({ v: 2, session: BOUND }))
+      writeNote(JSON.stringify({ version: 2, session_id: BOUND }))
       const laterVersion = await reasonFor(typeAt('from a newer launcher'))
       check(
         'a_binding_at_a_version_this_worker_does_not_know_is_refused_rather_than_read_as_far_as_it_goes',
         /form this worker does not know/.test(laterVersion),
         laterVersion,
       )
-      writeNote(JSON.stringify({ v: 1, session: BOUND, must_be_titled: 'the room' }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, must_be_titled: 'the room' }))
       const unknownKey = await reasonFor(typeAt('with a rule it cannot read'))
       check(
         'a_binding_carrying_a_key_this_worker_does_not_know_is_refused_rather_than_half_obeyed',
         /is not one it can read/.test(unknownKey),
         unknownKey,
       )
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       const beforeShape = prompts().length
       const shapeId = typeAt('and the shape it knows')
       check(
@@ -1413,6 +1424,66 @@ try {
           nAck(shapeId)?.status === 'accepted',
         `${prompts().at(-1)?.path} · ${JSON.stringify(nAck(shapeId) ?? null)}`,
       )
+
+      // The launcher is another org's program, and its shape shipped first: `conversation`,
+      // `canonical_project_dir`, `session_id`, `agent`, `generation`, `verified_at`. Those are the
+      // names read here, verbatim, because a repository that carries two spellings of one thing is
+      // a repository where the note a launcher writes and the note a reader wants drift apart in
+      // silence — and the drift shows up as every typed line refused, in a room, at the worst
+      // possible moment. `verified_at` is the launcher's own record: known, read past, acted on by
+      // nothing here.
+      //
+      // The object below is the launcher's, key for key: it is what its writer emits, and it is
+      // here so that the next time the two shapes part company it is a red test rather than a room
+      // where every line the operator types is refused. The two really did part company once — the
+      // launcher shipped `{v, session, directory}` against a reader wanting `{version, session_id,
+      // canonical_project_dir}` — and the way that was found was a live boot.
+      nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115, { agent: 'kickoff-room-steering' })]
+      writeNote(JSON.stringify({
+        conversation: ROOM,
+        canonical_project_dir: noteRepo,
+        session_id: BOUND,
+        agent: 'kickoff-room-steering',
+        generation: 30,
+        verified_at: '2026-09-07T08:00:00Z',
+        version: 1,
+      }))
+      const beforeWhole = prompts().length
+      const wholeId = typeAt('the whole shape, as it is written')
+      check(
+        'the_whole_shape_the_launcher_writes_is_read_key_for_key_and_his_words_reach_that_session',
+        (await until('the line under the whole shape', () => prompts().length > beforeWhole, 8000)) &&
+          prompts().at(-1)?.path === `/session/${BOUND}/prompt_async` &&
+          nAck(wholeId)?.status === 'accepted',
+        `${prompts().at(-1)?.path} · ${JSON.stringify(nAck(wholeId) ?? null)}`,
+      )
+
+      // A launcher pointing this wall at a SIBLING room's session. The id resolves, the directory
+      // may even match, and the agent may be the right one — the only thing that says it is not
+      // this worker's is the conversation the note was written for. This is the failure the whole
+      // binding exists to refuse, and it could not be caught at all until the note carried a room.
+      writeNote(JSON.stringify({ version: 1, conversation: ANOTHER_ROOM, session_id: BOUND, generation: 31 }))
+      const beforeAnotherRoom = prompts().length
+      const anotherRoom = await reasonFor(typeAt('this one is not yours'))
+      check(
+        'a_binding_written_for_another_rooms_conversation_is_refused_rather_than_spoken_to',
+        /belongs to a different conversation/.test(anotherRoom) && prompts().length === beforeAnotherRoom,
+        `${anotherRoom} · ${prompts().length - beforeAnotherRoom} prompt(s)`,
+      )
+
+      // The version is what makes a LATER shape refuse rather than be half-obeyed by this reader,
+      // so a note with no version at all is not a note this can read — and the sentence whoever
+      // wrote the launcher gets names the one key to add and what to set it to.
+      writeNote(JSON.stringify({ conversation: ROOM, session_id: BOUND, generation: 32 }))
+      const beforeNoVersion = prompts().length
+      const noVersion = await reasonFor(typeAt('and this one says nothing about its form'))
+      check(
+        'a_binding_that_says_no_version_at_all_is_refused_rather_than_read_as_far_as_it_goes',
+        /does not say which form it is written in/.test(noVersion) && prompts().length === beforeNoVersion,
+        `${noVersion} · ${prompts().length - beforeNoVersion} prompt(s)`,
+      )
+      nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 33 }))
 
       // The note is a private thing between the launcher and this process. One anybody else on the
       // box can read is one anybody else could have WRITTEN, and a note somebody else wrote is his
@@ -1434,7 +1505,7 @@ try {
       // in the order they were asked — the second keyboard belonging to the first question is a
       // wrong answer sent to an agent — so the delayed listing here must not let the second
       // overtake the first.
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
       const asksBeforeOrder = nFrames('ask').length
       nOc.delayNextListingMs = 900
@@ -1501,7 +1572,7 @@ try {
       // just booted. None of those is the note saying no; they are the machine not saying. Dropped,
       // the agent waits on a keyboard that never appears and nothing ever retries, which is the
       // dead keyboard this adapter exists to end, inverted.
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
       const asksBeforeStall = nFrames('ask').length
       nOc.delayNextListingMs = 11_000 // past the ten seconds any one request here is given
@@ -1569,7 +1640,7 @@ try {
         openAsk !== undefined && (await until('the tap', () => nOc.posted.length > repliesBeforeOpenTap, 8000)),
         JSON.stringify(nOc.posted.slice(repliesBeforeOpenTap).map(p => p.path)),
       )
-      writeNote(JSON.stringify({ v: 1, session: BOUND }))
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
 
       // ── the fence must survive a restart ──────────────────────────────────────────────────
       //
@@ -1583,7 +1654,7 @@ try {
       nChild.kill()
       await until('the first watcher to let go of the claim', () => nHub.live === 0, 8000)
       nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115), listedSession(OTHER, noteRepo, 1788607580000)]
-      writeNote(JSON.stringify({ v: 1, session: OTHER, generation: 22 }))
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 22 }))
       const nRestarted = Bun.spawn(
         [
           'bun', join(import.meta.dir, 'main.ts'),
@@ -1610,7 +1681,7 @@ try {
         )
         check('a_watcher_started_for_a_numbered_binding_takes_the_claim_as_before', cameBack)
         if (!cameBack) throw new Error('attach never came back with --opencode-binding-generation')
-        writeNote(JSON.stringify({ v: 1, session: BOUND, generation: 21 }))
+        writeNote(JSON.stringify({ version: 1, session_id: BOUND, generation: 21 }))
         const beforeRollback = prompts().length
         const rolledBack = await reasonFor(typeAt('take it back'))
         check(
@@ -1618,14 +1689,14 @@ try {
           /older than the one already in use/.test(rolledBack) && prompts().length === beforeRollback,
           `${rolledBack} · ${prompts().length - beforeRollback} prompt(s)`,
         )
-        writeNote(JSON.stringify({ v: 1, session: BOUND }))
+        writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
         const unnumbered = await reasonFor(typeAt('and this one'))
         check(
           'and_a_binding_that_does_not_say_how_new_it_is_cannot_be_taken_where_a_number_was_named_at_the_start',
           /does not say how new it is/.test(unnumbered),
           unnumbered,
         )
-        writeNote(JSON.stringify({ v: 1, session: OTHER, generation: 22 }))
+        writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 22 }))
         const beforeAtTheFloor = prompts().length
         const atTheFloor = typeAt('and now then')
         check(
@@ -1634,6 +1705,75 @@ try {
             prompts().at(-1)?.path === `/session/${OTHER}/prompt_async` &&
             nAck(atTheFloor)?.status === 'accepted',
           `${prompts().at(-1)?.path} · ${JSON.stringify(nAck(atTheFloor) ?? null)}`,
+        )
+        // This watcher was started the older way — a secret found by the upward walk, no
+        // conversation told — so it is attached perfectly well and cannot say which conversation
+        // it is. A note that names one is then a claim nobody can check, and an unprovable claim
+        // is not a check: it is refused, rather than obeyed on the strength of the keys around it.
+        writeNote(JSON.stringify({ version: 1, conversation: ROOM, session_id: OTHER, generation: 23 }))
+        const beforeUnprovable = prompts().length
+        const unprovable = await reasonFor(typeAt('whose room is this'))
+        check(
+          'a_binding_naming_a_conversation_a_wall_cannot_prove_is_its_own_is_refused_rather_than_obeyed',
+          /cannot tell whether that is this one/.test(unprovable) && prompts().length === beforeUnprovable,
+          `${unprovable} · ${prompts().length - beforeUnprovable} prompt(s)`,
+        )
+
+        // The same window, from the agent's side. Not being able to say which conversation this is
+        // is a state that MENDS — the operator grants, or the launcher rewrites the note without a
+        // claim nobody here can check — which is why the wall re-asks it on every line rather than
+        // deciding once at boot. A question asked while it holds is therefore in exactly the state
+        // a note that has not been written yet is in: nothing has been found out, so nothing has
+        // been decided. Dropping it instead spends an agent's whole turn on a keyboard that is
+        // never drawn, and says so to the operator once for however many questions are lost.
+        const asksBeforeUnprovable = nFrames('ask').length
+        nOc.push({
+          type: 'permission.v2.asked',
+          properties: { id: 'per_unprovable', sessionID: OTHER, action: 'run a command', resources: ['rm -rf /'] },
+        })
+        await new Promise(r => setTimeout(r, 1200))
+        check(
+          'a_question_asked_while_this_wall_cannot_say_which_conversation_it_is_is_not_shown_yet',
+          nFrames('ask').length === asksBeforeUnprovable,
+          `${nFrames('ask').length - asksBeforeUnprovable} ask(s)`,
+        )
+        writeNote(JSON.stringify({ version: 1, session_id: OTHER, generation: 23 }))
+        check(
+          'and_it_is_offered_again_once_the_note_stops_making_a_claim_this_wall_cannot_check',
+          await until(
+            'the kept question once the claim is gone',
+            () => nFrames('ask').some(f => String(f.ask_id).endsWith('per_unprovable')),
+            20000,
+          ),
+          `${nFrames('ask').length - asksBeforeUnprovable} ask(s)`,
+        )
+
+        // And the other half of "nothing was found out": his reply under a question this watcher
+        // itself drew still reaches the session that asked it. That session was proved against the
+        // note — conversation and all — when the keyboard went up; the question is his, the session
+        // is open, and the only thing missing is a claim nobody here can check yet. Refusing him
+        // there told him to try again in a moment about a thing no moment of his would mend, and
+        // left the question he was answering open in front of him.
+        const asksBeforeOpen = nFrames('ask').length
+        nOc.push({
+          type: 'question.v2.asked',
+          properties: {
+            id: 'que_unprovable',
+            sessionID: OTHER,
+            questions: [{ question: 'Unprovable: which branch?', header: 'Pick', options: [{ label: 'main' }, { label: 'next' }] }],
+          },
+        })
+        await until('the question to draw', () => nFrames('ask').length > asksBeforeOpen, 12000)
+        const unprovableAsk = nFrames('ask').at(-1)
+        writeNote(JSON.stringify({ version: 1, conversation: ROOM, session_id: OTHER, generation: 24 }))
+        const beforeUnprovableReply = prompts().length
+        const unprovableReply = typeAt('use next', { in_reply_to_ask: String(unprovableAsk?.ask_id) })
+        check(
+          'and_his_reply_under_a_question_it_drew_still_reaches_that_session_while_the_claim_cannot_be_checked',
+          (await until('the reply', () => prompts().length > beforeUnprovableReply, 8000)) &&
+            prompts().at(-1)?.path === `/session/${OTHER}/prompt_async` &&
+            nAck(unprovableReply)?.status === 'accepted',
+          `${prompts().at(-1)?.path} · ${JSON.stringify(nAck(unprovableReply) ?? null)}`,
         )
       } finally {
         nRestarted.kill()
@@ -1679,12 +1819,27 @@ try {
       // process can tell apart from the launcher's own writing once it has read it — so they are
       // refused before a byte is read, not made sense of afterwards.
       const realNote = join(fsDir, 'a-real-note')
-      writeFileSync(realNote, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+      writeFileSync(realNote, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
       check(
         'a_binding_file_this_user_owns_that_nobody_else_can_read_is_the_one_shape_that_is_read',
         'binding' in readBindingFile(realNote),
         JSON.stringify(readBindingFile(realNote)),
       )
+      // The one sentence a PERSON acts on. The operator is told only that the note cannot be read
+      // — he has never been told the note exists — so the half naming the key to add goes where
+      // whoever wrote the launcher looks: the journal, and `--check`. It is worth nothing unless it
+      // says the key and the value, because "add a version" is a question, not an instruction.
+      writeFileSync(realNote, JSON.stringify({ conversation: 'c-0d0d0d0d0d0d', session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+      const noVersionRead = readBindingFile(realNote)
+      check(
+        'a_binding_with_no_version_says_exactly_which_key_to_add_and_what_to_set_it_to',
+        !('binding' in noVersionRead) &&
+          noVersionRead.state === 'says no version' &&
+          String(noVersionRead.why).includes('"version": 1'),
+        JSON.stringify(noVersionRead),
+      )
+      writeFileSync(realNote, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+
       chmodSync(realNote, 0o640)
       check(
         'a_binding_file_a_group_can_read_is_refused_rather_than_trusted',
@@ -1704,7 +1859,7 @@ try {
       const openDir = join(fsDir, 'open-to-all')
       mkdirSync(openDir, { recursive: true })
       const noteInTheOpen = join(openDir, 'note')
-      writeFileSync(noteInTheOpen, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+      writeFileSync(noteInTheOpen, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
       chmodSync(openDir, 0o777)
       check(
         'a_binding_file_in_a_directory_anybody_can_write_in_is_refused_rather_than_read',

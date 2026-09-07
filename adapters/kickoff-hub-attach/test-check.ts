@@ -580,6 +580,13 @@ console.log('\nwhen a session note is named:')
     KICKOFF_HUB_RELAY_DIR: relayDir,
   }
   const notePath = join(dir, 's-note')
+  // The same wall, told which conversation it is — the shape a dispatcher starts a room with. The
+  // note names a conversation, and the only way to know whether that is THIS one is to be told.
+  const room = 'c-0a0a0a0a0a0a'
+  const roomXdg = join(dir, 's-xdg')
+  mkdirSync(join(roomXdg, 'herdr-tg', 'conversations', room), { recursive: true, mode: 0o700 })
+  writeFileSync(join(roomXdg, 'herdr-tg', 'conversations', room, 'secret'), 's'.repeat(64), { mode: 0o600 })
+  const roomEnv = { ...env, KICKOFF_HUB_CONVERSATION: room, XDG_STATE_HOME: roomXdg }
 
   const relative = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', 'notes/session'])
   check('the_check_refuses_a_session_note_path_that_is_not_absolute',
@@ -636,7 +643,7 @@ console.log('\nwhen a session note is named:')
 
   // A binding anybody else on the box can read is one anybody else could have written, and the
   // person who can put that right is whoever ran this check — so it is named here, in full.
-  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }))
+  writeFileSync(notePath, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000' }))
   chmodSync(notePath, 0o644)
   const readableByAll = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
   check('the_check_refuses_a_binding_file_somebody_else_on_the_box_could_have_written',
@@ -644,7 +651,7 @@ console.log('\nwhen a session note is named:')
     JSON.stringify(readableByAll.out.filter(l => /NOT/.test(l))))
   chmodSync(notePath, 0o600)
 
-  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  writeFileSync(notePath, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
   const named = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
   check('and_a_note_that_names_a_session_is_blessed_without_the_check_starting_or_creating_anything',
     named.code === 0 &&
@@ -659,28 +666,105 @@ console.log('\nwhen a session note is named:')
   // refuses OFFLINE, before any server is asked: the number it was written at, and the project it
   // says it is for. A check that reads the shape and stops blesses a wall where every line the
   // operator types is refused, which is the exact failure this command exists to catch.
-  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000', generation: 3 }), { mode: 0o600 })
+  writeFileSync(notePath, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000', generation: 3 }), { mode: 0o600 })
   const belowTheFloor = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath, '--opencode-binding-generation', '5'])
   check('the_check_refuses_a_binding_older_than_the_number_the_same_command_line_names',
     belowTheFloor.code === 1 && belowTheFloor.out.some(l => /^NOT\s+.*older than the one this worker was started for/.test(l)),
     `code ${belowTheFloor.code}; ${JSON.stringify(belowTheFloor.out.filter(l => /session/.test(l)))}`)
 
-  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  writeFileSync(notePath, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
   const unnumbered = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath, '--opencode-binding-generation', '5'])
   check('the_check_refuses_an_unnumbered_binding_where_the_command_line_names_a_number',
     unnumbered.code === 1 && unnumbered.out.some(l => /^NOT\s+.*does not say how new it is/.test(l)),
     `code ${unnumbered.code}; ${JSON.stringify(unnumbered.out.filter(l => /session/.test(l)))}`)
 
-  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000', directory: join(dir, 'somewhere-else') }), { mode: 0o600 })
+  writeFileSync(notePath, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000', canonical_project_dir: join(dir, 'somewhere-else') }), { mode: 0o600 })
   const elsewhere = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
   check('the_check_refuses_a_binding_that_says_it_is_for_a_different_project_than_the_one_it_runs_in',
     elsewhere.code === 1 && elsewhere.out.some(l => /^NOT\s+.*a different project/.test(l)),
     `code ${elsewhere.code}; ${JSON.stringify(elsewhere.out.filter(l => /session/.test(l)))}`)
 
+  // The version key, absent. The person who can put it right is whoever wrote the launcher, and
+  // the only sentence worth giving them names the key and the value — "add a version" sends them
+  // to a document to find out which spelling and which number.
+  writeFileSync(notePath, JSON.stringify({ session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  const noVersion = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_names_the_one_key_a_binding_with_no_version_has_to_add',
+    noVersion.code === 1 && noVersion.out.some(l => /^NOT\s+.*does not say which form it is written in.*"version": 1/.test(l)),
+    `code ${noVersion.code}; ${JSON.stringify(noVersion.out.filter(l => /session/.test(l)))}`)
+
+  // A key this worker does not know is a NARROWING of which session may be spoken to that it would
+  // have to guess at, so the whole note is refused — and the only person who can put that right is
+  // whoever wrote the launcher, who cannot act on "not one attach can read". The line names it.
+  writeFileSync(notePath, JSON.stringify({ version: 1, session_id: 'ses_theBoundOne00000000000', must_be_titled: 'the room' }), { mode: 0o600 })
+  const unknownKey = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_names_the_key_a_binding_holds_that_this_worker_does_not_know',
+    unknownKey.code === 1 && unknownKey.out.some(l => /^NOT\s+.*"must_be_titled"/.test(l)),
+    `code ${unknownKey.code}; ${JSON.stringify(unknownKey.out.filter(l => /session/.test(l)))}`)
+
+  // The note a launcher wrote before the two halves agreed on one spelling. Naming only the version
+  // key was true and useless: adding it left the note holding two more names this side had never
+  // accepted, each refused with nothing to act on, so one working note took four blind edits. The
+  // whole rename goes in one line.
+  writeFileSync(notePath, JSON.stringify({ v: 1, session: 'ses_theBoundOne00000000000', directory: repo }), { mode: 0o600 })
+  const theOldNames = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_gives_a_binding_written_with_the_names_this_worker_wanted_first_the_whole_rename_at_once',
+    theOldNames.code === 1 &&
+      theOldNames.out.some(l => /^NOT\s+/.test(l) && /"version"/.test(l) && /"session_id"/.test(l) && /"canonical_project_dir"/.test(l)),
+    `code ${theOldNames.code}; ${JSON.stringify(theOldNames.out.filter(l => /session/.test(l)))}`)
+
+  // A note written for a SIBLING room. Offline, before any server is asked, and the check must
+  // make it: what it blesses, the worker can do, and a worker here refuses every line he types.
+  writeFileSync(notePath, JSON.stringify({ version: 1, conversation: 'c-0f0f0f0f0f0f', session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  const anotherRoom = await runCheck(roomEnv, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_refuses_a_binding_written_for_a_different_conversation_than_the_one_it_runs_as',
+    anotherRoom.code === 1 && anotherRoom.out.some(l => /^NOT\s+.*written for conversation c-0f0f0f0f0f0f/.test(l)),
+    `code ${anotherRoom.code}; ${JSON.stringify(anotherRoom.out.filter(l => /session/.test(l)))}`)
+
+  // And the same note where nothing has told this worker which conversation it is: the claim
+  // cannot be checked, so it is not obeyed — and the line says which variable would let it be.
+  const cannotTell = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_refuses_a_binding_naming_a_conversation_this_worker_cannot_prove_is_its_own',
+    cannotTell.code === 1 && cannotTell.out.some(l => /^NOT\s+.*KICKOFF_HUB_CONVERSATION/.test(l) && /session/.test(l)),
+    `code ${cannotTell.code}; ${JSON.stringify(cannotTell.out.filter(l => /session/.test(l)))}`)
+
+  // The same note on a wall pointed at its secret BY PATH — the container answer. That wall cannot
+  // also be told which conversation it is: attach refuses both variables together, in this same
+  // program. So a line that answers "I cannot tell whose room this is" with "start it with
+  // KICKOFF_HUB_CONVERSATION" is advice the wall would refuse to start on. The way out has to name
+  // the path it would be replacing.
+  const toldTokenFile = join(dir, 's-told-token')
+  writeFileSync(toldTokenFile, 'b'.repeat(64), { mode: 0o600 })
+  const toldByPath = await runCheck({ ...env, KICKOFF_HUB_TOKEN_FILE: toldTokenFile },
+    ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_does_not_send_a_worker_pointed_at_its_secret_by_path_to_a_variable_it_would_refuse_to_start_with',
+    toldByPath.code === 1 && toldByPath.out.some(l => /^NOT\s+.*worker's session.*KICKOFF_HUB_TOKEN_FILE/.test(l)),
+    `code ${toldByPath.code}; ${JSON.stringify(toldByPath.out.filter(l => /session/.test(l)))}`)
+
+  // One note, two faults. What this command refuses, the worker refuses for the same reason — so
+  // the two must name the same fault FIRST, or somebody mends the one the worker was never going
+  // to reach and watches every typed line refused for the other.
+  writeFileSync(notePath, JSON.stringify({ version: 1, conversation: 'c-0f0f0f0f0f0f', session_id: 'ses_theBoundOne00000000000', generation: 2 }), { mode: 0o600 })
+  const twoFaults = await runCheck(roomEnv, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath, '--opencode-binding-generation', '9'])
+  check('the_check_names_the_same_fault_first_as_the_worker_when_a_note_is_both_for_another_room_and_older',
+    twoFaults.code === 1 && twoFaults.out.some(l => /^NOT\s+.*written for conversation c-0f0f0f0f0f0f/.test(l)),
+    `code ${twoFaults.code}; ${JSON.stringify(twoFaults.out.filter(l => /session/.test(l)))}`)
+
+  // The conversation it IS written for, and the check blesses it.
+  writeFileSync(notePath, JSON.stringify({ version: 1, conversation: room, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  // Not the exit code: a wall told a conversation and given no `--run` has a NOT of its own about
+  // the door a hand-started tool server would derive, which is the Q block's subject and not this
+  // one's. What is asserted is that the note itself is blessed and nothing about it is a NOT.
+  const ownRoom = await runCheck(roomEnv, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('and_a_binding_written_for_this_very_conversation_is_blessed',
+    ownRoom.out.some(l => /^ok\s+.*session.*names a session/.test(l)) &&
+      !ownRoom.out.some(l => /^NOT\s+.*worker's session/.test(l)),
+    `code ${ownRoom.code}; ${JSON.stringify(ownRoom.out.filter(l => /session/.test(l)))}`)
+
   // The id you can read first is not the one JSON keeps: the last of two keys of one name wins,
   // and `Object.keys` sees one. On the one file this whole flag treats as authoritative, "what it
   // says is not what it does" is the property that must not exist.
-  writeFileSync(notePath, '{"v":1,"session":"ses_theBoundOne00000000000","session":"ses_theOtherOne00000000000"}', { mode: 0o600 })
+  writeFileSync(notePath, '{"version":1,"session_id":"ses_theBoundOne00000000000","session_id":"ses_theOtherOne00000000000"}', { mode: 0o600 })
   const twice = await runCheck(env, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
   check('a_binding_that_names_the_session_twice_is_refused_rather_than_read_as_the_last_one',
     twice.code === 1 && twice.out.some(l => /^NOT\s+.*not one attach can read/.test(l)),

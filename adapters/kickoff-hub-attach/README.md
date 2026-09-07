@@ -24,7 +24,7 @@ flag: it is `KICKOFF_HUB_PROJECT_DIR`, and `.` means "the directory I was starte
 | --- | --- |
 | *(none)* | Hold the claim and open the door. This alone is what `adapters/fanin/` used to be. |
 | `--opencode <url>` | Also watch the opencode server at `<url>` — its questions and permission prompts go to the phone as `ask`, a tap goes back to its own reply endpoint, and what the operator types in the topic goes to the session as a prompt, verbatim (the session `--opencode-binding-file` names, or, with no binding, the one the server lists for the project directory; a reply under a question goes to the session that asked it). When there is no session to hand the words to, the hub is told and puts one line in his topic. Without this flag an opencode worker is half a phone — no questions, no prompts, and typed words refused out loud rather than carried — and the start and `--check` both say so. This is what `adapters/opencode-bridge/` used to be, minus its process, plus the half of the phone it never had. |
-| `--opencode-binding-file <path>` | Bind this conversation to ONE session of that server: the one the file at `<path>` names. Whatever starts the engine writes that file; this command only ever reads it, afresh on every line, and validates it against the server every time — root session, not archived, this project's directory, and the agent the binding expects. His typed words then go to that session and to no other, a question from any other session on the server is not drawn, and a line that arrives while the binding is absent, unreadable or naming a session that is not open is **refused in his own words** rather than guessed at. Without the flag, typed words go to the most recently active root session for the project directory — right on a wall running one session, a guess on a wall running several. An absolute path, and only alongside `--opencode`. |
+| `--opencode-binding-file <path>` | Bind this conversation to ONE session of that server: the one the file at `<path>` names. Whatever starts the engine writes that file; this command only ever reads it, afresh on every line, and validates it against the server every time — the conversation the binding was written for, root session, not archived, this project's directory, and the agent the binding expects. His typed words then go to that session and to no other, a question from any other session on the server is not drawn, and a line that arrives while the binding is absent, unreadable or naming a session that is not open is **refused in his own words** rather than guessed at. Without the flag, typed words go to the most recently active root session for the project directory — right on a wall running one session, a guess on a wall running several. An absolute path, and only alongside `--opencode`. |
 | `--opencode-binding-generation <n>` | The oldest binding `--opencode-binding-file` may name for the life of this process. A launcher that numbers every writing of the file is saying which is newer; the number inside a running watcher is memory, and a restart destroys memory, so the wall says the floor on the command line where nothing it reads later can lower it. Below it, a binding is refused for ever — as is one that names no number at all, because a wall started with a floor is a wall whose launcher numbers. Only alongside `--opencode-binding-file`. |
 | `--run <command...>` | Start `<command...>` as this process's child, in the project directory, with the namespace pinned so any adapter descending from it finds the door. When the child exits, say `bye`, close the door, and exit with the child's status. Everything after `--run` is the command. |
 | `--check` | Prove this environment can reach the hub — one plain line per fact, then exit 0 if all hold, 1 otherwise. Sends `hello` and `bye` and nothing else; **creates no topic**. |
@@ -34,13 +34,47 @@ whole by rename, mode `0600`, owned by the user attach runs as, in directories n
 write:
 
 ```json
-{ "v": 1, "session": "ses_…", "directory": "/abs/path", "agent": "the-agent", "generation": 7 }
+{ "version": 1,
+  "conversation": "c-…",
+  "canonical_project_dir": "/abs/path",
+  "session_id": "ses_…",
+  "agent": "the-agent",
+  "generation": 7,
+  "verified_at": "2026-09-07T08:00:00Z" }
 ```
 
-`v` and `session` are required; the other three narrow the binding and are checked when present.
+These are the **launcher's** key names, taken verbatim from the program that writes the file; the
+one key this side asked for is `version`, spelled out like the rest of them and not `v`, which
+already means the frame version on the wire. Two spellings of one thing is how a writer and a
+reader drift apart in silence, and the drift shows up as every line the operator types refused.
+
+`version` and `session_id` are required; `conversation`, `canonical_project_dir`, `agent` and
+`generation` narrow the binding and are checked when present. `verified_at` is the launcher's own
+record of when it last proved the session: known, so it is not mistaken for a rule this reader
+dropped, and otherwise ignored, because this side proves the session afresh on every line anyway.
+
+`conversation` is compared with the conversation attach is attached as — the one a dispatcher named
+(`KICKOFF_HUB_CONVERSATION`), or the one this repository is bound to — and a binding written for a
+different one is refused. That is a launcher pointing a wall at a sibling room's session, and it is
+the one claim in the file no server can settle: such a session resolves, sits in a room tree that
+may well match, and runs the very agent this worker expects. A wall that cannot say which
+conversation it is refuses that binding too, because a claim nobody can check is not a check — but
+that refusal is a *transient* one, since the operator may grant and the launcher may rewrite the
+note while the wall runs: a question asked in that window is kept and offered again rather than
+dropped, and a reply under a question this wall itself drew still reaches the session that asked it.
+A wall pointed at its secret by path (`KICKOFF_HUB_TOKEN_FILE`) is told to start with
+`KICKOFF_HUB_CONVERSATION` **in place of** the path, never beside it, because attach refuses the two
+together.
+
 The key set is **closed** — a key attach does not know may be a narrowing it would be quietly
 dropping, and it refuses rather than obey the rest — and a key written **twice** is refused with it,
-because JSON keeps the last and every reader shows the first. It may be absent or empty while the engine
+because JSON keeps the last and every reader shows the first. A file with no `version` at all is
+refused as its own case, and `--check` and the journal name that key and its value, because "add a
+version" is a question rather than an instruction. Every refusal about what is *written* names the
+part that stopped it in the journal and in `--check` — the key it did not know, the value that was
+the wrong shape, and for a note still using this side's older names (`v`, `session`, `directory`)
+the whole rename in one line. The operator's own sentence never carries any of it: he has never
+been told the file exists. It may be absent or empty while the engine
 boots; every line typed meanwhile is refused out loud, never queued. Rewriting it retargets the
 NEXT line, with nothing restarted. attach never writes it and never deletes it.
 
