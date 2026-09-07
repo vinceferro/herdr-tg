@@ -1,5 +1,10 @@
-<!-- SKETCH, not a decision. Written 2026-09-01 with the operator, from what is on the box.
-     Nothing here is built. Two questions at the end are his to answer. -->
+<!-- SKETCH, written 2026-09-01 with the operator, from what was on the box then. Read it as
+     history plus three answers. The two questions at the end are ANSWERED — the operator ruled on
+     the first on 2 September and it is built; the second is answered by the architecture, not by a
+     preference. Section 3's open addition is answered too, by kickoff, on 3 September. Each says so
+     where it stands. Everything else here still predates the conversation model
+     (docs/CONVERSATIONS.md), the exact-session binding and the transport seam, and it has not been
+     revised to match; where this sketch and docs/ATTACHING.md disagree, ATTACHING is the contract. -->
 
 # Wiring the hub to kickoff
 
@@ -91,6 +96,11 @@ The agent can already do this itself — it is in its charter. The operator shou
 it from a topic. **The hub does not restart anything**; it touches the flag, and the supervisor,
 which owns the process group, does the killing and restarting.
 
+**Who owns the restart: answered, 3 September, by kickoff.** Restart and re-grounding are theirs
+exclusively. The hub carries the operator's request as an input and never owns the killing or the
+respawning: it touches the flag, their supervisor does the rest. The partition in one line — we own
+conversation routing, they own the birth, death and rebirth of every session on the channel.
+
 One addition worth building: a refresh from the phone should be a two-tap confirm that says what it
 is about to throw away — *"this session is working on X. Refresh anyway?"*. The design forbade
 refresh-from-chat because *"a refresh costs a worker its in-flight context"*, and that was right
@@ -114,9 +124,17 @@ This needs one templated user unit, `kickoff@.service`, running `supervisor.sh` 
 the piece nobody has written, and it closes the first gap as a side effect: after a reboot, every
 enabled project has a supervisor again, so every intent file has a watcher.
 
-## The two questions that are the operator's
+## The two questions that were the operator's — both answered
 
-### Q1 — is a lane a topic, or a voice in the project's topic?
+### Q1 — is a lane a topic, or a voice in the project's topic? ANSWERED: a topic per lane
+
+The operator ruled on 2 September, and it is built and proven live: two worktrees of one project ran
+at the same moment and each got its own forum topic beside the project's. The middle option below —
+a lane speaking in the project's topic until he taps for one of its own — was not taken. The
+sprawl argument was real and is answered elsewhere: a vacant room is not listed until something has
+connected to it, and a conversation is a row rather than a directory (docs/CONVERSATIONS.md).
+
+The reasoning as it stood:
 
 A lane is **ephemeral** (hours) and a forum topic is **forever** — the design refuses to delete
 topics, because deletion needs `can_delete_messages` and posting into a *closed* topic is
@@ -129,7 +147,18 @@ undocumented. There are twelve lane worktrees from 28 August alone.
 A middle option: lanes speak in the project's topic by default, and a lane gets its own topic only
 when the operator taps for one. That keeps the common case tidy and makes the sprawl a choice.
 
-### Q2 — does the hub get to ask systemd to start units?
+### Q2 — does the hub get to ask systemd to start units? ANSWERED: no, and not by preference
+
+The architecture answers this one rather than a taste for caution. The hub is the communication,
+identity, presence and decision plane; it is not the process scheduler and must never gain an
+arbitrary command-execution surface. What starts a process is a launcher, which is simply another
+adapter: it holds a hub connection, offers what it may start, and acts on the operator's choice
+itself. So the hub still causes no process to exist, and `/new` from a phone is possible through
+that adapter rather than through a shell the hub grew. Lifecycle intentions may travel as typed,
+capability-checked operations against specs the launcher has declared in advance — never as an
+image, a command, a mount, a secret, an environment variable or a host path from Telegram.
+
+The reasoning as it stood:
 
 It is a real widening. `systemctl --user start kickoff@x` cannot become a shell, but it is still the
 hub causing a process to exist, and today it causes none.
