@@ -653,6 +653,9 @@ impl FakeBridge {
             repo: "/wherever".into(),
             pid,
             lane: lane.map(hub_proto::LaneId::new),
+            // The harness bridge answers no down-frame, which is what every bridge shipped so far
+            // does. The tests that need a promising bridge say so themselves.
+            confirms: None,
         })
         .await;
     }
@@ -2140,6 +2143,7 @@ async fn a_frame_the_hub_cannot_read_before_the_pong_does_not_kill_the_connectio
                 repo: "/wherever".into(),
                 pid: std::process::id(),
                 lane: None,
+                confirms: None,
             },
         ),
     )

@@ -46,19 +46,120 @@ pub struct Envelope<P> {
     pub v: u16,
     /// Opaque, per-connection, monotonic. What an `ack` refers back to.
     pub id: FrameId,
+    /// Which run of this address the sender believes it is talking as.
+    ///
+    /// **Both directions, one meaning: the generation this frame's sender holds for this address.**
+    /// The hub mints it when it grants a claim and stamps the `welcome` that grants it — that
+    /// stamp *is* the lease, there is no second field carrying it — and stamps everything it sends
+    /// to that connection afterwards. A bridge remembers the number it was welcomed with and
+    /// stamps every frame it sends, the `hello` it redials with included. A peer that holds none
+    /// (every bridge shipped before this field existed, and every hub) stamps none, and a peer
+    /// reading a frame from one is told nothing about fencing by its absence.
+    ///
+    /// It rides on the ENVELOPE rather than inside a payload so that one field covers every frame
+    /// in both directions — and because a second field of the same name inside a payload could not
+    /// work: `flatten` puts both in one object, so a peer that set both would emit a duplicate key
+    /// and serde refuses to read that, while a peer that set only the payload's would have it
+    /// swallowed by this one and read back as nothing. This protocol has met that collision once
+    /// already, when ping and pong tried to name their nonce `id`. **No payload field in either
+    /// direction may be named `generation`**; `a_generation_rides_on_every_frame_in_both_directions_and_is_named_exactly_once`
+    /// fails the day one is.
+    ///
+    /// Absent means "I hold no generation". A zero says the same thing and is read as absent: a
+    /// zero is a number a fence can compare and it would lose every comparison it was ever in, and
+    /// `welcome.generation ?? 0` is what a bridge written against the document in the language
+    /// every bridge is written in puts on the wire before it has been welcomed. Being fenced for
+    /// ever on every run is too high a price for a defaulting operator.
+    ///
+    /// The mint is bounded by [`MAX_GENERATION`], because the only bridges that exist read frames
+    /// with `JSON.parse`.
+    ///
+    /// Skipped when absent, so a peer that names none puts BYTE FOR BYTE what it always put on
+    /// the wire — on EVERY frame, which is the widest blast radius any field in this crate has.
+    #[serde(
+        default,
+        deserialize_with = "a_zero_is_no_generation",
+        skip_serializing_if = "holds_no_generation"
+    )]
+    pub generation: Option<u64>,
     #[serde(flatten)]
     pub payload: P,
 }
 
 impl<P> Envelope<P> {
-    /// Wraps a payload at the current version.
+    /// Wraps a payload at the current version, naming no generation.
     pub fn new(id: FrameId, payload: P) -> Self {
         Self {
             v: VERSION,
             id,
+            generation: None,
             payload,
         }
     }
+
+    /// Stamps this frame with the generation its sender believes it holds.
+    ///
+    /// A builder rather than a second constructor, because the overwhelming majority of call sites
+    /// hold no generation and every one of them would otherwise have to pass a `None` — and a
+    /// `None` passed by hand at fifty sites is a `Some` waiting to be pasted into the wrong one.
+    ///
+    /// A zero stamps nothing, so that the one value the field cannot mean cannot reach the wire
+    /// from this side either. See [`Envelope::generation`].
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = Some(generation).filter(|g| *g != 0);
+        self
+    }
+}
+
+/// The largest generation a bridge can be trusted to hold.
+///
+/// `2^53 - 1`. Every bridge that exists reads frames with `JSON.parse`, which has no integers —
+/// past this a number comes back as the nearest one a double can hold, and the bridge then stamps
+/// a generation the hub never minted. That failure has no wrong-looking value anywhere in it: the
+/// run is simply fenced for ever. The hub's mint (`max(latest + 1, now_ms)`) is a quarter of a
+/// million years short of this in milliseconds, crosses it in the twenty-third century in
+/// microseconds, and is past it today in nanoseconds — so the ceiling is here to be checked by
+/// whoever changes the unit.
+pub const MAX_GENERATION: u64 = (1 << 53) - 1;
+
+/// Reads a generation, taking a zero for silence. See [`Envelope::generation`].
+fn a_zero_is_no_generation<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(d)?.filter(|g| *g != 0))
+}
+
+/// True when there is no generation to put on the wire — none held, or the zero that means none.
+///
+/// A predicate rather than `Option::is_none`, so that a `Some(0)` built by hand cannot put a
+/// number on the wire that every reader of it is required to ignore.
+fn holds_no_generation(generation: &Option<u64>) -> bool {
+    !matches!(generation, Some(g) if *g != 0)
+}
+
+/// Does this `hello`'s promise cover the named down-frame?
+///
+/// The only way to read [`BridgeFrame::Hello::confirms`]. A reader that asks whether the promise
+/// was *present* rather than whether it *names this frame* will hold a tap open for a bridge that
+/// promised something else, and then tell the operator his answer was never taken by a session
+/// that took it. Names are compared exactly: a name this hub does not send is a promise about
+/// nothing, which is the same as no promise, and both fail towards saying less rather than more.
+pub fn promises_to_confirm(confirms: &Option<Vec<String>>, frame_kind: &str) -> bool {
+    confirms.iter().flatten().any(|w| w == frame_kind)
+}
+
+/// Reads a promise, taking an empty list for silence. See [`BridgeFrame::Hello::confirms`].
+fn an_empty_promise_is_no_promise<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(d)?.filter(|c| !c.is_empty()))
+}
+
+/// True when this `hello` promised to answer nothing — unsaid, or the empty list that says it.
+fn promises_nothing(confirms: &Option<Vec<String>>) -> bool {
+    !matches!(confirms, Some(c) if !c.is_empty())
 }
 
 /// How a send ended, in the only three values that can be told apart.
@@ -107,6 +208,20 @@ pub enum AckWhy {
     /// the case that mends itself: a shed file is worth attaching again in a minute, where the
     /// refusals behind [`AckWhy::NoFile`] are permanent for that file.
     NoFileUnsaid,
+    /// The frame came from a run of this address that a later run has replaced. Nothing it says is
+    /// acted on. Paired with [`Delivered::No`].
+    ///
+    /// It means the connection is over, not that this one frame was unlucky: the next frame gets
+    /// the same answer, and so does the one after it. An adapter that reads it should stop rather
+    /// than re-send — re-sending is how one project ends up with two voices in one topic, which is
+    /// the whole thing the generation exists to prevent.
+    ///
+    /// A DUTY on the hub, which this crate cannot enforce: send it only to a connection that
+    /// stamped a generation. A bridge old enough not to know the word renders an unknown `why` as
+    /// "his phone did not take it", so sending this to one tells the operator's agent that his
+    /// messaging app refused a frame his phone never saw. Such a connection is fenced by its
+    /// socket and its pid alone, which is what it was before this field existed.
+    StaleGeneration,
 }
 
 /// Why the hub refused a connection outright. The frame is followed by a close.
@@ -135,6 +250,21 @@ pub enum RefusedReason {
     /// permanent, not temporary: the same lane name will be refused every time, so a bridge that
     /// treats an unknown reason as worth retrying must be taught this one or it spins for ever.
     BadLane,
+    /// The connection named a generation, and a later run of the same address has since been
+    /// admitted. The number it holds is over.
+    ///
+    /// PERMANENT for that run, and the one refusal where redialling is exactly the wrong move: the
+    /// address has an incumbent that is not going away, so a bridge that retries spins until
+    /// somebody kills it. What ends it is a new run — a fresh instance, redialling from nothing.
+    ///
+    /// Two duties, neither of which this crate can enforce. The HUB sends it only to a connection
+    /// that stamped a generation, for the reason [`RefusedReason::BadLane`] gives — a bridge old
+    /// enough not to know the word cannot have stamped one, and both refusal tables written
+    /// against this protocol so far treat a reason they do not know as worth retrying, on purpose.
+    /// A BRIDGE that stamps a generation must therefore add this to the set it treats as
+    /// permanent before it stamps its first one, or the first time it is fenced it redials until
+    /// somebody kills it.
+    StaleGeneration,
 }
 
 /// One answer button, as the bridge minted it.
@@ -306,6 +436,32 @@ pub enum BridgeFrame {
         /// reason at all, on the one frame whose failure is a project that can never connect.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         lane: Option<crate::ids::LaneId>,
+        /// Which of the hub's own frames this bridge will answer with a [`BridgeFrame::Ack`],
+        /// named by their `t` — today at most `["choice"]`.
+        ///
+        /// A promise, and the hub holds nothing open waiting for an answer it was not promised.
+        /// It has to be on the wire because the alternative is inferring it from a version number
+        /// no bridge sends: a hub that assumed every bridge answers would sooner or later tell the
+        /// operator his tap was never taken, about a bridge that took it and had no word for
+        /// saying so.
+        ///
+        /// Unknown names are ignored rather than refused — a bridge that promises to confirm
+        /// something this hub never sends has promised nothing, which is harmless, where a
+        /// refusal would be a project that cannot connect because it was too new. Read it with
+        /// [`promises_to_confirm`] and never by asking whether it is present.
+        ///
+        /// Absent means "I answer none of them", which is every bridge shipped before this field
+        /// existed. An EMPTY list says the same thing and is read as absent: an adapter that
+        /// builds the list by filtering writes the empty one every time it promises nothing, and
+        /// two spellings of one meaning is how a reader ends up branching on the wrong one.
+        /// Skipped when it promises nothing, so such a bridge puts BYTE FOR BYTE what it always
+        /// put on the wire.
+        #[serde(
+            default,
+            deserialize_with = "an_empty_promise_is_no_promise",
+            skip_serializing_if = "promises_nothing"
+        )]
+        confirms: Option<Vec<String>>,
     },
     /// Something the agent said. Does not buzz.
     Say {
@@ -444,6 +600,13 @@ pub enum HubFrame {
         /// the hub would strip in silence.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         outbox: Option<String>,
+        //
+        // The generation this welcome grants is [`Envelope::generation`] on the welcome itself,
+        // and there is deliberately no field for it here: the envelope's own `generation` and a
+        // payload one flatten into the same key, so a hub that set both would emit a duplicate key
+        // no reader can read, and one that set only this would have it swallowed on the way in and
+        // read back as nothing. A bridge takes its lease from the envelope of the frame that
+        // grants it, exactly as it takes it from every frame afterwards.
     },
     /// Not admitted. The connection closes immediately after.
     Refused { reason: RefusedReason },
@@ -570,6 +733,7 @@ mod tests {
             repo: "/home/u/Projects/herdr-tg".into(),
             pid: 42,
             lane: Some(crate::ids::LaneId::new("lane-0902-201212-2783563")),
+            confirms: None,
         }))
         .expect("serialises");
         for forbidden in ["\"name\"", "\"project\":", "\"title\"", "\"topic\""] {
@@ -594,6 +758,7 @@ mod tests {
             repo: "/home/u/Projects/herdr-tg".into(),
             pid: 42,
             lane: None,
+            confirms: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -621,6 +786,7 @@ mod tests {
                 repo: "/r".into(),
                 pid: 1,
                 lane: None,
+                confirms: None,
             },
             "a bridge that named no lane stopped being the project's own voice"
         );
@@ -1206,6 +1372,570 @@ mod tests {
         assert_eq!(
             json,
             r#"{"v":1,"id":"f1","t":"message","msg_id":"m-4414","text":"have a look","from":{"chat_id":-1001,"user_id":7},"files":[{"kind":"photo","why":"not-stored"}]}"#
+        );
+    }
+
+    // ── the generation, and what a bridge promises to confirm ─────────────────────────────────
+
+    #[test]
+    fn the_generation_stamped_on_an_envelope_survives_a_round_trip() {
+        // A number the hub minted is worthless if the crate that carries it quietly drops it: the
+        // fence would then admit every stale run and nobody would see a wrong answer until two
+        // sessions were writing into one topic.
+        let on_the_wire = r#"{"v":1,"id":"f1","generation":7,"t":"ping"}"#;
+        let f: Envelope<HubFrame> =
+            serde_json::from_str(on_the_wire).expect("a stamped frame must parse");
+        assert_eq!(f.payload, HubFrame::Ping);
+        assert_eq!(f.generation, Some(7));
+        let back = serde_json::to_string(&f).expect("serialises");
+        assert_eq!(
+            back, on_the_wire,
+            "the generation did not survive being read and written again"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_a_peer_that_has_never_heard_of_generations_names_no_generation_here() {
+        // Every bridge shipped so far sends exactly this. It must go on meaning "I hold no
+        // generation" rather than being a parse error or a zero, because a zero would be a number
+        // the fence could compare and would lose every comparison.
+        let on_the_wire = r#"{"v":1,"id":"f1","t":"ping"}"#;
+        let f: Envelope<HubFrame> =
+            serde_json::from_str(on_the_wire).expect("an unstamped frame must parse");
+        assert_eq!(f.generation, None);
+        let back = serde_json::to_string(&f).expect("serialises");
+        assert_eq!(
+            back, on_the_wire,
+            "reading and writing an unstamped frame put something new on the wire"
+        );
+    }
+
+    #[test]
+    fn a_generation_named_inside_a_hello_is_the_envelopes_own_and_there_is_only_one_of_them() {
+        // There is ONE generation and it lives on the envelope, including on the `hello` a bridge
+        // redials with. A second field of the same name inside the payload cannot exist: `flatten`
+        // puts both in one object, so a peer that set both would emit a duplicate key and serde
+        // refuses to read it — the `id` collision this protocol already hit once, with a number
+        // that fences claims instead of a nonce.
+        let on_the_wire = r#"{"v":1,"id":"f1","t":"hello","project_id":"p","token":"s","instance":"i","repo":"/r","pid":1,"generation":9}"#;
+        let f: Envelope<BridgeFrame> =
+            serde_json::from_str(on_the_wire).expect("a redialling hello must parse");
+        assert_eq!(f.generation, Some(9));
+        let back = serde_json::to_string(&f).expect("serialises");
+        assert!(
+            back.contains(r#""generation":9"#),
+            "the generation a redialling bridge named was dropped: {back}"
+        );
+        assert_eq!(
+            back.matches(r#""generation""#).count(),
+            1,
+            "two generations in one frame is a duplicate key nobody can read: {back}"
+        );
+    }
+
+    #[test]
+    fn a_generation_arriving_beside_a_field_this_build_has_never_heard_of_is_still_read() {
+        // The skew rule of this crate applied to the new field: a newer peer adds something else
+        // beside the generation, and the generation still arrives. Ignoring the unknown must not
+        // mean ignoring its neighbour.
+        let f: Envelope<HubFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f1","generation":7,"t":"ping","telepathy":"blue"}"#,
+        )
+        .expect("an unknown field beside a generation must not be a parse error");
+        assert_eq!(f.generation, Some(7));
+        assert_eq!(f.payload, HubFrame::Ping);
+        let back = serde_json::to_string(&f).expect("serialises");
+        assert_eq!(back, r#"{"v":1,"id":"f1","generation":7,"t":"ping"}"#);
+    }
+
+    #[test]
+    fn a_refusal_for_a_run_a_newer_one_has_replaced_is_spelt_the_way_the_document_does() {
+        let f: Envelope<HubFrame> =
+            serde_json::from_str(r#"{"v":1,"id":"f1","t":"refused","reason":"stale_generation"}"#)
+                .expect("a bridge must be able to read the reason it is being sent away for");
+        assert_eq!(
+            f.payload,
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration
+            }
+        );
+        let back = serde_json::to_string(&f).expect("serialises");
+        assert_eq!(
+            back,
+            r#"{"v":1,"id":"f1","t":"refused","reason":"stale_generation"}"#
+        );
+    }
+
+    #[test]
+    fn an_ack_saying_a_newer_run_has_taken_the_address_is_spelt_the_way_the_document_does() {
+        let f: Envelope<HubFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f1","t":"ack","ref":"f7","delivered":"no","why":"stale-generation"}"#,
+        )
+        .expect("a bridge must be able to read why its frame went nowhere");
+        assert_eq!(
+            f.payload,
+            HubFrame::Ack {
+                r#ref: FrameId::new("f7"),
+                delivered: Delivered::No,
+                why: Some(AckWhy::StaleGeneration),
+            }
+        );
+        let back = serde_json::to_string(&f).expect("serialises");
+        assert_eq!(
+            back,
+            r#"{"v":1,"id":"f1","t":"ack","ref":"f7","delivered":"no","why":"stale-generation"}"#
+        );
+    }
+
+    #[test]
+    fn a_frame_a_newer_peer_stamped_still_parses_on_a_build_that_has_never_heard_of_generations() {
+        // The direction that cannot be run end to end, because the peer that would have to be old
+        // is the one being replaced. Every frame in both directions carries this field now, so a
+        // build that rejected it would go deaf on the first ping rather than on some rare frame.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct EnvelopeBeforeGenerations<P> {
+            v: u16,
+            id: FrameId,
+            #[serde(flatten)]
+            payload: P,
+        }
+        let sent =
+            serde_json::to_string(&env(HubFrame::Ping).with_generation(7)).expect("serialises");
+        assert_eq!(sent, r#"{"v":1,"id":"f1","generation":7,"t":"ping"}"#);
+        let old: EnvelopeBeforeGenerations<HubFrame> =
+            serde_json::from_str(&sent).expect("a build older than generations must still read it");
+        assert_eq!(old.payload, HubFrame::Ping);
+        assert_eq!(old.v, VERSION);
+    }
+
+    #[test]
+    fn a_hello_that_promises_to_confirm_nothing_is_byte_for_byte_the_hello_this_protocol_has_always_sent()
+     {
+        // A bridge that answers no down-frame says nothing about it, and a hub reading that hello
+        // sees exactly the bytes it has always seen. Pinned as BYTES rather than as a round trip,
+        // because a round trip stays green when a `"confirms":null` or a `"confirms":[]` has
+        // appeared — and either would make an older hub tolerate a field for no reason at all, on
+        // the one frame whose failure is a project that can never connect. Both spellings of the
+        // empty promise are pinned to the same bytes, so this cannot quietly become a second copy
+        // of the lane pin standing beside it.
+        let hello = |confirms| {
+            serde_json::to_string(&env(BridgeFrame::Hello {
+                project_id: ProjectId::new("unknown-until-the-hub-says"),
+                token: "s3cret".into(),
+                instance: "i1".into(),
+                repo: "/home/u/Projects/herdr-tg".into(),
+                pid: 42,
+                lane: None,
+                confirms,
+            }))
+            .expect("serialises")
+        };
+        let always = r#"{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"s3cret","instance":"i1","repo":"/home/u/Projects/herdr-tg","pid":42}"#;
+        assert_eq!(hello(None), always);
+        assert_eq!(
+            hello(Some(vec![])),
+            always,
+            "a bridge that promised nothing still put a promise on the wire"
+        );
+    }
+
+    #[test]
+    fn a_hello_that_names_which_frames_it_will_confirm_carries_them_on_the_wire() {
+        // The hub has to know WHICH bridges will answer before it can hold anything open waiting
+        // for an answer. A bridge that promises nothing is never waited on, so the promise has to
+        // be on the wire rather than inferred from a version number nobody sends.
+        let json = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: "/r".into(),
+            pid: 1,
+            lane: None,
+            confirms: Some(vec!["choice".into()]),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"p","token":"s","instance":"i","repo":"/r","pid":1,"confirms":["choice"]}"#
+        );
+    }
+
+    #[test]
+    fn a_hello_that_names_what_it_will_confirm_still_parses_on_a_hub_that_has_never_heard_of_confirming()
+     {
+        // Same shape as the lane case: an adapter is upgraded and the hub in front of it is not.
+        // A refusal here is a project that can never connect, so the tolerance is pinned rather
+        // than assumed.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BridgeFrameBeforeConfirming {
+            Hello {
+                project_id: ProjectId,
+                token: String,
+                instance: String,
+                repo: String,
+                pid: u32,
+                #[serde(default)]
+                lane: Option<crate::ids::LaneId>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: "/r".into(),
+            pid: 1,
+            lane: None,
+            confirms: Some(vec!["choice".into()]),
+        }))
+        .expect("serialises");
+        let old: Envelope<BridgeFrameBeforeConfirming> =
+            serde_json::from_str(&sent).expect("a hub older than confirming must still welcome it");
+        assert!(
+            matches!(old.payload, BridgeFrameBeforeConfirming::Hello { ref instance, .. } if instance == "i"),
+            "{old:?}"
+        );
+    }
+
+    #[test]
+    fn a_welcome_that_names_no_generation_is_byte_for_byte_the_welcome_this_protocol_has_always_sent()
+     {
+        // A hub that mints no generation — which is every hub before this change, and this one on
+        // a path that has not minted yet — puts exactly what it always put on the wire. The zero
+        // is pinned here rather than only on a ping because `welcome` is the frame whose failure
+        // is a project that can never connect, and because a hub reading a lease out of a file
+        // that has never been written is the way a zero gets minted in the first place.
+        let plain = env(HubFrame::Welcome {
+            project: "A Title".into(),
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+        });
+        let json = serde_json::to_string(&plain).expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#
+        );
+        let zeroed = serde_json::to_string(&plain.with_generation(0)).expect("serialises");
+        assert_eq!(
+            zeroed, json,
+            "a hub that granted a zero granted a number every fence would refuse: {zeroed}"
+        );
+    }
+
+    #[test]
+    fn a_welcome_carrying_a_generation_still_parses_on_a_bridge_that_has_never_heard_of_generations()
+     {
+        // The bridge in the operator's own session restarts only when his conversation does, so it
+        // will read a welcome carrying a number it has no word for. It must still be welcomed: a
+        // parse error at `welcome` is a project that can never connect. Read through an envelope
+        // from before the field as well as a payload from before it — the new envelope would eat
+        // the key on the way in and prove nothing about the bridge that actually has to read this.
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct EnvelopeBeforeGenerations<P> {
+            v: u16,
+            id: FrameId,
+            #[serde(flatten)]
+            payload: P,
+        }
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum HubFrameBeforeGenerations {
+            Welcome {
+                project: String,
+                #[serde(default)]
+                lane: Option<crate::ids::LaneId>,
+                #[serde(default)]
+                topic_id: Option<i32>,
+                limits: Limits,
+                #[serde(default)]
+                outbox: Option<String>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(
+            &env(HubFrame::Welcome {
+                project: "A Title".into(),
+                lane: None,
+                topic_id: None,
+                limits: Limits {
+                    max_frame: 65536,
+                    max_text: 3500,
+                    frames_per_min: 20,
+                },
+                outbox: None,
+            })
+            .with_generation(1_757_000_000_000),
+        )
+        .expect("serialises");
+        assert_eq!(
+            sent,
+            r#"{"v":1,"id":"f1","generation":1757000000000,"t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#
+        );
+        let old: EnvelopeBeforeGenerations<HubFrameBeforeGenerations> =
+            serde_json::from_str(&sent).expect("a bridge older than generations must be welcomed");
+        assert_eq!(old.v, VERSION);
+        assert!(
+            matches!(old.payload, HubFrameBeforeGenerations::Welcome { ref project, .. } if project == "A Title"),
+            "{old:?}"
+        );
+    }
+
+    #[test]
+    fn a_bridge_that_promises_an_empty_list_has_promised_nothing() {
+        // Two spellings of one meaning is how a reader ends up branching on "did it say anything"
+        // instead of "did it promise THIS", and the operator is then told his tap was never
+        // confirmed by a bridge that never promised to confirm it. An adapter that builds the list
+        // by filtering — which is the idiom the worked example in the documents uses — writes the
+        // empty one whenever it promises nothing, so this is the ordinary case, not the odd one.
+        let empty = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: "/r".into(),
+            pid: 1,
+            lane: None,
+            confirms: Some(vec![]),
+        }))
+        .expect("serialises");
+        assert!(
+            !empty.contains("confirms"),
+            "a bridge that promised nothing said something about it: {empty}"
+        );
+        let read: Envelope<BridgeFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"p","token":"s","instance":"i","repo":"/r","pid":1,"confirms":[]}"#,
+        )
+        .expect("an empty promise must not be a parse error");
+        let BridgeFrame::Hello { confirms, .. } = read.payload else {
+            panic!("a hello stopped being a hello")
+        };
+        assert_eq!(
+            confirms, None,
+            "an empty list of promises read back as a promise"
+        );
+    }
+
+    #[test]
+    fn a_generation_of_zero_is_read_as_naming_no_generation_at_all() {
+        // A bridge written in TypeScript against the document writes `welcome.generation ?? 0`
+        // without thinking about it, and a zero that reaches a fence loses every comparison it is
+        // ever in — so that bridge would be sent away on every run, for ever. A zero means the
+        // same as silence: this peer holds no generation and is fenced by its socket and its pid.
+        let read: Envelope<HubFrame> =
+            serde_json::from_str(r#"{"v":1,"id":"f1","generation":0,"t":"ping"}"#)
+                .expect("a zero must not be a parse error");
+        assert_eq!(read.generation, None, "a zero was taken for a generation");
+        let back = serde_json::to_string(&read).expect("serialises");
+        assert_eq!(back, r#"{"v":1,"id":"f1","t":"ping"}"#);
+        let stamped =
+            serde_json::to_string(&env(HubFrame::Ping).with_generation(0)).expect("serialises");
+        assert_eq!(
+            stamped, r#"{"v":1,"id":"f1","t":"ping"}"#,
+            "a zero was put on the wire as though it were a lease"
+        );
+    }
+
+    #[test]
+    fn the_number_the_hub_grants_is_on_the_welcomes_envelope_and_a_welcome_never_names_it_twice() {
+        // The welcome is where the hub says which run the bridge is. If the number lived in the
+        // payload as well as on the envelope, the one frame that grants the lease would carry the
+        // word twice — a duplicate key serde refuses outright — and a hub that set only the
+        // payload's would have it swallowed by the envelope and read back as nothing.
+        let stamped = env(HubFrame::Welcome {
+            project: "A Title".into(),
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+        })
+        .with_generation(5);
+        let json = serde_json::to_string(&stamped).expect("serialises");
+        assert_eq!(
+            json.matches(r#""generation""#).count(),
+            1,
+            "the welcome names the generation more than once: {json}"
+        );
+        let back: Envelope<HubFrame> =
+            serde_json::from_str(&json).expect("the welcome the hub grants must be readable");
+        assert_eq!(
+            back.generation,
+            Some(5),
+            "the number the hub granted did not survive the round trip: {json}"
+        );
+    }
+
+    #[test]
+    fn a_generation_rides_on_every_frame_in_both_directions_and_is_named_exactly_once() {
+        // The fence reads the generation off whatever frame arrived, so it has to survive every
+        // one of them — and the five the other tests use carry no traffic. The count is the half
+        // that matters later: the day somebody adds a payload field called `generation` to any
+        // frame in either direction, that frame starts going out with the word twice and serde
+        // refuses to read it back. This is the test that says so, rather than the operator.
+        let bridge = vec![
+            BridgeFrame::Hello {
+                project_id: ProjectId::new("p"),
+                token: "s".into(),
+                instance: "i".into(),
+                repo: "/r".into(),
+                pid: 1,
+                lane: None,
+                confirms: Some(vec!["choice".into()]),
+            },
+            BridgeFrame::Say {
+                text: "x".into(),
+                hint: None,
+                file: None,
+            },
+            BridgeFrame::Done {
+                text: "built it".into(),
+                file: None,
+            },
+            BridgeFrame::Ask {
+                ask_id: AskId::new("a1"),
+                text: "ok?".into(),
+                options: None,
+            },
+            BridgeFrame::AskResolved {
+                ask_id: AskId::new("a1"),
+                how: AskEnd::Answered,
+                outcome: None,
+            },
+            BridgeFrame::Beat {
+                state: BeatState::Blocked,
+                note: None,
+            },
+            BridgeFrame::Ack {
+                r#ref: FrameId::new("f3"),
+                status: AckStatus::Accepted,
+                reason: None,
+                files: None,
+            },
+            BridgeFrame::Bye {
+                reason: "refresh".into(),
+            },
+            BridgeFrame::Pong {
+                r#ref: FrameId::new("f4"),
+            },
+        ];
+        for f in bridge {
+            let json =
+                serde_json::to_string(&env(f.clone()).with_generation(7)).expect("serialises");
+            assert_eq!(
+                json.matches(r#""generation""#).count(),
+                1,
+                "this frame names the generation more than once: {json}"
+            );
+            let back: Envelope<BridgeFrame> =
+                serde_json::from_str(&json).expect("a stamped frame must be readable");
+            assert_eq!(back.generation, Some(7), "the stamp was lost: {json}");
+            assert_eq!(back.payload, f, "the stamp changed the frame: {json}");
+        }
+
+        let hub = vec![
+            HubFrame::Welcome {
+                project: "A Title".into(),
+                lane: None,
+                topic_id: None,
+                limits: Limits {
+                    max_frame: 65536,
+                    max_text: 3500,
+                    frames_per_min: 20,
+                },
+                outbox: None,
+            },
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration,
+            },
+            HubFrame::Message {
+                msg_id: MsgId::new("m1"),
+                text: "hi".into(),
+                from: From {
+                    chat_id: -1001,
+                    user_id: 7,
+                },
+                files: None,
+                in_reply_to_ask: None,
+            },
+            HubFrame::Choice {
+                msg_id: MsgId::new("m2"),
+                ask_id: AskId::new("a1"),
+                option_id: OptionId::new("y"),
+            },
+            HubFrame::Ack {
+                r#ref: FrameId::new("f7"),
+                delivered: Delivered::No,
+                why: Some(AckWhy::StaleGeneration),
+            },
+            HubFrame::Ping,
+        ];
+        for f in hub {
+            let json =
+                serde_json::to_string(&env(f.clone()).with_generation(7)).expect("serialises");
+            assert_eq!(
+                json.matches(r#""generation""#).count(),
+                1,
+                "this frame names the generation more than once: {json}"
+            );
+            let back: Envelope<HubFrame> =
+                serde_json::from_str(&json).expect("a stamped frame must be readable");
+            assert_eq!(back.generation, Some(7), "the stamp was lost: {json}");
+            assert_eq!(back.payload, f, "the stamp changed the frame: {json}");
+        }
+    }
+
+    #[test]
+    fn a_generation_a_bridge_reading_it_with_json_parse_could_not_hold_is_over_the_ceiling() {
+        // The ceiling is not decoration: past it a bridge reads back a number that is not the one
+        // it was sent, stamps that, and is fenced for ever without a single wrong-looking value
+        // anywhere. Milliseconds since the epoch sit ages short of it; nanoseconds
+        // are already past it, which is one edit away.
+        assert_eq!(MAX_GENERATION, 9_007_199_254_740_991);
+        const {
+            assert!(
+                1_757_000_000_000_u64 < MAX_GENERATION,
+                "a generation minted from the clock in milliseconds must be safe to hold"
+            )
+        };
+        // The first number past the ceiling that a bridge reads back as a DIFFERENT number, which
+        // is the failure the ceiling exists to keep on this side of the wire.
+        let too_big = MAX_GENERATION + 2;
+        assert_eq!(
+            (too_big as f64) as u64,
+            too_big - 1,
+            "a number over the ceiling must be the kind that comes back changed"
+        );
+    }
+
+    #[test]
+    fn a_bridge_that_promised_to_confirm_another_frame_promised_nothing_about_this_one() {
+        // The reading that must be impossible to get wrong: the hub holds a tap open only for a
+        // bridge that named THIS frame, never for one that merely said something. Getting it
+        // wrong tells the operator his answer was not taken by a session that took it.
+        assert!(promises_to_confirm(&Some(vec!["choice".into()]), "choice"));
+        assert!(!promises_to_confirm(
+            &Some(vec!["message".into()]),
+            "choice"
+        ));
+        assert!(!promises_to_confirm(&None, "choice"));
+        assert!(
+            !promises_to_confirm(&Some(vec![]), "choice"),
+            "an empty promise covered a frame"
+        );
+        assert!(
+            !promises_to_confirm(&Some(vec!["CHOICE".into()]), "choice"),
+            "a name that is not the frame's own name promised something"
         );
     }
 }
