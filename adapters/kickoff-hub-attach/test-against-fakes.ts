@@ -61,7 +61,17 @@ let sessions: Record<string, any>[] = []
  */
 let promptStatus = 204
 /** Hang the NEXT request of the kind named: taken by the server and never answered. */
-const hangNext = { session: false, prompt: false }
+const hangNext = { session: false, prompt: false, reply: false }
+/** What the two reply endpoints answer. 200 is what 1.18.25 answers a reply it took. */
+let replyStatus = 200
+/**
+ * The messages this server holds, by id — `GET /session/{id}/message/{id}` answers `{info, parts}`,
+ * and `info.agent` is the agent the TURN ran under.
+ *
+ * Captured from the 1.18.25 OpenAPI at `/doc`, not invented: `AssistantMessage` carries `agent`,
+ * and the asked events do not — which is why the agent of a turn has to be asked for.
+ */
+const messages = new Map<string, Record<string, unknown>>()
 const aSession = (id: string, updated: number, extra: Record<string, unknown> = {}) => ({
   id,
   slug: 'jolly-wizard',
@@ -132,11 +142,20 @@ const hub = Bun.listen({
   },
 })
 
-/** Push a tap down to the bridge, the way a real tap arrives. */
-function tap(askId: string, optionId: string): void {
+/**
+ * Push a tap down to the bridge, the way a real tap arrives, and hand back the id it went under.
+ *
+ * A fresh envelope id per tap, because the hub now waits for an answer NAMING that id — two taps
+ * under one id would have the second's answer read as the first's, which is the one thing the id
+ * is for.
+ */
+let tapSeq = 0
+function tap(askId: string, optionId: string): string {
+  const id = `h-tap-${++tapSeq}`
   hubSock?.write(
-    JSON.stringify({ v: 1, id: 'h9', t: 'choice', msg_id: 'm1', ask_id: askId, option_id: optionId }) + '\n',
+    JSON.stringify({ v: 1, id, t: 'choice', msg_id: 'm1', ask_id: askId, option_id: optionId }) + '\n',
   )
+  return id
 }
 
 // ── the fake opencode ──────────────────────────────────────────────────────────────────────────
@@ -180,6 +199,12 @@ const oc = Bun.serve({
         .sort((a, b) => b.time.updated - a.time.updated)
       return Response.json(list)
     }
+    const asMessage = /^\/session\/([^/]+)\/message\/([^/]+)$/.exec(url.pathname)
+    if (asMessage && req.method === 'GET') {
+      const info = messages.get(asMessage[2])
+      if (!info) return new Response('not found', { status: 404 })
+      return Response.json({ info, parts: [] })
+    }
     if (req.method === 'POST') {
       posted.push({ path: url.pathname, body: await req.json() })
       // `prompt_async` answers 204 with no body — captured — and the rest answer `{}`.
@@ -193,6 +218,13 @@ const oc = Bun.serve({
           { name: 'NotFoundError', data: { message: 'Session not found: ses_000000000000000000theOne' } },
           { status: promptStatus },
         )
+      }
+      if (url.pathname.endsWith('/reply')) {
+        if (hangNext.reply) {
+          hangNext.reply = false
+          return new Promise<Response>(() => {})
+        }
+        if (replyStatus !== 200) return Response.json({ name: 'NotFoundError' }, { status: replyStatus })
       }
       return new Response('{}', { headers: { 'content-type': 'application/json' } })
     }
@@ -459,7 +491,7 @@ try {
   )
 
   console.log('\na tap goes back to opencode as the label it published')
-  tap(ask.ask_id, ask.options[0].option_id)
+  const tookIt = tap(ask.ask_id, ask.options[0].option_id)
   check('opencode is told', await until('the reply', () => posted.length > 0))
   check(
     'at the endpoint the spec names for a v2 question',
@@ -476,11 +508,84 @@ try {
   await new Promise(r => setTimeout(r, 400))
   check('and the bridge does not retire it a second time', !frame('ask_resolved'), JSON.stringify(frame('ask_resolved')))
 
+  // The hub has already put "Sent: <label>" under his tap, and it edits that line to what the
+  // engine actually did with it. So an answer has to go back, and it has to go back only once
+  // opencode has spoken — an `accepted` sent when the POST was merely started is the dead keyboard
+  // this whole path exists to end, wearing a thumbs-up.
+  const answerFor = (ref: string) => seen.find(f => f.t === 'ack' && f.ref === ref)
+  check(
+    'the_watcher_acks_a_choice_only_after_opencode_has_answered',
+    (await until('the answer to the tap', () => !!answerFor(tookIt), 8000)) &&
+      answerFor(tookIt)?.status === 'accepted',
+    JSON.stringify(answerFor(tookIt) ?? null),
+  )
+
   console.log('\na tap on a question that is already answered answers nothing twice')
   const before = posted.length
   tap(ask.ask_id, ask.options[0].option_id)
   await new Promise(r => setTimeout(r, 300))
   check('nothing more is posted to opencode', posted.length === before, `${posted.length - before} were`)
+
+  console.log('\nwhat the operator is told when the worker will not take his answer')
+  {
+    pushEvent!({
+      id: 'evt_no',
+      type: 'question.v2.asked',
+      properties: {
+        id: 'que_refused',
+        sessionID: 'ses_1',
+        questions: [{ question: 'Roll it forward?', header: 'Migrate', options: [{ label: 'Roll it' }] }],
+      },
+    })
+    await until('the question', () => frames('ask').some(f => f.text?.startsWith('Roll it forward?')))
+    const q = frames('ask').find(f => f.text?.startsWith('Roll it forward?'))!
+    replyStatus = 500
+    const refusedRef = tap(q.ask_id, q.options[0].option_id)
+    const got = async () => {
+      await until('the answer', () => seen.some(f => f.t === 'ack' && f.ref === refusedRef), 8000)
+      return seen.find(f => f.t === 'ack' && f.ref === refusedRef)
+    }
+    const said = await got()
+    check(
+      'a_tap_the_worker_would_not_take_is_answered_refused_and_never_as_taken',
+      said?.status === 'refused' && /would not take it/.test(String(said?.reason)),
+      JSON.stringify(said ?? null),
+    )
+    check(
+      'and_the_reason_names_no_status_code_and_no_machinery',
+      typeof said?.reason === 'string' && !/\d/.test(said.reason) && !/opencode|watcher|session/i.test(said.reason),
+      String(said?.reason),
+    )
+    replyStatus = 200
+  }
+
+  console.log('\nwhen the worker takes the answer and never says so')
+  {
+    pushEvent!({
+      id: 'evt_hang',
+      type: 'question.v2.asked',
+      properties: {
+        id: 'que_hung',
+        sessionID: 'ses_1',
+        questions: [{ question: 'Wipe the cache?', header: 'Cache', options: [{ label: 'Wipe it' }] }],
+      },
+    })
+    await until('the question', () => frames('ask').some(f => f.text?.startsWith('Wipe the cache?')))
+    const q = frames('ask').find(f => f.text?.startsWith('Wipe the cache?'))!
+    hangNext.reply = true
+    const hungRef = tap(q.ask_id, q.options[0].option_id)
+    check(
+      'a_tap_the_worker_never_answers_is_answered_refused_once_the_deadline_passes',
+      await until('the answer after the deadline', () => seen.some(f => f.t === 'ack' && f.ref === hungRef), 14000),
+      JSON.stringify(seen.filter(f => f.t === 'ack' && f.ref === hungRef)),
+    )
+    const late = seen.find(f => f.t === 'ack' && f.ref === hungRef)
+    check(
+      'and_it_says_the_server_did_not_answer_in_time',
+      late?.status === 'refused' && /did not answer in time/.test(String(late?.reason)),
+      JSON.stringify(late ?? null),
+    )
+  }
 
   console.log('\na permission request offers only the three answers opencode accepts')
   pushEvent!({
@@ -488,8 +593,10 @@ try {
     type: 'permission.v2.asked',
     properties: { id: 'per_1', sessionID: 'ses_1', action: 'run a command', resources: ['rm -rf /'] },
   })
-  check('it arrives as an ask', await until('the permission ask', () => frames('ask').length > 1))
-  const perm = frames('ask')[1]
+  // Found by its own shape, never by position: the questions above it are a moving target.
+  const permAsks = () => frames('ask').filter(f => Array.isArray(f.options) && f.options.some((o: any) => o.option_id === 'once'))
+  check('it arrives as an ask', await until('the permission ask', () => permAsks().length > 0))
+  const perm = permAsks()[0]
   check('it says what is wanted, in plain words', perm?.text?.includes('run a command') === true, perm?.text)
   check(
     'three buttons and no more',
@@ -511,7 +618,7 @@ try {
     type: 'permission.v2.asked',
     properties: { id: 'per_2', sessionID: 'ses_1', action: 'delete a file', resources: ['build/'] },
   })
-  await until('the second permission ask', () => frames('ask').length > 2)
+  await until('the second permission ask', () => permAsks().length > 1)
   const perm2 = frames('ask').filter(f => Array.isArray(f.options) && f.options.some((o: any) => o.option_id === 'reject')).at(-1)
   const beforeReject = posted.length
   tap(perm2!.ask_id, 'reject')
@@ -870,6 +977,27 @@ try {
   await new Promise(r => setTimeout(r, 400))
   check('and a session nobody typed at failing says nothing on his phone', frames('say').length === saysBefore + 1)
 
+  // One of those failures is this adapter's own doing, and it must not reach him in the server's
+  // register. Measured against a real opencode 1.18.25 on 7 September: a prompt naming an agent the
+  // server cannot resolve is answered 204, NO user message is created — his words are gone — and
+  // the failure comes back as `Agent not found: "<name>". Available agents: build, explore,
+  // general, plan`. Forwarded verbatim that is a quoted identifier and an internal roster, on a
+  // phone. Since this watcher is what names the agent, it is also what knows what that sentence
+  // means, and it says it in his words.
+  const saysBeforeAgent = frames('say').length
+  typed('h-e2', 'and this one names an agent')
+  await until('the words to be taken', () => ackFor('h-e2')?.status === 'accepted')
+  pushEvent!(failed('ses_000000000000000000theOne',
+    'Agent not found: "kickoff-room-steering". Available agents: build, explore, general, plan'))
+  const aboutTheAgent = (await until('the line about the agent', () => frames('say').length > saysBeforeAgent)) ? frames('say').at(-1) : null
+  check(
+    'an_agent_the_workers_server_cannot_resolve_is_said_in_his_own_words_and_never_in_the_servers',
+    /could not act on what you typed/.test(String(aboutTheAgent?.text)) &&
+      /agent its server does not know/.test(String(aboutTheAgent?.text)) &&
+      !/Available agents|Agent not found|"/.test(String(aboutTheAgent?.text)),
+    JSON.stringify(aboutTheAgent ?? null),
+  )
+
   // ── the session the note names, and nothing else ──────────────────────────────────────────────
   //
   // Without `--opencode-binding-file` the watcher takes the most recently active root session the
@@ -1084,6 +1212,109 @@ try {
           prompts().at(-1)?.path === `/session/${BOUND}/prompt_async`,
         String(prompts().at(-1)?.path),
       )
+
+      // Proving the SESSION's agent is not enough, and the room tree that shipped an opencode.json
+      // naming the org coordinator as its default is why: the prompt endpoint resolves an agent of
+      // its own when the body does not name one, so a session bound to one agent can run its turn
+      // under another. The body names it. (`agent` is an optional top-level string on
+      // `POST /session/{id}/prompt_async`, read off the 1.18.25 OpenAPI at `/doc`.)
+      check(
+        'the_prompt_that_carries_his_words_names_the_agent_the_note_binds',
+        prompts().at(-1)?.body?.agent === 'kickoff-room-steering',
+        JSON.stringify(prompts().at(-1)?.body),
+      )
+
+      // The agent is named, and it also has to EXIST. Measured on a real 1.18.25 on 7 September:
+      // `prompt_async` naming an agent the server cannot resolve answers 204 and writes no message
+      // at all — his words are gone — so the ack for them said "taken" and his line carried the
+      // thumb, with the contradiction arriving seconds later as a line in the topic. The session
+      // check cannot see it: a session goes on naming an agent that has been dropped from the
+      // tree's configuration while it lives, which is the case the server's own error names.
+      //
+      // RED, before the fix:
+      //   FAIL words_for_a_worker_whose_agent_its_server_cannot_resolve_are_refused_rather_than_lost
+      //        NOT REFUSED: {"v":1,"id":"r17","t":"ack","ref":"n-16","status":"accepted"} · 1 prompt(s)
+      {
+        nOc.agents = ['build', 'plan']
+        const beforeGone = prompts().length
+        const gone = await reasonFor(typeAt('is anyone still there?'))
+        check(
+          'words_for_a_worker_whose_agent_its_server_cannot_resolve_are_refused_rather_than_lost',
+          /agent its server does not know/.test(gone) && prompts().length === beforeGone,
+          `${gone} · ${prompts().length - beforeGone} prompt(s)`,
+        )
+        // The set the server answers with is the whole server's, so it is asked once for a run and
+        // remembered — and a name missing from what was remembered is asked about again before
+        // anything is refused on it, or an agent added while the wall ran would be refused for ever.
+        nOc.agents = ['build', 'kickoff-room-steering']
+        const beforeKnown = prompts().length
+        typeAt('and now?')
+        check(
+          'and_an_agent_the_server_does_resolve_still_carries_his_words',
+          await until('the prompt', () => prompts().length > beforeKnown, 8000),
+          `${prompts().length - beforeKnown} prompt(s)`,
+        )
+        // A server that will not say — an older one with no such route — refuses nothing. Withholding
+        // his words on a fact nobody could observe would silence every line typed at such a server,
+        // and what it guards against is still said after the fact, in his own register.
+        nOc.agents = null
+        const beforeSilent = prompts().length
+        typeAt('and at a server that will not say?')
+        check(
+          'and_a_server_that_will_not_say_which_agents_it_knows_still_carries_his_words',
+          await until('the prompt', () => prompts().length > beforeSilent, 8000),
+          `${prompts().length - beforeSilent} prompt(s)`,
+        )
+      }
+
+      // And the same rule on the way back, or it is a rule in one direction only: a turn that ran
+      // under another agent is another worker's turn, and its question belongs on nobody's phone
+      // under this project's name.
+      {
+        const asksBeforeStray = nFrames('ask').length
+        nOc.messages.set('msg_stray', { id: 'msg_stray', sessionID: BOUND, role: 'assistant', agent: 'coordinator' })
+        nOc.push({
+          type: 'question.v2.asked',
+          properties: {
+            id: 'que_stray',
+            sessionID: BOUND,
+            tool: { messageID: 'msg_stray', callID: 'call_1' },
+            questions: [{ question: 'Push to production?', header: 'Deploy', options: [{ label: 'Push it' }] }],
+          },
+        })
+        await new Promise(r => setTimeout(r, 900))
+        check(
+          'a_turn_running_under_an_agent_the_note_does_not_bind_never_reaches_his_phone',
+          nFrames('ask').length === asksBeforeStray,
+          JSON.stringify(nFrames('ask').slice(asksBeforeStray).map(f => f.text)),
+        )
+        // Withheld is not the same as handled. Nothing rejects the request on opencode, so the
+        // agent that asked blocks on a keyboard that will never be drawn — for ever, on a wall
+        // whose tree names another agent by default, which is the very configuration the fence was
+        // written for. The session was already proved to be this conversation's own, so turning the
+        // question down is this watcher's to do and nobody else's.
+        check(
+          'and_the_worker_is_not_left_blocked_on_a_keyboard_that_will_never_be_drawn',
+          await until('the question to be turned down',
+            () => nOc.posted.some(p => p.path.endsWith('/question/que_stray/reject')), 8000),
+          JSON.stringify(nOc.posted.map(p => p.path)),
+        )
+        nOc.messages.set('msg_ours', { id: 'msg_ours', sessionID: BOUND, role: 'assistant', agent: 'kickoff-room-steering' })
+        nOc.push({
+          type: 'question.v2.asked',
+          properties: {
+            id: 'que_ours',
+            sessionID: BOUND,
+            tool: { messageID: 'msg_ours', callID: 'call_2' },
+            questions: [{ question: 'Tag the release?', header: 'Release', options: [{ label: 'Tag it' }] }],
+          },
+        })
+        check(
+          'and_a_turn_running_under_the_agent_it_does_bind_is_shown',
+          await until('the bound agent\'s question', () => nFrames('ask').some(f => f.text?.startsWith('Tag the release?')), 8000),
+          JSON.stringify(nFrames('ask').map(f => f.text)),
+        )
+      }
 
       // Read at delivery time, never cached: the launcher rewrites the note and the NEXT line goes
       // to the new session with nothing restarted.
@@ -1639,6 +1870,46 @@ try {
         'and_his_tap_on_it_reaches_that_session_too_rather_than_dying_with_the_note',
         openAsk !== undefined && (await until('the tap', () => nOc.posted.length > repliesBeforeOpenTap, 8000)),
         JSON.stringify(nOc.posted.slice(repliesBeforeOpenTap).map(p => p.path)),
+      )
+
+      // The agent has to travel with the QUESTION, not with the watcher. Held as one value for the
+      // whole process — the agent of whichever note was last obeyed — it is paired at the hatch
+      // with the OLDER session that asked: after a rollover onto a session running a different
+      // agent, a reply typed under the old question goes into the old session naming the NEW
+      // session's agent. That is a turn under an agent nothing ever bound to it, which is the one
+      // failure the binding exists to refuse, caused by the fix for the note going missing.
+      nOc.sessions = [
+        listedSession(BOUND, noteRepo, 1788607585115, { agent: 'kickoff-room-steering' }),
+        listedSession(OTHER, noteRepo, 1788607580000, { agent: 'coordinator' }),
+      ]
+      writeNote(JSON.stringify({ version: 1, session_id: BOUND, agent: 'kickoff-room-steering' }))
+      const asksBeforeTwoAgents = nFrames('ask').length
+      nOc.push({
+        type: 'question.v2.asked',
+        properties: {
+          id: 'que_twoagents',
+          sessionID: BOUND,
+          questions: [{ question: 'Which agent asked this?', header: 'Pick', options: [{ label: 'this one' }] }],
+        },
+      })
+      await until('the question from the bound agent', () => nFrames('ask').length > asksBeforeTwoAgents, 12000)
+      const twoAgentsAsk = nFrames('ask').at(-1)!
+      // The launcher rolls the wall over onto a session running a different agent, and that note is
+      // obeyed once — which is all it takes to become "the last agent a note named".
+      writeNote(JSON.stringify({ version: 1, session_id: OTHER, agent: 'coordinator' }))
+      const beforeRollover = prompts().length
+      typeAt('a line under the new agent')
+      await until('the line under the new agent', () => prompts().length > beforeRollover, 8000)
+      // Then the note goes missing, which is the only reason the hatch exists at all.
+      writeNote(null)
+      const beforeUnderOld = prompts().length
+      typeAt('and back to the old question', { in_reply_to_ask: String(twoAgentsAsk.ask_id) })
+      await until('the reply under the old question', () => prompts().length > beforeUnderOld, 8000)
+      check(
+        'a_reply_to_a_question_one_agent_asked_is_never_carried_into_that_session_under_another_agent',
+        prompts().at(-1)?.path === `/session/${BOUND}/prompt_async` &&
+          prompts().at(-1)?.body?.agent === 'kickoff-room-steering',
+        `${prompts().at(-1)?.path} · agent ${JSON.stringify(prompts().at(-1)?.body?.agent)}`,
       )
       writeNote(JSON.stringify({ version: 1, session_id: BOUND }))
 

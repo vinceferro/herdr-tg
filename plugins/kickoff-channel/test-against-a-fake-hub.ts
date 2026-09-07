@@ -1647,6 +1647,210 @@ for (const bad of ['../../etc', 'p-0123456789AB', 'c-0123456789a', 'p-0123456789
   staleRoomHub.stop()
 }
 
+// ── Slice C: the lease the hub grants, and the tap this session answers for ────────────────────
+//
+// The hub admits one run per address and mints it a LEASE — a number on the `welcome`'s OWN
+// envelope, and on every frame the hub sends that connection afterwards. There is no payload field
+// of that name and there cannot be one: an envelope flattens its payload, so a second `generation`
+// is the same key twice and serde refuses the whole frame. A run that comes back stamps the number
+// it is holding on its `hello`; a run a later one has replaced is turned away for good.
+//
+// The tap's other half is here too. The hub puts "Sent: <label>" on the operator's phone the moment
+// his answer is queued for this session, and only an `ack` from here can turn that into "Taken" or
+// take it back. A session that answered for nothing left him reading "Sent" for an answer no agent
+// ever received.
+console.log('\nabout the lease and the tap:')
+{
+  const leaseSock = join(dir, 'lease.sock')
+  let leaseConn: any = null
+  let grants = 700
+  const leaseHub = fakeHub(leaseSock, (_h, s) => {
+    leaseConn = s
+    s.write(JSON.stringify({ v: 1, id: 'h-w', t: 'welcome', project: 'repo', generation: grants,
+      limits: { max_frame_bytes: 65536, per_minute: 20 } }) + '\n')
+  })
+  const leased = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: leaseSock })
+  await handshake(leased)
+  await until('the first hello', () => leaseHub.got.some(f => f.t === 'hello'))
+  const firstHello = leaseHub.got.find(f => f.t === 'hello')!
+  // A run that has never been welcomed holds no lease, and a zero is not one either: the hub reads
+  // `0` as "this peer holds none", so a bridge that wrote one would look like it held a number and
+  // lose every comparison that number was ever in.
+  check('a_bridge_that_has_never_been_welcomed_stamps_no_lease_on_its_hello',
+    !('generation' in firstHello), JSON.stringify(firstHello.generation ?? null))
+  check('a_bridge_that_will_answer_for_a_tap_promises_so_in_its_hello',
+    Array.isArray(firstHello.confirms) && firstHello.confirms.includes('choice'),
+    JSON.stringify(firstHello.confirms ?? null))
+
+  await call(leased, 700, 'reply', { text: 'the first thing after the welcome' })
+  await until('a say', () => leaseHub.got.some(f => f.t === 'say'), 4000).catch(() => {})
+  const firstSay = leaseHub.got.find(f => f.t === 'say')
+  leaseConn.write(JSON.stringify({ v: 1, id: 'h-p1', t: 'ping' }) + '\n')
+  await until('a pong', () => leaseHub.got.some(f => f.t === 'pong'), 4000).catch(() => {})
+  const pong = leaseHub.got.find(f => f.t === 'pong')
+  check('the_lease_on_the_welcomes_envelope_is_stamped_on_every_envelope_the_bridge_sends_after_it',
+    firstSay?.generation === 700 && pong?.generation === 700,
+    `say ${JSON.stringify(firstSay?.generation ?? null)}, pong ${JSON.stringify(pong?.generation ?? null)}`)
+
+  // His tap, delivered into a live turn. The hub is waiting to hear whether the agent got it.
+  leaseConn.write(JSON.stringify({ v: 1, id: 'h-tap1', t: 'choice', msg_id: 'm7',
+    ask_id: 'a-live', option_id: 'y' }) + '\n')
+  await until('the answer for the tap',
+    () => leaseHub.got.some(f => f.t === 'ack' && f.ref === 'h-tap1'), 4000).catch(() => {})
+  const forTheTap = leaseHub.got.find(f => f.t === 'ack' && f.ref === 'h-tap1')
+  check('a_tap_handed_into_the_agents_turn_is_answered_accepted_so_his_receipt_can_say_taken',
+    forTheTap?.status === 'accepted', JSON.stringify(forTheTap ?? 'no answer at all'))
+
+  // The race the hub cannot see from its side: the agent answered the question itself and took the
+  // buttons off, and his thumb was already on its way. Acking this one `accepted` would tell him
+  // his answer was taken when the agent had moved on without it.
+  await call(leased, 701, 'ask_resolved', { ask_id: 'a-mine', how: 'answered', outcome: 'went ahead' })
+  leaseConn.write(JSON.stringify({ v: 1, id: 'h-tap2', t: 'choice', msg_id: 'm8',
+    ask_id: 'a-mine', option_id: 'n' }) + '\n')
+  await until('the answer for the late tap',
+    () => leaseHub.got.some(f => f.t === 'ack' && f.ref === 'h-tap2'), 4000).catch(() => {})
+  const late = leaseHub.got.find(f => f.t === 'ack' && f.ref === 'h-tap2')
+  check('a_late_choice_for_a_question_answered_at_the_terminal_is_refused_by_the_tool_server',
+    late?.status === 'refused' && /answered at the terminal first/.test(String(late?.reason)),
+    JSON.stringify(late ?? 'no answer at all'))
+
+  // The same race, one hop out — and the likelier half of it. `ask` returns straight away and the
+  // instructions tell the agent to carry on, so the ordinary way a question ends here is that the
+  // agent STOPPED WAITING for it, not that somebody answered it at a keyboard. Told "answered at
+  // the terminal", he reads that a person answered a question he was the only one looking at:
+  // two truths on one screen with one of them false to him, which is the thing slice A deleted.
+  await call(leased, 704, 'ask_resolved', { ask_id: 'a-gave-up', how: 'timeout' })
+  leaseConn.write(JSON.stringify({ v: 1, id: 'h-tap3', t: 'choice', msg_id: 'm9',
+    ask_id: 'a-gave-up', option_id: 'n' }) + '\n')
+  await until('the answer for the tap on a question given up on',
+    () => leaseHub.got.some(f => f.t === 'ack' && f.ref === 'h-tap3'), 4000).catch(() => {})
+  const gaveUp = leaseHub.got.find(f => f.t === 'ack' && f.ref === 'h-tap3')
+  check('a_tap_on_a_question_the_agent_stopped_waiting_for_is_not_told_it_was_answered_at_the_terminal',
+    gaveUp?.status === 'refused' && /stopped waiting/.test(String(gaveUp?.reason)) &&
+      !/at the terminal/.test(String(gaveUp?.reason)),
+    JSON.stringify(gaveUp ?? 'no answer at all'))
+
+  await call(leased, 705, 'ask_resolved', { ask_id: 'a-withdrawn', how: 'withdrawn' })
+  leaseConn.write(JSON.stringify({ v: 1, id: 'h-tap4', t: 'choice', msg_id: 'm10',
+    ask_id: 'a-withdrawn', option_id: 'n' }) + '\n')
+  await until('the answer for the tap on a withdrawn question',
+    () => leaseHub.got.some(f => f.t === 'ack' && f.ref === 'h-tap4'), 4000).catch(() => {})
+  const pulled = leaseHub.got.find(f => f.t === 'ack' && f.ref === 'h-tap4')
+  check('and_neither_is_a_tap_on_a_question_the_agent_took_back',
+    pulled?.status === 'refused' && /stopped waiting/.test(String(pulled?.reason)) &&
+      !/at the terminal/.test(String(pulled?.reason)),
+    JSON.stringify(pulled ?? 'no answer at all'))
+
+  // The socket goes, and the run comes back holding the number it had. What it queued while it was
+  // away was written down BEFORE it could have read the new welcome, so those bytes carry the old
+  // number and nothing may rewrite them — the hub refuses only a number it never granted, and an
+  // invented re-stamp is what would turn a healthy backlog into a permanent refusal.
+  grants = 900
+  leaseConn.end()
+  await Bun.sleep(200)
+  await call(leased, 702, 'reply', { text: 'what it queued while it was away' })
+  await until('a second hello', () => leaseHub.got.filter(f => f.t === 'hello').length >= 2, 8000)
+  const secondHello = leaseHub.got.filter(f => f.t === 'hello')[1]
+  check('a_run_that_comes_back_carries_on_its_hello_the_lease_it_was_holding',
+    secondHello?.generation === 700, JSON.stringify(secondHello?.generation ?? null))
+  await until('the backlog',
+    () => leaseHub.got.some(f => f.t === 'say' && f.text === 'what it queued while it was away'),
+    4000).catch(() => {})
+  const carriedIn = leaseHub.got.find(f => f.t === 'say' && f.text === 'what it queued while it was away')
+  check('and_the_backlog_it_carried_in_still_says_the_number_it_was_written_under',
+    carriedIn?.generation === 700, JSON.stringify(carriedIn?.generation ?? null))
+  await call(leased, 703, 'reply', { text: 'the first thing under the new lease' })
+  await until('the first frame of the new lease',
+    () => leaseHub.got.some(f => f.t === 'say' && f.text === 'the first thing under the new lease'),
+    4000).catch(() => {})
+  const afterTheNewWelcome = leaseHub.got.find(f => f.t === 'say' && f.text === 'the first thing under the new lease')
+  check('while_what_it_says_under_the_new_lease_carries_the_new_number',
+    afterTheNewWelcome?.generation === 900, JSON.stringify(afterTheNewWelcome?.generation ?? null))
+  leased.child.kill()
+  leaseHub.stop()
+
+  // A run a later one replaced. Every other refusal this bridge does not recognise is treated as
+  // something waiting will mend — on purpose — and this is the one where waiting mends nothing:
+  // the address has moved on, and a redial loop would spend the rest of the session asking to come
+  // back to a place that is taken.
+  const staleSock = join(dir, 'stale-lease.sock')
+  const staleHub = fakeHub(staleSock, (_h, s) => {
+    s.write(JSON.stringify({ v: 1, id: 'h-r', t: 'refused', reason: 'stale_generation' }) + '\n')
+    s.end()
+  })
+  const superseded = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: staleSock })
+  await handshake(superseded)
+  await until('the hello it is refused for', () => staleHub.got.some(f => f.t === 'hello'), 4000)
+  // Two backoffs' worth of quiet: the first redial would be a second after the close, the next two
+  // seconds after that.
+  await Bun.sleep(2600)
+  const supersededSaid = await call(superseded, 710, 'reply', { text: 'anything at all' })
+  check('a_run_a_newer_one_replaced_is_told_to_restart_the_session_and_never_dials_again',
+    staleHub.got.filter(f => f.t === 'hello').length === 1 && supersededSaid.isError &&
+      /newer run/.test(supersededSaid.text) && /restart/i.test(supersededSaid.text),
+    `${staleHub.got.filter(f => f.t === 'hello').length} hello(s): ${supersededSaid.text}`)
+  superseded.child.kill()
+  staleHub.stop()
+
+  // Print mode ends the turn and tears this process down, and his thumb arrives after it. There is
+  // nothing left to hand the answer to, so answering `accepted` would put "Taken" on his phone for
+  // an answer no agent ever read. EOF on stdin is the end of the turn as this process sees it — the
+  // one signal that arrives whichever process the engine actually signalled.
+  const endedSock = join(dir, 'ended-turn.sock')
+  let endedConn: any = null
+  const endedHub = fakeHub(endedSock, (_h, s) => { endedConn = s; welcome(s) })
+  const ending = startBridge({ CLAUDE_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: endedSock })
+  await handshake(ending)
+  await until('the welcome', () => endedConn !== null)
+  await Bun.sleep(200)
+  ending.child.stdin.end()
+  await Bun.sleep(30)
+  endedConn.write(JSON.stringify({ v: 1, id: 'h-tap9', t: 'choice', msg_id: 'm9',
+    ask_id: 'a-print', option_id: 'y' }) + '\n')
+  await until('the answer after the turn',
+    () => endedHub.got.some(f => f.t === 'ack' && f.ref === 'h-tap9'), 2000).catch(() => {})
+  const afterTheTurn = endedHub.got.find(f => f.t === 'ack' && f.ref === 'h-tap9')
+  check('a_choice_that_arrives_after_the_turn_has_ended_is_refused_rather_than_answered_as_taken',
+    afterTheTurn?.status === 'refused' && /has ended/.test(String(afterTheTurn?.reason)),
+    JSON.stringify(afterTheTurn ?? 'no answer at all'))
+
+  // And his typed words, in the identical window. `accepted` is claimed for one thing on this wire
+  // — the words are in the agent's turn — so acking it for a turn that has ended puts a thumb on
+  // his message for a line no agent will ever read. The tap beside it was refused for this; the
+  // words were not, and it is the same lie.
+  endedConn.write(JSON.stringify({ v: 1, id: 'h-words9', t: 'message', msg_id: 'm11',
+    text: 'anything at all' }) + '\n')
+  await until('the answer about words after the turn',
+    () => endedHub.got.some(f => f.t === 'ack' && f.ref === 'h-words9'), 2000).catch(() => {})
+  const wordsAfterTheTurn = endedHub.got.find(f => f.t === 'ack' && f.ref === 'h-words9')
+  check('and_so_are_his_typed_words_rather_than_thumbed_as_read',
+    wordsAfterTheTurn?.status === 'refused' && /had already ended/.test(String(wordsAfterTheTurn?.reason)),
+    JSON.stringify(wordsAfterTheTurn ?? 'no answer at all'))
+  ending.child.kill()
+  endedHub.stop()
+
+  // The same fact one engine down: opencode has no passthrough for the notification his answer
+  // travels in, so a tap there reaches nobody. It is refused on the wire for the same reason his
+  // typed words are, and the hub puts the reason in the topic he tapped in.
+  const noTapSock = join(dir, 'no-tap.sock')
+  let noTapConn: any = null
+  const noTapHub = fakeHub(noTapSock, (_h, s) => { noTapConn = s; welcome(s) })
+  const tapThere = startBridge({ KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: noTapSock })
+  await handshake(tapThere, OPENCODE)
+  await until('the welcome', () => noTapConn !== null)
+  await Bun.sleep(200)
+  noTapConn.write(JSON.stringify({ v: 1, id: 'h-tap8', t: 'choice', msg_id: 'm10',
+    ask_id: 'a-there', option_id: 'y' }) + '\n')
+  await until('the answer on the other engine',
+    () => noTapHub.got.some(f => f.t === 'ack' && f.ref === 'h-tap8'), 4000).catch(() => {})
+  const thereItIs = noTapHub.got.find(f => f.t === 'ack' && f.ref === 'h-tap8')
+  check('a_tap_on_an_engine_that_cannot_hand_it_to_the_agent_is_refused_on_the_wire_not_answered_as_taken',
+    thereItIs?.status === 'refused' && /--opencode/.test(String(thereItIs?.reason)),
+    JSON.stringify(thereItIs ?? 'no answer at all'))
+  tapThere.child.kill()
+  noTapHub.stop()
+}
+
 // ── The `start` command, the way the plugin manifest runs it ──────────────────────────────────
 //
 // Every bridge above is spawned as `bun server.ts`. Claude Code does not do that: `.mcp.json` runs

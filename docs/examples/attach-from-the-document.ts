@@ -5,15 +5,19 @@
  * It imports NOTHING from this repository — not the wire, not the configuration reader, not a type.
  * That is the point of it: the interface is only abstract if somebody who has never read our
  * TypeScript can attach from the document, so this file is the test of the document rather than of
- * the code. `adapters/fanin/test-two-producers.ts` runs it against the real relay.
+ * the code. `adapters/kickoff-hub-attach/test-two-producers.ts` runs it against the real door, and
+ * `test-run.ts` runs it as the engine attach starts. (`adapters/fanin/` is gone; the sentence
+ * that named it outlived it.)
  *
- * It does the five steps §1 lists, and only those:
+ * It does the five steps §1 lists, and two more that §6 added in v22:
  *
  *   1. connect to a Unix socket,
- *   2. write one line of JSON — `hello`, carrying the secret,
+ *   2. write one line of JSON — `hello`, carrying the secret, and promising to answer for a tap,
  *   3. answer a `ping` with a `pong`,
- *   4. write one more line — `say`,
- *   5. read the `ack` for it.
+ *   4. write one more line — `say`, and one question with buttons,
+ *   5. read the `ack` for it,
+ *   6. answer any `choice` with an `ack`, because step 2 promised to,
+ *   7. ignore the lease on the `welcome`'s envelope, which §6 says a bridge may hold none of.
  *
  * Everything it refuses to do — guess a directory, keep a secret in a variable, retry a name the
  * hub will not address — is refused because the document said so, and every such refusal names the
@@ -108,8 +112,14 @@ const socket = viaRelay
 // ── §6, the handshake ──────────────────────────────────────────────────────────────────────────
 
 const PROTOCOL_VERSION = 1
+const A_MOMENT_FOR_HIS_THUMB = 1_500
 let seq = 0
 let up = false
+/** The id of the line this adapter came to say. Its `ack` is what it waits for. */
+let said: string | null = null
+/** Has a tap been answered for? Then there is nothing left to wait on. */
+let answered = false
+let leaving = false
 
 const conn = await Bun.connect({
   unix: socket,
@@ -127,6 +137,12 @@ const conn = await Bun.connect({
         pid: process.pid,
         // §4: never send `"lane": null`. Omit the field.
         ...(address ? { lane: address } : {}),
+        // §6: which of the hub's own frames this adapter will answer with an `ack`. Promising it is
+        // what makes the operator's line say whether his answer was taken, and §8 rule 13 is the
+        // other half of the bargain: having promised, every `choice` gets exactly one answer. An
+        // adapter that would rather not is silent here — an EMPTY list is no promise either, and
+        // saying nothing keeps the behaviour every adapter had before v22.
+        confirms: ['choice'],
       })
     },
     data(s, chunk) {
@@ -151,9 +167,35 @@ const conn = await Bun.connect({
 
 let buf = ''
 
-/** §8 rule 1: the trailing newline is appended in exactly one place. */
-function write(s: import('bun').Socket, payload: Record<string, unknown>): void {
-  s.write(JSON.stringify({ v: PROTOCOL_VERSION, id: `s${++seq}`, ...payload }) + '\n')
+/**
+ * §8 rule 1: the trailing newline is appended in exactly one place.
+ *
+ * It hands the id back because §6 says every frame after `hello` gets exactly one `ack` naming it,
+ * and this adapter waits for the one belonging to the line it came to say. Nothing here stamps a
+ * `generation`: see the `welcome` arm.
+ */
+function write(s: import('bun').Socket, payload: Record<string, unknown>): string {
+  const id = `s${++seq}`
+  s.write(JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n')
+  return id
+}
+
+/**
+ * §6 step 10: `bye`, then wait for the kernel to take it before exiting — `process.exit()` on the
+ * same tick loses it to a short write.
+ *
+ * It waits a moment first, because this adapter asked a question and a question nobody is there to
+ * answer for is worse than no question: leaving the instant its own line was acked would take the
+ * buttons off his phone (§9, the grace window) before a thumb could reach them. A real adapter
+ * stays for as long as its agent does; this one is a worked example and leaves.
+ */
+function leave(s: import('bun').Socket): void {
+  if (leaving) return
+  leaving = true
+  setTimeout(() => {
+    write(s, { t: 'bye', reason: 'said what it came to say' })
+    setTimeout(() => process.exit(0), 200)
+  }, answered ? 0 : A_MOMENT_FOR_HIS_THUMB)
 }
 
 function onFrame(s: import('bun').Socket, f: Record<string, any>): void {
@@ -168,10 +210,26 @@ function onFrame(s: import('bun').Socket, f: Record<string, any>): void {
       }
       up = true
       say(`WELCOME ${f.project}${f.lane ? ` · ${f.lane}` : ''}`)
+      // §6, the lease: it is on this frame's OWN ENVELOPE — `f.generation` — and never in the
+      // payload. This adapter holds none on purpose, which §6 permits: a bridge that stamps no
+      // lease is fenced by its socket and its pid, exactly as every bridge was before leases
+      // existed, and the smallest thing that counts as an adapter need not carry the number at all.
+      // What it must NOT do is stamp `f.generation ?? 0`: §6 says a zero is read as silence, so the
+      // `?? 0` that comes naturally in this language would put on the wire the one value a lease
+      // cannot mean. Nothing below writes a `generation`.
+      //
       // §6 step 4 in the smallest-adapter list is "write one more line", and it goes HERE rather
       // than after a ping: §9 says a relay never pings its producers, so an adapter that waited for
       // one before speaking would sit silent for ever behind one.
-      write(s, { t: 'say', text: 'attached from the document alone' })
+      said = write(s, { t: 'say', text: 'attached from the document alone' })
+      // §7 offer 4: a question with buttons, so there is something for him to tap and something for
+      // the promise above to be about. The ids and the labels are this adapter's to mint.
+      write(s, {
+        t: 'ask',
+        ask_id: 'a1',
+        text: 'Attached from the document. Anything to say back?',
+        options: [{ option_id: 'ok', label: 'Nothing, carry on' }, { option_id: 'stop', label: 'Stop' }],
+      })
       return
     }
     case 'ping':
@@ -179,15 +237,30 @@ function onFrame(s: import('bun').Socket, f: Record<string, any>): void {
       // layer — liveness is what keeps the claim.
       write(s, { t: 'pong', ref: f.id })
       return
+    case 'choice': {
+      // Promised on the `hello`, so it is answered — exactly once, and §8 rule 13 says what the
+      // answer means: `accepted` is "the answer is in the agent's turn", never "I read the frame".
+      // Here the agent IS this file and reading it is taking it, which is the only reason
+      // `accepted` is honest this early; an adapter with an engine behind it says `accepted` when
+      // its engine has the answer and `refused`, with one sentence the operator can read, when it
+      // never will.
+      say(`CHOICE ${f.option_id}`)
+      write(s, { t: 'ack', ref: f.id, status: 'accepted' })
+      // §7 offer 5: the question has stopped being open, so say so — after a tap too, which is the
+      // second chance rather than a duplicate.
+      write(s, { t: 'ask_resolved', ask_id: f.ask_id, how: 'answered' })
+      answered = true
+      return
+    }
     case 'ack':
       // §7 offer 3: three values, and `unseen` is not success. Branch on `=== "yes"`, never on
       // `!== "no"`.
+      // The hub's ack carries `delivered`; the one this adapter sent up carries `status`, and the
+      // hub acks THAT one too, because every frame after `hello` gets exactly one. It is
+      // bookkeeping — answering it would be a loop with no end.
+      if (f.delivered === undefined) return
       say(`ACK ${f.delivered === 'yes' ? 'reached' : f.delivered}${f.why ? ` (${f.why})` : ''}`)
-      if (f.delivered !== undefined) {
-        // §6 step 10: send `bye`, then wait for the kernel to take it before exiting.
-        write(s, { t: 'bye', reason: 'said what it came to say' })
-        setTimeout(() => process.exit(0), 200)
-      }
+      if (f.ref === said) leave(s)
       return
     case 'refused':
       say(`REFUSED ${f.reason}`)

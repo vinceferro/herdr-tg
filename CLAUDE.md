@@ -59,7 +59,7 @@ run under `adapters/`, on purpose.
 
 **One namespace, `KICKOFF_HUB_`, and one document.** `docs/ATTACHING.md` is the contract an adapter
 attaches by — eight variables of which a normal adopter sets one, the address a dispatcher mints, the
-credential rule, the handshake, and the twelve wire rules; §13 is `kickoff-hub-attach` itself. It is
+credential rule, the handshake, and the thirteen wire rules; §13 is `kickoff-hub-attach` itself. It is
 written to be implementable by a stranger, and `docs/examples/attach-from-the-document.ts` is a
 stranger's adapter that imports nothing of ours and is run against the real door by attach's own suite.
 
@@ -173,6 +173,20 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
   reads "the session that asked has ended" instead of dead buttons; the plugin starts from a
   read-only mount without `bun install` (`start.ts`). ATTACHING §13.1 has the Claude worked
   invocation: `--channels` last, prompt on stdin, trust pre-accepted, one ToolSearch turn.
+- **A run of an address carries a lease, and a tap is answered for** (7 September). The hub
+  mints a number for every claim it grants, stamps it on the `welcome` that grants it and on
+  everything it sends afterwards, and a bridge stamps it back — so a run a later one replaced
+  is refused `stale_generation` and told to stop, where before it was overwritten in silence
+  and went on emptying its queue into a conversation its successor owned. That refusal is
+  permanent for the run: the way back is a new run, never a redial — the tool server stops
+  dialling and tells its agent to restart the session, and `kickoff-hub-attach` stops the whole
+  run, engine and all, so whatever starts walls starts a new one — but that word never travels
+  DOWN through attach's door: a producer holds no lease, and one told to stop dialling never finds
+  the next run of the wall, which `Restart=always` brings up seconds later. Their sockets are
+  ended instead, which every producer already reads as "wait, and dial again". And a bridge that promises
+  `confirms: ["choice"]` now answers every tap `accepted` or `refused`, so the line on his
+  phone is edited from `Sent: X` to `Taken: X`, or to why it was not taken — it said "Sent"
+  for ever before, whatever the far side did with the answer.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.

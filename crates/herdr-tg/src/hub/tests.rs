@@ -10821,6 +10821,113 @@ async fn a_tap_the_bridge_could_not_act_on_is_taken_back_on_the_phone_with_the_b
 }
 
 #[tokio::test]
+async fn a_tap_the_agent_refused_is_still_told_when_telegram_would_not_send_his_receipt() {
+    // The receipt is a send, and a send can be refused — by a flood wait, on a busy forum, which is
+    // the state the chat is in when he taps at all. Everything else about the tap went through: the
+    // answer is on the wire and the keyboard has already come off. So when the agent then says it
+    // could not act on the answer, this is the only word he will ever get, and it was being
+    // swallowed: the ack found no receipt and parked what it said, the window found no receipt and
+    // wrote itself down, and both were waiting for a round trip that had already failed.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    // Everything `bot.rs` does for a tap EXCEPT hand over the receipt, because Telegram refused the
+    // send that would have been it.
+    let (addr, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+        .await
+        .expect("the tap resolves");
+    let frame = h
+        .hub
+        .deliver_tap(&addr, ALLOWED_CHAT, &msg, ask_id, option_id, "No")
+        .await
+        .expect("his answer went down to the bridge");
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "No").await;
+    h.hub.his_receipt_never_arrived(&frame).await;
+    let _ = bridge.next_choice().await;
+
+    let sends_before = h.fake.sends.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the session that asked has ended".into()),
+            files: None,
+        })
+        .await;
+
+    // Waited out rather than waited ON: what this test is about is what he is told when nothing
+    // speaks, so the assertion below has to be the thing that fails, with the sentence that says
+    // what he was left with.
+    for _ in 0..120 {
+        if h.fake.sends.lock().await.len() > sends_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let sends = h.fake.sends.lock().await.clone();
+    let told = sends[sends_before..].iter().any(|(_, text, _)| {
+        text.contains("Not taken") && text.contains("the session that asked has ended")
+    });
+    assert!(
+        told,
+        "his answer reached nobody and he was never told, because the line his receipt would have \
+         been was never sent: sends {} -> {}, last {:?}",
+        sends_before,
+        sends.len(),
+        sends.last().map(|(_, text, _)| text)
+    );
+}
+
+#[tokio::test]
+async fn a_tap_the_agent_took_is_said_nothing_about_when_his_receipt_was_never_sent() {
+    // The other half, and it must stay silent: with no receipt there is no line claiming anything,
+    // so there is nothing to correct — and a send per tap, on the one path that only runs when the
+    // chat is already refusing sends, is the last thing that budget needs.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    let (addr, ask_id, option_id) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the tap resolves");
+    let frame = h
+        .hub
+        .deliver_tap(&addr, ALLOWED_CHAT, &msg, ask_id, option_id, "Yes")
+        .await
+        .expect("his answer went down to the bridge");
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+    h.hub.his_receipt_never_arrived(&frame).await;
+    let _ = bridge.next_choice().await;
+
+    let sends_before = h.fake.sends.lock().await.len();
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        sends_before,
+        "a tap the agent took spent a send saying so"
+    );
+}
+
+#[tokio::test]
 async fn a_bridge_that_never_promised_to_confirm_a_choice_is_not_nagged_about_it() {
     // Green today, and it must stay green. Every bridge shipped so far acks no choice at all, and
     // telling the operator that a session "has not confirmed" a tap it was never going to confirm

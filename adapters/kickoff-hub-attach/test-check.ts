@@ -54,7 +54,7 @@ async function runCheck(env: Record<string, string>, args: string[] = [], cwd = 
  * A hub that welcomes, pings, and REMEMBERS every frame it is sent — so a test can prove a pong was
  * never sent and therefore no topic could have been made. It creates nothing.
  */
-function recordingHub(path: string, opts: { refuse?: string; silentAfterHello?: boolean; mute?: boolean; project?: string } = {}) {
+function recordingHub(path: string, opts: { refuse?: string; silentAfterHello?: boolean; mute?: boolean; project?: string; lease?: number } = {}) {
   const seen: Record<string, any>[] = []
   const server = Bun.listen({
     unix: path,
@@ -81,6 +81,8 @@ function recordingHub(path: string, opts: { refuse?: string; silentAfterHello?: 
           }
           s.write(JSON.stringify({
             v: 1, id: 'h-w', t: 'welcome', project: opts.project ?? 'the-fake-project',
+            // The lease rides on the welcome's own ENVELOPE, exactly as the hub sends it.
+            ...(opts.lease !== undefined ? { generation: opts.lease } : {}),
             ...(f.lane ? { lane: f.lane } : {}),
             limits: { max_frame: 262144, max_text: 3500, frames_per_min: 20 },
           }) + '\n')
@@ -144,6 +146,71 @@ console.log('\nwhen the hub names the conversation in its own title:')
   check('the admitted line is the hub\'s own title and nothing after it',
     r.out.some(l => l === 'ok   admitted as "hub-dogfood · …fy-0904-check"'),
     JSON.stringify(r.out.filter(l => /admitted/.test(l))))
+  hub.stop()
+}
+
+// ── A3. the lease: a check holds no place, and must never be told it lost one ─────────────────
+//
+// A run of an address holds a lease, and the hub raises its floor for that address every time it
+// grants one. A check is not a run: it is what somebody types precisely when a wall looks broken —
+// which is when a session is most likely to be between sockets — so if a check moved the address on,
+// it would fence the session that was merely redialling, for ever, with nothing on the phone. The
+// hub gives the number back to a connection that never became LIVE, and this command stays that way
+// on purpose: it says `bye` before the ping is answered, and it answers no ping at all.
+//
+// And nothing here can ever be told its lease is over, because it never carries one of its own. If
+// a hub says so anyway, the two disagree about the wire — and the operator gets a sentence rather
+// than the word.
+//
+// RED, before the fix:
+//   FAIL a_check_told_its_lease_is_over_says_so_without_naming_the_machinery NOT  the hub refused for a reason this command does not know (stale_generation)
+//   FAIL and_it_carries_no_number_of_its_own_on_the_goodbye_that_ends_it hub saw ["hello","bye@900"]
+//   FAIL and_it_names_no_cause_it_cannot_see "NOT ... the only cause left is that this command and
+//        the hub disagree about the wire — upgrade one of them"
+console.log('\nwhen the hub grants this check a lease:')
+{
+  const hubSock = join(dir, 'a3-hub.sock')
+  const hub = recordingHub(hubSock, { lease: 900 })
+  const r = await runCheck({
+    KICKOFF_HUB_PROJECT_DIR: laneDir,
+    KICKOFF_HUB_SOCKET: hubSock,
+    KICKOFF_HUB_RELAY_DIR: relayDir,
+  })
+  const seen = JSON.stringify(hub.seen.map(f => `${f.t}${f.generation !== undefined ? `@${f.generation}` : ''}`))
+  check('a_check_never_becomes_live_so_the_lease_number_it_was_given_goes_back',
+    r.code === 0 && !hub.seen.some(f => f.t === 'pong') && hub.seen.some(f => f.t === 'bye'),
+    `hub saw ${seen}`)
+  check('and the hello it opened with claims no lease at all',
+    hub.seen.find(f => f.t === 'hello')?.generation === undefined,
+    JSON.stringify(hub.seen.find(f => f.t === 'hello')))
+  // Not one frame of it, the goodbye included. A check that stamped the number it was welcomed with
+  // is a command claiming the address it is only asking about — and the hub's eviction kick answers
+  // a connection that stamped a number, so it is also the one way a check could ever be told its
+  // lease was over.
+  check('and_it_carries_no_number_of_its_own_on_the_goodbye_that_ends_it',
+    hub.seen.every(f => f.generation === undefined), `hub saw ${seen}`)
+  hub.stop()
+}
+
+console.log('\nwhen the hub says this check\'s lease is over:')
+{
+  const hubSock = join(dir, 'a4-hub.sock')
+  const hub = recordingHub(hubSock, { refuse: 'stale_generation' })
+  const r = await runCheck({
+    KICKOFF_HUB_PROJECT_DIR: laneDir,
+    KICKOFF_HUB_SOCKET: hubSock,
+    KICKOFF_HUB_RELAY_DIR: relayDir,
+  })
+  const said = r.out.find(l => l.startsWith('NOT')) ?? ''
+  check('a_check_told_its_lease_is_over_says_so_without_naming_the_machinery',
+    r.code === 1 && !/stale_generation/.test(said) && /newer run|took its place|took the/.test(said),
+    JSON.stringify(said))
+  // Two causes are left once "this command took the address" is ruled out — the two disagreeing
+  // about the wire, and a hub that kicked this connection over a number of its own — and this
+  // command can see neither. Naming one sends whoever runs the wall to upgrade a binary over
+  // somebody else's defect.
+  check('and_it_names_no_cause_it_cannot_see',
+    !/only cause|upgrade one of them/.test(said), JSON.stringify(said))
   hub.stop()
 }
 

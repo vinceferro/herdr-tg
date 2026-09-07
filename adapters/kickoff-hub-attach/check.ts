@@ -424,6 +424,18 @@ function refusalSentence(reason: string, address: string | null, project: { how?
       return `the hub will not address a conversation called ${address ?? 'this one'}; if the hub is older than this command, restart herdr-tg`
     case 'already_claimed':
       return 'another connection holds this conversation right now; if it is your own worker, run the check before it and not beside it; if nothing of yours is running, a stray process is squatting the claim'
+    case 'stale_generation':
+      // This command holds no place of its own — it dials once, is welcomed, and says goodbye
+      // before the hub's ping is answered, so the hub gives back the number it granted and nothing
+      // here ever carries one in. So the one thing this refusal cannot mean is what it says, and
+      // the sentence says that and stops.
+      //
+      // It names no cause, because there is more than one left and this command cannot see which:
+      // the two may disagree about the wire, or the hub may have kicked this connection for a
+      // generation it holds on its own side. Naming one of them would send whoever runs the wall to
+      // upgrade a binary over somebody else's defect. A sentence rather than the word, because the
+      // word is machinery and this line is read by whoever runs the wall.
+      return 'the hub says a newer run of this conversation took its place, which nothing this command does can cause; what went wrong is not something this command can see, and the hub\'s own log names the run it means'
     default:
       return `the hub refused for a reason this command does not know (${reason})`
   }

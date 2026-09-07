@@ -819,6 +819,10 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
     // Not every answer earns a message. A refusal that only says his tap changed nothing is
     // already on the button he is looking at, and repeating it under the question spends a send
     // per tap on a keyboard he is going to keep tapping.
+    // Whether the hub was handed the message his receipt is. A tap that went down and whose receipt
+    // never existed has to be said so exactly once, below: the hub cannot tell "not yet" from
+    // "never" on its own, and it waits for ever on the difference.
+    let mut receipt_handed_over = false;
     if let Some(msg) = q.message.as_ref().filter(|_| answer.in_the_topic) {
         // This one IS a message, so it comes out of the chat's budget — through the path that
         // cannot refuse, because he tapped a button and the answer to that is not an agent's
@@ -846,8 +850,17 @@ async fn on_callback(bot: Bot, q: CallbackQuery, ctx: Ctx) -> anyhow::Result<()>
         if let (Some(hub), Some(frame), Ok(receipt)) = (&ctx.hub, &tap_went_down, &answered) {
             hub.his_receipt_for_a_tap(frame, &hub_proto::MsgId::new(receipt.id.0.to_string()))
                 .await;
+            receipt_handed_over = true;
         }
         what_telegram_said(&ctx, chat.0, answered).await;
+    }
+    // Telegram refused the send, or there was no message to send it under. Either way the line that
+    // would have said "Sent" does not exist and never will, and the hub is told so — otherwise an
+    // agent that refuses the answer is answering into a record that waits for a receipt that is not
+    // coming, and the operator is left with a keyboard that has gone and no word about his answer.
+    // The refusal happens precisely when the forum is busy, which is when he is tapping.
+    if let (Some(hub), Some(frame), false) = (&ctx.hub, &tap_went_down, receipt_handed_over) {
+        hub.his_receipt_never_arrived(frame).await;
     }
     tracing::info!(chat_id, "handled a button");
     Ok(())

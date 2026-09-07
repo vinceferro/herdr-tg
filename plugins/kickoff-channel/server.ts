@@ -137,6 +137,55 @@ const CANNOT_TAKE_TYPED_WORDS =
   'nothing on this engine can take typed words from the phone by itself; a worker started with --opencode carries them'
 
 /**
+ * Why his TAP cannot be handed to the agent on the same engine, and it is the same fact: an answer
+ * travels in the notification only one client consumes. It reaches the topic he tapped in, under
+ * the line already telling him it was sent, so it says what a worker started differently would do
+ * about it rather than naming a thing he has never heard of.
+ */
+const CANNOT_TAKE_A_TAP =
+  'nothing on this engine can hand the agent an answer from the phone by itself; a worker started with --opencode can'
+
+/**
+ * Why a tap that arrives after the turn is over cannot be taken.
+ *
+ * Print mode is the ordinary way to get here: the engine ends the turn and tears this process down,
+ * and his thumb lands after it. There is nothing left to hand the answer to, and saying otherwise
+ * would put "Taken" on his phone for an answer no agent ever read.
+ */
+const THE_TURN_HAS_ENDED =
+  'the session that asked has ended, so there was nothing left here to hand the answer to'
+
+/**
+ * Why a tap for a question this session already closed itself cannot be taken.
+ *
+ * The race neither side can see alone: the agent answers at the terminal and retires the question
+ * while his thumb is already on its way. Whichever closing wins, the answer still arrives here for
+ * a question the agent has finished with.
+ */
+const ANSWERED_AT_THE_TERMINAL_FIRST = 'that question was answered at the terminal first'
+
+/**
+ * Why a tap for a question this session STOPPED WAITING for cannot be taken.
+ *
+ * The same race and a different fact, and this is the likelier half of it: `ask` returns straight
+ * away and the agent is told to carry on, so the ordinary end of a question here is that the agent
+ * gave up on it or took it back — not that anybody answered it at a keyboard. Told the terminal
+ * sentence for one of those, he reads that a person answered a question he was the only one
+ * looking at, while the hub's own note on the question line says it was withdrawn or timed out:
+ * two sentences on one screen with one of them false to him.
+ */
+const THE_AGENT_STOPPED_WAITING = 'the agent had already stopped waiting for an answer to that question'
+
+/**
+ * Why his typed words cannot be taken after the turn is over.
+ *
+ * Its own sentence rather than the tap's, because the hub puts this one in his topic as "What you
+ * typed did not reach the agent — <this>." A tap and a line he typed end the same way here and
+ * read differently to him.
+ */
+const THE_TURN_HAS_ENDED_FOR_WORDS = 'the session you typed at had already ended'
+
+/**
  * Where a file the agent wants him to see is put, as the hub said at `welcome` — or null, which is
  * every hub built before files existed (`docs/ATTACHING.md` §14).
  *
@@ -281,6 +330,16 @@ function withTheFile(
  *
  * A client this build does not recognise gets the careful sentence, not the confident one: not
  * knowing whether an answer can arrive is exactly when the agent must not be told to expect it.
+ *
+ * WHAT IT CANNOT SEE, said out loud because everything inbound rests on it: a Claude Code session
+ * started WITHOUT `--channels` looks exactly like one started with it. Nothing in the handshake
+ * separates them, so on that session the notification goes nowhere, his typed words are acked as
+ * taken and his tap is confirmed as taken — the same claim, on the same evidence, as everything
+ * else inbound has made since it was written. The honest alternative is to promise nothing on the
+ * name alone, and that would silence the confirmation on the one engine the feature exists for,
+ * for every correctly started session, to be right about a misconfigured one. So it is not made
+ * here: it is the engine's to declare, and the moment either client advertises a capability the
+ * check above reads it in preference to the name.
  */
 function canCarryAChannelMessage(): boolean {
   const caps = mcp.getClientCapabilities() as Record<string, any> | undefined
@@ -528,6 +587,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!['answered', 'withdrawn', 'timeout'].includes(how)) {
           throw new Error(`how must be answered, withdrawn or timeout — "${how}" is none of them`)
         }
+        // Written down before the frame goes anywhere. His thumb may already be on its way, and if
+        // it is, the answer that lands here is for a question the agent has finished with: it is
+        // refused, and he is told so under the line saying it was sent, rather than told it was
+        // taken by an agent that never saw it.
+        rememberItWasClosedHere(askId, how)
         return outcome(
           link.send(
             {
@@ -737,6 +801,11 @@ function identify(): Identity {
       // Omitted entirely when there is no address, so a session speaking for the project puts byte
       // for byte on the wire what this bridge has always put there. Never `"lane": null`.
       ...(LANE ? { lane: LANE } : {}),
+      // The down-frames this session will answer for, by name. It is a PROMISE: on the strength of
+      // it the hub waits for a word about every tap it hands over, and says so on the operator's
+      // receipt if none comes. Never the empty list — that is read as promising nothing, and two
+      // spellings of one meaning is how a reader ends up branching on the wrong one.
+      confirms: ['choice'],
     },
   }
 }
@@ -804,12 +873,75 @@ function onUnanswered(gone: Unanswered[], why: string): void {
  */
 let liveRefusalWhy: string | null = null
 
+/**
+ * Questions this session closed itself and HOW, so a tap that arrives for one can be turned away
+ * with the true reason. The three ways a question ends here are three different things to tell him,
+ * and the fact of the closing alone cannot tell them apart — which is how a tap that crossed a
+ * question the agent gave up on came to be answered "somebody answered it at the terminal".
+ *
+ * Written down when the TOOL is called and not when its frame goes out: the agent has moved on
+ * either way, and whether the retirement reached the hub changes nothing about that.
+ *
+ * Bounded, because a long session asks a great many questions and a set that only grows is a leak
+ * with a plan. The oldest go first: a tap for a question closed five hundred questions ago is not
+ * the race this exists for, it is a stray.
+ */
+const closedHere = new Map<string, string>()
+const MOST_CLOSED_QUESTIONS_REMEMBERED = 512
+
+function rememberItWasClosedHere(askId: string, how: string): void {
+  closedHere.set(askId, how)
+  while (closedHere.size > MOST_CLOSED_QUESTIONS_REMEMBERED) {
+    const oldest = closedHere.keys().next()
+    if (oldest.done) break
+    closedHere.delete(oldest.value)
+  }
+}
+
+/**
+ * Why his answer cannot be put in front of the agent — or null when it can.
+ *
+ * The hub has already told him "Sent: <label>" for this tap, and only the answer this decides can
+ * turn that into "Taken" or take it back. So `accepted` is claimed for exactly one thing: the
+ * answer is in the agent's turn. Everything else here is a way for that to be false while the
+ * frame still arrived, and each one has to reach him in words, under the line he is looking at.
+ *
+ * The question's own fate is asked about first, because it is the most useful thing he can be
+ * told: an answer that crossed the agent's own is not the same story as a session that ended.
+ */
+function whyHisAnswerCannotBeTaken(askId: string): string | null {
+  const closed = askId ? closedHere.get(askId) : undefined
+  // Only `answered` is somebody having answered it. The other two are the agent giving up on the
+  // question or taking it back, and on this engine those are the ordinary ending.
+  if (closed !== undefined) return closed === 'answered' ? ANSWERED_AT_THE_TERMINAL_FIRST : THE_AGENT_STOPPED_WAITING
+  if (!canCarryAChannelMessage()) return CANNOT_TAKE_A_TAP
+  if (leaving) return THE_TURN_HAS_ENDED
+  return null
+}
+
+/**
+ * Why his typed words cannot be put in front of the agent — or null when they can.
+ *
+ * The twin of the tap's, and it exists because the two windows are the same one: `accepted` is
+ * claimed on this wire for exactly one thing, that the words are in the agent's turn, and the turn
+ * that has ended is as ended for a line he typed as it is for a tap. Refusing the tap and thumbing
+ * the words in the identical instant was one honest half and one lie.
+ */
+function whyHisWordsCannotBeTaken(): string | null {
+  if (!canCarryAChannelMessage()) return CANNOT_TAKE_TYPED_WORDS
+  if (leaving) return THE_TURN_HAS_ENDED_FOR_WORDS
+  return null
+}
+
 /** Why the hub says a frame never reached his phone, in words the agent can pass on. */
 const ackReasons = new Map<string, string>([
   ['too-fast', 'too much was sent to his phone at once, so this one was shed'],
   ['clamped', 'it was too long for one message'],
   ['no-topic', 'there is nowhere in his chat to put it'],
   ['telegram-refused', 'his messaging app would not take it'],
+  // Sent only to a connection that has stamped a lease of its own, so a bridge that never held one
+  // is never handed a word it would render as a guess about his phone.
+  ['stale-generation', 'a newer run of this project has taken its place on his phone'],
 ])
 
 function onFrame(frame: Record<string, any>): void {
@@ -865,6 +997,12 @@ function onFrame(frame: Record<string, any>): void {
         bad_token: staleCopy ?? 'The secret this session presents is not one the hub knows. Enrol the project again at a terminal:  herdr-tg enroll <the project folder>',
         not_enabled: 'This project is enrolled with the hub but switched off, so nothing is delivered for it.',
         version_skew: 'The hub speaks a different version of this protocol than the bridge. Run:  kickoff pull',
+        // The one refusal no person can mend while this session runs. Every other permanent one
+        // names something the operator does at a terminal and the next dial then succeeds, which
+        // is why the dial loop keeps running behind them; here the address has moved on to a later
+        // run and this one can never be admitted under its own identity again.
+        stale_generation:
+          "This session's place on his phone was taken by a newer run of the same project. Nothing from here reaches him again until the session is restarted.",
         // Permanent, not temporary: the same name is refused on every attempt, so treating it as
         // retryable — which is what an unknown reason gets, deliberately — would spin for ever
         // saying nothing useful.
@@ -945,20 +1083,27 @@ function onFrame(frame: Record<string, any>): void {
       // Permanent when a relay is proven to be holding this conversation: waiting cannot mend a
       // setting, and telling the agent its message "goes out when the link comes back" is a promise
       // about a link that is never coming back on this configuration.
-      link.markDown(stuck || joinTheRelay || reason in forGood, said)
+      //
+      // And one refusal stops the dialling altogether. An unknown reason is treated as retryable on
+      // purpose — a hub shipped after this build may refuse for something recoverable — so a bridge
+      // that had never heard this word would ask to come back to an address that has moved on, once
+      // a second, for the rest of the session.
+      if (reason === 'stale_generation') link.giveUp(said)
+      else link.markDown(stuck || joinTheRelay || reason in forGood, said)
       note(said)
       break
     }
-    case 'message':
-      if (!canCarryAChannelMessage()) {
-        // Refused on the wire, never dropped into a notification nothing here reads. His words
-        // used to go out as `notifications/claude/channel` on this engine too — into the void,
-        // with a line on stderr and no ack — so the hub went on believing they were read and the
-        // operator went on looking at a line that had reached nobody. The wire has always had
-        // this ack; the hub puts its reason in the topic he typed in.
-        note(`this engine cannot take typed words from the phone; the hub was told: ${frame.text}`)
+    case 'message': {
+      // Refused on the wire, never dropped into a notification nothing here reads. His words
+      // used to go out as `notifications/claude/channel` on this engine too — into the void,
+      // with a line on stderr and no ack — so the hub went on believing they were read and the
+      // operator went on looking at a line that had reached nobody. The wire has always had
+      // this ack; the hub puts its reason in the topic he typed in.
+      const cannotTake = whyHisWordsCannotBeTaken()
+      if (cannotTake) {
+        note(`his typed words cannot be handed to the agent; the hub was told: ${cannotTake}`)
         link.send(
-          { t: 'ack', ref: String(frame.id), status: 'refused', reason: CANNOT_TAKE_TYPED_WORDS },
+          { t: 'ack', ref: String(frame.id), status: 'refused', reason: cannotTake },
           'an answer about typed words',
         )
         break
@@ -987,15 +1132,36 @@ function onFrame(frame: Record<string, any>): void {
         )
       }
       break
-    case 'choice':
+    }
+    case 'choice': {
       // The answer to a question this session asked. It arrives as a message in the agent's own
       // turn — never as a keystroke — which is the whole safety story of this design.
+      //
+      // And the hub is told what became of it, because his phone is already showing "Sent: …" for
+      // this tap: that line is the receipt for a frame the hub QUEUED, and nothing but this answer
+      // can turn it into "Taken" or take it back. Nothing was ever sent before, so a tap the agent
+      // could not act on — a question it had already closed itself, a turn that ended under it —
+      // left him reading "Sent" for an answer no agent ever received.
+      const cannot = whyHisAnswerCannotBeTaken(String(frame.ask_id ?? ''))
+      if (cannot) {
+        note(`a tap arrived that nothing here can act on; the hub was told: ${cannot}`)
+        link.send(
+          { t: 'ack', ref: String(frame.id), status: 'refused', reason: cannot },
+          'an answer about his tap',
+        )
+        break
+      }
       deliver(`Answer to ${frame.ask_id}: ${frame.option_id}`, {
         message_id: frame.msg_id,
         ask_id: frame.ask_id,
         option_id: frame.option_id,
       })
+      // Said the moment his answer is in the agent's turn, which is the whole of what this side can
+      // ever know — the same honesty as the ack for his typed words. What the agent then DOES with
+      // it is not a thing to keep his receipt waiting on.
+      link.send({ t: 'ack', ref: String(frame.id), status: 'accepted' }, 'an answer about his tap')
       break
+    }
     case 'ack': {
       // The frame reached the HUB, which is all `send` could see, so its tool call has already come
       // back saying he was reached. This is the hub saying he was not — and it went to stderr,

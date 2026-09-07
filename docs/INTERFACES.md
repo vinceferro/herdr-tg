@@ -80,7 +80,16 @@ The contract, in one line each:
 * **Authority flows one way.** No frame carries addressing. The hub knows which connection is which.
 * **Every frame is acked exactly once**, with three delivery values — `yes`, `no`, `unseen` —
   because a send that timed out may or may not have landed and there is no way to ask.
-* **A tap resolves against a written record**, never a button's position.
+* **A tap resolves against a written record**, never a button's position — and, since
+  7 September, an adapter that promised to (`confirms: ["choice"]`) answers for what became of it,
+  so what the operator reads is what happened in the agent's turn rather than what happened to a
+  frame.
+* **A run holds a lease, and it is the hub's to mint.** The `instance` says which PROCESS is
+  speaking and is what a tap and a retirement are matched on; the lease — a number on the
+  `welcome`'s own envelope, stamped back onto everything the bridge says — says which RUN of
+  the address holds it now. A run a later one replaced is refused rather than quietly
+  overwritten, which is what happened to a dead bridge's claim before: it went on draining
+  what it had queued into a conversation its successor already owned.
 * **Skew is normal**: unknown frame kind is ignored, unknown field is ignored, major version
   mismatch is refused.
 
@@ -112,6 +121,15 @@ named one and does not get it back refuses rather than connecting — because an
 unknown field and would admit the worktree AS THE PROJECT, taking its claim and its topic while the
 project's own session is turned away. A channel plugin restarts only when its session does, so
 new-bridge/old-hub is the ordinary middle of an upgrade rather than an exotic state.
+
+**The second widening, and it is the fence the first one needed. BUILT, 7 September.** `hello`
+gained an optional `confirms` and the envelope an optional `generation`, both omitted when
+absent, so a bridge from before either is byte for byte what it always was. The generation is
+the lease above; `confirms: ["choice"]` is a bridge promising to say what became of the
+operator's tap, and the hub holds his receipt open only for a bridge that promised. Additive
+in both directions again, and for the same reason: a channel plugin restarts only when its
+session does, so new-bridge/old-hub and old-bridge/new-hub are both the ordinary middle of an
+upgrade. `docs/ATTACHING.md` §6 is the contract for both.
 
 The opencode adapter can now be TOLD its address, like any other — one bridge per conversation,
 named by whoever started it. What it still cannot do is serve SEVERAL conversations from one event

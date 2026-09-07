@@ -27,10 +27,10 @@ const LANE = 'lane-0903-201500-9999'
 const { repo, laneDir } = makeRepo(dir, LANE)
 
 /** One relay, one fake hub, one address — a scenario that cannot disturb the next one. */
-function scenario(name: string, projectDir: string, opts: { hub?: boolean; env?: Record<string, string> } = {}) {
+function scenario(name: string, projectDir: string, opts: { hub?: boolean; env?: Record<string, string>; lease?: number } = {}) {
   const hubSock = join(dir, `${name}.sock`)
   const faninDir = join(dir, `${name}-fanin`)
-  const hub = opts.hub === false ? null : claimingHub(hubSock)
+  const hub = opts.hub === false ? null : claimingHub(hubSock, undefined, opts.lease)
   const relay = startAttach(projectDir, {
     KICKOFF_HUB_SOCKET: hubSock, KICKOFF_HUB_RELAY_DIR: faninDir, ...(opts.env ?? {}),
   }, true)
@@ -441,6 +441,358 @@ console.log('\nwhen the project is switched off under a live door:')
     `producer saw ${JSON.stringify(heard)}`)
 
   s.relay.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+// ── I. the lease, and a tap nobody answered for ───────────────────────────────────────────────
+//
+// Two things arrived on the wire with the confirmed tap, and both of them are the DOOR's to get
+// right, because the door is the only thing here the hub has ever spoken to.
+//
+// The lease is the dangerous one. It is minted per run of an address and it fences: a number the
+// hub reads as higher than the one it handed out raises its floor for that address, and the
+// project's real run is then refused for ever with nothing on the operator's phone. The door holds
+// the connection, so the door's lease is the only true one — and a producer behind it, written by
+// a stranger to the document, may stamp its own on everything it says. It must not travel.
+//
+// The tap is the other half. The hub now waits for a bridge that promised to confirm one, and
+// edits his receipt with what it hears. The door promises for all of them, so every tap it hands
+// on must come back with an answer or, where nobody can honestly give one, with nothing at all —
+// which is the hub's own "not confirmed" line, and true.
+//
+// The lease is stripped in two places — at the door, where a producer's frame arrives, and at the
+// writer, which deletes any `generation` in a payload before stamping the connection's own. Against
+// a hub that GRANTS one they hide each other: the writer's stamp overwrites whatever the payload
+// carried, so either can be deleted and the check below still passes. The check that can see them
+// is the one against a hub that grants none — every hub built before the lease, which is the
+// compatibility case the document promises — and it is the second block here.
+//
+// RED, before the fix:
+//   FAIL the_door_promises_the_hub_it_will_answer_for_every_tap hello said undefined
+//   FAIL a_tap_a_producer_took_is_answered_to_the_hub_as_taken no ack for the tap
+//   FAIL a_tap_a_producer_refused_is_answered_with_its_own_reason no ack for the tap
+//   FAIL a_tap_for_a_question_no_producer_holds_is_answered_rather_than_dropped no ack for the tap
+//   FAIL a_producer_that_dies_holding_a_tap_has_the_door_answer_for_it no ack for the tap
+console.log('\nwith a lease on the wire and a tap to answer for:')
+
+{
+  const s = scenario('lease', repo, { lease: 4242 })
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const sock = await s.sockOf()
+
+  const doorHello = s.hub!.got.find(f => f.t === 'hello')!
+  check('the_door_promises_the_hub_it_will_answer_for_every_tap',
+    Array.isArray(doorHello.confirms) && doorHello.confirms.includes('choice'),
+    `hello said ${JSON.stringify(doorHello.confirms)}`)
+
+  const P = rawProducer(sock)
+  await P.ready
+  // A producer that promises to answer for a tap, and that stamps a lease of its own on everything
+  // it says — the shape a stranger's adapter has the moment it remembers its own welcome.
+  P.send({ ...hello({ instance: 'the-one-with-a-lease', confirms: ['choice'] }), generation: 999999 })
+  await until('the producer to be greeted', () => P.got.some(f => f.t === 'welcome'), 10000)
+
+  const welcomed = P.got.find(f => f.t === 'welcome')!
+  check('the_door_hands_a_producer_the_welcome_the_hub_sent_it_unchanged',
+    welcomed.generation === 4242, JSON.stringify(welcomed))
+
+  P.send({ v: 1, id: 'b1', generation: 999999, t: 'ask', ask_id: 'a1',
+    text: 'ship it?', options: [{ option_id: 'y', label: 'Yes' }] })
+  await until('the question at the hub', () => s.hub!.got.some(f => f.t === 'ask'), 10000)
+  const asked = s.hub!.got.find(f => f.t === 'ask')!
+  // The lease the hub reads is the DOOR's own — the one it granted this connection — and never the
+  // producer's. It is not `undefined`: a door that stamped nothing would be a door the hub cannot
+  // fence at all. This one passes with either strip deleted (the stamp overwrites the payload); the
+  // block below is the one that holds them.
+  check('the_lease_the_hub_reads_is_the_one_it_granted_this_door',
+    asked.generation === 4242, `the hub read ${JSON.stringify(asked)}`)
+
+  // Taken.
+  s.hub!.to({ v: 1, id: 'h-tap-took', t: 'choice', msg_id: 'm1', ask_id: asked.ask_id, option_id: 'y' })
+  await until('the tap at the producer', () => P.got.some(f => f.t === 'choice'), 10000)
+  const tap = P.got.find(f => f.t === 'choice')!
+  P.send({ v: 1, id: 'b2', t: 'ack', ref: tap.id, status: 'accepted' })
+  await until('the answer at the hub',
+    () => s.hub!.got.some(f => f.t === 'ack' && f.ref === 'h-tap-took'), 8000).catch(() => {})
+  const took = s.hub!.got.find(f => f.t === 'ack' && f.ref === 'h-tap-took')
+  check('a_tap_a_producer_took_is_answered_to_the_hub_as_taken',
+    took?.status === 'accepted', took ? JSON.stringify(took) : 'no ack for the tap')
+
+  // Refused, with a reason that must travel word for word: the hub puts it under his own receipt.
+  P.send({ v: 1, id: 'b3', t: 'ask', ask_id: 'a2', text: 'and this?',
+    options: [{ option_id: 'y', label: 'Yes' }] })
+  await until('the second question at the hub', () => s.hub!.got.filter(f => f.t === 'ask').length >= 2, 10000)
+  const asked2 = s.hub!.got.filter(f => f.t === 'ask')[1]
+  s.hub!.to({ v: 1, id: 'h-tap-no', t: 'choice', msg_id: 'm2', ask_id: asked2.ask_id, option_id: 'y' })
+  await until('the second tap at the producer', () => P.got.filter(f => f.t === 'choice').length >= 2, 10000)
+  const tap2 = P.got.filter(f => f.t === 'choice')[1]
+  P.send({ v: 1, id: 'b4', t: 'ack', ref: tap2.id, status: 'refused',
+    reason: 'the worker had already closed that question' })
+  await until('the second answer at the hub',
+    () => s.hub!.got.some(f => f.t === 'ack' && f.ref === 'h-tap-no'), 8000).catch(() => {})
+  const refused = s.hub!.got.find(f => f.t === 'ack' && f.ref === 'h-tap-no')
+  check('a_tap_a_producer_refused_is_answered_with_its_own_reason',
+    refused?.status === 'refused' && refused?.reason === 'the worker had already closed that question',
+    refused ? JSON.stringify(refused) : 'no ack for the tap')
+
+  // A tap for a question this door never asked. Dropped, the hub waits out its window and tells him
+  // the session never confirmed it — when the truth is that nothing here could have.
+  s.hub!.to({ v: 1, id: 'h-tap-orphan', t: 'choice', msg_id: 'm3', ask_id: 'nobody~asked-this', option_id: 'y' })
+  await until('the orphan answered',
+    () => s.hub!.got.some(f => f.t === 'ack' && f.ref === 'h-tap-orphan'), 8000).catch(() => {})
+  const orphan = s.hub!.got.find(f => f.t === 'ack' && f.ref === 'h-tap-orphan')
+  check('a_tap_for_a_question_no_producer_holds_is_answered_rather_than_dropped',
+    orphan?.status === 'refused' && typeof orphan?.reason === 'string' && orphan.reason.length > 0,
+    orphan ? JSON.stringify(orphan) : 'no ack for the tap')
+
+  // The producer takes a tap and dies with it in its hand.
+  P.send({ v: 1, id: 'b5', t: 'ask', ask_id: 'a3', text: 'last one?',
+    options: [{ option_id: 'y', label: 'Yes' }] })
+  await until('the third question at the hub', () => s.hub!.got.filter(f => f.t === 'ask').length >= 3, 10000)
+  const asked3 = s.hub!.got.filter(f => f.t === 'ask')[2]
+  s.hub!.to({ v: 1, id: 'h-tap-gone', t: 'choice', msg_id: 'm4', ask_id: asked3.ask_id, option_id: 'y' })
+  await until('the third tap at the producer', () => P.got.filter(f => f.t === 'choice').length >= 3, 10000)
+  P.end()
+  await Bun.sleep(1500)
+  const gone = s.hub!.got.find(f => f.t === 'ack' && f.ref === 'h-tap-gone')
+  // Nobody said no. The socket died with the tap in the producer's hand, and this door cannot tell
+  // "it never read the frame" from "it read it, acted on it, and died before saying so" — so
+  // "not taken" is a sentence about a tap the worker very probably did take, and his receipt is
+  // corrected with something nothing here knows. It is the argument this door already makes for a
+  // producer that promised nothing, and the same one applies to a producer that promised and went:
+  // the hub's own window closes on silence and says the session did not confirm it, which is true.
+  check('a_tap_a_producer_died_holding_is_left_unconfirmed_rather_than_called_not_taken',
+    gone === undefined, `the door said ${JSON.stringify(gone ?? null)}`)
+
+  s.relay.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+{
+  // The same producer against a hub that grants no lease at all — every hub built before the lease
+  // existed, and the compatibility case §6 promises. Nothing overwrites the payload here, so a
+  // number a producer stamped travels unless something takes it OUT: the door strips it off every
+  // frame it forwards, and the writer deletes it before stamping. Either alone is enough; both are
+  // kept because the door is where a stranger's number enters and one layer is not a proof.
+  //
+  // A number this hub never granted is the worst thing that can arrive on this wire: it raises the
+  // floor for the address, and the project's real run is then refused for ever with nothing on the
+  // operator's phone.
+  //
+  // RED, with both strips removed:
+  //   FAIL a_producers_own_lease_number_never_reaches_a_hub_that_granted_the_door_none
+  //        the hub read {"v":1,"id":"n1","generation":999999,"t":"ask","ask_id":"a1",...}
+  const s = scenario('nolease', repo)
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const sock = await s.sockOf()
+  const P = rawProducer(sock)
+  await P.ready
+  P.send({ ...hello({ instance: 'the-one-a-stranger-wrote', confirms: ['choice'] }), generation: 999999 })
+  await until('the producer to be greeted', () => P.got.some(f => f.t === 'welcome'), 10000)
+  P.send({ v: 1, id: 'n1', generation: 999999, t: 'ask', ask_id: 'a1',
+    text: 'ship it?', options: [{ option_id: 'y', label: 'Yes' }] })
+  await until('the question at the hub', () => s.hub!.got.some(f => f.t === 'ask'), 10000)
+  const asked = s.hub!.got.find(f => f.t === 'ask')!
+  check('a_producers_own_lease_number_never_reaches_a_hub_that_granted_the_door_none',
+    asked.generation === undefined, `the hub read ${JSON.stringify(asked)}`)
+  // And the door's own hello — the first frame of all, written before any welcome — claims none
+  // either, so a hub that fences on what it reads has nothing to raise its floor with.
+  const doorHello = s.hub!.got.find(f => f.t === 'hello')!
+  check('and_the_door_itself_claims_no_lease_it_was_never_granted',
+    doorHello.generation === undefined, `the hub read ${JSON.stringify(doorHello)}`)
+
+  s.relay.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+// ── J. a worker too old to answer for a tap ───────────────────────────────────────────────────
+//
+// The door promises the hub it will answer for every tap, and it keeps that promise by folding
+// what its producers say. A producer that never promised says nothing — and the door must not
+// invent an answer on its behalf. "Taken" would be a guess; "not taken" would be a lie about a tap
+// the producer very probably did take. Silence is the one true answer, and the hub already has a
+// line for it: the session did not confirm it took the answer.
+//
+// RED, before the fix:
+//   FAIL a_tap_taken_by_a_worker_too_old_to_answer_for_it_is_left_unconfirmed_rather_than_called_taken
+//        (there was no fold at all, so this passed for the wrong reason — watched against the fold
+//         with the promise check removed, where the door answered refused)
+console.log('\nwith a worker too old to answer for a tap:')
+
+{
+  const s = scenario('old', repo)
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const sock = await s.sockOf()
+  const P = rawProducer(sock)
+  await P.ready
+  P.send(hello({ instance: 'the-one-from-before-answers' }))
+  await until('the producer to be greeted', () => P.got.some(f => f.t === 'welcome'), 10000)
+  P.send({ v: 1, id: 'o1', t: 'ask', ask_id: 'a1', text: 'go?', options: [{ option_id: 'y', label: 'Yes' }] })
+  await until('the question at the hub', () => s.hub!.got.some(f => f.t === 'ask'), 10000)
+  const asked = s.hub!.got.find(f => f.t === 'ask')!
+  s.hub!.to({ v: 1, id: 'h-tap-old', t: 'choice', msg_id: 'm1', ask_id: asked.ask_id, option_id: 'y' })
+  await until('the tap at the producer', () => P.got.some(f => f.t === 'choice'), 10000)
+  // It answers nothing, because its build has never heard of answering a tap. Then it goes, which
+  // is the moment the door would otherwise speak for it.
+  P.end()
+  await Bun.sleep(1200)
+  const spoken = s.hub!.got.find(f => f.t === 'ack' && f.ref === 'h-tap-old')
+  check('a_tap_taken_by_a_worker_too_old_to_answer_for_it_is_left_unconfirmed_rather_than_called_taken',
+    spoken === undefined, `the door said ${JSON.stringify(spoken ?? null)}`)
+
+  s.relay.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+// ── K. a run a newer one replaced ───────────────────────────────────────────────
+//
+// Every other refusal this door does not recognise is treated as something waiting will mend, on
+// purpose: a hub shipped after this build may refuse for a reason a person fixes at a terminal
+// while the run lives. `stale_generation` is the one where waiting mends nothing — the hub has
+// given this address to a NEWER run, and the document says in as many words that the way back is a
+// new run and never a redial. A door that redials spins until somebody kills it, with its own
+// socket still open in front of producers it can never carry anything for.
+//
+// The unit makes it ordinary rather than exotic: `Restart=always` means a restarted attach whose
+// predecessor is still between sockets is two runs on one address, which is what the lease exists
+// for. The loser stops, and whatever starts walls starts a new one.
+//
+// RED, before the fix:
+//   FAIL a_door_a_newer_run_replaced_never_dials_again 4 hello(s)
+//   FAIL and_it_stops_rather_than_holding_a_door_that_can_carry_nothing still running after 8s
+//   FAIL a_greeted_producer_is_told_the_run_is_over_and_its_socket_ends still open
+console.log('\nwith a newer run of the same project holding the address:')
+
+/** A hub with one answer for every hello, so a door's whole dial loop is visible. */
+function refusingHub(path: string, reason: string) {
+  const hellos: Record<string, any>[] = []
+  const server = Bun.listen({
+    unix: path,
+    socket: {
+      open() {},
+      data(sock: any, chunk: any) {
+        for (const line of chunk.toString().split('\n')) {
+          if (!line.trim()) continue
+          const f = JSON.parse(line)
+          if (f.t !== 'hello') continue
+          hellos.push(f)
+          sock.write(JSON.stringify({ v: 1, id: 'h-r', t: 'refused', reason }) + '\n')
+          sock.end()
+        }
+      },
+      close() {}, error() {},
+    },
+  })
+  return { hellos, stop: () => server.stop(true) }
+}
+
+{
+  // The control, and it must stay green: `not_enabled` is permanent for the connection and a PERSON
+  // mends it at a terminal while this run lives, so the dial loop behind it is the recovery.
+  const sock = join(dir, 'k-enabled.sock')
+  const hub = refusingHub(sock, 'not_enabled')
+  const relay = startAttach(laneDir, {
+    KICKOFF_HUB_SOCKET: sock, KICKOFF_HUB_RELAY_DIR: join(dir, 'k-enabled-fanin'),
+  }, true)
+  await until('the door to dial once', () => hub.hellos.length >= 1, 15000)
+  await Bun.sleep(8000)
+  check('a_refusal_a_person_can_mend_while_the_run_lives_is_still_dialled_behind',
+    hub.hellos.length > 1, `${hub.hellos.length} hello(s)`)
+  relay.kill(); hub.stop()
+  await Bun.sleep(300)
+}
+
+{
+  const sock = join(dir, 'k-stale.sock')
+  const hub = refusingHub(sock, 'stale_generation')
+  const relay = startAttach(laneDir, {
+    KICKOFF_HUB_SOCKET: sock, KICKOFF_HUB_RELAY_DIR: join(dir, 'k-stale-fanin'),
+  }, true)
+  await until('the door to dial once', () => hub.hellos.length >= 1, 15000)
+  let stopped = false
+  void relay.exited.then(() => { stopped = true })
+  await until('the door to stop', () => stopped, 8000).catch(() => {})
+  check('a_door_a_newer_run_replaced_never_dials_again',
+    hub.hellos.length === 1, `${hub.hellos.length} hello(s)`)
+  check('and_it_stops_rather_than_holding_a_door_that_can_carry_nothing',
+    stopped, 'still running after 8s')
+  relay.kill(); hub.stop()
+  await Bun.sleep(300)
+}
+
+{
+  // The same word on a LIVE link — the hub kicking a run whose address a newer one took. A producer
+  // that has been greeted is holding an agent's turn open; it has to be ENDED, and it must not be
+  // handed the word itself.
+  //
+  // The lease is a fact about THIS door's connection to the hub, and the producer holds no lease at
+  // the hub at all. Passed down, it says something about the producer that is not true and that the
+  // producer acts on for good: `server.ts` reads `stale_generation` and calls `giveUp`, which stops
+  // its dial loop for the life of the session. The next run of this wall is five seconds away
+  // (`deploy/kickoff-hub-attach@.service`, `Restart=always`), and a session that joined the relay
+  // rather than being started by it is still alive to find it — unless it was told to stop looking.
+  // A close is the truth the wire already has for this: the door went away, wait and dial again.
+  //
+  // RED, before the fix:
+  //   FAIL and_is_never_told_the_word_that_would_stop_it_looking_for_the_next_run
+  //        producer heard [{"t":"refused","reason":"stale_generation"}]
+  const s = scenario('k-live', repo)
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const sock = await s.sockOf()
+  const P = rawProducer(sock)
+  await P.ready
+  P.send(hello({ instance: 'the-one-on-a-replaced-run', confirms: ['choice'] }))
+  await until('the producer to be greeted', () => P.got.some(f => f.t === 'welcome'), 10000)
+  s.hub!.to({ v: 1, id: 'h-stale', t: 'refused', reason: 'stale_generation' })
+  await until('its socket to end', () => !P.connected, 8000).catch(() => {})
+  check('a_greeted_producer_behind_a_replaced_run_has_its_socket_ended',
+    !P.connected, P.connected ? 'still open' : 'ended')
+  check('and_is_never_told_the_word_that_would_stop_it_looking_for_the_next_run',
+    !P.got.some(f => f.t === 'refused' && f.reason === 'stale_generation'),
+    `producer heard ${JSON.stringify(P.got.filter(f => f.t === 'refused'))}`)
+  s.relay.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+{
+  // The whole path the door's half is for: a REAL tool server behind a door whose run was replaced,
+  // and the next run of the same wall. This is the session the finding is about — one that joined
+  // the relay (`KICKOFF_HUB_RELAY=1`, the sentence `server.ts` prints for whoever starts one), so it
+  // is not attach's child and outlives the run that was replaced.
+  //
+  // RED, before the fix:
+  //   FAIL a_session_behind_a_door_that_was_replaced_finds_the_next_run_of_that_wall
+  //        the next door carried 0 of its messages; not … yet — he has not seen this. It is waiting
+  //        in line and goes out when the link to his phone comes back.
+  const s = scenario('k-back', repo)
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const via = { KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_HUB_RELAY_DIR: s.faninDir, KICKOFF_HUB_RELAY: '1' }
+  const A = startServer({ CLAUDE_PROJECT_DIR: repo, ...via })
+  await handshake(A, CLAUDE_CODE.capabilities, CLAUDE_CODE.clientInfo)
+  const before = await call(A, 'reply', { text: 'before the wall was replaced' })
+  check('a session behind the door reaches him while its run holds the address', before.text === 'said', before.text)
+
+  s.hub!.to({ v: 1, id: 'h-stale2', t: 'refused', reason: 'stale_generation' })
+  let stopped = false
+  void s.relay.exited.then(() => { stopped = true })
+  await until('the replaced run to stop', () => stopped, 10000).catch(() => {})
+
+  // What the unit does five seconds later, on the same address and the same door directory. Started
+  // as the WALL starts it — `KICKOFF_HUB_RELAY` is the producer's variable, and it is what tells a
+  // session to join a door rather than to be one.
+  const next = startAttach(repo, {
+    KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_HUB_RELAY_DIR: s.faninDir,
+  }, true)
+  await until('the next run to reach the hub',
+    () => s.hub!.got.filter(f => f.t === 'hello').length >= 2, 20000).catch(() => {})
+  const after = await call(A, 'reply', { text: 'after the wall came back' })
+  await until('the message to reach the hub through the next run',
+    () => s.hub!.got.some(f => f.t === 'say' && f.text === 'after the wall came back'), 30000).catch(() => {})
+  check('a_session_behind_a_door_that_was_replaced_finds_the_next_run_of_that_wall',
+    s.hub!.got.some(f => f.t === 'say' && f.text === 'after the wall came back'),
+    `the next door carried ${s.hub!.got.filter(f => f.t === 'say').length - 1} of its messages; ${after.text}`)
+
+  A.child.kill(); next.kill(); s.relay.kill(); s.hub!.stop()
   await Bun.sleep(300)
 }
 

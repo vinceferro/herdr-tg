@@ -116,6 +116,16 @@ type Open = {
   v2: boolean
   /** option_id → the label opencode published. A tap is looked up here and nowhere else. */
   labels: Map<string, string>
+  /**
+   * The agent the note bound this session to when the keyboard went up, or null when it bound none.
+   *
+   * Held per QUESTION and not per watcher, because the one place it is used pairs it with the
+   * session that ASKED — an older one after a rollover. One value for the whole process was the
+   * agent of whichever note was last obeyed, so a reply typed under an old question went into the
+   * old session naming the new session's agent: a turn under an agent nothing ever bound to it,
+   * which is the failure the binding exists to refuse.
+   */
+  agent: string | null
 }
 
 export function startWatcher(cfg: WatcherConfig): void {
@@ -406,8 +416,13 @@ export function startWatcher(cfg: WatcherConfig): void {
     }
   }
 
-  async function fromTheBoundSession(sessionID: string, ev: Record<string, any>): Promise<boolean> {
-    if (!BINDING_FILE) return true
+  async function fromTheBoundSession(
+    sessionID: string,
+    ev: Record<string, any>,
+  ): Promise<{ agent: string | null } | null> {
+    // No note, so nothing here has ever been told which agent this worker is, and a question drawn
+    // without one carries none.
+    if (!BINDING_FILE) return { agent: null }
     if (!sessionID) {
       // An older event shape that names no session cannot be matched against the note at all. It is
       // still not shown — nothing can prove it is this conversation's — but the agent that asked is
@@ -417,26 +432,124 @@ export function startWatcher(cfg: WatcherConfig): void {
         'named no session',
         'The worker asked something that did not say which of its sessions it came from, so it is not being shown here.',
       )
-      return false
+      return null
     }
     const bound = await theSessionTheNoteNames(null)
     if ('refused' in bound) {
       // Nothing was found out, so nothing has been decided: kept, and offered again. He is told
       // only once this has stopped waiting, because a sentence about a question that then appears
       // a second later is a sentence he can do nothing with.
-      if (bound.couldNotFindOut && keepForLater(ev)) return false
+      if (bound.couldNotFindOut && keepForLater(ev)) return null
       keptQuestions.delete(ev)
       note(`a question from ${sessionID} was not passed on: ${bound.refused}`)
       tellHimOnce(bound.refused, `The worker asked something and it cannot be shown here — ${bound.refused}.`)
-      return false
+      return null
     }
     keptQuestions.delete(ev)
     if (bound.sessionID !== sessionID) {
       note(`a question from ${sessionID} was not passed on: this conversation is bound to ${bound.sessionID}`)
-      return false
+      return null
+    }
+    // And the same rule on the way back, or it is a rule in one direction only. The note's agent is
+    // proved against the SESSION above; a turn inside that session can still run under another
+    // agent, because the prompt endpoint resolves one when the body names none and a tree's own
+    // `opencode.json` can name the org coordinator as its default. A turn that ran under somebody
+    // else's agent is somebody else's turn, and its question belongs on no phone under this
+    // project's name — so it is withheld, exactly as a question from another session is.
+    if (bound.agent !== null) {
+      const running = await theAgentAnswering(sessionID, ev?.properties ?? ev?.data ?? {})
+      if (running !== null && running !== bound.agent) {
+        note(`a question from ${sessionID} was not passed on: the turn ran under ${running}, not ${bound.agent}`)
+        // Withheld is not the same as handled. Nothing else answers this request, so the agent that
+        // asked would block on a keyboard nobody will ever draw — for ever, on a wall whose tree
+        // names another agent by default, which is the configuration the fence was written for.
+        // Turning it down is this watcher's to do here and nowhere else: the session was already
+        // proved to be this conversation's own, and a question from somebody else's session is
+        // left alone precisely because it is not ours to answer.
+        await turnDown(sessionID, ev)
+        tellHimOnce(
+          A_DIFFERENT_AGENT_IS_ANSWERING,
+          `The worker asked something and it cannot be shown here — ${A_DIFFERENT_AGENT_IS_ANSWERING}. ` +
+            'It has been turned down, so the worker is not left waiting on it.',
+        )
+        return null
+      }
     }
     alreadySaid.clear()
-    return true
+    return { agent: bound.agent }
+  }
+
+  /**
+   * Tell opencode nobody is going to answer this request, so the turn that asked can move on.
+   *
+   * Both shapes, measured against a real opencode 1.18.25 on 7 September: a question has its own
+   * `reject` endpoint and takes no body at all, and a permission is rejected through the reply it
+   * already has, with the one word opencode's own closed set uses. Best effort — a server that
+   * will not take it leaves the worker exactly where withholding alone would have left it, and
+   * there is nothing better to do about that than say so where a developer looks.
+   */
+  async function turnDown(sessionID: string, ev: Record<string, any>): Promise<void> {
+    const data = ev?.properties ?? ev?.data ?? {}
+    const requestID = String(data.id ?? '')
+    if (!requestID) return
+    const type = String(ev?.type ?? '')
+    const kind: Open['kind'] = type.startsWith('question') ? 'question' : 'permission'
+    const v2 = type.includes('.v2.')
+    const sid = encodeURIComponent(sessionID)
+    const rid = encodeURIComponent(requestID)
+    const url =
+      kind === 'question'
+        ? v2
+          ? `${OPENCODE}/api/session/${sid}/question/${rid}/reject`
+          : `${OPENCODE}/question/${rid}/reject`
+        : replyUrl({ kind, v2, sessionID, requestID })
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        ...(kind === 'question'
+          ? {}
+          : { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reply: 'reject' }) }),
+        signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
+      })
+      if (!r.ok) note(`opencode would not take the refusal of ${requestID} (${r.status})`)
+      else note(`${requestID} was turned down so the worker is not left waiting on it`)
+    } catch (e) {
+      note(`could not tell opencode nobody will answer ${requestID}: ${(e as Error)?.message ?? e}`)
+    }
+  }
+
+  /**
+   * The agent a turn ran under, or null when this server will not say.
+   *
+   * The asked events carry no agent — measured against the 1.18.25 OpenAPI at `/doc`, where
+   * `QuestionV2Asked.data` and `PermissionV2Asked.data` have no such field — but each names the
+   * message the tool call belongs to, and `AssistantMessage` carries `agent`. So the agent of a
+   * turn is one request away, on the same deadline every request here shares.
+   *
+   * Null on anything but a plain answer, and null is NOT a refusal: a build that names no message,
+   * a server that will not serve it, a message with no agent on it. Withholding on a fact nobody
+   * could observe would silence every question a server like that ever asks, while the note's own
+   * session check still stands. What is withheld is a turn OBSERVED to be somebody else's.
+   */
+  async function theAgentAnswering(sessionID: string, data: Record<string, any>): Promise<string | null> {
+    const named = data?.tool?.messageID ?? data?.source?.messageID
+    if (typeof named !== 'string' || named.length === 0) return null
+    try {
+      const r = await fetch(
+        `${OPENCODE}/session/${encodeURIComponent(sessionID)}/message/${encodeURIComponent(named)}`,
+        { signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS) },
+      )
+      if (!r.ok) {
+        note(`opencode would not say which agent is answering (${r.status})`)
+        return null
+      }
+      const m: any = await r.json()
+      const running = m?.info?.agent
+      return typeof running === 'string' && running.length > 0 ? running : null
+    } catch (e) {
+      note(`could not ask opencode which agent is answering: ${(e as Error)?.message ?? e}`)
+      return null
+    }
   }
 
   /**
@@ -525,6 +638,11 @@ export function startWatcher(cfg: WatcherConfig): void {
           instance: INSTANCE,
           repo: project.repo,
           pid: process.pid,
+          // Every tap this watcher is handed comes back answered, once opencode has spoken. The
+          // door folds these into the one answer the hub hears, and answers nothing at all for a
+          // producer that promised nothing — so a watcher that stopped saying this would have its
+          // taps read as unconfirmed however well they went.
+          confirms: ['choice'],
           // Omitted entirely when there is no address. Never `"lane": null`.
           ...(ADDRESS ? { lane: ADDRESS } : {}),
         },
@@ -629,7 +747,10 @@ export function startWatcher(cfg: WatcherConfig): void {
         return
       }
       case 'choice':
-        void answer(String(f.ask_id), String(f.option_id))
+        // The hub's own id for the tap goes with it: the answer this watcher owes for it names
+        // that id, and the hub edits the receipt it has already put under his thumb with what it
+        // hears back.
+        void answer(String(f.ask_id), String(f.option_id), String(f.id))
         return
       case 'message':
         // The operator typed at this conversation. Carried one at a time, in the order the lines
@@ -702,11 +823,33 @@ export function startWatcher(cfg: WatcherConfig): void {
       answerFor(ref, 'the message arrived without any words in it')
       return
     }
+    // The agent the note binds has to be one this server can actually resolve, and that is asked
+    // BEFORE his words go anywhere. Measured on 1.18.25 on 7 September: a prompt naming an agent
+    // the server does not know is answered 204 and writes no message at all — his words are gone —
+    // so the ack below would have said they were taken and his line would have carried the thumb,
+    // with the truth arriving seconds later as a `session.error`. One of the two was always false.
+    //
+    // The session-level check cannot see this: a session goes on naming an agent that has been
+    // renamed or dropped from the tree's own configuration while it lives.
+    if (target.agent !== null) {
+      const known = await thisServerResolves(target.agent)
+      if (known === false) {
+        note(`opencode does not resolve the agent the note binds (${target.agent})`)
+        answerFor(ref, THE_SERVER_DOES_NOT_KNOW_THE_AGENT)
+        return
+      }
+    }
     try {
       const r = await fetch(`${OPENCODE}/session/${sid}/prompt_async`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ parts }),
+        // The agent the note binds, NAMED, when it names one. `agent` is an optional top-level
+        // string on this endpoint, read off the running 1.18.25 server's own OpenAPI at `/doc`
+        // rather than guessed. Without it the server resolves an agent of its own — and the room
+        // tree measured on 6 September ships an `opencode.json` whose default is the org
+        // coordinator, so a session bound to the room's agent ran its turn under the coordinator
+        // and the note's check had proved nothing about the turn his words actually reached.
+        body: JSON.stringify({ parts, ...(target.agent !== null ? { agent: target.agent } : {}) }),
         signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
       })
       if (!r.ok) {
@@ -722,6 +865,52 @@ export function startWatcher(cfg: WatcherConfig): void {
     } catch (e) {
       note(`could not reach opencode with the operator's words: ${(e as Error)?.message ?? e}`)
       answerFor(ref, unreached(e))
+    }
+  }
+
+  /**
+   * The agent names this server can resolve, as it last answered — `GET /agent`, measured on
+   * 1.18.25: 200 and a JSON array of `{name, mode, native, …}`, the whole server's set rather than
+   * one session's.
+   *
+   * Asked once for a run and remembered, so the ordinary typed line costs nothing: the objection to
+   * a pre-flight was a request per line, and the answer is not per line. A name that is NOT in the
+   * remembered set is asked about again before anything is refused on it — a set from ten minutes
+   * ago is not evidence that an agent added since does not exist — so the extra request happens
+   * only while the name really is unknown.
+   *
+   * `null` means this side could not find out: an older server with no such route, or one that
+   * would not answer. Nothing is refused on that. Withholding his words on a fact nobody could
+   * observe would silence every line typed at such a server, and the failure it guards against is
+   * still caught after the fact by `session.error`.
+   */
+  let agentsKnown: Set<string> | null = null
+  async function thisServerResolves(name: string): Promise<boolean | null> {
+    if (agentsKnown?.has(name)) return true
+    const fresh = await agentsThisServerKnows()
+    if (fresh === null) return agentsKnown === null ? null : agentsKnown.has(name)
+    agentsKnown = fresh
+    return fresh.has(name)
+  }
+
+  async function agentsThisServerKnows(): Promise<Set<string> | null> {
+    try {
+      const r = await fetch(`${OPENCODE}/agent`, { signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS) })
+      if (!r.ok) {
+        note(`opencode would not say which agents it knows (${r.status})`)
+        return null
+      }
+      const list = await r.json()
+      if (!Array.isArray(list)) {
+        note('opencode answered something other than a list of agents')
+        return null
+      }
+      return new Set(
+        list.filter((a: any) => a && typeof a.name === 'string' && a.name.length > 0).map((a: any) => String(a.name)),
+      )
+    } catch (e) {
+      note(`could not ask opencode which agents it knows: ${(e as Error)?.message ?? e}`)
+      return null
     }
   }
 
@@ -810,6 +999,8 @@ export function startWatcher(cfg: WatcherConfig): void {
   const IS_NOT_OPEN = 'the session named for this worker is not open on its server'
   const SAYS_NO_AGENT = 'the session named for this worker does not say which agent it is running'
   const RUNS_ANOTHER_AGENT = 'the session named for this worker is running a different agent from the one it should be'
+  const A_DIFFERENT_AGENT_IS_ANSWERING = 'the worker is answering under a different agent from the one it should be'
+  const THE_SERVER_DOES_NOT_KNOW_THE_AGENT = 'the worker is set to run as an agent its server does not know'
   const THE_QUESTION_HAS_MOVED_ON = 'the question you replied to was asked by a session this worker no longer speaks to'
   const MOVED_WHILE_ON_ITS_WAY = 'the worker moved to another session while that was on its way, so it was not delivered; send it again'
 
@@ -841,11 +1032,13 @@ export function startWatcher(cfg: WatcherConfig): void {
    */
   async function sessionForTypedWords(
     inReplyTo: string | null,
-  ): Promise<{ sessionID: string; how: string } | { refused: string }> {
+  ): Promise<{ sessionID: string; how: string; agent: string | null } | { refused: string }> {
     if (BINDING_FILE) return await theSessionTheNoteNames(inReplyTo)
     if (inReplyTo) {
       const asked = open.get(inReplyTo)
-      if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}` }
+      // No note, so nothing here has ever been told which agent this worker is. The prompt names
+      // none and the server resolves its own, which is exactly what happened before a note existed.
+      if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}`, agent: null }
     }
     const listed = await rootSessionsHere()
     if ('refused' in listed) return listed
@@ -858,6 +1051,7 @@ export function startWatcher(cfg: WatcherConfig): void {
     return {
       sessionID: String(candidates[0].id),
       how: candidates.length === 1 ? 'the one session open' : `the most recently active of ${candidates.length} sessions`,
+      agent: null,
     }
   }
 
@@ -880,7 +1074,7 @@ export function startWatcher(cfg: WatcherConfig): void {
    */
   async function theSessionTheNoteNames(
     inReplyTo: string | null,
-  ): Promise<{ sessionID: string; how: string } | { refused: string; couldNotFindOut?: true }> {
+  ): Promise<{ sessionID: string; how: string; agent: string | null } | { refused: string; couldNotFindOut?: true }> {
     const b = bindingNow()
     if ('refused' in b) {
       // A question THIS watcher drew had its session proved against the note when the keyboard went
@@ -891,7 +1085,13 @@ export function startWatcher(cfg: WatcherConfig): void {
       // MOVED ON is a different fact and is refused below, where it always was.
       if (b.couldNotFindOut && inReplyTo) {
         const asked = open.get(inReplyTo)
-        if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}` }
+        // The agent THIS question was drawn under, because the note itself cannot be read at this
+        // instant and a prompt that names none lets the server resolve its own — which on a tree
+        // whose `opencode.json` names another agent by default is the very failure the binding
+        // exists to refuse. It is the question's own agent and not the watcher's last one: the
+        // session here is the one that ASKED, and after a rollover the two are different sessions
+        // running different agents.
+        if (asked) return { sessionID: asked.sessionID, how: `the session that asked ${inReplyTo}`, agent: asked.agent }
       }
       return b
     }
@@ -938,12 +1138,13 @@ export function startWatcher(cfg: WatcherConfig): void {
       if (asked && asked.sessionID !== want.sessionID) return { refused: THE_QUESTION_HAS_MOVED_ON }
       if (asked) {
         fenceBehind(want)
-        return { sessionID: want.sessionID, how: `the session that asked ${inReplyTo}, which is the one the note names` }
+        return { sessionID: want.sessionID, how: `the session that asked ${inReplyTo}, which is the one the note names`, agent: want.agent }
       }
     }
     fenceBehind(want)
-    return { sessionID: want.sessionID, how: 'the session the note names' }
+    return { sessionID: want.sessionID, how: 'the session the note names', agent: want.agent }
   }
+
 
   /** The root sessions this server lists for the project directory — the one measured listing. */
   async function rootSessionsHere(): Promise<{ list: any[] } | { refused: string; couldNotFindOut?: true }> {
@@ -1012,16 +1213,26 @@ export function startWatcher(cfg: WatcherConfig): void {
       : `${OPENCODE}/permission/${rid}/reply`
   }
 
-  /** Post the operator's tap back to opencode, as the label it published. */
-  async function answer(askId: string, optionId: string): Promise<void> {
+  /**
+   * Post the operator's tap back to opencode, as the label it published — and say what became of it.
+   *
+   * The hub has already put "Sent: <label>" under his thumb and is waiting to edit that line. So
+   * every tap is answered, exactly once, and NEVER before opencode has spoken: an `accepted` sent
+   * when the POST was merely started is the dead keyboard this adapter exists to end, wearing a
+   * thumbs-up. `refused` carries a reason in his own register, because that reason goes verbatim
+   * into the topic under the receipt.
+   */
+  async function answer(askId: string, optionId: string, ref: string): Promise<void> {
     const o = open.get(askId)
     if (!o) {
       note(`a tap arrived for ${askId}, which this watcher has no record of; nothing was answered`)
+      answerForTap(ref, 'the worker no longer has that question open')
       return
     }
     const label = o.labels.get(optionId)
     if (label === undefined) {
       note(`a tap named an option ${askId} never offered; nothing was answered`)
+      answerForTap(ref, 'that is not one of the answers the worker offered')
       return
     }
     // A tap for a question this conversation can no longer speak to the asker of. Proved the same
@@ -1047,6 +1258,12 @@ export function startWatcher(cfg: WatcherConfig): void {
           { t: 'say', text: `Your answer did not reach the worker — ${why}. Nothing was sent to it.`, hint: 'prose' },
           'a word about an answer that reached nobody',
         )
+        // And on the wire too, so a hub that reads a tap's answer edits the receipt under his thumb
+        // rather than leaving it "Sent". The line above stays because it is the only thing that
+        // reaches him on a hub from before a tap was answered for; on a hub that reads one he gets
+        // the same fact twice, which is noise rather than a contradiction, and cheaper than his
+        // only notice disappearing on the older half of the fleet.
+        answerForTap(ref, why)
         return
       }
     }
@@ -1065,15 +1282,33 @@ export function startWatcher(cfg: WatcherConfig): void {
         signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
       })
       if (!r.ok) {
+        // The status is for a developer, here. The reason goes verbatim into his topic, where a
+        // number is jargon — the same split the typed-words path makes, in the same words.
         note(`opencode refused the answer to ${askId} (${r.status})`)
+        answerForTap(ref, "the worker's server would not take it")
         return
       }
       // No `ask_resolved` here. The hub already took the buttons off when it resolved the tap, and
       // said so in his own words. A second retirement from this side would overwrite that.
       note(`opencode took the answer to ${askId}`)
+      answerForTap(ref)
     } catch (e) {
       note(`could not reach opencode to answer ${askId}: ${(e as Error)?.message ?? e}`)
+      answerForTap(ref, unreached(e))
     }
+  }
+
+  /**
+   * Tell the hub what became of one tap, on the wire.
+   *
+   * The same two shapes `answerFor` uses for his typed words, and deliberately the same words: a
+   * server that would not take a line and one that would not take a tap are one fact to him.
+   */
+  function answerForTap(ref: string, refused?: string): void {
+    say(
+      refused ? { t: 'ack', ref, status: 'refused', reason: refused } : { t: 'ack', ref, status: 'accepted' },
+      'an answer about a tap',
+    )
   }
 
   /**
@@ -1105,7 +1340,8 @@ export function startWatcher(cfg: WatcherConfig): void {
     switch (type) {
       case 'question.v2.asked':
       case 'question.asked': {
-        if (!(await fromTheBoundSession(String(data.sessionID ?? ''), ev))) return
+        const boundTo = await fromTheBoundSession(String(data.sessionID ?? ''), ev)
+        if (!boundTo) return
         const questions: any[] = Array.isArray(data.questions) ? data.questions : []
         // opencode can publish several questions in one request. Only the first is drawn: the reply
         // shape answers them in order, and a phone that shows two keyboards for one request cannot
@@ -1128,6 +1364,7 @@ export function startWatcher(cfg: WatcherConfig): void {
           kind: 'question',
           v2: type.includes('.v2.'),
           labels,
+          agent: boundTo.agent,
         })
         const more =
           questions.length > 1 ? `\n\n(it asked ${questions.length} things at once; this is the first)` : ''
@@ -1137,7 +1374,8 @@ export function startWatcher(cfg: WatcherConfig): void {
       }
       case 'permission.v2.asked':
       case 'permission.asked': {
-        if (!(await fromTheBoundSession(String(data.sessionID ?? ''), ev))) return
+        const boundTo = await fromTheBoundSession(String(data.sessionID ?? ''), ev)
+        if (!boundTo) return
         // The reply set is opencode's own and it is closed: once, always, reject. The operator picks
         // one of three; he never names the action, and this watcher never invents a fourth.
         const askId = `p${data.id}`
@@ -1152,6 +1390,7 @@ export function startWatcher(cfg: WatcherConfig): void {
           kind: 'permission',
           v2: type.includes('.v2.'),
           labels,
+          agent: boundTo.agent,
         })
         const what = Array.isArray(data.resources) && data.resources.length
           ? `${data.action}: ${data.resources.join(', ')}`
@@ -1202,7 +1441,17 @@ export function startWatcher(cfg: WatcherConfig): void {
         const sid = String(data.sessionID ?? '')
         if (!sid || !prompted.delete(sid)) return
         const err = data.error ?? {}
-        const said = firstLine(err?.data?.message) || firstLine(err?.name) || 'it did not say why'
+        const raw = firstLine(err?.data?.message) || firstLine(err?.name) || ''
+        // One of these failures is this watcher's own doing. Measured against a real opencode
+        // 1.18.25 on 7 September: a prompt naming an agent the server cannot resolve is answered
+        // 204, NO user message is written — his words are gone — and the failure arrives here as
+        // `Agent not found: "<name>". Available agents: build, explore, general, plan`. Forwarded
+        // word for word that is a quoted identifier and an internal roster in a message on his
+        // phone. The prompt names the agent because the note binds one, so this side knows what
+        // that sentence means and says it in his register instead. Reachable without anybody
+        // touching the note: an agent renamed or dropped from the tree's own configuration while
+        // a session lives passes every check made against the SESSION and fails at the prompt.
+        const said = /^Agent not found:/.test(raw) ? THE_SERVER_DOES_NOT_KNOW_THE_AGENT : raw || 'it did not say why'
         say(
           { t: 'say', text: `The agent could not act on what you typed: ${said}`, hint: 'prose' },
           'a word about typed words the agent could not act on',

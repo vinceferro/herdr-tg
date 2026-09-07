@@ -66,7 +66,7 @@ export function makeRepo(dir: string, laneName: string) {
  * A hub that admits ONE live connection per (repo, lane) and refuses the second, which is the rule
  * `hub.rs` actually enforces and the only reason any of this exists.
  */
-export function claimingHub(path: string, outbox?: string) {
+export function claimingHub(path: string, outbox?: string, lease?: number) {
   type Conn = { s: any; acc: string; addr?: string }
   const conns = new Map<any, Conn>()
   const claims = new Map<string, any>()
@@ -120,6 +120,11 @@ export function claimingHub(path: string, outbox?: string) {
             c.addr = addr
             write(s, {
               v: 1, id: 'h-w', t: 'welcome', project: 'repo',
+              // The lease rides on the ENVELOPE of the welcome and of every frame after it — there
+              // is no payload field for it and there cannot be one (`hub-proto`'s `Welcome` says
+              // why). A suite that put it in the payload would be proving the door forwards a
+              // field the real hub never sends.
+              ...(lease !== undefined ? { generation: lease } : {}),
               ...(f.lane ? { lane: f.lane } : {}),
               limits: { max_frame: 262144, max_text: 3500, frames_per_min: 20 },
               // Where this conversation's files go (`docs/ATTACHING.md` §14), when the suite
@@ -333,12 +338,18 @@ export function fakeOpencode() {
   const sessionQueries: string[] = []
   let promptStatus = 204
   let push: ((e: unknown) => void) | null = null
+  /** The messages this server holds, by id — see the message endpoint below. */
+  const messages = new Map<string, Record<string, unknown>>()
   // A listing that takes its time, once. The window between reading the note and hearing the
   // server back is where a launcher's rollover lands in the wrong session if nothing re-reads.
   let delayNextListingMs = 0
   // A server that answers `directory=` with sessions from elsewhere. It is not how 1.18.25 behaves
   // and that is the point: the acceptance must not rest on the query having been obeyed.
   let ignoreDirectoryFilter = false
+  // The agent names this server can resolve. `null` is a server that will not say — an older one
+  // with no such route — and it is the DEFAULT, because that is what every suite written before the
+  // question was asked stood on, and nothing may be refused on an answer nobody gave.
+  let agents: string[] | null = null
 
   const server = Bun.serve({
     port: 0,
@@ -359,6 +370,13 @@ export function fakeOpencode() {
           { headers: { 'content-type': 'text/event-stream' } },
         )
       }
+      // `GET /agent`, measured on 1.18.25 on 7 September: 200 and a JSON array of
+      // `{name, description, mode, native, permission, options}` — the whole server's set, not one
+      // session's. Only `name` is read here; the rest is carried so the shape is the real one.
+      if (url.pathname === '/agent' && req.method === 'GET') {
+        if (agents === null) return new Response('not found', { status: 404 })
+        return Response.json(agents.map(name => ({ name, description: '', mode: 'primary', native: true })))
+      }
       if (url.pathname === '/session' && req.method === 'GET') {
         sessionQueries.push(url.search)
         if (delayNextListingMs > 0) {
@@ -374,8 +392,26 @@ export function fakeOpencode() {
             .sort((a, b) => b.time.updated - a.time.updated),
         )
       }
+      // `GET /session/{id}/message/{id}` answers `{info, parts}`, and `info.agent` is the agent the
+      // TURN ran under. Captured from the 1.18.25 OpenAPI at `/doc`: `AssistantMessage` carries
+      // `agent` and the asked events do not, which is why the agent of a turn has to be asked for.
+      const asMessage = /^\/session\/([^/]+)\/message\/([^/]+)$/.exec(url.pathname)
+      if (asMessage && req.method === 'GET') {
+        const info = messages.get(asMessage[2])
+        if (!info) return new Response('not found', { status: 404 })
+        return Response.json({ info, parts: [] })
+      }
       if (req.method === 'POST') {
-        posted.push({ path: url.pathname, body: await req.json() })
+        // Not every POST on this wire carries a body: `question/{id}/reject` takes none at all
+        // (measured off 1.18.25's own `/doc`), and a fake that insisted on JSON answered the one
+        // request that unblocks a stranded worker with a 500.
+        let body: unknown = null
+        try {
+          body = await req.json()
+        } catch {
+          body = null
+        }
+        posted.push({ path: url.pathname, body })
         if (url.pathname.endsWith('/prompt_async')) {
           if (promptStatus === 204) return new Response(null, { status: 204 })
           return Response.json({ name: 'NotFoundError', data: { message: 'Session not found' } }, { status: promptStatus })
@@ -389,6 +425,8 @@ export function fakeOpencode() {
   return {
     posted,
     sessionQueries,
+    /** What agent a turn ran under: `messages.set(<messageID>, {id, role: 'assistant', agent})`. */
+    messages,
     get url() { return `http://127.0.0.1:${server.port}` },
     get sessions() { return sessions },
     set sessions(v: Record<string, any>[]) { sessions = v },
@@ -397,6 +435,8 @@ export function fakeOpencode() {
     set delayNextListingMs(v: number) { delayNextListingMs = v },
     /** Answer every listing with every session, whatever `directory=` asked for. */
     set ignoreDirectoryFilter(v: boolean) { ignoreDirectoryFilter = v },
+    /** The agent names this server resolves; `null` answers 404, as a server without the route. */
+    set agents(v: string[] | null) { agents = v },
     /** Push one event down the stream; null until the watcher has subscribed. */
     get pushing() { return push !== null },
     push: (e: unknown) => push?.(e),

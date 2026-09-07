@@ -211,6 +211,16 @@ export function createRelay(cfg: RelayConfig): Relay {
     checked: boolean
     /** It has been given a `welcome`, so its own queue has been allowed to drain. */
     greeted: boolean
+    /**
+     * What its own `hello` promised to answer for — `hub_proto`'s `confirms`, read as membership.
+     *
+     * The door promises the hub it will answer for every tap, and it keeps that promise out of
+     * what its producers say. A producer built before answering a tap existed says nothing about
+     * one, and no answer can be invented for it: "taken" would be a guess and "not taken" a lie
+     * about a tap it very probably did take. Silence is the true answer there, and the hub has the
+     * line for it.
+     */
+    confirms: string[]
   }
 
   const producers = new Set<Producer>()
@@ -238,7 +248,23 @@ export function createRelay(cfg: RelayConfig): Relay {
    * carrier's reason when the carrier is among them (`cfg.carrier`). Bounded, oldest first out,
    * because a producer that never answers must not turn this into a leak.
    */
-  type TypedWords = {
+  type Handed = {
+    /**
+     * What the hub handed down, in the words this door's own journal uses.
+     *
+     * One record type and one fold for his typed words and his taps, deliberately: the carrier's
+     * refusal outranking another voice's acceptance is a rule that must not exist twice, and the
+     * one time this project kept two copies of a thing that folds answers the copy drifted.
+     */
+    what: 'typed words' | 'a tap'
+    /**
+     * Whether anybody it was handed to promised to answer for it.
+     *
+     * False only for a tap held by a producer from before answering one existed. Nothing is sent
+     * up for those, ever — see `Producer.confirms`. His typed words have always had to be answered
+     * for on this wire, so they are always answerable.
+     */
+    answerable: boolean
     waiting: Set<string>
     refusals: { key: string; reason: string }[]
     /** How many entries his message carried in `files`. Zero for ordinary typed words. */
@@ -266,8 +292,24 @@ export function createRelay(cfg: RelayConfig): Relay {
      */
     settled: boolean
   }
-  const typedWords = new Map<string, TypedWords>()
-  const TYPED_WORDS_KEPT = 64
+  const handed = new Map<string, Handed>()
+  const HANDED_DOWN_KEPT = 64
+
+  /**
+   * Write down what the hub handed to whom, so the one answer it gets can be folded out of theirs.
+   *
+   * Bounded, oldest first out, because a producer that never answers must not turn this into a
+   * leak. The hub's own frame id is the key for both kinds — it is what a producer's `ack` names,
+   * and the hub mints one counter for the connection, so a tap's id and a message's cannot collide.
+   */
+  function handOut(ref: string, r: Handed): void {
+    handed.set(ref, r)
+    while (handed.size > HANDED_DOWN_KEPT) {
+      const oldest = handed.keys().next()
+      if (oldest.done) break
+      handed.delete(oldest.value)
+    }
+  }
 
   /**
    * Who the producers are and what they are waiting on — including across a restart of this process.
@@ -335,6 +377,9 @@ export function createRelay(cfg: RelayConfig): Relay {
   /** The `welcome` the hub gave us, held so every producer can be answered with the same one. */
   let welcomeFrame: Record<string, any> | null = null
 
+  /** The door itself, held so a run the hub has ended can stop answering on it. */
+  let doorServer: ReturnType<typeof Bun.listen> | null = null
+
   /** The secret this relay authenticated with, so a producer's own token can be compared to it. */
   let secretHeld: string | null = null
 
@@ -384,6 +429,13 @@ export function createRelay(cfg: RelayConfig): Relay {
           // and a claim held under a pid that is not the one holding the socket is a claim the
           // eviction rule cannot reason about.
           pid: process.pid,
+          // The door answers for every tap it is handed, so it promises for all of them. It can
+          // keep that promise whoever is behind it: it folds the answer of the producer that holds
+          // the question, and where nobody can honestly give one it says nothing — which is the
+          // hub's own "the session has not confirmed it took your answer", and true. Promising is
+          // strictly better than staying silent about the promise: without it the hub never edits
+          // his receipt at all, and a tap the worker refused reads "Sent" for ever.
+          confirms: ['choice'],
           ...(OUR_LANE ? { lane: OUR_LANE } : {}),
         },
       }
@@ -510,6 +562,46 @@ export function createRelay(cfg: RelayConfig): Relay {
       }
       case 'refused': {
         const reason = String(f.reason)
+        if (reason === 'stale_generation') {
+          // The one refusal where a redial is exactly the wrong move. The hub has given this
+          // address to a NEWER run of this project, and nothing this run can do wins it back:
+          // `docs/ATTACHING.md` §6 says the way back is a new run and never a redial, and the tool
+          // server behind this door already obeys that. Left in the ordinary table it read as
+          // recoverable — 1 s doubling to 60 s, for ever — and the two halves of one wall then
+          // disagreed about whether the run was over, with this half still holding an open door in
+          // front of producers it could never carry a word for.
+          //
+          // Reachable by the ordinary shape of the deployment, not by an exotic one: the unit is
+          // `Restart=always`, so a restarted attach whose predecessor is still between sockets is
+          // two runs on one address, which is the case the lease exists for.
+          note('a newer run of this project has taken this conversation; nothing from here can reach him again')
+          const over = 'A newer run of this project has taken this conversation. Nothing from here reaches him again; what starts this wall has to start it fresh.'
+          // The word itself stops HERE, and that is the whole of this branch's care for producers.
+          //
+          // The lease is a fact about this door's connection to the hub. A producer holds no lease
+          // at the hub and never did, so the word says something about it that is not true — and it
+          // is the one word a producer acts on for good: `server.ts` reads it and stops dialling for
+          // the life of the session. The run this door was is over; the WALL is not. `Restart=always`
+          // brings the next run up on this same address seconds later, and a session that joined the
+          // relay rather than being started by it is still there to find it — unless this door told
+          // it to stop looking. The close below is what the wire already means by "the door went
+          // away": wait, and dial again. The fact itself is on this run's own journal, where a
+          // developer reads it, and nothing a producer's agent could act on is lost with it.
+          //
+          // `giveUp` marks the link permanently down AND stops the dial loop, which `markDown` alone
+          // does not. Its `onState(false)` is what ends every greeted producer's socket, answering
+          // whatever the link was holding for it first — so the ending is done by letting go of the
+          // link, and only a producer the link never knew about is left to end here.
+          link.giveUp(over)
+          for (const p of producers) p.down.endAfterFlush()
+          // The door goes with the run, and it has to: a door still bound to this address is a door
+          // producers keep dialling into and it can never carry a word again — and it is also the
+          // socket the next run of the wall has to bind. Letting go of it is what makes the redial
+          // above find something.
+          doorServer?.stop()
+          overForGood()
+          break
+        }
         // The same split the tool server makes: will waiting help? An unknown reason is temporary on
         // purpose — a hub shipped after this build may refuse for something recoverable.
         const forGood = ['unknown_project', 'bad_token', 'not_enabled', 'version_skew', 'bad_lane']
@@ -586,9 +678,17 @@ export function createRelay(cfg: RelayConfig): Relay {
       }
       case 'choice': {
         const id = String(f.ask_id)
+        const ref = String(f.id)
         const a = ledger.who(id)
         if (!a) {
           note(`a tap arrived for ${id}, which no producer here asked; it was not delivered`)
+          // Answered, never dropped. Dropped, the hub waits out its window and tells him the
+          // session did not confirm it took his answer — when the truth is that nothing behind
+          // this door could have, and that is a different thing for him to do something about.
+          answerHub(
+            { t: 'ack', ref, status: 'refused', reason: 'the worker no longer has that question open' },
+            'an answer about a tap',
+          )
           break
         }
         // Answered once and for all, at the hub, the moment he tapped — so this routing record has
@@ -601,7 +701,31 @@ export function createRelay(cfg: RelayConfig): Relay {
           // anywhere ever learned the answer the operator had already given. It cannot be delivered
           // now — his tap is spent — so the one thing left is to say so where a developer can see it.
           note(`a tap on ${id} arrived after its producer had gone; the answer reached nobody`)
+          // And said upstairs too, so his receipt is corrected rather than left saying "Sent". The
+          // one thing worse than a tap that reached nobody is a tap that reached nobody and looks
+          // like it landed.
+          answerHub(
+            { t: 'ack', ref, status: 'refused', reason: 'the worker that asked that question went away before it could be answered' },
+            'an answer about a tap',
+          )
           break
+        }
+        // Written down BEFORE the frame is on the socket, because a producer that answers the
+        // instant it reads is racing this line, and an answer for a tap this door is not yet
+        // holding would be dropped as one nobody is waiting on.
+        handOut(ref, {
+          what: 'a tap',
+          answerable: p.confirms.includes('choice'),
+          waiting: new Set([p.key]),
+          refusals: [],
+          files: 0,
+          handedOn: 0,
+          accepted: false,
+          carrierRefused: false,
+          settled: false,
+        })
+        if (!p.confirms.includes('choice')) {
+          note(`producer ${p.n} is from before a tap was answered for; the hub will hear nothing about this one`)
         }
         // To exactly one producer, and named with the id THAT producer minted. Handing it to the
         // wrong one would answer a question a different agent is still waiting on.
@@ -644,7 +768,11 @@ export function createRelay(cfg: RelayConfig): Relay {
         }
         // Everyone it was handed to has to answer, or go, before the hub hears a refusal — and,
         // when his message carried a file, before it hears a count that is short.
-        typedWords.set(String(f.id), {
+        handOut(String(f.id), {
+          what: 'typed words',
+          // His words have always had to be answered for on this wire, whatever a producer
+          // promised, and every producer this door greets is one that reads a `message`.
+          answerable: true,
           waiting: handedTo,
           refusals: [],
           files: Array.isArray(f.files) ? f.files.length : 0,
@@ -653,11 +781,6 @@ export function createRelay(cfg: RelayConfig): Relay {
           carrierRefused: false,
           settled: false,
         })
-        while (typedWords.size > TYPED_WORDS_KEPT) {
-          const oldest = typedWords.keys().next()
-          if (oldest.done) break
-          typedWords.delete(oldest.value)
-        }
         break
       }
       default:
@@ -676,6 +799,27 @@ export function createRelay(cfg: RelayConfig): Relay {
     if (!p.checked || p.greeted || !welcomeFrame || !link.isUp) return
     p.greeted = true
     p.down.relay(welcomeFrame)
+  }
+
+  /**
+   * End this run of the whole command, the way a person or a supervisor ends it.
+   *
+   * Not `die()`: under `--run` the engine is attach's child, and exiting on the spot orphans it —
+   * a wall whose questions stay on his phone with nobody behind them. Attach already has one
+   * stop path, and it is the one wired to the signal: it forwards the signal to the engine, gives
+   * it the ten seconds §13.5 promises, takes the buttons off the questions it leaves, says the
+   * door's `bye` and exits with the child's status. Signalling ourselves is how this file reaches
+   * that path without knowing whether there is a child at all — and it is what the supervisor
+   * reads as "this run is over", which is what starts the new one.
+   */
+  function overForGood(): void {
+    try {
+      process.kill(process.pid, 'SIGTERM')
+    } catch {
+      // Nothing handles it and nothing can stop this run gracefully; the link is down and the door
+      // is closed either way, which is the half that matters to the operator.
+      note('this run could not stop itself; nothing here reaches his phone until it is restarted')
+    }
   }
 
   /** Turn a producer away, exactly as the hub would: one frame, then the connection closes. */
@@ -729,6 +873,10 @@ export function createRelay(cfg: RelayConfig): Relay {
       }
       p.checked = true
       p.key = key
+      // Read as membership and never as presence, exactly as `hub_proto::promises_to_confirm` does:
+      // an empty list is no promise, which is what a producer that knows the field and promises
+      // nothing means by it.
+      p.confirms = Array.isArray(f.confirms) ? f.confirms.filter((w: unknown) => typeof w === 'string') : []
       // Reused when this key has been seen before, so a producer that reconnects keeps the namespace
       // its still-open questions were asked under.
       p.n = ledger.numberFor(key)
@@ -762,17 +910,17 @@ export function createRelay(cfg: RelayConfig): Relay {
         p.down.endAfterFlush()
         return
       case 'ack': {
-        // A producer's ack is always an answer about his typed words, and it is folded into the
-        // one answer the hub will hear. One that names words this door is not holding — handed
-        // out before the fold aged out, or never handed to this producer at all — is not sent up
-        // as it is: the hub would read a second answer for a message it was already answered for,
-        // or one for a frame it never sent.
-        const about = typedWords.get(String(f.ref))
+        // A producer's ack answers something the hub handed down — his typed words or his tap —
+        // and it is folded into the one answer the hub will hear. One that names something this
+        // door is not holding, handed out before the fold aged out or never handed to this
+        // producer at all, is not sent up as it is: the hub would read a second answer for a frame
+        // it was already answered for, or one for a frame it never sent.
+        const about = handed.get(String(f.ref))
         if (about) {
-          answerForTypedWords(String(f.ref), about, p, f)
+          answerForOne(String(f.ref), about, p, f)
           return
         }
-        note(`producer ${p.n} answered for typed words (${f.ref}) this door is not holding; it was dropped`)
+        note(`producer ${p.n} answered for something (${f.ref}) this door is not holding; it was dropped`)
         return
       }
       case 'say':
@@ -807,9 +955,21 @@ export function createRelay(cfg: RelayConfig): Relay {
       refuseFrame(p, ref, 'too-fast')
       return
     }
-    // The envelope is this relay's to mint — `v` and `id` are per connection, and two producers both
-    // counting from 1 would make an `ack` ambiguous. Everything else travels untouched.
-    const { v: _v, id: _id, ...payload } = f
+    // The envelope is this relay's to mint — `v`, `id` and the lease are per CONNECTION, and this
+    // door holds the only connection there is. Two producers both counting from 1 would make an
+    // `ack` ambiguous; and a producer's own lease number is the dangerous one, because the hub
+    // reads the lease on a frame as a claim about which run is speaking. A number from a producer
+    // that has been welcomed by some other door, or invented by a stranger's adapter written to
+    // the document, is higher than the one this connection was granted — and the hub refuses every
+    // frame stamped higher than its claim's (the delivery fence). The agent's question would never
+    // reach the phone, and the answer that came back would say a newer run of this project had
+    // taken its place: false, and with no wrong-looking value anywhere in it. The floor the hub
+    // keeps for the address is raised only by a `hello`, and a door never forwards a producer's —
+    // which is why forwarding one is the thing §9 forbids an implementer outright.
+    // `hub-link.ts::lineFor` drops it again on the way out; it is dropped HERE too because the door
+    // is where it enters, and one layer is not enough for a failure nothing looks wrong in.
+    // Everything else travels untouched.
+    const { v: _v, id: _id, generation: _lease, ...payload } = f
     let askUp: string | undefined
     if (f.t === 'ask' || f.t === 'ask_resolved') {
       askUp = namespaced(p, String(f.ask_id))
@@ -838,8 +998,8 @@ export function createRelay(cfg: RelayConfig): Relay {
     else ledger.closed(askUp)
   }
 
-  /** One producer's answer about his typed words, folded into the one the hub will hear. */
-  function answerForTypedWords(ref: string, about: TypedWords, p: Producer, f: Record<string, any>): void {
+  /** One producer's answer about something the hub handed down, folded into the one it will hear. */
+  function answerForOne(ref: string, about: Handed, p: Producer, f: Record<string, any>): void {
     // A second answer from one producer, or one from a producer the words were never handed to,
     // says nothing the first did not.
     if (!about.waiting.delete(p.key)) return
@@ -848,12 +1008,16 @@ export function createRelay(cfg: RelayConfig): Relay {
       forgetWhenEveryoneHasAnswered(ref, about)
       return
     }
+    // A producer that promised nothing has still said something, and a fact freely given is better
+    // than the silence its promise entitled it to. Recorded here rather than at the hand-out,
+    // because what settles the record is whether anybody CAN answer, and one just did.
+    if (f.status === 'accepted' || f.status === 'refused') about.answerable = true
     if (f.status === 'accepted') {
       about.accepted = true
       // Recorded, then held: the one voice whose answer decides has not spoken yet, and it is the
       // only one that knows whether his words reached the session they were addressed to.
       if (about.carrierRefused || (cfg.carrier !== null && about.waiting.has(cfg.carrier))) {
-        settleTypedWords(ref, about)
+        settle(ref, about)
         return
       }
       // The count of his files this producer handed on — the one frame this door rebuilds rather
@@ -866,48 +1030,71 @@ export function createRelay(cfg: RelayConfig): Relay {
       // message carrying a file it is the first producer that took ALL of them — and when the one
       // that answers first took none, waiting for the rest is the only way the number is a fact
       // rather than a race between processes, which is what the refusal path has always done.
-      if (about.handedOn >= about.files || !about.waiting.size) acceptTypedWords(ref, about)
+      if (about.handedOn >= about.files || !about.waiting.size) accept(ref, about)
       return
     }
     about.refusals.push({ key: p.key, reason: typeof f.reason === 'string' ? f.reason : '' })
     if (p.key === cfg.carrier) about.carrierRefused = true
-    settleTypedWords(ref, about)
+    settle(ref, about)
   }
 
   /** Nothing more will come for it once nobody is left to answer; until then it names a fold. */
-  function forgetWhenEveryoneHasAnswered(ref: string, about: TypedWords): void {
-    if (!about.waiting.size) typedWords.delete(ref)
+  function forgetWhenEveryoneHasAnswered(ref: string, about: Handed): void {
+    if (!about.waiting.size) handed.delete(ref)
   }
 
-  /** Somebody took his words: one accepted answer goes up, with the count nobody can better. */
-  function acceptTypedWords(ref: string, about: TypedWords): void {
+  /** Somebody took it: one accepted answer goes up, with the count nobody can better. */
+  function accept(ref: string, about: Handed): void {
     about.settled = true
     forgetWhenEveryoneHasAnswered(ref, about)
     answerHub(
       { t: 'ack', ref, status: 'accepted', ...(about.files > 0 ? { files: about.handedOn } : {}) },
-      'an answer about typed words',
+      `an answer about ${about.what}`,
     )
   }
 
   /** Nobody left to answer: one answer goes up, with the reason that matters most if it is no. */
-  function settleTypedWords(ref: string, about: TypedWords): void {
+  function settle(ref: string, about: Handed): void {
     if (about.waiting.size) return
     // Already answered for; the last voice going quiet changes nothing.
     if (about.settled) {
-      typedWords.delete(ref)
+      handed.delete(ref)
+      return
+    }
+    // Nobody behind this door ever promised to answer for it, so nothing here knows what became of
+    // it. Saying "taken" would be a guess and "not taken" a lie about a tap the worker very
+    // probably did take; the hub's own window closes on silence and tells him it was not
+    // confirmed, which is the only true thing anybody can say.
+    if (!about.answerable) {
+      note(`nothing behind this door answers for ${about.what}; the hub was told nothing about it`)
+      about.settled = true
+      handed.delete(ref)
       return
     }
     // Somebody did take them; a later producer's refusal does not unsay that — unless it is the
     // carrier's, which is the one voice that can say where his words went.
     if (about.accepted && !about.carrierRefused) {
-      acceptTypedWords(ref, about)
+      accept(ref, about)
       return
     }
     about.settled = true
-    typedWords.delete(ref)
+    handed.delete(ref)
     const said = about.refusals.find(r => r.key === cfg.carrier) ?? about.refusals[0]
+    // Nobody said no; everybody just went. For a TAP that is a fact this door does not have: the
+    // socket died with the frame in the producer's hand, and "it never read it" and "it read it,
+    // acted on it and died before saying so" look identical from here. "Not taken" would correct
+    // his receipt with something nothing here knows, about a tap the worker very probably did
+    // take — the same argument this door already makes for a producer that promised nothing, and
+    // it does not stop applying because the producer had promised. The hub's own window closes on
+    // silence and tells him the session did not confirm it, which is the only true sentence.
+    // His typed words keep the old answer: their refusal is what the hub renders as "what you
+    // typed did not reach the agent", and there the door going quiet says nothing at all.
+    if (!said && about.what === 'a tap') {
+      note('the worker holding a tap went away without answering; the hub was told nothing about it')
+      return
+    }
     const reason = said?.reason || 'everything attached to the worker went away before taking it'
-    answerHub({ t: 'ack', ref, status: 'refused', reason }, 'an answer about typed words')
+    answerHub({ t: 'ack', ref, status: 'refused', reason }, `an answer about ${about.what}`)
   }
 
   function detach(p: Producer): void {
@@ -915,9 +1102,9 @@ export function createRelay(cfg: RelayConfig): Relay {
     note(`a producer went away; ${producers.size} left`)
     if (!p.checked || attached.get(p.key) !== p) return
     attached.delete(p.key)
-    // Whatever of his typed words it had not answered for, it never will now.
-    for (const [ref, about] of typedWords) {
-      if (about.waiting.delete(p.key)) settleTypedWords(ref, about)
+    // Whatever it had not answered for — his typed words, his taps — it never will now.
+    for (const [ref, about] of handed) {
+      if (about.waiting.delete(p.key)) settle(ref, about)
     }
     ledger.rememberNow()
     // The other half of the same proof the hub makes: its socket is gone, and if nothing comes back
@@ -955,7 +1142,7 @@ export function createRelay(cfg: RelayConfig): Relay {
       if (live) die(`another attach is already holding ${LISTEN}; this one is not needed`)
       unlinkSync(LISTEN)
     }
-    Bun.listen({
+    doorServer = Bun.listen({
       unix: LISTEN,
       socket: {
         open(s) {
@@ -970,6 +1157,7 @@ export function createRelay(cfg: RelayConfig): Relay {
             buf: '',
             checked: false,
             greeted: false,
+            confirms: [],
           }
           ;(s as any).data = p
           producers.add(p)

@@ -1919,6 +1919,13 @@ struct HisTap {
     /// Did the bridge promise, at `hello`, to say what became of every choice? Only a bridge that
     /// promised is ever said to have gone silent.
     promised: bool,
+    /// Telegram refused the send that would have been his receipt, so there is no line to change
+    /// and none is coming. Different from `receipt: None`, which is the ordinary moment before the
+    /// round trip comes back: this one says the wait is over and nothing arrived. Without it a
+    /// refusal from the agent waited for ever for a line that would never exist, and he was left
+    /// with a keyboard that had gone and no word at all — precisely when the chat is busy, which
+    /// is when a receipt is refused and when a refusal matters most.
+    no_receipt_is_coming: bool,
     /// Did the window run out before there was any line to change? The window starts when the
     /// answer goes down and his receipt is a Telegram round trip that starts after it, so the two
     /// can cross — and when they do, the window has already run and nothing runs it again. Written
@@ -3082,6 +3089,7 @@ impl<S: Surface> Hub<S> {
                     said: None,
                     promised,
                     overdue: false,
+                    no_receipt_is_coming: false,
                 }),
             });
             while down.len() > DOWN_KEPT {
@@ -3172,7 +3180,60 @@ impl<S: Surface> Hub<S> {
             }
         };
         if let Some((addr, chat_id, question, label, said)) = now {
-            self.say_what_became_of_his_tap(&addr, chat_id, &question, receipt, &label, said)
+            self.say_what_became_of_his_tap(&addr, chat_id, &question, Some(receipt), &label, said)
+                .await;
+        }
+    }
+
+    /// Telegram refused the send that would have been his receipt for a tap. There is no line, and
+    /// there never will be.
+    ///
+    /// Until this existed the record simply waited: the ack arrived, found no receipt, parked what
+    /// the agent said and returned; the window fired, found no receipt, wrote it down and returned.
+    /// Both were waiting for a round trip that had already failed. So an agent's "I could not act on
+    /// this" was swallowed, and the operator was left with a question whose buttons had gone and not
+    /// one word about what became of his answer — and the send that fails is the one made while the
+    /// forum is busy, which is exactly when he is tapping.
+    ///
+    /// A tap the agent TOOK needs nothing said: "Sent" was never written, so nothing on his phone
+    /// is false. A refusal is said the only way left, under the question itself.
+    pub async fn his_receipt_never_arrived(&self, frame: &FrameId) {
+        // Its turn among the things that edit this receipt, exactly as the arrival of one is. See
+        // `tap_edits`.
+        let _in_order = self.tap_edits.lock().await;
+        let now = {
+            let mut down = self.down.lock().await;
+            let Some(at) = down.iter().position(|d| &d.frame == frame) else {
+                return;
+            };
+            let Some(Down {
+                addr,
+                chat_id,
+                msg_id,
+                what: His::Tap(tap),
+                ..
+            }) = down.get_mut(at)
+            else {
+                return;
+            };
+            tap.no_receipt_is_coming = true;
+            // Nothing has been heard from the bridge yet. The record stays where it is: an answer
+            // arriving later finds this flag and says its piece rather than parking it for ever.
+            let Some(said) = tap.said.take() else {
+                return;
+            };
+            let it = (
+                addr.clone(),
+                *chat_id,
+                msg_id.clone(),
+                tap.label.clone(),
+                said,
+            );
+            down.remove(at);
+            Some(it)
+        };
+        if let Some((addr, chat_id, question, label, said)) = now {
+            self.say_what_became_of_his_tap(&addr, chat_id, &question, None, &label, said)
                 .await;
         }
     }
@@ -3236,12 +3297,15 @@ impl<S: Surface> Hub<S> {
     /// An EDIT, never a send. Telegram charges a chat twenty messages a minute and charges nothing
     /// for editing one it already has, and a tap is made precisely while he is looking at a busy
     /// forum — so a second message per tap would come out of the budget an agent's questions need.
+    /// `receipt` is `None` when Telegram refused the send that would have been it. There is then no
+    /// line carrying "Sent" at all, which is the same position as an edit Telegram will not make and
+    /// takes the same way out.
     async fn say_what_became_of_his_tap(
         &self,
         addr: &Addr,
         chat_id: i64,
         question: &MsgId,
-        receipt: &MsgId,
+        receipt: Option<&MsgId>,
         label: &str,
         said: WhatBecameOfTheTap,
     ) {
@@ -3274,24 +3338,31 @@ impl<S: Surface> Hub<S> {
                 format!("Not taken: {label} — {why}. The agent has not got your answer.")
             }
         };
-        if let Err(e) = self.surface.rewrite(receipt, &text).await {
-            tracing::warn!(
-                error = %e, project = %addr.project, lane = addr.lane_field(),
-                "could not tell him what became of his answer"
-            );
-            // A refusal is the one of the two he must not miss: "Sent" is not false about a tap
-            // the agent took, and it IS false about one the agent said no to. The free edit is
-            // always tried first and this runs only when Telegram refused it, so the ordinary tap
-            // still costs nothing — and a send that keeps him from acting on an answer nobody has
-            // is worth one of the twenty.
-            if matches!(said, WhatBecameOfTheTap::Refused(_)) {
-                let outcome = self.say_under(addr, &text, question).await;
-                if !matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
-                    tracing::error!(
-                        project = %addr.project, lane = addr.lane_field(), outcome = ?outcome,
-                        "his answer was refused by the agent and there is no way left to tell him"
-                    );
-                }
+        // The free edit first, wherever there is a line to edit.
+        let no_line = match receipt {
+            Some(receipt) => match self.surface.rewrite(receipt, &text).await {
+                Ok(()) => return,
+                Err(e) => e.to_string(),
+            },
+            None => "the line that would have said it was never sent".to_owned(),
+        };
+        tracing::warn!(
+            error = %no_line, project = %addr.project, lane = addr.lane_field(),
+            "could not tell him what became of his answer"
+        );
+        // A refusal is the one of the two he must not miss: "Sent" is not false about a tap the
+        // agent took — and where his receipt never went at all it was never even claimed — and it
+        // IS false about one the agent said no to. The free edit is always tried first and this
+        // runs only when Telegram refused it or never made the line, so the ordinary tap still
+        // costs nothing — and a send that keeps him from acting on an answer nobody has is worth
+        // one of the twenty.
+        if matches!(said, WhatBecameOfTheTap::Refused(_)) {
+            let outcome = self.say_under(addr, &text, question).await;
+            if !matches!(outcome, SendOutcome::Sent(_) | SendOutcome::Clamped(_)) {
+                tracing::error!(
+                    project = %addr.project, lane = addr.lane_field(), outcome = ?outcome,
+                    "his answer was refused by the agent and there is no way left to tell him"
+                );
             }
         }
     }
@@ -5570,7 +5641,14 @@ impl<S: Surface> Hub<S> {
     ///
     /// Only for a frame this hub handed THIS conversation as his words. A refusal naming an id the
     /// bridge made up, or a frame of any other kind, writes nothing — a bridge cannot put text in
-    /// his topic under the hub's name by refusing things it was never sent. And the FIRST answer
+    /// his topic under the hub's name by refusing things it was never sent. The record is matched
+    /// on the frame id and the address, and NOT on the run: a record outlives the run it was handed
+    /// to, so a later run of the same address that names an id handed to an earlier one is answered
+    /// as if it were that run. Ids are sequential, so guessing one is not hard — but it takes a
+    /// bridge that has already authenticated for this project and is then deliberately naming a
+    /// frame it was never sent, which is a lie and not an accident. Left as it is: closing it means
+    /// carrying the minting run's generation on every record and through this handler, and the
+    /// price of that is paid by every honest frame. And the FIRST answer
     /// for a message is the one that counts: the record goes with it, so a second cannot write a
     /// second line. Behind attach's door several producers may answer one message, and the door
     /// folds them into one before this hub hears it; the Claude tool server answers `accepted`
@@ -5626,17 +5704,27 @@ impl<S: Surface> Hub<S> {
                     // the rule has to be said out loud instead.
                     return;
                 }
-                let Some(receipt) = tap.receipt.clone() else {
-                    // Nowhere to say it yet. Kept beside the tap, and said the moment `bot.rs`
-                    // hands over which message his receipt is.
+                let receipt = tap.receipt.clone();
+                if receipt.is_none() && !tap.no_receipt_is_coming {
+                    // Nowhere to say it YET. Kept beside the tap, and said the moment `bot.rs`
+                    // hands over which message his receipt is. Where the bot has already said no
+                    // line is coming, waiting is waiting for ever, so it falls through and is said
+                    // the only way left.
                     tap.said = Some(said);
                     return;
-                };
+                }
                 let (chat_id, question, label) = (*chat_id, msg_id.clone(), tap.label.clone());
                 down.remove(at);
                 drop(down);
-                self.say_what_became_of_his_tap(addr, chat_id, &question, &receipt, &label, said)
-                    .await;
+                self.say_what_became_of_his_tap(
+                    addr,
+                    chat_id,
+                    &question,
+                    receipt.as_ref(),
+                    &label,
+                    said,
+                )
+                .await;
                 return;
             }
         }

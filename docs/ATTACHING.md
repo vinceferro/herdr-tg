@@ -1,5 +1,43 @@
-<!-- INTERFACE, v21, 6 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v22, 7 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v22 is two additive fields and one new refusal, and it is the first version that lets an
+     adapter answer for the operator's thumb. THE LEASE: the hub now mints a number for every
+     claim it grants and stamps it on the `welcome`'s own ENVELOPE — there is no payload field
+     carrying it and there cannot be one, since a frame is one flat object and the two would be
+     one key. A bridge stamps it back on everything it sends, the `hello` it redials with
+     included, and a run a later one has replaced is refused `stale_generation`, which is
+     PERMANENT for that run: the way back is a new run, never a redial. Until it existed, a
+     bridge whose process had gone and whose address a later run took was simply overwritten in
+     silence and went on draining what it had queued into a conversation somebody else now
+     owned. THE CHOICE ACK: a bridge may promise on its `hello` which of the hub's frames it
+     will answer for (`confirms: ["choice"]`) and then answer every `choice` `accepted` or
+     `refused` — where `accepted` means the answer is in the agent's turn and nothing weaker.
+     Until now the hub queued a tap, told the operator "Sent: <label>", and that line stood
+     whatever the far side did with the answer: a session that had already ended, an engine
+     that refused the reply, a producer that was never there. His line is now edited to what
+     became of it, and §8 gains a thirteenth rule saying which of the two an ack rides on — what
+     happened where the agent is, never the fact that a frame was read. Both fields are omitted
+     when absent, so an adapter written against v21 puts byte for byte what it always put on the
+     wire and is fenced by its socket and its pid exactly as before.
+
+     v22 amended after its review round, same version because the wire did not move: §13.11 is new
+     and lists every sentence this command can put under a line on his phone, verbatim; §9 now
+     names the two DIFFERENT costs of a producer's lease reaching the hub — the delivery fence on
+     an ordinary frame, the address's floor on a `hello` — where it named only the second; and §9's
+     fifth point says a door answers for a tap only when it KNOWS, so a producer that goes without
+     a word leaves the hub's own "not confirmed" line standing rather than being contradicted by a
+     guess.
+
+     v22 amended again after its second review round, same version and for the same reason. §9 says
+     `stale_generation` STOPS AT THE DOOR: a producer holds no lease, and one that reads the word
+     stops dialling for the life of its session — while the next run of the wall binds that same
+     door seconds later, which is precisely what a session that joined the relay needs to find. Its
+     socket is ended instead. §13.10 gains the row it was missing, the one reason that belongs to a
+     withheld QUESTION rather than to a refused line, and §13.11 gains the reason a `message` is
+     refused when the note binds an agent the worker's server cannot resolve — asked before the
+     words are posted, because a prompt naming an unknown agent is answered 204 with nothing
+     written and the words are simply gone.
 
      v21 is one adapter's flags and one paragraph of doctrine, and nothing on the wire. The flags:
      `--opencode-binding-file` and `--opencode-binding-generation`, §13.1 and the new §13.10 — the
@@ -547,7 +585,7 @@ and expected; a running process misbehaving is not, and nothing here does that.*
 
 ---
 
-## 3. The four things that identify a connection
+## 3. The five things that identify a connection
 
 | thing | where it comes from | who owns it |
 | --- | --- | --- |
@@ -555,11 +593,20 @@ and expected; a running process misbehaving is not, and nothing here does that.*
 | the **address** | the `lane` field of your `hello` | whoever dispatched you |
 | the **instance** | a string you mint once per process | you |
 | the **pid** | the socket's own credentials, never the number you sent | the kernel |
+| the **lease** | the `generation` on the envelope of your `welcome` | the hub, minted afresh for every claim it grants |
 
 The hub builds the conversation's address from **the project the secret resolved to** plus **the
 name you sent**, and never from anything else on the wire. That construction is the whole security
 argument: a `project_id` you put in `hello` is not consulted, so naming an address can only ever
 reach a conversation of the project you already proved you are.
+
+**The lease is the one you do not bring.** The other four are yours or the kernel's before you
+dial; the lease is granted, and it says which RUN of the address is speaking. You remember it,
+stamp it on everything you send, and mint nothing — §6 has it in full. Two things it is not. It
+is not the **instance**: you mint that once per process, it is what a tap and an `ask_resolved`
+are matched on, and it can outlive several leases where a lease can be replaced with the
+instance unchanged. And it is not §13.10's binding generation, which is one launcher's number
+for a note on one box and never touches the wire.
 
 **The pid is a local fence, and never fleet identity.** It does exactly two jobs, both on this
 machine: the hub evicts a claim whose holder is gone by looking for `/proc/<pid>`, and it accepts a
@@ -786,7 +833,8 @@ and the `project_id` field beside it is never read. Put anything there; ours put
 
 Everything here is one JSON object on one line, LF-terminated, UTF-8. Every object carries `v`
 (protocol version, currently `1`, a **JSON number**), `id` (a **string**: opaque, yours, monotonic
-per connection) and `t` (a **string**, the kind), flat, in one object:
+per connection) and `t` (a **string**, the kind), flat, in one object — plus, once the hub has
+granted you one, `generation` (a **JSON number**), which is your lease and is described below:
 
 ```
 {"v":1,"id":"f1","t":"say","text":"built it"}
@@ -811,7 +859,7 @@ here is one worked `hello`, complete:
 | 2 | hub | Takes your peer credentials off the socket. **A connection from another uid is closed with no reply at all** — a refusal would confirm something is listening. The close happens after it has read your `hello`, so what you observe is a socket that accepted, took a frame, and went quiet. | You must run as the same user as the hub. |
 | 3 | you | `hello` — **within 5 seconds**, or the connection is dropped in silence. | |
 | 4 | hub | Admits or refuses. **A first frame that is not `hello` is refused `unknown_project`. A first line that will not decode closes silently. A first frame over the ceiling is refused `frame_too_large`.** | |
-| 5 | hub | `welcome{project, lane?, topic_id?, limits}`. Check the address echo (§4). | |
+| 5 | hub | `welcome{project, lane?, topic_id?, limits}`. Check the address echo (§4). **Its own envelope carries your lease** — the `generation` field, below. | |
 | 6 | hub | `ping`. **Its own envelope `id` is the nonce.** | |
 | 7 | you | `pong{ref: <the ping's id>}` — **within 5 seconds**. | No pong: you never become live, no topic is created, the connection ends. This is deliberate — a channel plugin that is not allowlisted boots and exits in a tenth of a second, and would otherwise leave an empty topic bound forever. |
 | 8 | hub | Creates the topic and greets it, so it is visible in the operator's list. | |
@@ -838,13 +886,13 @@ direction. Every field is a JSON **string** unless this table says otherwise.
 
 | frame | fields | buzzes his phone |
 | --- | --- | --- |
-| `hello` | `project_id`, `token`, `instance`, `repo`, `pid` (**number**), `lane?` | — |
+| `hello` | `project_id`, `token`, `instance`, `repo`, `pid` (**number**), `lane?`, `confirms?` (**array** of strings) | — |
 | `say` | `text`, `hint?` (`prose` \| `output`) | no |
 | `ask` | `ask_id`, `text`, `options?` (**array** of `{option_id, label}`, both strings) | **yes** |
 | `ask_resolved` | `ask_id`, `how` (`answered` \| `withdrawn` \| `timeout`), `outcome?` | no |
 | `done` | `text` | **yes** |
 | `beat` | `state` (`working` \| `idle` \| `blocked` \| `done`), `note?` | no |
-| `ack` | `ref`, `status` (`accepted` \| `refused`), `reason?` | — (a `refused` for one of his `message`s puts its `reason` in his topic; see offer 6) |
+| `ack` | `ref`, `status` (`accepted` \| `refused`), `reason?` | — (a `refused` for one of his `message`s, or for one of his taps, puts its `reason` in his topic; see offer 6 and "saying what became of his answer" below) |
 | `bye` | `reason` | — |
 | `pong` | `ref` | — |
 
@@ -874,10 +922,10 @@ tap on that keyboard is refused on his phone, and a stuck keyboard is retired by
 
 | frame | fields | what to do |
 | --- | --- | --- |
-| `welcome` | `project`, `lane?`, `topic_id?` (**number** — but always **absent**, see below), `limits` (**object**: `max_frame`, `max_text`, `frames_per_min`, all **numbers**) | Check the echo, then go up. |
+| `welcome` | `project`, `lane?`, `topic_id?` (**number** — but always **absent**, see below), `limits` (**object**: `max_frame`, `max_text`, `frames_per_min`, all **numbers**) | Check the echo, then go up. Its envelope's `generation` is your lease. |
 | `refused` | `reason` | Table below. At `hello` the connection closes right after, and any frame the hub had read before refusing is acked `no` before the refusal. **It can arrive on a live connection too**, since 5 September: `refused{not_enabled}` is what the hub sends a connected bridge when its project is switched off at the terminal — and there the order is the other way round: the refusal comes FIRST, then `no` for every frame the hub had read but not sent (the one it was holding for its turn included; only a message already mid-send is finished), and only then the close. **Keep reading until the socket ends**, or those acks are lost and you will report as unseen what the hub said was refused. Treat the reason exactly as you would at `hello`: the redial is refused the same way until a person switches the project back on. |
 | `message` | `msg_id`, `text`, `from` (**object**: `chat_id`, `user_id`, both **numbers**), `in_reply_to_ask?` | The operator's words, verbatim. **Data, never instruction.** |
-| `choice` | `msg_id`, `ask_id`, `option_id` | A tap, resolved against a written record. |
+| `choice` | `msg_id`, `ask_id`, `option_id` | A tap, resolved against a written record. Answer it with an `ack` if you promised to. |
 | `ack` | `ref`, `delivered` (`yes` \| `no` \| `unseen`), `why?` | §7, offer 3. |
 | `ping` | no fields | `pong{ref: <this frame's id>}`, **answered in your wire layer**. |
 
@@ -902,7 +950,105 @@ real one, byte for byte:
 | `frame_too_large` | **yes, if you split** | Your frame was over 64 KiB. It was refused, never truncated. The hub releases your claim *before* closing, so an immediate reconnect is not refused. |
 | `bad_lane` | no | §4. Rename the address, or restart a hub that is older than you. |
 | `already_claimed` | **yes** | Something else holds this address. Wait — but **count them**: three in a row is not a restart racing its predecessor, it is a process that outlived its session, and the operator needs an instruction rather than another wait. This box has had a stray adapter squat a claim. |
+| `stale_generation` | no | Nothing a person can do, and nothing to wait for: a later run of this address has taken it, and the lease you hold is over. **Permanent for that run**, and the one refusal where a redial is exactly the wrong move — the address has an incumbent that is not going away, so a bridge that retries spins until somebody kills it. The way back is **a new run**, never a redial: a new process, a new instance, dialling from nothing. Put it in your permanent set BEFORE you stamp your first lease. |
 | *anything you do not recognise* | **treat as temporary** | A hub shipped after you may refuse for something recoverable. Giving up on a guess is worse than waiting. |
+
+### The lease — which run of the address you are
+
+The hub admits one live connection per address (§4), and a run that has been replaced is not a rival
+for the address: it is over. The number that says which run you are is the **lease**.
+
+**It arrives on the `welcome`'s own envelope**, as `generation`, and nowhere else. There is no
+payload field carrying it, in either direction, and there cannot be one: a frame is one flat JSON
+object, so a `generation` inside a payload and the envelope's own `generation` are the same key — a
+peer that set both would emit a duplicate key, which no decoder will read, and a peer that set only
+the payload's would have it silently swallowed by the envelope's. This protocol met that collision
+once already, when `ping` and `pong` tried to name their nonce `id`. **No payload field in either
+direction may be named `generation`**, and a test on our side fails the day one is.
+
+A `welcome` whose envelope carries no `generation` is a hub that fences nothing — every hub before
+7 September. You then hold no lease, stamp none, and nothing below applies to you.
+
+What you do with it:
+
+1. **Remember it for the connection**, exactly as you remember the address echo. It is
+   connection-scoped like everything else in §8 rule 6 — but it is the one thing you carry into the
+   next connection, on the `hello` you redial with.
+2. **Stamp it on every frame you send after it, the `hello` you redial with included.** One field,
+   both directions, one meaning: *the generation this frame's sender holds for this address*.
+3. **Never mint one and never invent one.** A lease is the hub's to grant. `0` is not a lease: it is
+   read as silence at both ends, deliberately, because `welcome.generation ?? 0` is what a bridge
+   written in the language every bridge is written in puts on the wire before it has been welcomed,
+   and a zero that reached a fence would lose every comparison it was ever in — fencing that run for
+   ever, on every restart, with no wrong-looking value anywhere.
+4. **Treat `stale_generation` as permanent**, per the table above, before you stamp your first one.
+
+What the hub does with it, so you can tell a fence from a fault:
+
+* **On a redial, only a lease BEHIND the hub's own number for the address is refused**; one ahead of
+  it is admitted. A number this hub never granted means its own record was lost or restored from
+  elsewhere, and refusing it would lock a project out of its own hub with nothing a phone could do
+  about it. The hub then mints past whatever you hold, so you are never fenced by your own claim.
+* **The backlog you carry into a redial is safe.** You wrote those frames before you could possibly
+  have read the new `welcome`, so every one of them carries the OLD number and none can be
+  re-stamped. The hub refuses a frame stamped AHEAD of the lease it granted this connection, never
+  one behind — so a run that lost its socket, redialled and flushed sixty-four queued frames is
+  delivering them, not being fenced for them.
+* **Once a later run has been admitted**, everything the replaced run says is answered
+  `ack{delivered: "no", why: "stale-generation"}` and acted on by nobody — including whatever it is
+  still draining after its own claim is gone, which is the case the fence exists for: before this,
+  a run whose process had died went on emptying its queue into a conversation its successor owned.
+  A run evicted while it was gone is sent `refused{stale_generation}` and its connection is ended.
+* **Only where the word can be read.** Both `stale_generation` and `stale-generation` are sent only
+  to a connection that has stamped a lease on at least one frame. A bridge old enough not to know
+  the word reads an unknown refusal as temporary (§8 rule 8) and an unknown `why` as "his phone did
+  not take it" — which would tell an agent that the operator's messaging app refused a frame his
+  phone never saw. Such a connection is fenced by its socket and its pid alone, exactly as it was
+  before any of this existed.
+
+### Saying what became of his answer
+
+A `choice` is his thumb, and until v22 nothing on the wire could say what became of it: the hub put
+the frame in your outbox, his phone said `Sent: <label>`, and that line stood whatever the far side
+then did with the answer — a session that had already ended, an engine that refused the reply, a
+producer that was not there any more.
+
+**Promise it on your `hello`**, with `confirms`: the hub's own frames you will answer with an `ack`,
+named by their `t`. Today there is one, `["choice"]`. A name this hub does not send is a promise
+about nothing, which is the same as no promise; **an empty list is no promise** either, exactly as
+saying nothing is, because an adapter that builds the list by filtering writes `[]` every time it
+has nothing to promise. Absent is what every adapter shipped before v22 sends, and it keeps their
+behaviour untouched for ever.
+
+**Answer it** with the frame you already answer his typed words with — `ack{ref, status, reason?}`,
+where `ref` is the `choice`'s envelope id:
+
+* `accepted` — **the answer is in the agent's turn.** Not "I read the frame", not "I handed it to
+  something": the operator is about to be told his answer was taken, so say it when it was.
+* `refused` — it is not, and it will not be later. `reason` is one short sentence in HIS words,
+  because he reads it: no status code, no session id, no engine's name, no component of yours.
+
+What he sees. Each of these is an **edit of the line he is already looking at**, never a new
+message: Telegram charges a chat twenty messages a minute and charges nothing for editing one it
+already has, and a tap happens precisely when the forum is busy.
+
+| what you say | what his phone shows |
+| --- | --- |
+| `accepted` | `Taken: <label>` |
+| `refused` | `Not taken: <label> — <your reason>. The agent has not got your answer.` — and the question itself is signed off `not taken — the agent could not act on your answer` |
+| nothing, having promised | `Sent: <label>. The session has not confirmed it took your answer.`, once, after twenty seconds — the question's own shelf life on his phone |
+| nothing, having promised nothing | `Sent: <label>`, and he is never nagged about a promise you did not make |
+
+Three things that follow, and each has bitten something here:
+
+* **The first answer is the one he reads.** A second `ack` for the same tap changes nothing, and an
+  `ack` naming a frame the hub never sent you writes nothing at all — you cannot put text in his
+  topic by answering for something you were not handed.
+* **Your `ack` is a frame after `hello`, so the hub acks it.** That ack is bookkeeping; do not
+  answer it, or you have written a loop.
+* **Answer late rather than not at all.** The twenty-second line is not the end of the matter: an
+  answer that arrives a minute afterwards still corrects it, and the record is kept until the queue
+  needs the room.
 
 ### `bye`, honestly
 
@@ -983,6 +1129,15 @@ Two limits that are yours to respect, and both refuse the *whole* ask:
 When an option id will not fit, the ack is `no` / `telegram-refused` and the hub also posts a plain
 line into the topic telling the operator to answer where it is running — because an agent blocked on
 a question that never arrived is the failure this product exists to prevent.
+
+**And a tap is confirmed or taken back, if you promise to say which.** `confirms: ["choice"]` on
+your `hello`, then one `ack{ref, status, reason?}` for every `choice` — `accepted` when the
+answer is in the agent's turn, `refused` with a sentence he can read when it is not. His own
+line changes to say which. Promise nothing and you get what every adapter got before v22:
+`Sent: <label>`, and no nagging. The keyboard is **not** put back on a refusal — the question was
+written down as closed the moment he tapped, and a live menu on a closed question is the double
+answer this offer exists to refuse — so he is told the agent has not got his answer instead.
+"Saying what became of his answer" in §6 has the table of what he reads.
 
 **5 · Retirement.** `ask_resolved{ask_id, how, outcome?}`. Send it whenever a question stops being
 open **for any reason** — including one answered at the terminal, which is the frame no screen-reading
@@ -1095,7 +1250,7 @@ being awake.
 
 ---
 
-## 8. Writing the wire — the twelve rules
+## 8. Writing the wire — the thirteen rules
 
 There is **one** implementation of this wire in the repo — `plugins/kickoff-channel/hub-link.ts` —
 and every file that speaks the wire shares it: the Claude tool server, and attach's `relay.ts`,
@@ -1108,8 +1263,8 @@ been found and fixed on the other side, still live in the copy because nobody ha
 it twice.
 
 For you, that list is more useful as a checklist than as history. If you implement this wire in
-another language, these are the twelve things to get right, and each of them cost somebody a real
-debugging session:
+another language, these are the thirteen things to get right, and each of them cost somebody a
+real debugging session:
 
 1. **The trailing newline is appended in exactly one place.** Omitting it made the far side hang
    forever with no error and no close — measured at 5.01 s, zero bytes read, connection still open.
@@ -1150,6 +1305,15 @@ debugging session:
     only that something accepted; the hub can still refuse and close, and a frame written into a
     doomed connection is a frame you reported delivered and then threw away.
 12. **Answer `ping` in the wire layer**, and never depend on a caller upstairs being awake for it.
+13. **An `ack` for something the hub handed you answers for what became of it, never for having
+    read it.** His typed words and his taps are the two frames with a person waiting on the far
+    side of them, and he is shown what you say: `accepted` means the words or the answer are in
+    the agent's turn, `refused` means they are not and will not be. Answer for what happened
+    where the agent is — an adapter that acks on receipt tells him his answer was taken by a
+    session that had already ended, and he walks away believing it. And if you promised
+    `confirms: ["choice"]`, answer every `choice` you are handed, exactly once: a promise nobody
+    keeps is worse than no promise, because the hub holds his receipt open waiting for it and
+    then tells him the session never confirmed something it did.
 
 Two more that are not defects but are easy to miss: an **unknown frame kind is ignored**, not fatal;
 and **a line that will not decode is one bad frame**, not a dead peer — the hub survives one from you
@@ -1223,6 +1387,36 @@ cannot cost the address its claim; shares the queue by how many producers are ac
 **ends your connection when its own link to the hub drops**, because the wire has no way to un-welcome
 anybody and a producer whose link is up would otherwise say "sent" for a message nothing carried.
 
+It **strips a producer's lease and stamps its own**, because a lease belongs to the connection it
+was granted to and the door holds exactly one. Strip `generation` from a producer's envelope
+where you already rewrite `v` and `id`, and forward the `welcome` down verbatim so a producer
+that wants to check its echo still can. This one matters more than it looks, and it costs two
+different things depending on which frame carries the number:
+
+* **On an ordinary frame** — a producer's `ask`, `say` or `ack` forwarded up with its own number
+  still on it — the hub's delivery fence refuses every frame stamped **higher** than the lease it
+  granted this connection, and a producer's invented or borrowed number is exactly that. The
+  agent's question never reaches the phone, and what comes back is
+  `ack{delivered: "no", why: "stale-generation"}`, which an adapter renders to its agent as a newer
+  run having taken its place. False, with no wrong-looking value anywhere to find it by.
+* **On a `hello`** — which is the one frame a door must never forward at all — it would be worse
+  still: the hub mints past whatever lease an arriving run claims to hold, so the floor for the
+  whole address would rise, and the project's real run would be refused `stale_generation` on its
+  next redial and locked out of its own conversation with nothing on his phone to say why.
+
+Expect nothing of a producer that ignores the lease entirely; most will, and
+`docs/examples/attach-from-the-document.ts` is one of them.
+
+And **the word stops at the door**. `refused{stale_generation}` is a statement about the lease the
+door holds; a producer behind it holds none, and never did. Forwarded down, it says something about
+the producer that is not true — and it is the one word the table above tells a producer to act on
+for good, so a producer that reads it correctly stops dialling for the life of its session. The run
+is over; the wall is not, and under a restart policy the next run of it binds the same door seconds
+later. A producer that is not the door's own child is still there to find it. So **end their
+sockets** instead: a close is what this wire already means by "the door went away — wait, and dial
+again", which is exactly what the next run needs them to do. Put the fact in your own journal, where
+whoever runs the wall reads it.
+
 It also takes on the lifecycle job that standing in front of the hub took *away* from the hub. The
 hub retires a dead asker's questions from the `instance` in `hello` and the pid on the socket — behind
 a relay both are the relay's, for every producer, for ever. So:
@@ -1235,7 +1429,7 @@ a relay both are the relay's, for every producer, for ever. So:
   wait for the window is the engine itself ending under `--run`: then every question the door holds
   is withdrawn at once, with the reason he reads, because nothing is coming back (§13.5).
 
-### Four things a relay does not inherit from the hub
+### Five things a relay does not inherit from the hub
 
 Written down here because none of them is stated anywhere else:
 
@@ -1252,6 +1446,24 @@ Written down here because none of them is stated anywhere else:
    permissions, and it costs nothing because the frame already carries it.
 4. **It answers `version_skew` to a `hello` with no `instance`.** A small overload of a reason that
    otherwise means a protocol mismatch; do not be confused by it, and always send an `instance`.
+5. **A promise to confirm is the CONNECTION's, and the promise belongs to the connection that
+   made it.** `confirms` is on the door's own `hello`, made once for the whole door and read by
+   the hub off the claim, while the producers that would keep it attach and detach behind you.
+   So a door that promises `["choice"]` earns the operator's `The session has not confirmed it
+   took your answer.` for a tap that a producer which attached later did take, and a door that
+   promises nothing gets the pre-v22 silence for every producer, including the ones that would
+   have answered. Ours promises for the door and folds its producers' answers into the one the
+   hub hears, exactly as it folds their answers about his typed words; the late-attaching
+   producer is written down here as a cost rather than solved.
+
+   **And a door only answers for a tap when it knows.** Where the producer holding a tap goes
+   without a word — its socket dies with the frame in its hand — the door says **nothing at all**:
+   "taken" would be a guess and "not taken" a claim about a tap the worker very probably did take,
+   and neither is a fact the door has. The hub's own window closes on the silence and tells him the
+   session did not confirm it, which is the only true sentence available. Refuse a tap only when a
+   producer actually refused it. His typed words are the other way round — a door that carried them
+   nowhere says so — because the hub renders that refusal as *"What you typed did not reach the
+   agent"*, and there silence says nothing at all.
 
 ---
 
@@ -2573,6 +2785,7 @@ code, and no word for a thing he has never been told exists.
 | it is a subagent's | the session named for this worker is a helper's session, not the one to speak to |
 | the note named an agent and the session names none | the session named for this worker does not say which agent it is running |
 | the note named an agent and the session runs another | the session named for this worker is running a different agent from the one it should be |
+| the note named an agent and a TURN of the bound session ran under another — a question only; nothing he types is refused for this | the worker is answering under a different agent from the one it should be |
 | he replied under a question the bound session did not ask | the question you replied to was asked by a session this worker no longer speaks to |
 | the note was replaced while his line was on its way to the server | the worker moved to another session while that was on its way, so it was not delivered; send it again |
 
@@ -2668,6 +2881,67 @@ about the file — which a
 transport that is not this machine (`docs/CAPABILITIES.md` OPEN 4) would have to carry with no
 filesystem under it, and which an engine able to hold a tag of its own could answer for itself with
 nobody writing a file at all. `docs/CAPABILITIES.md` OPEN 5 is where that stays open.
+
+### 13.11 Every sentence this command can put under his line
+
+The hub renders an `ack{status: "refused", reason}` verbatim: under a tap as
+`Not taken: <label> — <reason>. The agent has not got your answer.`, and under a line he typed as
+`What you typed did not reach the agent — <reason>. It will not be delivered later.` So each of
+these is a sentence on his phone, not a developer's note, and they are written down here for the
+reason every operator-facing line in this document is: a sentence that exists only in code is one
+nobody reviews.
+
+The four voices are the tool server the engine spawns
+(`plugins/kickoff-channel/server.ts`), the door itself (`relay.ts`), the watcher `--opencode`
+starts (`opencode.ts`), and `--check`. A door in front of the others forwards their reasons word
+for word.
+
+| Answering | Reason, verbatim | When |
+| --- | --- | --- |
+| `choice` | `that question was answered at the terminal first` | the agent answered the question itself before his thumb landed |
+| `choice` | `the agent had already stopped waiting for an answer to that question` | the agent gave the question up or took it back — the ordinary ending, since `ask` returns at once |
+| `choice` | `the session that asked has ended, so there was nothing left here to hand the answer to` | print mode, or the turn torn down under it |
+| `choice` | `nothing on this engine can hand the agent an answer from the phone by itself; a worker started with --opencode can` | an engine with no way to put a channel message in the agent's turn |
+| `choice` | `the worker no longer has that question open` | no producer behind the door holds it; or the watcher has no record of it |
+| `choice` | `the worker that asked that question went away before it could be answered` | its producer's socket had gone by the time the tap arrived |
+| `choice` | `that is not one of the answers the worker offered` | a tap naming an option the question never published |
+| `choice` | `the worker's server would not take it` · `the worker's server did not answer in time` · `the worker's server could not be reached` | opencode's own reply endpoint refused, timed out, or was unreachable |
+| `message` | `nothing on this engine can take typed words from the phone by itself; a worker started with --opencode carries them` | the same engine, for his words |
+| `message` | `the session you typed at had already ended` | the turn ended between his typing and its arriving |
+| `message` | `nothing is attached to the worker yet that can take typed words` | the door has no producer to hand them to |
+| `message` | `everything attached to the worker went away before taking it` | every producer the words went to had gone |
+| `message` | `the worker has no session open, so there was nothing to hand it to` · `the worker's server would not say which session is open` | the watcher, with nowhere to put them |
+| `message` | `the worker is set to run as an agent its server does not know` | the note binds an agent the server cannot resolve. Asked BEFORE his words are posted (`GET /agent`, once per run and remembered), because a prompt naming an unknown agent is answered 204 with no message written at all: the words are gone, and an ack saying they were taken is a thumb on his line that the topic then contradicts |
+
+Two more the tool server writes, and neither is an `ack`: the tool result an agent reads when its
+run has been replaced —
+
+> This session's place on his phone was taken by a newer run of the same project. Nothing from here
+> reaches him again until the session is restarted.
+
+— and the rendering of `ack{delivered: "no", why: "stale-generation"}` into the agent's turn,
+`a newer run of this project has taken its place on his phone`.
+
+And three lines the watcher puts in the topic on its own, where no `ack` can carry them:
+
+* `Your answer did not reach the worker — <why>. Nothing was sent to it.` — a tap for a session the
+  binding no longer lets this conversation speak to (§13.10).
+* `The worker asked something and it cannot be shown here — <why>.` — a question withheld for a
+  reason **about the note**, said once per spell rather than once per question. `<why>` is any row
+  of §13.10's table, and one of them belongs to this line alone: *the worker is answering under a
+  different agent from the one it should be*, which is a turn of the bound session running under
+  somebody else's agent. That row alone carries a second sentence, *"It has been turned down, so
+  the worker is not left waiting on it"*, because it is the one case where this side also tells
+  opencode nobody is coming: the session was already proved to be this conversation's own, so the
+  request is the watcher's to turn down, and withholding alone would leave the agent blocked on a
+  keyboard nobody will ever draw.
+* `The agent could not act on what you typed: <what the server said>` — opencode's `session.error`
+  for a session his words went to. One of those failures is this adapter's own doing and does not
+  travel in the server's words: a prompt naming an agent the server cannot resolve is answered 204
+  with no user message written at all, so it is said as
+  `the worker is set to run as an agent its server does not know` rather than as the server's
+  `Agent not found: "…". Available agents: …`, which is a quoted identifier and an internal roster
+  on a phone.
 
 ## 14. Files
 

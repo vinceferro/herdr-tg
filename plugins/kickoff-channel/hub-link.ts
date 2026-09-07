@@ -211,6 +211,30 @@ export class HubLink {
   private saidItWasDown = false
   private seq = 0
 
+  /**
+   * The lease this run holds for its address, granted on the `welcome`'s own envelope.
+   *
+   * `undefined` until a hub grants one, and again the moment a hub says it grants none — an older
+   * hub fences nothing, and stamping it a number it never minted would be a claim about a thing it
+   * has no opinion on. A zero is not a lease either: the hub reads one as "this peer holds none",
+   * so a bridge that wrote a zero would look as though it held a number and lose every comparison
+   * that number was ever in — turned away, for ever, on every restart.
+   *
+   * It outlives the connection it came from on purpose. A run that lost its socket comes back
+   * saying which lease it is holding, and the hub uses it to tell a run that is merely redialling
+   * from one a later run has already replaced.
+   */
+  private lease: number | undefined
+
+  /**
+   * Has this run been told there is no way back for it? Then it never dials again.
+   *
+   * Separate from `state.permanent`, which nearly always means "until a person mends something"
+   * — no secret on disk, a project not enrolled — and which the dial loop keeps retrying behind
+   * on purpose, because the recovery a tool result prescribes happens while this session runs.
+   */
+  private givenUp = false
+
   /** Has this link ever been welcomed? Tells a close-before-welcome from a live link dropping. */
   private reachedWelcome = false
 
@@ -313,11 +337,34 @@ export class HubLink {
     }
   }
 
+  /**
+   * One frame's bytes: the envelope, the lease this run holds, and the payload.
+   *
+   * The lease goes on the ENVELOPE and nowhere else. An envelope flattens its payload, so a second
+   * field of that name is the same key twice in one object — which the hub's reader refuses
+   * outright — and a payload that named it alone would have the envelope swallow it and read back
+   * as nothing. So anything arriving under that key in a payload is an envelope field that leaked
+   * (a relay forwarding a producer's whole envelope is how), and it is dropped here rather than
+   * put on the wire as this connection's number: one producer holding a number from before a
+   * re-claim would otherwise fence the whole link.
+   *
+   * Stamped when the frame is written down, and NEVER rewritten afterwards. A run that lost its
+   * socket comes back holding a newer lease and flushes what it queued under the old one, and
+   * those bytes keep the old number on purpose: the hub refuses only a number it never granted, so
+   * a backlog stamped behind the current lease is delivered. A re-stamp invented here is exactly
+   * what would make a healthy run's whole backlog look like somebody else's.
+   */
+  private lineFor(id: string, payload: Record<string, unknown>): Uint8Array {
+    const frame: Record<string, unknown> = { v: PROTOCOL_VERSION, id, ...payload }
+    delete frame.generation
+    if (this.lease !== undefined) frame.generation = this.lease
+    return Buffer.from(JSON.stringify(frame) + '\n', 'utf8')
+  }
+
   /** THE ONLY WRITER. Rule 1: the newline is appended here and nowhere else. */
   send(payload: Record<string, unknown>, what: string, askId?: string, owner?: string): Delivery {
     const id = this.nextId()
-    const line = JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n'
-    const bytes = Buffer.from(line, 'utf8')
+    const bytes = this.lineFor(id, payload)
     if (bytes.length > MAX_FRAME_BYTES) {
       // Refused rather than truncated. Half a message on a phone is worse than none and looks the
       // same as a whole one.
@@ -411,8 +458,7 @@ export class HubLink {
     const s = this.sock
     if (!s) return
     const id = this.nextId()
-    const line = JSON.stringify({ v: PROTOCOL_VERSION, id, ...payload }) + '\n'
-    this.control.push({ id, bytes: Buffer.from(line, 'utf8'), what: 'a liveness answer', control: true })
+    this.control.push({ id, bytes: this.lineFor(id, payload), what: 'a liveness answer', control: true })
     this.flush(s)
   }
 
@@ -471,6 +517,22 @@ export class HubLink {
 
   /** End this connection now — a refusal this side is making, rather than one it was given. */
   end(): void {
+    this.sock?.end()
+  }
+
+  /**
+   * Stop for good: this run is over and no amount of dialling can change it.
+   *
+   * `markDown(true, …)` alone is not that. Nearly every permanent refusal is one a PERSON mends
+   * while the session is still running — a project enrolled, a secret granted — and the dial loop
+   * goes on running behind it precisely so that the recovery a tool result prescribes takes effect
+   * without a restart. One refusal is not like that: a run a later run has replaced can never be
+   * admitted again under this identity, and dialling on would be the session spending the rest of
+   * its life asking to come back to an address that has moved on.
+   */
+  giveUp(why: string): void {
+    this.givenUp = true
+    this.markDown(true, why)
     this.sock?.end()
   }
 
@@ -555,8 +617,9 @@ export class HubLink {
           // `welcome` (a live link dropping) or after a `refused` the caller already heard — the
           // hub closes right after refusing, and that close explains nothing the refusal did not.
           else if (!this.reachedWelcome && !this.sawRefusal) this.o.onDial?.({ closedBeforeWelcome: true })
-          // A caller proving reachability dials once and stops; a caller holding a claim redials.
-          if (this.o.once) return
+          // A caller proving reachability dials once and stops; a caller holding a claim redials —
+          // unless it has been told there is no way back for it at all.
+          if (this.o.once || this.givenUp) return
           setTimeout(() => this.connect(), this.backoff)
           this.backoff = Math.min(this.backoff * 2, 60_000)
         },
@@ -577,7 +640,7 @@ export class HubLink {
         this.o.note(`nothing is listening at ${who.socket} (${code}); retrying`)
         this.saidItWasDown = true
       }
-      if (this.o.once) return
+      if (this.o.once || this.givenUp) return
       setTimeout(() => this.connect(), this.backoff)
       this.backoff = Math.min(this.backoff * 2, 60_000)
     })
@@ -603,6 +666,21 @@ export class HubLink {
       // this module being awake — a fan-in with a wedged producer would otherwise lose the lane.
       this.sendControl({ t: 'pong', ref: frame.id })
       return
+    }
+    if (frame.t === 'welcome') {
+      // The lease, read off the welcome's OWN envelope — there is no payload field of that name
+      // and there cannot be one, for the reason on `lineFor`. Read on every welcome and not once:
+      // a hub replaced under a reconnecting bridge grants its own number, and a hub that grants
+      // none is saying it fences nothing, which is a thing to forget rather than to remember.
+      const granted = frame.generation
+      // A caller proving reachability (`once`) holds no place and stamps nothing. The hub gives the
+      // number back to a connection that never became live, so a number this link put on its `bye`
+      // would be a claim to an address the check is deliberately not taking — and it is the one
+      // thing that could make the hub say a check's lease was over, for a check that has none.
+      this.lease =
+        !this.o.once && typeof granted === 'number' && Number.isSafeInteger(granted) && granted > 0
+          ? granted
+          : undefined
     }
     if (frame.t === 'refused') this.sawRefusal = true
     this.o.onFrame(frame)
