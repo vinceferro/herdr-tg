@@ -1314,6 +1314,240 @@ try {
           await until('the bound agent\'s question', () => nFrames('ask').some(f => f.text?.startsWith('Tag the release?')), 8000),
           JSON.stringify(nFrames('ask').map(f => f.text)),
         )
+
+        // ── and when the agent CANNOT be told, the fence still holds ──────────────────────────
+        //
+        // The fence let a question through whenever the agent could not be established: no message
+        // named in the event, a lookup answered with an error, a lookup that never answered, a
+        // message carrying no agent. Every one of those is the fence's own subject saying nothing,
+        // and showing the question anyway put a turn nobody has proved is this worker's on the
+        // operator's phone under this project's name — the one authority the fence exists to hold.
+        //
+        // Two kinds of not knowing, and they are not the same fact. A lookup that failed can come
+        // good a second later, so the question is KEPT and offered again, exactly as one asked
+        // while the note could not be read is. An event that names no message, or a message that
+        // names no agent, can never become knowable, so it is withheld for good, the worker is
+        // turned down rather than left blocked, and he is told once.
+        {
+          const asksBeforeNoMessage = nFrames('ask').length
+          const saysBeforeNoMessage = nFrames('say').length
+          nOc.push({
+            type: 'question.v2.asked',
+            properties: {
+              id: 'que_nomessage',
+              sessionID: BOUND,
+              questions: [{ question: 'Restore last night\'s backup?', header: 'Restore', options: [{ label: 'Restore it' }] }],
+            },
+          })
+          await new Promise(r => setTimeout(r, 1500))
+          check(
+            'a_question_whose_event_names_no_message_to_look_up_is_never_shown_under_this_projects_name',
+            nFrames('ask').length === asksBeforeNoMessage,
+            JSON.stringify(nFrames('ask').slice(asksBeforeNoMessage).map(f => f.text)),
+          )
+          check(
+            'and_a_question_whose_agent_can_never_be_told_is_turned_down_and_said_out_loud_once',
+            (await until('the question to be turned down',
+              () => nOc.posted.some(p => p.path.endsWith('/question/que_nomessage/reject')), 8000)) &&
+              nFrames('say').length > saysBeforeNoMessage,
+            `${JSON.stringify(nOc.posted.map(p => p.path).slice(-3))} · ${JSON.stringify(nFrames('say').slice(saysBeforeNoMessage).map(f => f.text))}`,
+          )
+
+          // The message is there and answers, and says nothing about which agent ran the turn. The
+          // same permanent fact, one hop further on.
+          const asksBeforeSilentMessage = nFrames('ask').length
+          nOc.messages.set('msg_silent', { id: 'msg_silent', sessionID: BOUND, role: 'assistant' })
+          nOc.push({
+            type: 'question.v2.asked',
+            properties: {
+              id: 'que_silentmessage',
+              sessionID: BOUND,
+              tool: { messageID: 'msg_silent', callID: 'call_3' },
+              questions: [{ question: 'Drop the index?', header: 'Schema', options: [{ label: 'Drop it' }] }],
+            },
+          })
+          check(
+            'a_question_whose_message_says_nothing_about_which_agent_ran_the_turn_is_never_shown_either',
+            (await until('that question to be turned down',
+              () => nOc.posted.some(p => p.path.endsWith('/question/que_silentmessage/reject')), 8000)) &&
+              nFrames('ask').length === asksBeforeSilentMessage,
+            JSON.stringify(nFrames('ask').slice(asksBeforeSilentMessage).map(f => f.text)),
+          )
+
+          // A lookup the server would not answer — 404 here, and a 500 or a proxy's 502 is the same
+          // fact. It can come good, so the question is kept: not shown, and not turned down either,
+          // because the worker may yet be told to carry on with it.
+          const asksBefore404 = nFrames('ask').length
+          nOc.push({
+            type: 'question.v2.asked',
+            properties: {
+              id: 'que_lookupfailed',
+              sessionID: BOUND,
+              tool: { messageID: 'msg_notheldyet', callID: 'call_4' },
+              questions: [{ question: 'Cut the release?', header: 'Release', options: [{ label: 'Cut it' }] }],
+            },
+          })
+          await new Promise(r => setTimeout(r, 2500))
+          check(
+            'a_question_the_server_would_not_answer_the_agent_lookup_for_is_kept_rather_than_shown_or_turned_down',
+            nFrames('ask').length === asksBefore404 &&
+              !nOc.posted.some(p => p.path.endsWith('/question/que_lookupfailed/reject')),
+            `${nFrames('ask').length - asksBefore404} ask(s) · ${JSON.stringify(nOc.posted.map(p => p.path).slice(-3))}`,
+          )
+          // And kept means offered again: the server holds the message a moment later, it says the
+          // agent the note binds, and the question the operator would never have seen appears.
+          nOc.messages.set('msg_notheldyet', { id: 'msg_notheldyet', sessionID: BOUND, role: 'assistant', agent: 'kickoff-room-steering' })
+          check(
+            'and_the_question_kept_while_the_agent_could_not_be_told_is_shown_once_the_server_says_it',
+            await until('the kept question', () => nFrames('ask').some(f => String(f.ask_id).endsWith('qque_lookupfailed')), 20000),
+            JSON.stringify(nFrames('ask').slice(asksBefore404).map(f => f.ask_id)),
+          )
+
+          // The worst of the four, because it ends in the fence's own case: the lookup times out,
+          // and the turn it could not ask about was another agent's all along. Shown on the timeout,
+          // this is another worker's keyboard on his phone under this project's name.
+          const asksBeforeSlow = nFrames('ask').length
+          nOc.messages.set('msg_slow', { id: 'msg_slow', sessionID: BOUND, role: 'assistant', agent: 'coordinator' })
+          nOc.delayNextMessageMs = 11_000 // past the ten seconds any one request here is given
+          nOc.push({
+            type: 'question.v2.asked',
+            properties: {
+              id: 'que_slowlookup',
+              sessionID: BOUND,
+              tool: { messageID: 'msg_slow', callID: 'call_5' },
+              questions: [{ question: 'Wipe the staging bucket?', header: 'Destructive', options: [{ label: 'Wipe it' }] }],
+            },
+          })
+          const turnedDownWhenTold = await until('the slow lookup to be decided on',
+            () => nOc.posted.some(p => p.path.endsWith('/question/que_slowlookup/reject')), 40000)
+          check(
+            'a_lookup_that_timed_out_never_lets_another_agents_question_through_when_the_answer_arrives',
+            turnedDownWhenTold && !nFrames('ask').some(f => String(f.ask_id).endsWith('qque_slowlookup')),
+            `${JSON.stringify(nFrames('ask').slice(asksBeforeSlow).map(f => f.ask_id))} · ${JSON.stringify(nOc.posted.map(p => p.path).slice(-3))}`,
+          )
+
+          // ── and a server that is merely SLOW must not put one question on his phone twice ────
+          //
+          // A re-offer is queued behind every event already waiting, so it can be in flight for as
+          // long as the lookup takes — and the timer that started it was cleared the moment it
+          // fired. Any question kept in that window starts a second timer, which picks the oldest
+          // kept question, which is still the one being offered. Two keyboards for one question:
+          // two of the twenty sends a minute, and his second tap answered "the worker no longer has
+          // that question open", which he can see is untrue because he has just answered it.
+          {
+            const asksBeforeSlowServer = nFrames('ask').length
+            // Well inside the ten seconds one request is given, and longer than the five between
+            // one re-offer and the next. Neither message is on the server yet, so the first look at
+            // each is the "could not find out" that keeps the question.
+            nOc.messageDelayMs = 6000
+            const askSlowly = (id: string, messageID: string, text: string) =>
+              nOc.push({
+                type: 'question.v2.asked',
+                properties: {
+                  id,
+                  sessionID: BOUND,
+                  tool: { messageID, callID: `call_${id}` },
+                  questions: [{ question: text, header: 'Slow', options: [{ label: 'go on' }] }],
+                },
+              })
+            askSlowly('que_twice1', 'msg_twice1', 'Shall the first one be done?')
+            await new Promise(r => setTimeout(r, 50))
+            askSlowly('que_twice2', 'msg_twice2', 'Shall the second one be done?')
+            // While the first one's re-offer is queued, the server starts holding its message, so
+            // that re-offer succeeds and the question is one he SHOULD see — exactly once.
+            await new Promise(r => setTimeout(r, 11_500))
+            nOc.messages.set('msg_twice1', { id: 'msg_twice1', sessionID: BOUND, role: 'assistant', agent: 'kickoff-room-steering' })
+            await until('the kept question to be offered',
+              () => nFrames('ask').some(f => String(f.ask_id).endsWith('qque_twice1')), 25000)
+            await new Promise(r => setTimeout(r, 12_000))
+            const shown = nFrames('ask').filter(f => String(f.ask_id).endsWith('qque_twice1'))
+            check(
+              'a_question_kept_while_the_server_was_slow_is_offered_to_him_exactly_once',
+              shown.length === 1,
+              `${shown.length} ask frame(s) for the one question: ${JSON.stringify(nFrames('ask').slice(asksBeforeSlowServer).map(f => f.ask_id))}`,
+            )
+            nOc.messageDelayMs = 0
+            nOc.messages.set('msg_twice2', { id: 'msg_twice2', sessionID: BOUND, role: 'assistant', agent: 'kickoff-room-steering' })
+            // Left in a state a later block can build on: the second one goes through, which is
+            // also what clears the record of what he has already been told.
+            await until('the other kept question', () => nFrames('ask').some(f => String(f.ask_id).endsWith('qque_twice2')), 25000)
+          }
+
+          // ── a permission nothing can place is never answered NO on his behalf ────────────────
+          //
+          // A question's turn-down says "nobody is coming". A permission's says No — it is the
+          // operator's own answer, given in his name, to a tool call he was never shown. Every
+          // `permission.v2.asked` this suite has ever carried names no message to look up, which is
+          // the shape that reaches the never-knowable branch, and nothing here or anywhere else
+          // proves a real one does better. Refusing to guess is what fail-closed means here: the
+          // worker waits, visibly, and he is told why.
+          {
+            const asksBeforePermission = nFrames('ask').length
+            const saysBeforePermission = nFrames('say').length
+            nOc.push({
+              type: 'permission.v2.asked',
+              properties: { id: 'per_unplaceable', sessionID: BOUND, action: 'run a command', resources: ['rm -rf /'] },
+            })
+            await new Promise(r => setTimeout(r, 2500))
+            check(
+              'a_permission_whose_turn_nothing_can_place_is_never_answered_no_on_his_behalf',
+              !nOc.posted.some(p => p.path.includes('per_unplaceable')),
+              JSON.stringify(nOc.posted.filter(p => p.path.includes('per_unplaceable'))),
+            )
+            check(
+              'and_it_is_withheld_and_said_out_loud_rather_than_shown_or_decided',
+              nFrames('ask').length === asksBeforePermission && nFrames('say').length > saysBeforePermission,
+              `${nFrames('ask').length - asksBeforePermission} ask(s) · ${JSON.stringify(nFrames('say').slice(saysBeforePermission).map(f => f.text))}`,
+            )
+          }
+
+          // ── and the sentence about a turn-down says whether it was actually taken ────────────
+          //
+          // "It has been turned down, so the worker is not left waiting on it" was said whether the
+          // server took the refusal or answered 500, and the two failures are correlated: the
+          // branch that gives up on placing a turn is the branch reading an event shape nobody
+          // understands, which is the same event whose id the refusal needs.
+          {
+            // A question that goes through first, which is what clears the record of what he has
+            // already been told — otherwise the sentence under test is never reached.
+            nOc.messages.set('msg_clears', { id: 'msg_clears', sessionID: BOUND, role: 'assistant', agent: 'kickoff-room-steering' })
+            nOc.push({
+              type: 'question.v2.asked',
+              properties: {
+                id: 'que_clears',
+                sessionID: BOUND,
+                tool: { messageID: 'msg_clears', callID: 'call_clears' },
+                questions: [{ question: 'Anything at all?', header: 'H', options: [{ label: 'yes' }] }],
+              },
+            })
+            await until('a question to go through', () => nFrames('ask').some(f => String(f.ask_id).endsWith('qque_clears')), 8000)
+
+            const saysBeforeRefused = nFrames('say').length
+            nOc.refusalStatus = 500
+            nOc.push({
+              type: 'question.v2.asked',
+              properties: {
+                id: 'que_norefusal',
+                sessionID: BOUND,
+                questions: [{ question: 'Roll the database forward?', header: 'Schema', options: [{ label: 'Roll it' }] }],
+              },
+            })
+            const said = await until('the word about it',
+              () => nFrames('say').length > saysBeforeRefused, 8000)
+            const words = nFrames('say').slice(saysBeforeRefused).map(f => String(f.text)).join(' ')
+            check(
+              'a_turn_down_the_workers_server_would_not_take_is_not_reported_to_him_as_done',
+              said && !words.includes('has been turned down'),
+              words,
+            )
+            check(
+              'and_he_is_told_the_worker_may_still_be_waiting_on_it',
+              words.includes('may still be waiting'),
+              words,
+            )
+            nOc.refusalStatus = 200
+          }
+        }
       }
 
       // Read at delivery time, never cached: the launcher rewrites the note and the NEXT line goes
@@ -1884,11 +2118,15 @@ try {
       ]
       writeNote(JSON.stringify({ version: 1, session_id: BOUND, agent: 'kickoff-room-steering' }))
       const asksBeforeTwoAgents = nFrames('ask').length
+      // The event names the message its tool call belongs to, as a real one does: with the note
+      // binding an agent, a question whose turn cannot be placed is not shown at all.
+      nOc.messages.set('msg_twoagents', { id: 'msg_twoagents', sessionID: BOUND, role: 'assistant', agent: 'kickoff-room-steering' })
       nOc.push({
         type: 'question.v2.asked',
         properties: {
           id: 'que_twoagents',
           sessionID: BOUND,
+          tool: { messageID: 'msg_twoagents', callID: 'call_6' },
           questions: [{ question: 'Which agent asked this?', header: 'Pick', options: [{ label: 'this one' }] }],
         },
       })

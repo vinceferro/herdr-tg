@@ -288,7 +288,7 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
         // and no question is ever shown; the likeliest by hand is a launcher copying the wrong
         // project into the binding. Whether the session is OPEN stays the server's answer and is
         // still not asked here.
-        const { canonicalProjectDir, conversation, generation } = binding.binding
+        const { canonicalProjectDir, conversation, generation, agent } = binding.binding
         // Which conversation the note was written for is the third such claim, and the one no
         // server could ever settle: a sibling room's session resolves, sits in a room tree, and
         // runs the expected agent. Checked here for the same reason as the other two — what this
@@ -316,7 +316,16 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
         } else if (canonicalProjectDir !== null && !sameDirectory(canonicalProjectDir, CONFIG.projectDir)) {
           not(`the worker's session: ${opts.bindingFile} is written for a different project than the one this is run in, so every line the operator types would be refused`)
         } else {
-          ok(`the worker's session: ${opts.bindingFile} names a session, and every line the operator types goes to that one or is refused`)
+          // Whether the reverse half of the fence is RUNNING is a property of the note and not of
+          // the flag: a question is checked against the agent its turn ran under only where the
+          // note names one. A launcher writing `{version, session_id}` gets no turn-level check at
+          // all, which is a perfectly good arrangement and a completely different one — and until
+          // this line existed, nothing anywhere said which of the two a wall was in.
+          ok(`the worker's session: ${opts.bindingFile} names a session, and every line the operator types goes to that one or is refused; ${
+            agent === null
+              ? 'it names no agent, so a question from that session is shown whatever agent its turn ran under'
+              : `it names ${agent}, so a question is shown only where that session's turn ran under ${agent}`
+          }`)
         }
       } else if (binding.state === 'not written yet') {
         ok(`the worker's session: ${opts.bindingFile} is not written yet; until whatever starts the engine writes it, every line the operator types is refused out loud rather than guessed at`)

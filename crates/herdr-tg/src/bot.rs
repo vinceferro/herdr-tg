@@ -39,16 +39,23 @@
 //! volume the latency difference is invisible.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
-use teloxide::RequestError;
+use futures_core::Stream;
 use teloxide::prelude::*;
+use teloxide::stop::StopToken;
+use teloxide::types::AllowedUpdate;
 use teloxide::types::{MessageId, ParseMode, ThreadId};
+use teloxide::update_listeners::{AsUpdateStream, UpdateListener};
 use teloxide::utils::command::BotCommands;
+use teloxide::{ApiError, RequestError};
 
 use crate::config::Config;
-use crate::heartbeat::{Heartbeat, HubHealth};
+use crate::heartbeat::{Health, Heartbeat, Verdict};
 use crate::render::escape_html;
 
 /// Telegram's hard limit on a message body. Exceeding it is a 400 from the API, which in a
@@ -414,6 +421,305 @@ impl AcceptPacing {
     }
 }
 
+/// How long the hub waits between one look at itself and the next.
+///
+/// Two of these fit inside the ninety seconds a fact stays fresh, and three inside the watchdog's
+/// three-minute staleness window — so one missed answer is not an alarm and two are.
+///
+/// What he actually waits is longer than that window, and the four numbers that make it live in
+/// three files: a leg that dies just after a good answer is still fresh at the next tick and is
+/// stamped over, so the last stamp is one tick late; then the alarm wants its whole staleness
+/// window; then it only looks when its timer lets it. Forty-five, a hundred and eighty, sixty and
+/// ten seconds — so the operator hears within about five minutes, not three.
+/// `tests/the_heartbeat_is_earned_not_scheduled.rs` does that arithmetic and fails if this sentence
+/// promises him sooner than the numbers can manage.
+const WATCHDOG_TICK: Duration = Duration::from_secs(45);
+
+/// How long a knock has to come out the far end of the door before the loop is called stopped.
+///
+/// Generous for a local socket the accept loop is sitting on, short enough that the tick it runs
+/// in cannot slide out of the freshness window even if it times out every time.
+const A_KNOCK_IS_ANSWERED_WITHIN: Duration = Duration::from_secs(2);
+
+/// How often the knock looks to see whether the accept loop took it.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(10);
+
+/// Where the agents' door is, as far as the watchdog contract is concerned.
+///
+/// It is a value passed to the tick rather than a flag the tick reads off the hub, because every
+/// way this hub can come up without a door — no forum, a forum it may not write in, a socket that
+/// would not open — is a different sentence to the operator and the same silence to the watchdog.
+/// Making them one type is what stops a fourth way being added with no sentence at all.
+pub(crate) enum Door {
+    /// Open, and being accepted on at this path. The tick knocks at it.
+    Open(PathBuf),
+    /// Never opened, and this is why, in the words the operator reads. No number of Bot API round
+    /// trips may cover for it.
+    Shut(&'static str),
+}
+
+/// Accept connections and serve them, for as long as this process lives.
+///
+/// A per-connection error must not end the loop. Running out of file descriptors, or a peer that
+/// hangs up between the SYN and the accept, is a transient squeeze — and breaking here would leave
+/// the socket half gone for the life of the process, with the Telegram half still running and
+/// nothing anywhere saying the bridges could no longer connect. That is this system's signature
+/// failure: silence that looks exactly like health.
+///
+/// It is a function of its own, and not four lines inside `serve`, because the heartbeat's claim
+/// is about THIS loop: a test that wants to prove "a door nobody is accepting at earns no stamp"
+/// has to be able to run the real loop, and to leave it unrun.
+pub(crate) async fn hold_the_door<S: crate::hub::Surface>(
+    socket: crate::transport::LocalSocket,
+    hub: Arc<crate::hub::Hub<S>>,
+    health: Arc<Health>,
+) {
+    let mut pacing = AcceptPacing::new();
+    loop {
+        match socket.accept().await {
+            Ok(accepted) => {
+                pacing.a_connection_came_through();
+                // The one writer of the door's half of the heartbeat, and it is here rather than
+                // in the tick because this is the only place that knows the loop is still turning.
+                // A connection the kernel completed into the backlog of a listener whose loop has
+                // ended never reaches this line, which is exactly the difference the stamp is
+                // claiming to know.
+                health.a_connection_came_through_the_door(Instant::now());
+                let hub = Arc::clone(&hub);
+                tokio::spawn(async move {
+                    if let Err(e) = hub.serve_connection(accepted).await {
+                        tracing::warn!(error = %e, "a bridge connection ended badly");
+                    }
+                });
+            }
+            // Only the door itself reaches here. A connection whose peer the kernel would not name
+            // is dropped by the transport and never becomes an error at this level, so one
+            // unidentifiable peer can never put the hub to sleep on every other bridge's behalf.
+            Err(e) => {
+                let wait = pacing.wait_after_the_door_would_not_open();
+                tracing::warn!(
+                    error = %e, backoff_ms = wait.as_millis(),
+                    "the hub could not accept a connection; retrying"
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// The dispatcher's update listener, with the hub's third fact witnessed as it turns.
+///
+/// It wraps teloxide's long poll rather than replacing it, so what this bot asks Telegram for is
+/// unchanged — the same ten-second timeout, the same webhook deleted on the way in, the same
+/// backoff after a refusal. What it adds is the only witness in this process to the difference
+/// between "the dispatcher is still going to Telegram for his taps" and "it stopped": a wedged
+/// dispatcher stops pulling from this stream and nothing else on the box can tell. His phone line
+/// answers, his door accepts, and every tap he makes dies in silence.
+pub(crate) struct WatchedUpdates<L> {
+    inner: L,
+    health: Arc<Health>,
+}
+
+impl<L> WatchedUpdates<L> {
+    pub(crate) fn new(inner: L, health: Arc<Health>) -> Self {
+        Self { inner, health }
+    }
+}
+
+impl<L> UpdateListener for WatchedUpdates<L>
+where
+    L: UpdateListener,
+    Self: for<'a> AsUpdateStream<'a, StreamErr = L::Err>,
+{
+    type Err = L::Err;
+
+    fn stop_token(&mut self) -> StopToken {
+        self.inner.stop_token()
+    }
+
+    /// Handed straight on. Swallowing it would quietly change which update types this bot asks
+    /// Telegram for, which is a behaviour change nobody asked for in a health measurement.
+    fn hint_allowed_updates(&mut self, hint: &mut dyn Iterator<Item = AllowedUpdate>) {
+        self.inner.hint_allowed_updates(hint);
+    }
+}
+
+impl<'a, L> AsUpdateStream<'a> for WatchedUpdates<L>
+where
+    L: AsUpdateStream<'a>,
+    L::Stream: Send + 'a,
+{
+    type StreamErr = L::StreamErr;
+    type Stream = WatchedUpdateStream<L::Stream>;
+
+    fn as_stream(&'a mut self) -> Self::Stream {
+        WatchedUpdateStream {
+            inner: Box::pin(self.inner.as_stream()),
+            health: Arc::clone(&self.health),
+        }
+    }
+}
+
+/// The stream itself, taking a note every time the dispatcher drives it.
+pub(crate) struct WatchedUpdateStream<S> {
+    /// Boxed so this wrapper needs no pin projection of its own. One allocation, once, at startup:
+    /// the alternative is unsafe code in the middle of the thing that reports whether the hub is
+    /// well.
+    inner: Pin<Box<S>>,
+    health: Arc<Health>,
+}
+
+impl<S, E> Stream for WatchedUpdateStream<S>
+where
+    S: Stream<Item = Result<Update, E>>,
+{
+    type Item = Result<Update, E>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // Every drive counts, not only the ones carrying an update. A forum can be quiet for
+        // hours, and "nobody has tapped anything" must never be read as "the hub has stopped
+        // asking" — those are the two states this whole leg exists to tell apart.
+        this.health.the_hub_looked_for_updates(Instant::now());
+        let polled = this.inner.as_mut().poll_next(cx);
+        if let Poll::Ready(Some(Ok(_))) = &polled {
+            // One of his taps came out the far end. It is the only proof that Telegram is handing
+            // updates to THIS copy of the bot, so it is the only thing that can end a run of
+            // refusals early.
+            this.health.an_update_reached_the_hub(Instant::now());
+        }
+        polled
+    }
+}
+
+/// What Telegram refusing to hand the updates over means, in the words the operator reads.
+///
+/// Worded here rather than in `heartbeat.rs` for the same reason the door's failures are: this is
+/// where the reason is known, and "somebody else has your taps" and "the hub cannot get at them at
+/// all" are two different mornings and one silence.
+fn tell_the_health_what_telegram_refused(health: &Health, error: &RequestError, now: Instant) {
+    match error {
+        // The conflict item 4 was written for. A second `herdr-tg serve` beside the unit — a stray
+        // one started by hand at a keyboard is the likeliest way it happens on this box — takes the
+        // update slot, and Telegram answers this copy with a conflict on every call while its phone
+        // line and its door go on answering perfectly.
+        RequestError::Api(ApiError::TerminatedByOtherGetUpdates) => health
+            .the_update_stream_was_refused(
+                now,
+                "another copy of this bot is taking your taps, so none of them reach the agents \
+                 here",
+            ),
+        // The other way every tap dies while both the other halves answer perfectly. The hub
+        // clears the web address at startup, so this one means something set it afterwards — a
+        // hosted copy of the bot, a deploy script — and the fix is five seconds and on a different
+        // machine from the one the second-copy sentence would send him to.
+        RequestError::Api(ApiError::CantGetUpdates) => health.the_update_stream_was_refused(
+            now,
+            "something has pointed this bot at a web address, so your taps go there instead of \
+             here",
+        ),
+        _ => health.the_update_stream_was_refused(
+            now,
+            "the hub is being turned away when it goes to collect your taps",
+        ),
+    }
+}
+
+/// One turn of the watchdog contract: ask every leg, write down what they said, and stamp only
+/// what they earned.
+///
+/// Everything it depends on is handed to it, so the decision can be driven by a test with no
+/// Telegram, no dispatcher and no forum — the decision being the whole of item 4, and the state it
+/// gets wrong (a green stamp over a dead control plane) being one no live system announces.
+pub(crate) async fn stamp_what_the_hub_can_prove(
+    the_phone_line_answered: bool,
+    door: &Door,
+    health: &Health,
+    heartbeat: &Heartbeat,
+) -> Verdict {
+    if the_phone_line_answered {
+        health.the_phone_line_answered(Instant::now());
+    } else {
+        health.the_phone_line_did_not_answer();
+    }
+    knock_at(door, health).await;
+
+    let verdict = health.verdict(Instant::now());
+    // The note first: it is the only place that can say WHICH leg failed, and a tick that died
+    // between the two writes should leave the explanation behind rather than the stamp.
+    if let Err(e) = heartbeat.note(&verdict) {
+        tracing::error!(error = %e, path = %heartbeat.note_path().display(),
+            "could not write down which half of the hub is unwell");
+    }
+    if let Err(e) = heartbeat.stamp_if(&verdict) {
+        tracing::error!(error = %e, path = %heartbeat.path().display(),
+            "could not stamp the heartbeat — the watchdog may raise a false alarm");
+    }
+    verdict
+}
+
+/// Say in the journal, once per flip, which way the verdict went and what every leg said.
+///
+/// EVERY leg on the line, never only the one that failed. "Telegram is unreachable", "no agent can
+/// reach your phone" and "your taps are going to another copy of this bot" are three different
+/// outages with three different answers, and a line that says one of them without the others has
+/// been read as the whole story before. The operator never sees this — his sentence is the
+/// watchdog's — but whoever reads the journal afterwards is reconstructing an outage from it.
+fn say_in_the_journal_which_way_the_verdict_went(verdict: &Verdict, heartbeat: &Heartbeat) {
+    match verdict.why_withheld() {
+        Some(why) => tracing::warn!(
+            why = %why,
+            phone_line = %verdict.phone_line().said(),
+            door = %verdict.door().said(),
+            updates = %verdict.updates().said(),
+            note = %heartbeat.note_path().display(),
+            "the hub is not stamping the heartbeat, so the watchdog will raise the alarm"
+        ),
+        None => tracing::info!(
+            phone_line = %verdict.phone_line().said(),
+            door = %verdict.door().said(),
+            updates = %verdict.updates().said(),
+            "the hub is serving and stamping the heartbeat again"
+        ),
+    }
+}
+
+/// Provoke a connection through the door and find out whether one comes out the far end.
+///
+/// The connect returning `Ok` is NOT the proof and must never be treated as it: the kernel
+/// completes a connection into the backlog of a listener nobody is accepting on, so a hub whose
+/// accept loop had ended would pass a test made of connects while every bridge on the box sat in
+/// that backlog forever. What is asked instead is the accept loop's own count of connections it
+/// took, and the knock is only the thing that gives it something to take.
+async fn knock_at(door: &Door, health: &Health) {
+    let path = match door {
+        Door::Shut(why) => {
+            health.the_door_is_not_answering(why);
+            return;
+        }
+        Door::Open(path) => path,
+    };
+
+    let before = health.connections_that_came_through();
+    if let Err(e) = crate::transport::knock(path).await {
+        tracing::debug!(error = %e, path = %path.display(), "the hub could not reach its own door");
+        health.the_door_is_not_answering("the agents' door is not there any more");
+        return;
+    }
+
+    // Any connection counts, not only this one: a busy hub taking a real bridge's dial in the same
+    // moment is the same proof, and demanding our own back would fail the tick on a hub that is
+    // demonstrably working.
+    let give_up_at = Instant::now() + A_KNOCK_IS_ANSWERED_WITHIN;
+    while health.connections_that_came_through() == before {
+        if Instant::now() >= give_up_at {
+            health.the_door_is_not_answering("nothing is answering at the agents' door");
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+}
+
 /// Run the bot until the process is asked to stop.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let people = config.people();
@@ -436,13 +742,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // ── the hub ───────────────────────────────────────────────────────────────────────────────
     // It needs a forum: routing is a single rule — a topic, inside the one configured chat — and
     // without that chat there is nowhere for a project's topic to live.
-    let hub = match config.forum_chat_id {
+    //
+    // Both halves of the watchdog contract are decided here, together, and that is deliberate:
+    // every way this block can end without a door is a way the operator's agents reach nobody
+    // while his phone still answers, and each of them hands the heartbeat a sentence saying so.
+    let health = Arc::new(Health::new());
+    let (hub, door) = match config.forum_chat_id {
         None => {
             tracing::warn!(
                 "no forum chat is configured, so no project can be given a topic. Set \
                  HERDR_TG_FORUM_CHAT_ID to switch the hub on."
             );
-            None
+            (
+                None,
+                Door::Shut("no forum is configured, so no agent has anywhere to reach you"),
+            )
         }
         Some(forum) if !config.allowed_chat_ids.contains(&forum) => {
             // Every question would go out and every tap would die in silence: the callback handler
@@ -455,7 +769,13 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                 "the forum chat is not on the allowlist, so every button in it would be dead. Add \
                  it to HERDR_TG_ALLOWED_CHAT_IDS. The hub will not start."
             );
-            None
+            (
+                None,
+                Door::Shut(
+                    "the forum this hub was pointed at is not one it may write in, so it did not \
+                     start",
+                ),
+            )
         }
         Some(forum) => {
             let surface = Arc::new(crate::surface::Telegram::new(bot.clone(), ChatId(forum)));
@@ -472,9 +792,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             match crate::transport::LocalSocket::bind(&sock) {
                 Err(e) => {
                     // Not fatal. The Telegram half still answers `/projects`, and refusing to boot
-                    // over the socket would take the operator's only channel down with it.
+                    // over the socket would take the operator's only channel down with it. It is
+                    // not silent either, which it used to be after this line: the heartbeat is
+                    // withheld from here on, so the watchdog buzzes his phone within about five
+                    // minutes instead of a journal line nobody reads carrying the whole of the news.
                     tracing::error!(error = %e, path = %sock.display(), "could not open the hub's socket");
-                    None
+                    (None, Door::Shut("the agents' door could not be opened"))
                 }
                 Ok(socket) => {
                     // The transport says what it is and who may reach it. "It is up" and "it is up
@@ -491,42 +814,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
                     // The other half of `herdr-tg disable`: the flag alone turns away the NEXT
                     // connection, and this is what ends one that is already on the socket.
                     Arc::clone(&hub).watch_the_registry(crate::hub::REGISTRY_WATCH_EVERY);
-                    let accept = Arc::clone(&hub);
-                    tokio::spawn(async move {
-                        // A per-connection error must not end the loop. Running out of file
-                        // descriptors, or a peer that hangs up between the SYN and the accept, is a
-                        // transient squeeze — and breaking here would leave the socket half gone for
-                        // the life of the process, with the Telegram half still running and nothing
-                        // anywhere saying the bridges could no longer connect. That is this
-                        // system's signature failure: silence that looks exactly like health.
-                        let mut pacing = AcceptPacing::new();
-                        loop {
-                            match socket.accept().await {
-                                Ok(accepted) => {
-                                    pacing.a_connection_came_through();
-                                    let hub = Arc::clone(&accept);
-                                    tokio::spawn(async move {
-                                        if let Err(e) = hub.serve_connection(accepted).await {
-                                            tracing::warn!(error = %e, "a bridge connection ended badly");
-                                        }
-                                    });
-                                }
-                                // Only the door itself reaches here. A connection whose peer the
-                                // kernel would not name is dropped by the transport and never
-                                // becomes an error at this level, so one unidentifiable peer can
-                                // never put the hub to sleep on every other bridge's behalf.
-                                Err(e) => {
-                                    let wait = pacing.wait_after_the_door_would_not_open();
-                                    tracing::warn!(
-                                        error = %e, backoff_ms = wait.as_millis(),
-                                        "the hub could not accept a connection; retrying"
-                                    );
-                                    tokio::time::sleep(wait).await;
-                                }
-                            }
-                        }
-                    });
-                    Some(hub)
+                    tokio::spawn(hold_the_door(socket, Arc::clone(&hub), Arc::clone(&health)));
+                    (Some(hub), Door::Open(sock))
                 }
             }
         }
@@ -541,29 +830,47 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // The other half of the watchdog contract. `deploy/herdr-tg-watchdog.sh` buzzes the operator's
     // phone when this file stops being touched, and it arms itself the first time it ever sees it.
     //
-    // WHAT THIS STAMP PROVES: the process is alive, the network is up, the token is still good, and
-    // Telegram answered. It is a real round trip, not a local clock read.
+    // WHAT A STAMP PROVES: the process is alive, the network is up, the token is still good and
+    // Telegram answered — a real round trip, not a local clock read — AND a connection came out
+    // the far end of the agents' door inside the last minute and a half — AND the dispatcher went
+    // to Telegram for his taps inside that same window and was not turned away every time it did.
+    // Every one, every time. The Bot API answering on its own used to be the whole of it, which
+    // meant a hub whose socket never opened stamped a green file every forty-five seconds while
+    // every agent on the box was talking to nobody; then it was that and the door, which still let
+    // a second copy of this bot take the update slot and leave this file green while every tap he
+    // made went somewhere else.
     //
-    // WHAT IT DOES NOT PROVE: that updates are being DELIVERED. A dispatcher wedged behind a stuck
-    // handler would keep this stamping. That gap is deliberate rather than overlooked, and claiming
-    // more here would be the exact failure the watchdog exists to prevent — a healthy-looking
-    // report from something that is not.
+    // The third fact is witnessed by the update stream itself (`WatchedUpdates`, above) and by the
+    // listener's error handler, never by this tick: a dispatcher wedged behind a stuck handler
+    // stops driving that stream, and a timer that voted on its behalf would report health straight
+    // through the outage.
+    //
+    // WHAT IT STILL DOES NOT PROVE: that a tap which arrived was ACTED ON. A handler that took one
+    // and hung looks healthy here until the wedge backs up far enough to stop the stream being
+    // driven. That gap is named rather than overlooked, and claiming more here would be the exact
+    // failure the watchdog exists to prevent — a healthy-looking report from something that is not.
     let heartbeat = Heartbeat::new(Heartbeat::default_path());
     let hb_bot = bot.clone();
+    let hb_health = Arc::clone(&health);
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(45));
+        let mut tick = tokio::time::interval(WATCHDOG_TICK);
+        // Said on the way in and then only when it changes. A line every forty-five seconds is a
+        // line nobody reads, and the transition is the news.
+        let mut said_last_time: Option<bool> = None;
         loop {
             tick.tick().await;
-            match hb_bot.get_me().await {
-                Ok(_) => {
-                    if let Err(e) = heartbeat.stamp(HubHealth::Serving) {
-                        tracing::error!(error = %e, path = %heartbeat.path().display(),
-                            "could not stamp the heartbeat — the watchdog may raise a false alarm");
-                    }
+            let answered = match hb_bot.get_me().await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!(error = %e, "the Bot API did not answer");
+                    false
                 }
-                // Deliberately NOT stamped. An unreachable Bot API is exactly the state the operator
-                // needs to hear about, and stamping here would hide it from the one thing watching.
-                Err(e) => tracing::warn!(error = %e, "the Bot API did not answer; not stamping"),
+            };
+            let verdict =
+                stamp_what_the_hub_can_prove(answered, &door, &hb_health, &heartbeat).await;
+            if said_last_time != Some(verdict.earned()) {
+                say_in_the_journal_which_way_the_verdict_went(&verdict, &heartbeat);
+                said_last_time = Some(verdict.earned());
             }
         }
     });
@@ -572,12 +879,28 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .branch(Update::filter_message().endpoint(on_message))
         .branch(Update::filter_callback_query().endpoint(on_callback));
 
+    // The long poll is teloxide's own, unchanged, with two things listened to as it runs: the
+    // stream being driven (the hub is still asking) and every refusal (somebody else may have the
+    // answers). `dispatch()` would build the same listener and throw both away.
+    let updates = WatchedUpdates::new(
+        teloxide::update_listeners::polling_default(bot.clone()).await,
+        Arc::clone(&health),
+    );
+    let refused = Arc::clone(&health);
+    let when_telegram_will_not_hand_them_over = Arc::new(move |e: RequestError| {
+        let refused = Arc::clone(&refused);
+        async move {
+            tell_the_health_what_telegram_refused(&refused, &e, Instant::now());
+            tracing::warn!(error = %e, "Telegram would not hand over the operator's taps");
+        }
+    });
+
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![ctx])
         .distribution_function(which_conversation)
         .enable_ctrlc_handler()
         .build()
-        .dispatch()
+        .dispatch_with_listener(updates, when_telegram_will_not_hand_them_over)
         .await;
 
     Ok(())
@@ -2994,6 +3317,317 @@ mod tests {
             Some(hub_proto::MsgId::new(THE_RECEIPT.to_string())),
             "the hub does not know which line his receipt is, so the answer to the tap can only be \
              said in a new message — or not at all"
+        );
+    }
+
+    /// The three lines of the note beside the heartbeat, as a reader gets them.
+    fn what_the_note_says(hb: &Heartbeat) -> Vec<String> {
+        std::fs::read_to_string(hb.note_path())
+            .expect("the note beside the heartbeat is readable")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_hub_whose_socket_could_not_be_opened_never_stamps_the_heartbeat_however_often_telegram_answers()
+     {
+        // Item 4. Opening the socket fails for ordinary reasons — the runtime directory is gone
+        // after a login session ended, a stale hub still holds the path — and the hub deliberately
+        // carries on so the operator keeps his `/projects` command. What it used to do as well was
+        // go on stamping a green heartbeat every forty-five seconds, because the stamp asked
+        // Telegram and nothing else. Every agent on the box was talking to nobody and the one
+        // thing watching stayed quiet about it.
+        let d = tempfile::tempdir().expect("tmp");
+        let hb = Heartbeat::new(d.path().join("hub.heartbeat"));
+        let health = Health::new();
+        let door = Door::Shut("the agents' door could not be opened");
+
+        for _ in 0..5 {
+            let verdict = stamp_what_the_hub_can_prove(true, &door, &health, &hb).await;
+            assert!(
+                !verdict.earned(),
+                "a Bot API round trip on its own was taken as proof that the hub is serving"
+            );
+            assert!(
+                !hb.path().exists(),
+                "the watchdog's file was stamped by a hub no agent can reach, so the alarm can \
+                 never fire"
+            );
+        }
+
+        // And the file beside it says which of the legs failed, because "Telegram is
+        // unreachable" and "no agent can reach your phone" need different things from him.
+        assert_eq!(
+            what_the_note_says(&hb),
+            vec![
+                "not serving".to_string(),
+                "the phone line answered 0 seconds ago".to_string(),
+                "the agents' door could not be opened".to_string(),
+                "the hub has not looked for your taps since it started".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_door_nobody_is_accepting_at_earns_no_heartbeat_and_the_same_door_with_its_loop_turning_earns_one()
+     {
+        // The subtle half of the same defect: the socket bound, the file is on disk, and the
+        // accept loop is not running. The kernel completes a connection into the backlog of such a
+        // listener, so a probe that only dialled would report health while every bridge on the box
+        // sat in that backlog forever. What is counted is what came out the far end.
+        let d = tempfile::tempdir().expect("tmp");
+        let hb = Heartbeat::new(d.path().join("hub.heartbeat"));
+        let health = Arc::new(Health::new());
+        let path = d.path().join("hub.sock");
+        let socket = crate::transport::LocalSocket::bind(&path).expect("the door opens");
+        let door = Door::Open(path);
+
+        let verdict = stamp_what_the_hub_can_prove(true, &door, &health, &hb).await;
+        assert!(
+            !verdict.earned(),
+            "a socket that exists was taken as a hub that is answering at it"
+        );
+        assert!(!hb.path().exists());
+        assert_eq!(
+            what_the_note_says(&hb)[2],
+            "nothing is answering at the agents' door"
+        );
+
+        // The same door, with the real accept loop behind it. The update stream's own note is
+        // taken here by hand: in the live hub it is `WatchedUpdateStream` that takes it, and this
+        // test has no dispatcher — but without it the stamp is withheld for a reason that has
+        // nothing to do with the door, which is the thing being proved.
+        tokio::spawn(hold_the_door(
+            socket,
+            a_hub(d.path(), THE_FORUM, OPERATOR),
+            Arc::clone(&health),
+        ));
+        health.the_hub_looked_for_updates(Instant::now());
+        let verdict = stamp_what_the_hub_can_prove(true, &door, &health, &hb).await;
+        assert!(
+            verdict.earned(),
+            "a hub answering at its door and at Telegram is exactly the state the stamp is for: {}",
+            verdict.why_withheld().unwrap_or_default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(hb.path()).expect("stamped"),
+            "serving\n"
+        );
+        assert_eq!(
+            what_the_note_says(&hb),
+            vec![
+                "serving".to_string(),
+                "the phone line answered 0 seconds ago".to_string(),
+                "the agents' door let a connection through 0 seconds ago".to_string(),
+                "the hub looked for your taps 0 seconds ago".to_string(),
+            ],
+            "the note has to keep up with a hub that recovered, or it sends him to look at a door \
+             that is open"
+        );
+    }
+
+    /// Everything one `tracing` event said, as `name=value` pairs plus the message.
+    ///
+    /// Hand-rolled rather than pulled from a subscriber crate because what is under test is the
+    /// exact set of fields on one line, and a formatter would put a rendering of them between the
+    /// assertion and the thing asserted.
+    #[derive(Default)]
+    struct WhatTheJournalHeard(std::sync::Mutex<Vec<String>>);
+
+    /// The borrow the field walk needs, kept apart from the shared record so the visit can take
+    /// `&mut` while the subscriber itself is behind an `Arc`.
+    struct EachField<'a>(&'a mut Vec<String>);
+
+    impl tracing::field::Visit for EachField<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for WhatTheJournalHeard {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut said = self.0.lock().expect("nothing else holds this");
+            event.record(&mut EachField(&mut said));
+        }
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    /// The journal's account of an outage names every half, including the one this slice added.
+    ///
+    /// The line is written once per flip and it is what an outage is reconstructed from afterwards.
+    /// A hub whose taps are all going to a second copy of itself writes a `why` that says nothing
+    /// he taps is getting through and then, on the same line, two legs saying they are perfectly
+    /// well — and the one sentence naming the thing to go and switch off was left out entirely.
+    #[test]
+    fn the_journal_line_for_an_outage_names_every_half_including_the_one_that_failed() {
+        let t0 = Instant::now();
+        let sustained = Duration::from_secs(91);
+        let health = Health::new();
+        for at in [t0, t0 + Duration::from_secs(45), t0 + sustained] {
+            health.the_phone_line_answered(at);
+            health.a_connection_came_through_the_door(at);
+            health.the_hub_looked_for_updates(at);
+            tell_the_health_what_telegram_refused(
+                &health,
+                &RequestError::Api(ApiError::TerminatedByOtherGetUpdates),
+                at,
+            );
+        }
+        let verdict = health.verdict(t0 + sustained);
+        assert!(!verdict.earned(), "the outage this test is about");
+
+        let heard = std::sync::Arc::new(WhatTheJournalHeard::default());
+        tracing::subscriber::with_default(std::sync::Arc::clone(&heard), || {
+            say_in_the_journal_which_way_the_verdict_went(&verdict, &Heartbeat::new("/nowhere/x"));
+        });
+        let said = heard.0.lock().expect("nothing else holds this").join(" ");
+
+        assert!(
+            said.contains("another copy of this bot is taking your taps"),
+            "the journal's account of the outage left out the only sentence naming what to go and \
+             switch off: {said}"
+        );
+        assert!(
+            said.contains("the phone line answered") && said.contains("the agents' door let a"),
+            "the halves that were WELL have to be on the line too, or the reader cannot tell a \
+             third of an outage from all of it: {said}"
+        );
+    }
+
+    /// A stream of exactly what a test hands it, standing in for teloxide's long poll.
+    struct AStreamOf(std::vec::IntoIter<Result<Update, RequestError>>);
+
+    impl Stream for AStreamOf {
+        type Item = Result<Update, RequestError>;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.get_mut().0.next())
+        }
+    }
+
+    /// One line he typed, in the shape the Bot API sends it.
+    fn one_of_his_lines() -> Update {
+        serde_json::from_str(
+            r#"{"update_id":1,"message":{"message_id":5,"date":1675229140,"chat":{"id":-1001,"type":"supergroup","title":"the forum","is_forum":true},"from":{"id":7,"is_bot":false,"first_name":"the operator"},"text":"a line"}}"#,
+        )
+        .expect("the Bot API's own shape for a forum message")
+    }
+
+    /// The third leg has no witness but this stream. A wedged dispatcher stops driving it and says
+    /// nothing about it anywhere else, so what is recorded here is the whole of the difference
+    /// between a hub that is still asking for his taps and one that has quietly stopped.
+    #[tokio::test]
+    async fn the_hub_notices_every_time_its_dispatcher_goes_for_updates_and_when_one_of_his_taps_arrives()
+     {
+        let t0 = Instant::now();
+        let health = Arc::new(Health::new());
+        let mut stream = WatchedUpdateStream {
+            inner: Box::pin(AStreamOf(
+                vec![
+                    Err(RequestError::Api(ApiError::TerminatedByOtherGetUpdates)),
+                    Ok(one_of_his_lines()),
+                ]
+                .into_iter(),
+            )),
+            health: Arc::clone(&health),
+        };
+
+        assert_eq!(
+            health.verdict(t0).updates().said(),
+            "the hub has not looked for your taps since it started",
+            "a hub nobody has driven yet claimed to be collecting his taps"
+        );
+
+        // Driven once, and what came back was a refusal. The drive still counts: a hub that is
+        // asking and being turned away is a different failure from one that has stopped asking,
+        // and only the run of refusals can tell the first story.
+        let first = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await;
+        assert!(matches!(first, Some(Err(_))));
+        assert!(
+            health.verdict(Instant::now()).updates().is_fresh(),
+            "the dispatcher went to Telegram and the hub did not notice"
+        );
+
+        // Now the refusals as the dispatcher's error handler reports them, for long enough to be
+        // an outage rather than a blip — with the hub still driving the stream throughout, which
+        // is exactly why "it looked recently" cannot be the whole of this leg.
+        let sustained = Duration::from_secs(91);
+        for at in [t0, t0 + Duration::from_secs(45), t0 + sustained] {
+            health.the_hub_looked_for_updates(at);
+            tell_the_health_what_telegram_refused(
+                &health,
+                &RequestError::Api(ApiError::TerminatedByOtherGetUpdates),
+                at,
+            );
+        }
+        let out = health.verdict(t0 + sustained);
+        assert!(
+            !out.updates().is_fresh(),
+            "the hub was being turned away on every call and still called this half well"
+        );
+        assert_eq!(
+            out.updates().said(),
+            "another copy of this bot is taking your taps, so none of them reach the agents here"
+        );
+
+        // And one of his lines coming out of the stream ends it at once: it is the only proof that
+        // Telegram is handing updates to THIS copy of the bot.
+        let second = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await;
+        assert!(matches!(second, Some(Ok(_))));
+        // The drive that follows it, so the assertion below is about the run of refusals and not
+        // about how long ago the stream was last touched.
+        health.the_hub_looked_for_updates(t0 + sustained);
+        assert!(
+            health.verdict(t0 + sustained).updates().is_fresh(),
+            "one of his lines arrived and the hub went on reporting that none of them do"
+        );
+    }
+
+    /// A stray second `herdr-tg serve` beside the unit is the likeliest way this box loses its
+    /// taps, and it is the one refusal he can do something about — so it gets its own sentence,
+    /// and no other refusal is allowed to borrow it.
+    #[test]
+    fn a_conflict_from_a_second_copy_of_this_bot_is_worded_for_him_and_no_other_refusal_is_dressed_up_as_one()
+     {
+        let t0 = Instant::now();
+        let sustained = Duration::from_secs(91);
+        let said_after = |error: RequestError| {
+            let health = Health::new();
+            for at in [t0, t0 + Duration::from_secs(45), t0 + sustained] {
+                health.the_hub_looked_for_updates(at);
+                tell_the_health_what_telegram_refused(&health, &error, at);
+            }
+            health.verdict(t0 + sustained).updates().said().to_owned()
+        };
+
+        assert_eq!(
+            said_after(RequestError::Api(ApiError::TerminatedByOtherGetUpdates)),
+            "another copy of this bot is taking your taps, so none of them reach the agents here"
+        );
+        assert_eq!(
+            said_after(RequestError::Api(ApiError::Unknown(
+                "Bad Gateway".to_owned()
+            ))),
+            "the hub is being turned away when it goes to collect your taps",
+            "an outage nobody can name was reported as a second copy of the bot, and he would go \
+             looking for one that is not there"
+        );
+        assert_eq!(
+            said_after(RequestError::Api(ApiError::CantGetUpdates)),
+            "something has pointed this bot at a web address, so your taps go there instead of \
+             here",
+            "a bot whose taps are being posted to a web address is the OTHER way they all die \
+             while both the other halves answer, and it has its own five-second fix — telling him \
+             to go and hunt for a second copy of the bot sends him to the wrong machine"
         );
     }
 }

@@ -190,8 +190,32 @@ cargo test -p herdr-tg the_real_plugin -- --ignored
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
-- **The watchdog is live** and shares no code or process with the hub. It arms the first time
-  something stamps `~/.local/state/herdr-tg/hub.heartbeat`.
+- **The watchdog measures the control plane, not just Telegram.** It still shares no code or
+  process with the hub, and it arms the first time it sees **either** of the hub's own files in
+  `~/.local/state/herdr-tg/` — the stamp, or the note beside it. Arming on the stamp alone kept
+  exactly the box this change is about silent for its whole life: a hub whose door never opened
+  never earns a stamp, so there was nothing to arm on. What changed otherwise is what a stamp
+  costs. `heartbeat.rs` holds **three** facts apart — the phone line answering, a connection coming
+  out the far end of the accept loop, and the dispatcher still being handed his taps — and
+  `stamp_if` touches the file only when all three were true inside ninety seconds. Before this, a
+  hub whose socket never opened answered `get_me` every forty-five seconds and stamped a green file
+  while every agent on the box talked to nobody; and after the first two legs, a second copy of the
+  bot holding the update slot kept both of them perfectly true while every tap died in silence. The
+  third leg is two shapes in one: a dispatcher that has **stopped looking** goes stale like any
+  other leg, and one that is **looking and being refused** never goes stale at all, so a run of
+  refusals that outlasts the freshness window is watched in its own right — one refused call is a
+  blip, and two blips further apart than a run survives are two blips. **Withholding is the signal**
+  — the only one a script that reads a modification time can hear, which is why a watchdog installed
+  before this change starts alarming on a dead door with no update at all *on a box that had already
+  stamped once*. A box that never stamped needs this copy of the script;
+  `scripts/install-watchdog.sh` is what puts it there.
+  `hub.health` beside it says which leg failed, in sentences, rewritten every tick; the watchdog
+  reads it **only** to word an alarm it has already decided to raise, never to decide whether to
+  raise one, and `tests/the_heartbeat_is_earned_not_scheduled.rs` holds the hub's sentences and the
+  script's `case` patterns together in both directions. What is still proved by no leg is that a tap
+  which arrived was **acted on** — a handler that took one and hung looks well here until the wedge
+  backs up far enough to stop the stream being driven — and `heartbeat.rs` says so rather than
+  implying it. The alarm still restarts nothing; that belongs to whoever dispatches.
 - **A project has an off switch, at the terminal only.** `herdr-tg disable <repo>` writes the flag
   for the project's seed AND every room of it (a room's id in place of the folder switches that
   one room);

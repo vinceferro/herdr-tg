@@ -828,6 +828,23 @@ console.log('\nwhen a session note is named:')
       !ownRoom.out.some(l => /^NOT\s+.*worker's session/.test(l)),
     `code ${ownRoom.code}; ${JSON.stringify(ownRoom.out.filter(l => /session/.test(l)))}`)
 
+  // Whether the reverse fence is RUNNING is a property of the note, not of the flag: it holds only
+  // where the note names an agent, and a launcher that writes `{version, session_id}` — the shape
+  // most of this repo's own fixtures use — gets no turn-level check at all. Nothing said so
+  // anywhere, so "the fence holds" and "the fence holds where somebody opted in" looked identical
+  // from the one command written to answer what this wall will do.
+  writeFileSync(notePath, JSON.stringify({ version: 1, conversation: room, session_id: 'ses_theBoundOne00000000000' }), { mode: 0o600 })
+  const noAgent = await runCheck(roomEnv, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('the_check_says_a_binding_that_names_no_agent_leaves_every_question_from_that_session_shown',
+    noAgent.out.some(l => /^ok\s+.*session.*names no agent.*whatever agent its turn ran under/.test(l)),
+    JSON.stringify(noAgent.out.filter(l => /session/.test(l))))
+
+  writeFileSync(notePath, JSON.stringify({ version: 1, conversation: room, session_id: 'ses_theBoundOne00000000000', agent: 'kickoff-room-steering' }), { mode: 0o600 })
+  const withAgent = await runCheck(roomEnv, ['--opencode', 'http://127.0.0.1:9711', '--opencode-binding-file', notePath])
+  check('and_it_names_the_agent_a_question_has_to_have_run_under_before_it_is_shown',
+    withAgent.out.some(l => /^ok\s+.*session.*kickoff-room-steering/.test(l)),
+    JSON.stringify(withAgent.out.filter(l => /session/.test(l))))
+
   // The id you can read first is not the one JSON keeps: the last of two keys of one name wins,
   // and `Object.keys` sees one. On the one file this whole flag treats as authoritative, "what it
   // says is not what it does" is the property that must not exist.

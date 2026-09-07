@@ -275,6 +275,28 @@ impl LocalSocket {
     }
 }
 
+/// Open a connection at a local door, say nothing, and close it.
+///
+/// The hub's own way of finding out whether its accept loop is still turning. It exists because
+/// the two easy answers are both lies: that `bind` returned `Ok` once, minutes or days ago, and
+/// that the socket file is on disk — a listener whose loop has ended leaves both of those looking
+/// exactly as they do when everything is fine, and the kernel will still complete a `connect` into
+/// its backlog. Only something coming out the far end is proof, so the caller watches its own
+/// count of connections that came through and treats this as the thing that provokes one.
+///
+/// **It sends nothing, and waits for nothing.** A knock that wrote a byte would be a frame the hub
+/// has to read, time out on and log; an immediate close is the one shape the far side already
+/// treats as a non-event ("a connection was opened and never said anything"). It also costs the
+/// far side nothing to serve, which matters for something that runs every forty-five seconds for
+/// the life of the process.
+pub async fn knock(path: &Path) -> std::io::Result<()> {
+    // Dropped straight away, and named rather than `let _ =` so it cannot be mistaken for a
+    // connection that is being kept.
+    let opened = UnixStream::connect(path).await?;
+    drop(opened);
+    Ok(())
+}
+
 /// Read the credentials of whoever is on the other end of a connection.
 ///
 /// See the module docs for what the pid means, and where it stops meaning it. A peer the kernel
@@ -459,6 +481,44 @@ mod tests {
             .expect("a frame");
         assert_eq!(got.id.as_str(), "h-ping");
         drop(rx);
+    }
+
+    /// The heartbeat's own probe, from both sides: it comes through a door that is being answered,
+    /// and it carries no bytes with it. A knock that said something would be a frame the far side
+    /// has to wait on and log, forty-five seconds apart, forever.
+    #[tokio::test]
+    async fn a_knock_comes_through_an_open_door_and_carries_nothing_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hub.sock");
+        let socket = LocalSocket::bind(&path).expect("bind");
+
+        let knocking = tokio::spawn(async move { knock(&path).await });
+        let accepted = socket.accept().await.expect("the knock came through");
+        knocking
+            .await
+            .expect("the knock finished")
+            .expect("knocked");
+
+        let (rx, _tx) = tokio::io::split(accepted.stream);
+        let mut reader = hub_proto::FrameReader::new(rx);
+        assert!(
+            reader
+                .next::<hub_proto::BridgeFrame>()
+                .await
+                .expect("a closed connection is not an error")
+                .is_none(),
+            "the knock said something; the far side now has a frame to time out on"
+        );
+    }
+
+    /// A door that was never opened must fail the knock rather than look like a visit — this is
+    /// the whole of the socket half of the watchdog contract.
+    #[tokio::test]
+    async fn a_knock_at_a_door_that_was_never_opened_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        knock(&dir.path().join("nothing-here.sock"))
+            .await
+            .expect_err("there is nothing to come through");
     }
 
     /// What the journal says the hub is listening on. A line that names the door and who may reach

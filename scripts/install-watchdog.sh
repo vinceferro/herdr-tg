@@ -83,12 +83,22 @@ say "  installed the script, both units and the timer"
 say
 say "Proof 1 — a hub that stopped answering an hour ago really does produce an alarm…"
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
-: > "$STAGE/hub.heartbeat"; touch -d '1 hour ago' "$STAGE/hub.heartbeat"
-: > "$STAGE/watchdog.armed"
-# A watchdog that has just started, or that woke from a suspend, gives the hub one full window
-# before judging it. Stage a previous check a minute ago so this proves the STEADY-STATE decision
-# and not the grace window.
-printf '%s 0\n' "$(( $(date +%s) - 60 ))" > "$STAGE/watchdog.tick"
+# Staged the way the hub really writes it — a word in the stamp and a four-line note beside it, one
+# sentence per leg — so this proves the decision the operator will actually get and not a shape only
+# a fixture makes.
+stage_hub() {   # $1 dir, $2 stamp age, $3 note age, $4 phone, $5 door, $6 update line
+  printf 'serving\n' > "$1/hub.heartbeat"; touch -d "$2" "$1/hub.heartbeat"
+  printf 'not serving\n%s\n%s\n%s\n' "$4" "$5" "$6" > "$1/hub.health"; touch -d "$3" "$1/hub.health"
+  : > "$1/watchdog.armed"
+  printf '%s 0\n' "$(( $(date +%s) - 60 ))" > "$1/watchdog.tick"
+}
+PHONE_OK="the phone line answered 12 seconds ago"
+DOOR_OK="the agents' door let a connection through 12 seconds ago"
+UPD_OK="the hub looked for your taps 12 seconds ago"
+stage_hub "$STAGE" '1 hour ago' 'now' "the phone line last answered 1 hour ago" "$DOOR_OK" "$UPD_OK"
+# stage_hub also writes watchdog.tick a minute back: a watchdog that has just started, or that woke
+# from a suspend, gives the hub one full window before judging it, and this must prove the
+# STEADY-STATE decision rather than the grace window.
 DRY="$(HERDR_TG_STATE_DIR="$STAGE" HERDR_TG_ENV_FILE=/dev/null "$BIN_DST" --dry-run 2>/dev/null)" \
   || die "the watchdog exited non-zero deciding on a stale hub"
 printf '%s\n' "$DRY" | sed 's/^/  │ /'
@@ -107,7 +117,48 @@ SILENT="$(mktemp -d)"
 out="$(HERDR_TG_STATE_DIR="$SILENT" HERDR_TG_ENV_FILE=/dev/null "$BIN_DST" --dry-run 2>&1)"; rc=$?
 rm -rf "$SILENT"
 [ "$rc" -eq 0 ] && [ -z "$out" ] || die "a never-armed watchdog was not silent (rc=$rc): $out"
-say "  ✓ stale hub alarms; never-armed hub is silent"
+
+# The half with no symptom on the phone. The bot keeps answering Telegram, so every check he can
+# make by hand says "fine", while no agent can reach him at all. If this is the proof that ever
+# fails, the alarm has quietly gone back to watching one thing and naming it wrong.
+OTHER="$(mktemp -d)"
+stage_hub "$OTHER" '1 hour ago' 'now' "$PHONE_OK" \
+  "the agents' door has let nothing through since this hub started" "$UPD_OK"
+# `|| { … die … }`, because under `set -e` a bare assignment from a failing command substitution
+# ends the script where it stands: no message, no cleanup, and the units already laid down. The
+# operator would be left with a half-finished install and nothing said about why.
+ODRY="$(HERDR_TG_STATE_DIR="$OTHER" HERDR_TG_ENV_FILE=/dev/null "$BIN_DST" --dry-run 2>/dev/null)" \
+  || { rm -rf "$OTHER"; die "the watchdog exited non-zero deciding on a hub whose door had died"; }
+rm -rf "$OTHER"
+printf '%s' "$ODRY" | grep -q 'agents cannot reach it' \
+  || die "an agents' door that stopped accepting produced no alarm naming it"
+# `if`, not `&& die`: this script runs under `set -e`, and a `&&` chain whose test FAILS is the
+# passing case here — written the other way it would take the whole install down on success.
+if printf '%s' "$ODRY" | grep -q 'phone line is down'; then
+  die "it blamed the phone line for an outage on the agents' side; he would go and fix the wrong thing"
+fi
+
+# The leg with no symptom ANYWHERE. Telegram answers the bot, agents get through the door, and
+# Telegram has stopped handing this copy what the operator sends — a second copy of the bot is
+# holding the long poll. Every check he can make by hand says fine and every tap he makes dies in
+# silence, so if any proof here earns its minute, it is this one.
+TAPS="$(mktemp -d)"
+stage_hub "$TAPS" '1 hour ago' 'now' "$PHONE_OK" "$DOOR_OK" \
+  "another copy of this bot is taking your taps, so none of them reach the agents here"
+TDRY="$(HERDR_TG_STATE_DIR="$TAPS" HERDR_TG_ENV_FILE=/dev/null "$BIN_DST" --dry-run 2>/dev/null)" \
+  || { rm -rf "$TAPS"; die "the watchdog exited non-zero deciding on a hub whose taps stopped arriving"; }
+rm -rf "$TAPS"
+printf '%s' "$TDRY" | grep -q 'nothing you tap is reaching an agent' \
+  || die "an update line that stopped carrying his taps produced no alarm naming it"
+printf '%s' "$TDRY" | grep -q 'second copy of this bot' \
+  || die "the alarm named the leg but not the one thing he can check in ten seconds"
+if printf '%s' "$TDRY" | grep -q 'phone line is down'; then
+  die "it blamed the phone line for an outage on the update line; the phone in his hand is working"
+fi
+if printf '%s' "$TDRY" | grep -q 'agents cannot reach it'; then
+  die "it blamed the agents' door for an outage on the update line; agents are getting in fine"
+fi
+say "  ✓ any of the three legs going quiet alarms, the alarm names which; never-armed hub is silent"
 
 if [ "$PROVE" != yes ]; then
   systemctl --user enable herdr-tg-watchdog.timer >/dev/null
@@ -139,8 +190,12 @@ if [ "$FIRE" = yes ]; then
   say
   say "Proof 3 — firing one REAL alarm for a hub staged as dead three hours ago…"
   DRILL="$HOME/.local/state/herdr-tg-drill"; rm -rf "$DRILL"; mkdir -p "$DRILL"
-  : > "$DRILL/hub.heartbeat"; touch -d '3 hours ago' "$DRILL/hub.heartbeat"
-  : > "$DRILL/watchdog.armed"; printf '%s 0\n' "$(( $(date +%s) - 60 ))" > "$DRILL/watchdog.tick"
+  # Both halves dead, which is what a stopped hub really looks like: the drill should read like the
+  # alarm he would actually get, not like a shape only this script can produce.
+  stage_hub "$DRILL" '3 hours ago' '3 hours ago' \
+    "the phone line last answered 3 hours ago" \
+    "the agents' door last let a connection through 3 hours ago" \
+    "the hub last looked for your taps 3 hours ago"
   systemd-run --user --wait --collect --quiet --pty "${PROPS[@]}" \
     -p "Environment=HERDR_TG_STATE_DIR=$DRILL" "$BIN_DST" \
     || { rm -rf "$DRILL"; die "the full path did not deliver"; }
@@ -159,7 +214,13 @@ say "✅ Telegram accepted the drill. Check your phone — HTTP 200 means the Bo
 say "   not that it reached you. Only you can confirm the buzz."
 say
 say "  checks:     every 60s; alarms after 180s of silence, then every ~30 min"
-say "  arms:       the first time the hub ever stamps ~/.local/state/herdr-tg/hub.heartbeat"
+say "  arms:       the first time it sees either of the hub's own files in"
+say "              ~/.local/state/herdr-tg/ — hub.heartbeat or hub.health. Both, because a"
+say "              hub whose door never opened never earns a stamp to arm on."
+say "  watches:    the hub withholds that stamp when ANY of three legs stops — the phone line out"
+say "              to Telegram, the line Telegram sends your taps back down, and the door agents"
+say "              arrive at — and says which in hub.health beside it. The alarm names the leg,"
+say "              because the fix differs: a held update line is usually a second copy of the bot."
 say "  silence:    touch $STATE_DIR/watchdog.disarmed   (wears off after a day)"
 say "  if it dies: the unit goes 'failed' and notify-send shouts at the screen"
 say "  logs:       journalctl --user -u herdr-tg-watchdog -f"

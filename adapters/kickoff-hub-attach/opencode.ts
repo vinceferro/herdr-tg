@@ -342,9 +342,11 @@ export function startWatcher(cfg: WatcherConfig): void {
    * Questions the machine could not decide on, kept to be offered again — the event as it came,
    * against the moment this stops waiting for it.
    *
-   * A question is dropped when the NOTE says it is not this conversation's. It must not be dropped
-   * when nothing was found out: a server that stalled once, a server that answered 500, a note the
-   * launcher has not written yet because the engine booted a beat before it. Dropped there, the
+   * A question is dropped when the NOTE says it is not this conversation's, or when the machine
+   * says plainly that nothing will ever place the turn. It must not be dropped when nothing was
+   * found out: a server that stalled once, a server that answered 500 to the session listing or to
+   * the one lookup that says which agent a turn ran under, a note the launcher has not written yet
+   * because the engine booted a beat before it. Dropped there, the
    * agent that asked waits on a keyboard that never appears, no record exists to retire it, and
    * nothing tries again when the server is well a second later. Before the note existed a question
    * was drawn with no round trip at all, so that failure is new and it is this adapter's own worst
@@ -364,6 +366,18 @@ export function startWatcher(cfg: WatcherConfig): void {
   /** One went through, so the server is answering: the rest need not wait out the slow interval. */
   const OFFER_THE_NEXT_ONE_AFTER_MS = 250
   let tryingAgain: ReturnType<typeof setTimeout> | null = null
+  /**
+   * The kept question a re-offer is working on right now, if any.
+   *
+   * The timer that started a re-offer is cleared the moment it fires, but the offer itself is
+   * queued behind every event already waiting and then takes as long as the lookup does. Any
+   * question kept in that window started a SECOND timer, which picked the oldest kept question —
+   * still this one, because it is only dropped when its offer finishes — and offered it again.
+   * Two keyboards on his phone for one question: two of the twenty sends a minute, and his second
+   * tap answered "the worker no longer has that question open", which he can see is untrue because
+   * he has just answered it. The timer alone was never the whole of "one at a time".
+   */
+  let beingOfferedAgain: Record<string, any> | null = null
 
   /** Keep this question to be offered again, or false when it has waited as long as it may. */
   function keepForLater(ev: Record<string, any>): boolean {
@@ -387,21 +401,28 @@ export function startWatcher(cfg: WatcherConfig): void {
 
   /** Put the oldest kept question back through the ordinary path, one at a time, later. */
   function offerAKeptQuestionAgainIn(ms: number): void {
-    if (tryingAgain !== null || keptQuestions.size === 0) return
+    if (tryingAgain !== null || beingOfferedAgain !== null || keptQuestions.size === 0) return
     tryingAgain = setTimeout(() => {
       tryingAgain = null
       const next = keptQuestions.keys().next()
       if (next.done) return
       const ev = next.value
+      beingOfferedAgain = ev
       onOpencodeEvent(ev)
       // Only once it has been decided on, so two passes can never be in flight at once. Caught,
       // because this chain is the one every later event queues behind: a rejection left on it
-      // would be the last event this watcher ever handled.
+      // would be the last event this watcher ever handled — and the mark has to come off on the
+      // failing path too, or one rejection stops every kept question being offered for ever.
       handledInOrder = handledInOrder
-        .then(() =>
-          offerAKeptQuestionAgainIn(keptQuestions.has(ev) ? TRY_A_KEPT_QUESTION_AGAIN_MS : OFFER_THE_NEXT_ONE_AFTER_MS),
-        )
-        .catch(e => note(`a kept question could not be offered again: ${(e as Error)?.message ?? e}`))
+        .then(() => {
+          beingOfferedAgain = null
+          offerAKeptQuestionAgainIn(keptQuestions.has(ev) ? TRY_A_KEPT_QUESTION_AGAIN_MS : OFFER_THE_NEXT_ONE_AFTER_MS)
+        })
+        .catch(e => {
+          beingOfferedAgain = null
+          note(`a kept question could not be offered again: ${(e as Error)?.message ?? e}`)
+          offerAKeptQuestionAgainIn(TRY_A_KEPT_QUESTION_AGAIN_MS)
+        })
     }, ms)
     // Never a reason for this process to stay alive on its own.
     ;(tryingAgain as any)?.unref?.()
@@ -445,8 +466,8 @@ export function startWatcher(cfg: WatcherConfig): void {
       tellHimOnce(bound.refused, `The worker asked something and it cannot be shown here — ${bound.refused}.`)
       return null
     }
-    keptQuestions.delete(ev)
     if (bound.sessionID !== sessionID) {
+      keptQuestions.delete(ev)
       note(`a question from ${sessionID} was not passed on: this conversation is bound to ${bound.sessionID}`)
       return null
     }
@@ -456,24 +477,57 @@ export function startWatcher(cfg: WatcherConfig): void {
     // `opencode.json` can name the org coordinator as its default. A turn that ran under somebody
     // else's agent is somebody else's turn, and its question belongs on no phone under this
     // project's name — so it is withheld, exactly as a question from another session is.
+    //
+    // And a turn NOBODY can place is withheld too. Passing the unknown case on was the fence
+    // standing open: a lookup that answered 404, a server that never answered it, an event naming
+    // no message and a message naming no agent all came back the same "no fact", and a question
+    // whose turn nothing had proved was this worker's went to his phone under this project's name
+    // — which is the one authority this fence exists to hold. Not knowing is never a reason to
+    // show it; it is only ever a reason to wait, or to stop.
     if (bound.agent !== null) {
-      const running = await theAgentAnswering(sessionID, ev?.properties ?? ev?.data ?? {})
-      if (running !== null && running !== bound.agent) {
-        note(`a question from ${sessionID} was not passed on: the turn ran under ${running}, not ${bound.agent}`)
+      const who = await theAgentAnswering(sessionID, ev?.properties ?? ev?.data ?? {})
+      if ('couldNotFindOut' in who) {
+        // Not knowing YET — the server errored, stalled, or answered something unreadable. It can
+        // be true a second later, so this is the same fact as a note that cannot be read yet and it
+        // takes the same mechanism: kept, offered again, bounded in count and in time. A second
+        // holding pen for one kind of waiting is how two copies of one rule start drifting.
+        if (keepForLater(ev)) return null
+        keptQuestions.delete(ev)
+        note(`a question from ${sessionID} was not passed on: the server never said which agent the turn ran under`)
+        // It has waited as long as it may. The session was already proved to be this conversation's
+        // own, so turning a QUESTION down is this watcher's to do — and doing it is the whole
+        // difference between a worker that can carry on and one blocked for ever on a keyboard that
+        // is never coming. A permission is not turned down here: see NOBODY_HAS_ANSWERED_IT.
+        await sayWhatBecameOfIt(sessionID, ev, THE_SERVER_WOULD_NOT_SAY_WHICH_AGENT)
+        return null
+      }
+      keptQuestions.delete(ev)
+      if (who.agent === null) {
+        // Not knowing EVER — the event named no message to look up, or the message it named carries
+        // no agent. Nothing about that changes by waiting, so keeping it would only spend a slot on
+        // a question that can never be decided, and showing it is the fail-open this replaces.
+        note(`a question from ${sessionID} was not passed on: nothing says which agent the turn ran under`)
+        await sayWhatBecameOfIt(sessionID, ev, NOTHING_SAYS_WHICH_AGENT)
+        return null
+      }
+      if (who.agent !== bound.agent) {
+        note(`a question from ${sessionID} was not passed on: the turn ran under ${who.agent}, not ${bound.agent}`)
         // Withheld is not the same as handled. Nothing else answers this request, so the agent that
         // asked would block on a keyboard nobody will ever draw — for ever, on a wall whose tree
         // names another agent by default, which is the configuration the fence was written for.
         // Turning it down is this watcher's to do here and nowhere else: the session was already
         // proved to be this conversation's own, and a question from somebody else's session is
         // left alone precisely because it is not ours to answer.
-        await turnDown(sessionID, ev)
+        const taken = await turnDown(sessionID, ev)
         tellHimOnce(
           A_DIFFERENT_AGENT_IS_ANSWERING,
           `The worker asked something and it cannot be shown here — ${A_DIFFERENT_AGENT_IS_ANSWERING}. ` +
-            'It has been turned down, so the worker is not left waiting on it.',
+            whatBecameOfIt(taken),
         )
         return null
       }
+    } else {
+      keptQuestions.delete(ev)
     }
     alreadySaid.clear()
     return { agent: bound.agent }
@@ -485,13 +539,18 @@ export function startWatcher(cfg: WatcherConfig): void {
    * Both shapes, measured against a real opencode 1.18.25 on 7 September: a question has its own
    * `reject` endpoint and takes no body at all, and a permission is rejected through the reply it
    * already has, with the one word opencode's own closed set uses. Best effort — a server that
-   * will not take it leaves the worker exactly where withholding alone would have left it, and
-   * there is nothing better to do about that than say so where a developer looks.
+   * will not take it leaves the worker exactly where withholding alone would have left it — and
+   * the answer says WHICH of the two happened, because the sentence the operator gets ends either
+   * "so the worker is not left waiting on it" or "so it may still be waiting on it", and those are
+   * not the same morning. Saying the first regardless is the more likely mistake than it sounds:
+   * every branch that reaches here is a branch where something about this request could not be
+   * established, and the empty `id` that makes the refusal impossible comes from the same event
+   * shape nobody understood.
    */
-  async function turnDown(sessionID: string, ev: Record<string, any>): Promise<void> {
+  async function turnDown(sessionID: string, ev: Record<string, any>): Promise<boolean> {
     const data = ev?.properties ?? ev?.data ?? {}
     const requestID = String(data.id ?? '')
-    if (!requestID) return
+    if (!requestID) return false
     const type = String(ev?.type ?? '')
     const kind: Open['kind'] = type.startsWith('question') ? 'question' : 'permission'
     const v2 = type.includes('.v2.')
@@ -511,29 +570,73 @@ export function startWatcher(cfg: WatcherConfig): void {
           : { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reply: 'reject' }) }),
         signal: AbortSignal.timeout(OPENCODE_ANSWERS_WITHIN_MS),
       })
-      if (!r.ok) note(`opencode would not take the refusal of ${requestID} (${r.status})`)
-      else note(`${requestID} was turned down so the worker is not left waiting on it`)
+      if (!r.ok) {
+        note(`opencode would not take the refusal of ${requestID} (${r.status})`)
+        return false
+      }
+      note(`${requestID} was turned down so the worker is not left waiting on it`)
+      return true
     } catch (e) {
       note(`could not tell opencode nobody will answer ${requestID}: ${(e as Error)?.message ?? e}`)
+      return false
     }
   }
 
   /**
-   * The agent a turn ran under, or null when this server will not say.
+   * Withhold a request nothing could place, do whatever is right about it, and say so once.
+   *
+   * The two branches that get here are the two shapes of not knowing, and the rule is the same for
+   * both: a QUESTION is turned down, because nobody is coming and the agent that asked would
+   * otherwise block for ever on a keyboard nobody will draw; a PERMISSION is not, because opencode
+   * has no way to say "nobody is coming" about one — the only refusal it takes is `reject`, which
+   * is the operator's own No to a tool call he was never shown. Every `permission.v2.asked` this
+   * adapter has been handed names no message to look up, which is exactly the branch above, so
+   * guessing here would answer No to every tool call a bound wall ever makes.
+   *
+   * Said once per spell per shape, not per request: the two sentences differ in the one thing he
+   * would act on — whether the worker was released or is still stopped — so one standing in for
+   * the other is the false report this whole change is about.
+   */
+  async function sayWhatBecameOfIt(
+    sessionID: string,
+    ev: Record<string, any>,
+    why: string,
+  ): Promise<void> {
+    const itIsAQuestion = String(ev?.type ?? '').startsWith('question')
+    const ending = itIsAQuestion ? whatBecameOfIt(await turnDown(sessionID, ev)) : NOBODY_HAS_ANSWERED_IT
+    tellHimOnce(
+      `${why} · ${itIsAQuestion ? 'question' : 'permission'}`,
+      `The worker asked something and it cannot be shown here — ${why}. ${ending}`,
+    )
+  }
+
+  /**
+   * The agent a turn ran under — and, when it cannot be told, WHICH KIND of not telling it is.
    *
    * The asked events carry no agent — measured against the 1.18.25 OpenAPI at `/doc`, where
    * `QuestionV2Asked.data` and `PermissionV2Asked.data` have no such field — but each names the
    * message the tool call belongs to, and `AssistantMessage` carries `agent`. So the agent of a
    * turn is one request away, on the same deadline every request here shares.
    *
-   * Null on anything but a plain answer, and null is NOT a refusal: a build that names no message,
-   * a server that will not serve it, a message with no agent on it. Withholding on a fact nobody
-   * could observe would silence every question a server like that ever asks, while the note's own
-   * session check still stands. What is withheld is a turn OBSERVED to be somebody else's.
+   * Three answers, because the caller owes two different things to two different silences:
+   *
+   *   - `{agent}` — the turn's own agent, the only answer a question can be shown on.
+   *   - `{agent: null}` — nothing NAMES it: the event carried no message id, or the message carried
+   *     no agent. No amount of waiting makes that knowable, so the caller stops.
+   *   - `{couldNotFindOut}` — the server said nothing usable: a status that is not a plain answer,
+   *     a request that never came back, a body that could not be read. Every one of those can be
+   *     over a second later, so the caller keeps the question and asks again.
+   *
+   * None of the three is "show it anyway". Returning one null for all of them let a turn nobody
+   * had placed onto the operator's phone under this project's name whenever the server was merely
+   * busy — the fence held only while the machine was well, which is not a fence.
    */
-  async function theAgentAnswering(sessionID: string, data: Record<string, any>): Promise<string | null> {
+  async function theAgentAnswering(
+    sessionID: string,
+    data: Record<string, any>,
+  ): Promise<{ agent: string | null } | { couldNotFindOut: true }> {
     const named = data?.tool?.messageID ?? data?.source?.messageID
-    if (typeof named !== 'string' || named.length === 0) return null
+    if (typeof named !== 'string' || named.length === 0) return { agent: null }
     try {
       const r = await fetch(
         `${OPENCODE}/session/${encodeURIComponent(sessionID)}/message/${encodeURIComponent(named)}`,
@@ -541,14 +644,16 @@ export function startWatcher(cfg: WatcherConfig): void {
       )
       if (!r.ok) {
         note(`opencode would not say which agent is answering (${r.status})`)
-        return null
+        return { couldNotFindOut: true }
       }
       const m: any = await r.json()
       const running = m?.info?.agent
-      return typeof running === 'string' && running.length > 0 ? running : null
+      return { agent: typeof running === 'string' && running.length > 0 ? running : null }
     } catch (e) {
+      // The one catch covers a request that failed or timed out AND a body that would not read.
+      // Both are the server not saying, and neither is the server saying "no agent".
       note(`could not ask opencode which agent is answering: ${(e as Error)?.message ?? e}`)
-      return null
+      return { couldNotFindOut: true }
     }
   }
 
@@ -1000,6 +1105,28 @@ export function startWatcher(cfg: WatcherConfig): void {
   const SAYS_NO_AGENT = 'the session named for this worker does not say which agent it is running'
   const RUNS_ANOTHER_AGENT = 'the session named for this worker is running a different agent from the one it should be'
   const A_DIFFERENT_AGENT_IS_ANSWERING = 'the worker is answering under a different agent from the one it should be'
+  const NOTHING_SAYS_WHICH_AGENT = 'there is no way to tell which of the worker\'s agents asked this'
+  const THE_SERVER_WOULD_NOT_SAY_WHICH_AGENT = 'the worker\'s server would not say which of its agents asked this'
+  /**
+   * What became of the request, which finishes every one of those three sentences.
+   *
+   * The claim and the world have to agree: "it has been turned down" was said whether opencode took
+   * the refusal or answered 500, and the operator has no other way to find out that a worker he was
+   * told had moved on is in fact still stopped.
+   */
+  const whatBecameOfIt = (taken: boolean): string =>
+    taken
+      ? 'It has been turned down, so the worker is not left waiting on it.'
+      : 'The worker\'s server would not take the refusal, so it may still be waiting on it.'
+  /**
+   * And what is said instead where refusing would be answering FOR him.
+   *
+   * A question's turn-down means nobody is coming. A permission's means No — his own answer, in his
+   * name, to a tool call he was never shown — so it is given only where the turn was positively
+   * placed under somebody else's agent, and never where nothing could place the turn at all.
+   */
+  const NOBODY_HAS_ANSWERED_IT =
+    'Nothing here has answered it, because answering it here would be answering for you. The worker is still waiting.'
   const THE_SERVER_DOES_NOT_KNOW_THE_AGENT = 'the worker is set to run as an agent its server does not know'
   const THE_QUESTION_HAS_MOVED_ON = 'the question you replied to was asked by a session this worker no longer speaks to'
   const MOVED_WHILE_ON_ITS_WAY = 'the worker moved to another session while that was on its way, so it was not delivered; send it again'

@@ -343,6 +343,18 @@ export function fakeOpencode() {
   // A listing that takes its time, once. The window between reading the note and hearing the
   // server back is where a launcher's rollover lands in the wrong session if nothing re-reads.
   let delayNextListingMs = 0
+  // The same, for the one request that says which agent a turn ran under. A server too busy to
+  // answer it is the case where the fence has nothing to decide on, and a fence that lets a
+  // question through because the server was slow is a fence with a hole in it.
+  let delayNextMessageMs = 0
+  // The same again, but for EVERY message lookup rather than one. A server that is merely slow —
+  // well inside the deadline, and slower than the gap between one re-offer of a kept question and
+  // the next — is the state where two of those re-offers were in flight at once.
+  let messageDelayMs = 0
+  // What the server answers a turn-down with. A refusal it will not take leaves the worker exactly
+  // where withholding alone would have left it, and this is how a test can tell whether the
+  // sentence in the topic is describing the world or hoping.
+  let refusalStatus = 200
   // A server that answers `directory=` with sessions from elsewhere. It is not how 1.18.25 behaves
   // and that is the point: the acceptance must not rest on the query having been obeyed.
   let ignoreDirectoryFilter = false
@@ -397,6 +409,13 @@ export function fakeOpencode() {
       // `agent` and the asked events do not, which is why the agent of a turn has to be asked for.
       const asMessage = /^\/session\/([^/]+)\/message\/([^/]+)$/.exec(url.pathname)
       if (asMessage && req.method === 'GET') {
+        if (delayNextMessageMs > 0) {
+          const wait = delayNextMessageMs
+          delayNextMessageMs = 0
+          await new Promise(r => setTimeout(r, wait))
+        } else if (messageDelayMs > 0) {
+          await new Promise(r => setTimeout(r, messageDelayMs))
+        }
         const info = messages.get(asMessage[2])
         if (!info) return new Response('not found', { status: 404 })
         return Response.json({ info, parts: [] })
@@ -412,6 +431,9 @@ export function fakeOpencode() {
           body = null
         }
         posted.push({ path: url.pathname, body })
+        if (refusalStatus !== 200 && (url.pathname.endsWith('/reject') || (body as any)?.reply === 'reject')) {
+          return new Response('no', { status: refusalStatus })
+        }
         if (url.pathname.endsWith('/prompt_async')) {
           if (promptStatus === 204) return new Response(null, { status: 204 })
           return Response.json({ name: 'NotFoundError', data: { message: 'Session not found' } }, { status: promptStatus })
@@ -433,6 +455,12 @@ export function fakeOpencode() {
     set promptStatus(v: number) { promptStatus = v },
     /** Make the next session listing take this long before it answers. One shot. */
     set delayNextListingMs(v: number) { delayNextListingMs = v },
+    /** Make the next message lookup take this long before it answers. One shot. */
+    set delayNextMessageMs(v: number) { delayNextMessageMs = v },
+    /** Make EVERY message lookup take this long. A server that is slow rather than broken. */
+    set messageDelayMs(v: number) { messageDelayMs = v },
+    /** What every turn-down is answered with. 200 is a server that takes it. */
+    set refusalStatus(v: number) { refusalStatus = v },
     /** Answer every listing with every session, whatever `directory=` asked for. */
     set ignoreDirectoryFilter(v: boolean) { ignoreDirectoryFilter = v },
     /** The agent names this server resolves; `null` answers 404, as a server without the route. */
