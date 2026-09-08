@@ -1,6 +1,6 @@
 {
   "name": "kickoff-channel",
   "description": "Carries this project's questions to the operator's phone through the herdr-tg hub, and carries his answers back into the agent's own turn. One Unix socket; no token, no allowlist, no Telegram in this process.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "keywords": ["kickoff", "herdr", "channel", "telegram", "hub", "mcp"]
 }

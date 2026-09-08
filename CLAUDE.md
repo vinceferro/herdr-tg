@@ -91,6 +91,13 @@ a bridge that disagrees with the hub:
 cargo test -p herdr-tg the_real_plugin -- --ignored
 ```
 
+**If you touch `plugins/kickoff-channel/`, bump its version in the same commit** — in
+`.claude-plugin/plugin.json` and `package.json`. The installed copy is cached by version, so a
+change that does not move the number never reaches a box that already has the plugin, silently;
+that is how a bridge from 1 September was still running on 7 September while the source had grown
+five times over. `the_channel_plugins_version_moves_with_its_content` turns the whole workspace red
+until the number moves, which is the point.
+
 ## The domains, and who owns them
 
 | Domain | Owner | Lives in |

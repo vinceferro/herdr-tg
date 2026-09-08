@@ -350,7 +350,10 @@ function canCarryAChannelMessage(): boolean {
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 
 const mcp = new Server(
-  { name: 'kickoff-channel', version: '0.1.0' },
+  // The third place this number is written, and the only one no installer, marketplace or registry
+  // ever reads — which is how it fell a week behind the two manifests. `the_bridge_announces_the_
+  // version_its_manifests_carry` fails the suite if it is left out of a bump again.
+  { name: 'kickoff-channel', version: '0.2.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
