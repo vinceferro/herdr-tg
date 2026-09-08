@@ -1671,7 +1671,9 @@ pub const GENERATIONS_FILE: &str = "hub.generations.json";
 ///
 /// The writing discipline IS presence's, and for presence's reason: whole, temp-and-rename, 0600,
 /// stamped with the pid that wrote it, so a reader never sees half a list and a person reading the
-/// file can tell which hub put it there.
+/// file can tell which hub put it there. With one deliberate difference — a failed write leaves the
+/// old file where it is rather than unlinking it, because a stale floor is a low answer and not a
+/// wrong one. See [`write_handed_out`].
 #[derive(Debug)]
 struct Generations {
     path: PathBuf,
@@ -1758,6 +1760,11 @@ impl Generations {
     /// Past both floors: one more than anything this hub has handed out for the address, and never
     /// behind the clock. The clock is what makes the number climb across a restart whose file was
     /// lost; the counter is what makes it climb when the clock does not.
+    ///
+    /// **Decides, and does not write.** Deciding has to happen under the claim's lock or two runs
+    /// can be handed one number; writing needs nothing that lock holds, and doing it here put a
+    /// disk between every project and its next message. The caller writes, with the lock let go —
+    /// see [`Hub::write_down_the_run_numbers`].
     fn mint(&mut self, addr: &Addr, held_by_the_arriving_run: u64) -> u64 {
         let next = self
             .highest
@@ -1792,7 +1799,6 @@ impl Generations {
             next
         };
         self.highest.insert(addr.clone(), next);
-        self.write();
         next
     }
 
@@ -1803,63 +1809,72 @@ impl Generations {
     /// replaced come back. A connection that never became live — `kickoff-hub-attach --check`
     /// says `bye` before the pong on purpose — otherwise moves the address on and fences a
     /// session that was merely redialling, permanently, from a command that makes nothing.
+    ///
+    /// Decides and does not write, for [`Self::mint`]'s reason; the caller puts the map on disk.
     fn give_back(&mut self, addr: &Addr, minted: u64, was: u64) {
         if self.highest.get(addr).copied() != Some(minted) {
             return;
         }
         self.highest.insert(addr.clone(), was);
-        self.write();
     }
 
     fn highest_for(&self, addr: &Addr) -> u64 {
         self.highest.get(addr).copied().unwrap_or(0)
     }
 
-    fn write(&self) {
-        if let Err(e) = self.write_whole() {
-            // Logged and nothing else: the map in memory is the truth for this hub's own life, and
-            // what is lost is only the belt against a clock that steps backwards after a restart.
-            tracing::error!(
-                error = %e, path = %self.path.display(),
-                "could not write down the run number just handed out; a restart after the clock \
-                 steps backwards could hand it out again"
-            );
-        }
+    /// Everything that should be on disk now, and where it goes.
+    ///
+    /// The WHOLE map every time, which is what makes a write that failed repairable: the next one
+    /// that lands carries the numbers the failed one was carrying, so one bad moment on the disk
+    /// costs nothing as soon as any later claim writes.
+    fn to_write_down(&self) -> (PathBuf, HandedOut) {
+        (
+            self.path.clone(),
+            HandedOut {
+                hub_pid: std::process::id(),
+                at: now_secs(),
+                addresses: self
+                    .highest
+                    .iter()
+                    .map(|(addr, generation)| AddressGeneration {
+                        project: addr.project.clone(),
+                        lane: addr.lane.clone(),
+                        generation: *generation,
+                    })
+                    .collect(),
+            },
+        )
     }
+}
 
-    fn write_whole(&self) -> std::io::Result<()> {
-        let file = HandedOut {
-            hub_pid: std::process::id(),
-            at: now_secs(),
-            addresses: self
-                .highest
-                .iter()
-                .map(|(addr, generation)| AddressGeneration {
-                    project: addr.project.clone(),
-                    lane: addr.lane.clone(),
-                    generation: *generation,
-                })
-                .collect(),
-        };
-        if let Some(dir) = self.path.parent() {
-            crate::conversations::private_state_dir(dir)?;
-        }
-        let tmp = self
-            .path
-            .with_extension(format!("json.tmp.{}", std::process::id()));
-        let body = serde_json::to_vec_pretty(&file)?;
-        {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&body)?;
-            f.flush()?;
-        }
-        fs::rename(&tmp, &self.path)
+/// Put the numbers on disk, whole.
+///
+/// A free function and not a method, because it must be callable with no lock held and nothing
+/// borrowed: [`Generations`] lives behind a `std::sync::Mutex`, and a write that took `&self` would
+/// have to be made while that mutex was held — which is where this write used to be, inside the
+/// claims lock as well, with every project's delivery behind it.
+fn write_handed_out(path: &Path, file: &HandedOut) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        crate::conversations::private_state_dir(dir)?;
     }
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let body = serde_json::to_vec_pretty(file)?;
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&body)?;
+        f.flush()?;
+    }
+    // The file a failed write leaves behind is NEVER unlinked, which is where this parts company
+    // with `presence` next door. Presence's file answers "who is connected now", so a stale one is
+    // a lie and unlinking it is the honest repair. This one answers "what has already been handed
+    // out", and a stale copy is not a lie — it is the same answer, lower. A lower floor is what the
+    // clock is there to lift; no floor at all is worse than a low one.
+    fs::rename(&tmp, path)
 }
 
 /// The wall clock in milliseconds, as the generation's floor reads it.
@@ -2139,9 +2154,20 @@ pub struct Hub<S: Surface> {
     /// The highest run number handed out for each address, and the file it survives a restart in.
     ///
     /// A `std::sync::Mutex` and not an async one, deliberately: it is taken INSIDE the claims lock
-    /// at the mint and never held across an await, so there is one lock order and no way to build a
-    /// cycle out of it.
+    /// at the mint, and inside [`Self::run_number_writes`] at the write, and never held across an
+    /// await in either — so there is one lock order and no way to build a cycle out of it.
     generations: Arc<std::sync::Mutex<Generations>>,
+    /// Whose turn it is to put those numbers on disk, and it is held across the SNAPSHOT as well as
+    /// the write.
+    ///
+    /// `mark_permit`'s problem, on the one file whose whole job is never to go backwards. Two
+    /// claims a millisecond apart each read the map and then reach the disk; without a turn between
+    /// them the one that read FIRST can land SECOND, and the file is left holding a floor below
+    /// numbers this hub has already handed out — which is the single failure the file exists to
+    /// prevent, written by the code that exists to prevent it. Taken outside the claims lock, never
+    /// inside it, which is the whole of the fix: a claim waits here for its own number to land, and
+    /// nothing else in the process waits with it.
+    run_number_writes: Arc<Mutex<()>>,
     /// How long a promising bridge has to confirm a tap. [`TAP_CONFIRM_WINDOW`], except under the
     /// tests that have to watch the window bite — waiting the real twenty seconds out is twenty
     /// seconds of a suite doing nothing, which is the reason `settle` is a field too.
@@ -2272,6 +2298,7 @@ impl<S: Surface> Hub<S> {
             generations: Arc::new(std::sync::Mutex::new(Generations::load(
                 audit_path.with_file_name(GENERATIONS_FILE),
             ))),
+            run_number_writes: Arc::new(Mutex::new(())),
             tap_confirm_window: AtomicU64::new(TAP_CONFIRM_WINDOW.as_millis() as u64),
             mark_permit: Arc::new(Mutex::new(())),
             tap_edits: Arc::new(Mutex::new(())),
@@ -2744,7 +2771,60 @@ impl<S: Surface> Hub<S> {
             );
             self.note_who_is_connected(&claims);
         }
+        // WITH THE CLAIMS LOCK LET GO, and still before the number is handed to anybody. Deciding
+        // the number needs the lock — two claims racing must not be given the same one, which is
+        // the whole reason the mint is up there — but writing it down needs nothing the lock holds.
+        // It used to be written inside it, so a disk that was slow or full stopped every project's
+        // delivery, not just this claim: `deliver_under` reads the same map to find the bridge a
+        // message is going to. What waits here now is this one connection's welcome, waiting for
+        // its own number to reach the disk, which is the order that was always intended.
+        self.write_down_the_run_numbers().await;
         Ok((generation, highest_was, kicked))
+    }
+
+    /// Put the numbers this hub has handed out on disk, holding no lock a delivery wants.
+    ///
+    /// **Awaited and read, never spawned and forgotten.** Firing the write off into a task nobody
+    /// looks at would take the lock off the claim path just as well and would be wrong for a reason
+    /// nothing would show: a hub whose disk is refusing writes would go on handing out numbers with
+    /// nothing anywhere saying they are not being written down, and the first sign of it would be a
+    /// restart re-handing a number it had already given. So the claim waits for its own number, and
+    /// a write that failed is said so at `error!` in the journal.
+    ///
+    /// A write that fails does NOT end the claim. The map in memory is the truth for this hub's own
+    /// life, so nothing can be double-handed while it runs; what a failed write costs is the belt
+    /// against a clock that steps BACKWARDS across a restart, and refusing every claim on the box
+    /// until somebody frees disk space would trade that rare belt for a certain silence on his
+    /// phone. The next write that lands carries the whole map, so it repairs every one that did not.
+    async fn write_down_the_run_numbers(&self) {
+        let _turn = self.run_number_writes.lock().await;
+        let (path, file) = self
+            .generations
+            .lock()
+            .expect("the generations are not held across an await")
+            .to_write_down();
+        // On a thread that is nobody's worker. A blocking write inside a task does not only stall
+        // that task: it parks the runtime worker it is running on, and a worker parked in a syscall
+        // takes the timer wheel down with it — measured while this was being fixed, a 50 ms
+        // `tokio::time::sleep` in another task never returned. Every pacing wait, every deadline
+        // and every settling window in this process is that timer.
+        let wrote = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || write_handed_out(&path, &file)
+        })
+        .await;
+        let refused = match wrote {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            // The writer panicked, which is a bug rather than a disk; said the same way, because
+            // what the operator's hub does next is the same either way.
+            Err(e) => e.to_string(),
+        };
+        tracing::error!(
+            error = refused, path = %path.display(),
+            "could not write down the run numbers this hub has handed out; a restart after the \
+             clock steps backwards could hand one of them out again"
+        );
     }
 
     /// Has a later run taken this address than the one asking?
@@ -4947,6 +5027,10 @@ impl<S: Surface> Hub<S> {
                 .lock()
                 .expect("the generations are not held across an await")
                 .give_back(&addr, generation, highest_was);
+            // And the file follows the map, here as at the mint. A floor put back in memory and
+            // left high on disk is the same refusal-for-ever after the next restart that giving it
+            // back is here to prevent.
+            self.write_down_the_run_numbers().await;
             // Every frame it said is answered for BEFORE the socket goes. Each was read and has an
             // id, and each is about to be destroyed; the wire's rule is one ack per frame, and a
             // bridge keys "which of mine reached him" by exactly these ids. `writer.abort()` used

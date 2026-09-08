@@ -12192,3 +12192,69 @@ async fn a_tap_the_agent_refused_is_not_left_looking_sent_because_one_edit_faile
          nothing else ever tells him: he is still reading that it was sent"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_number_that_cannot_reach_the_disk_never_holds_the_lock_every_delivery_takes() {
+    // The claims map is what `deliver_under` reads to find the bridge a message is going to, so a
+    // disk write held inside its lock is not one project's problem: it is every project's messages
+    // stopped behind one file. The number still has to be MINTED under the lock — two claims racing
+    // must not be handed the same one — but writing it down is not part of deciding it.
+    //
+    // A full disk is hard to arrange and a slow one is worse to test against. A FIFO where the
+    // write's temp file goes is neither: `open` for writing blocks there until somebody reads it,
+    // which is a write that never lands, on demand and with no waiting.
+    let h = harness().await;
+    let stuck = h
+        .dir
+        .path()
+        .join(GENERATIONS_FILE)
+        .with_extension(format!("json.tmp.{}", std::process::id()));
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&stuck)
+            .status()
+            .expect("mkfifo is on the box")
+            .success(),
+        "the test could not arrange a write that blocks, so it proves nothing"
+    );
+
+    // Its `hello` takes the address, which mints the number, which is the write that cannot land.
+    let _bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+
+    // THE PROBE RUNS ON A THREAD OF ITS OWN, AND ASKS WITH `try_lock`. Both halves are the point.
+    // A write that blocks inside a task blocks the runtime worker it is running on, and a worker
+    // blocked in a syscall takes the timer wheel down with it — measured: with the write under the
+    // lock, one `tokio::time::sleep(50ms)` in this test never returned. So a probe that waited on
+    // the lock with a timeout, or that slept between tries, would not FAIL here, it would hang, and
+    // a test that hangs says nothing about why.
+    let hub = Arc::clone(&h.hub);
+    let mine = h.own();
+    let probe = std::thread::spawn(move || {
+        for _ in 0..200 {
+            if let Ok(live) = hub.claims.try_lock()
+                && live.contains_key(&mine)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    });
+    let answered = probe.join().expect("the probe thread");
+
+    // Let the write land, and WAIT for it, before anything is asserted. A failed assertion takes
+    // the temp directory with it, and a FIFO whose name is gone can never be opened by a reader
+    // again — so the write would stay blocked on a thread the runtime waits for on its way out,
+    // and the test would hang instead of saying what was wrong.
+    std::thread::spawn(move || {
+        let _ = std::fs::read(&stuck);
+    })
+    .join()
+    .expect("the thread that lets the write land");
+    assert!(
+        answered,
+        "a bridge claimed the address and the claims lock never came free while the run number it \
+         minted sat in a write that could not land: every other project's delivery is behind that \
+         one file"
+    );
+}

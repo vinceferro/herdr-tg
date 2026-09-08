@@ -36,12 +36,16 @@
 //! fence is one the single-claim rule cannot hold, and refusing it one line at a time in the
 //! journal beats accepting it and evicting the whole fleet in a loop.
 //!
-//! It is only half. The rest is to stop asking `/proc` whether an incumbent is alive at all — the
-//! hub's own claim generation plus a kick down the incumbent's own connection, which lands in a
-//! later slice. Until then the hub and its bridges must share a pid namespace, which on this
-//! machine they do: both are the operator's own processes on his own box. The one repair that must
-//! NOT be made is trusting `hello.pid` instead, which is exactly the number the paragraph above
-//! says cannot be trusted.
+//! It is only half, and the other half has half landed. What DID land: a run holds a numbered
+//! lease on its address, and an incumbent the hub decides is gone is now ended by a kick down its
+//! own connection instead of being silently overwritten — so the evicted task stops rather than
+//! going on draining into a conversation its successor owns. What did NOT land: the hub still asks
+//! `/proc` whether an incumbent is alive at all, in `hub::Hub::claim_the_address`, and it asks it
+//! about the pid THIS file put on the connection. So the operating constraint is unchanged and
+//! still load-bearing — the hub and its bridges must share a pid namespace, which on this machine
+//! they do: both are the operator's own processes on his own box. The one repair that must NOT be
+//! made is trusting `hello.pid` instead, which is exactly the number the paragraph above says
+//! cannot be trusted.
 //!
 //! The uid half is unaffected: a foreign user is still refused, because 0 is not this user either.
 
