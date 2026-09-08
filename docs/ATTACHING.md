@@ -1,5 +1,26 @@
-<!-- INTERFACE, v24, 8 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v26, 8 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v26 corrects v25 where review found it wrong or half-said, and moves no frame. `project_id`
+     names two different things — the SEED on `welcome`, each row's OWN conversation id in the
+     inventory — and §3b's rule sentence sent a dispatcher joining a live connection to a room's
+     row at the seed's; it now says which id is which. The file trees in §14 are spelled with the
+     CONVERSATION, which is what the hub builds them from, rather than with `<project_id>`, which
+     since v25 means the seed. §3b gains three rows it claimed to already have — the operator's
+     Telegram numbers, the ids a tap is routed by, the file path in a `message` — and bounds its
+     own exhaustiveness claim to something a reader can check. The moved-folder example of a room
+     that stands for itself was simply wrong: a move leaves the old row on file, so the room goes
+     on naming it, and both documents now say that instead. The worked `hello` and one v20 sentence
+     no longer show an instance minted from a pid, which §3b forbids and no adapter here does.
+
+     v25 answers, for the first time in one place, what an adapter may carry off this machine.
+     `welcome` gains two additive fields — `project_id` and `conversation` — so a conversation is
+     named by an id instead of being unknowable from inside, and `hello`'s `repo` and `pid` become
+     optional, since the hub routes on neither. The new §3b is the table: every thing an adapter
+     handles, marked FLEET IDENTITY or LOCAL DETAIL, and the rule both halves exist for — a
+     dispatcher joins on the ids, never on a path. §7 offer 8 said the opposite in one sentence and
+     that sentence is struck; the inventory gained a `seed` field that says which project a room
+     belongs to, and `docs/CAPABILITIES.md` OPEN 3 is closed by it.
 
      v24 moves no frame and corrects §13.11 where it described behaviour that has changed. A
      PERMISSION prompt this side cannot place is now turned down like a question, not withheld and
@@ -143,9 +164,10 @@
      and nothing else: the hub evicts a dead claim by looking for `/proc/<pid>`, and it accepts a
      release only from the number that took the claim. Nothing is routed by it, and the pid you put
      in `hello` is compared with the socket's for one line in the journal and then ignored. Which RUN
-     you are is the `instance`, which you mint — and worth saying because our own two adapters mint
-     theirs as `<pid>-<milliseconds>`: a number that means something only to this kernel, travelling
-     inside the one string a fleet does read. The pid is also the one identifying thing that exists
+     you are is the `instance`, which you mint — and worth saying because our own adapters USED to
+     mint theirs as `<pid>-<milliseconds>`: a number that means something only to this kernel,
+     travelling inside the one string a fleet does read. Since v26 every one of them mints from
+     randomness and a clock (§3b), and each suite fails if a pid comes back. The pid is also the one identifying thing that exists
      only because both ends are on one machine, which is now written down where it belongs:
      `docs/CAPABILITIES.md` v16 makes the transport a thing of its own — REQUIRES 3 names today's
      one and the two facts it admits on, offer 9 says files are a capability OF that transport, and
@@ -632,6 +654,11 @@ are matched on, and it can outlive several leases where a lease can be replaced 
 instance unchanged. And it is not §13.10's binding generation, which is one launcher's number
 for a note on one box and never touches the wire.
 
+**Four of those five are fleet identity and one is not, and there is a table for it.** §3b
+says of everything an adapter handles whether it may be carried to another machine and joined on, or
+whether it is this box's own business — and the two ids the hub now names a conversation by are in
+it.
+
 **The pid is a local fence, and never fleet identity.** It does exactly two jobs, both on this
 machine: the hub evicts a claim whose holder is gone by looking for `/proc/<pid>`, and it accepts a
 release only from the process that took the claim. Nothing is routed by it — not a topic, not a
@@ -645,6 +672,80 @@ transport has both ends on one machine (`docs/CAPABILITIES.md` REQUIRES 3; its O
 transport without a pid would have to fence with instead). One caution stands rather than being
 asserted away: an adapter in its own PID namespace is judged by a number that means something else
 on the host side, and that has not been measured here (§10).
+
+## 3b. What is identity, and what is local
+
+§3 says what identifies a connection. This section answers the other question, the one whoever
+dispatches you asks: **of everything you handle, what may you write down, join two records on, and
+carry to another machine — and what is this box's own business and means nothing off it.**
+
+Two words, used exactly:
+
+* **FLEET IDENTITY** — stable, opaque, minted or resolved by the hub or by whoever dispatched you.
+  Safe to write into a record another machine reads, and safe to join two records on.
+* **LOCAL DETAIL** — this machine's business. It can be perfectly correct here and mean something
+  else, or nothing at all, one box over. Never a fleet name, and never a thing a dispatcher derives
+  a fleet name from.
+
+The table covers every field on the wire (§6, §14) and every variable in §2, which is what an
+adapter handles that anybody else can see. Something not in it is something this document has
+not thought about — read the silence that way, and not as a verdict of LOCAL DETAIL.
+
+| thing | which | what it is, and what you may do with it |
+| --- | --- | --- |
+| the **conversation id** | FLEET IDENTITY | `welcome.conversation` on the way down, `KICKOFF_HUB_CONVERSATION` on the way in (§2): the conversation your secret resolved to. `p-` or `c-` and twelve hex characters. It is the thing that has a topic, and it is what a room *is*. Treat the whole string as opaque — the letter says whether the operator opened a project or granted a room, and nothing else in it is yours to read or to reproduce. |
+| the **project id** | FLEET IDENTITY | `welcome.project_id`: the **seed** — the project a room belongs to, and the conversation's own id where the conversation is a project speaking for itself. It is what relates several rooms of one repository to one another without anybody comparing paths. `seed` in the inventory (§7 offer 8) is the same relation read at a keyboard. **The inventory's own `project_id` column is not this field**: it is each row's conversation id, row one above. And two equal ids prove less than they look: a conversation speaking for itself has `project_id == conversation`, and so does a room whose project is not in the list at all — a room that stands alone stands for itself (§7 offer 8) — so never read the two being equal as "I am a project". |
+| the **address** | FLEET IDENTITY | `hello.lane`, echoed on `welcome`; `KICKOFF_HUB_ADDRESS` (§4). Whoever dispatched you minted it and the hub interprets nothing. It names a conversation only as the **pair** `(conversation, address)`: two projects' `engineering` are two different places, which is why the hub will not de-duplicate one for you (§4). |
+| the **instance** | FLEET IDENTITY | A string you mint once per process (§3), which the hub compares as a string and reads nothing out of. It names one RUN of one process, and it is what a tap and an `ask_resolved` are matched on. Mint it from randomness and a clock: it must carry no pid, no path and no hostname, because every one of those is a LOCAL DETAIL row below and putting one inside an opaque string does not make it travel any better. Ours is eight random bytes as hex and the millisecond clock. |
+| the **lease** | FLEET IDENTITY | The `generation` on your `welcome`'s own envelope (§6). The hub's to mint and nobody else's. It is the one identity here that is a **fence rather than a name**: it says which run of an address holds it now, it is comparable only with another number for the same address from the same hub, and it is replaced on every claim. Stamp it back on everything you send; never join on it, and never store it as though it named a conversation. |
+| the **title** | LOCAL DETAIL | `welcome.project`, **display only**. The registry owns it, an operator can rename it, and it is not predictable from anything you hold — which is precisely why the address echo, and not the title, is what tells you a hub is older than you (§4). Show it to a person; never key on it, and never send one (`hello` carries no display name on purpose, §6). |
+| the **topic id** | LOCAL DETAIL | Telegram's number for the topic a conversation was given, in the operator's own forum. It is not on the wire down to you at all (`welcome.topic_id` is absent, §6), and it is read-only in the inventory so that whoever dispatches can link a person to a place. It names a row in ONE forum: another hub numbers its own, and a conversation nothing has ever connected as has none. |
+| the **repository path** | LOCAL DETAIL | `hello.repo`, and `repo` in an inventory row. **Optional on the wire**, kept for the audit record and for the person reading it, never for routing. It says where a checkout is on one box: a wall mounts it somewhere else (§10), a move re-enrols it, and a room's `repo` is its seed's, so two rows carry one string. Information for a human; never a key. Until 8 September this document told whoever dispatches you to join the room map on it. That sentence is struck, and the two ids above are what replaced it. |
+| the **secret** | LOCAL DETAIL | The bytes in the token file, and the path they live at (§5). It **proves** the project and **names** nothing: it is rotated with nothing else changing, and a hash of it is no better a key for being a hash. Never in a record, never in a log, never in a variable. |
+| the **socket path** | LOCAL DETAIL | `KICKOFF_HUB_SOCKET` (§2) — one uid's runtime directory on one box. Another box's hub is at the same path and is a different hub, which is the whole reason a path cannot be a name. |
+| the **door path** | LOCAL DETAIL | The relay's socket, `KICKOFF_HUB_RELAY_SOCKET` (§9, §13.3). It is **derived** from the conversation id and the address and then hashed, because `sun_path` caps at 108 bytes — so it is a function of identity, not a name for it. Read the ids off the wire; never read a door path to work out who you are, and never publish one as an address. |
+| the **pid** | LOCAL DETAIL | §3 has it in full: a fence on this machine, handed out again when the kernel's numbers wrap, something else entirely inside another PID namespace, and nothing at all off the box. **Optional on the wire**; the hub takes the number it fences with from the socket's own credentials and compares yours with it for one line in the journal. |
+| the **engine's session id** | LOCAL DETAIL | opencode's `ses_…`, or a Claude Code session — the engine's own name for where a turn lives (§13.10). It crosses this wire in **no** frame in either direction, and nothing outside the wall it runs in has business knowing it. Which session an adapter hands the operator's words to is the adapter's to decide and to enforce (`docs/CAPABILITIES.md` offer 6). |
+| the **binding file** | LOCAL DETAIL | Its path (`--opencode-binding-file`) and its generation (`--opencode-binding-generation`), §13.10. One launcher's note to one adapter on one box — flags rather than `KICKOFF_HUB_*` variables for exactly that reason (§2) — and its generation is **not** the lease above and never touches the wire. The one fleet-identity thing inside that note is its `conversation` key, which is row one, and which is what attach compares before it sends a word anywhere. |
+| the **health files** | LOCAL DETAIL | `hub.heartbeat` and `hub.health` in the hub's state directory (§7 offer 7). They say whether THIS hub on THIS box is serving, and the heartbeat's second line carries its pid for the local reader. Nothing in them names a conversation; a fleet that read one as a fact about a project would be reading one machine's weather. |
+| the **operator's Telegram numbers** | LOCAL DETAIL | `message.from.chat_id` and `from.user_id` on every word he types (§6), and `allowed_users` in an inventory row (§7 offer 8). They name one person in one messaging account, and they are the only personal data on this wire. Use them to tell one person from another WITHIN this hub's own conversation and nowhere else: never in a record another machine reads, never in a log, and never as the key a fleet joins on. An adapter that carries an audit line off this box strips them the way it strips the secret. |
+| the **frame and question ids** | LOCAL DETAIL | The envelope's `id`, and `ask_id`, `msg_id`, `option_id` (§6). They are how one connection's frames are matched to each other — a tap to the question it answers, an `ack` to the frame it is about — and they mean nothing outside the pair `(instance, connection)` they were minted in. Match on them; never store one as the name of a thing, and never send one to a peer that was not on that connection. |
+| the **file path in a message** | LOCAL DETAIL | `message.files[].path` (§14): the absolute path of a file the operator sent, which the hub has already written into this conversation's **media** directory — the mirror of the outbox row below, coming the other way, and the SECOND path on this wire. Local for the same reason as the first: it is a place on a filesystem both ends share, mounted read-only into a wall at the same path (§14.1), and it names where the bytes are rather than which file they are. Open it and read it while the turn lasts; never pass it on as an identifier, and never keep one — the hub sweeps that tree. |
+| the **outbox path** | LOCAL DETAIL | `welcome.outbox` (§14). A path on the wire, which looks like the exception and is not: it is a **mount point** for a peer that shares this filesystem, absent for one that does not (§7 offer 9), and its last two segments are built from the ids rather than being names in their own right. Mount it and write into it; derive nothing from how it is spelled. |
+
+**The rule, plainly: a dispatcher joins on the ids, never on a path.** Mind WHICH id, because one
+word is used for two: **the inventory's first column, also called `project_id`, is each row's own
+conversation id** — the same string as `welcome.conversation` — so that is what matches a live
+connection to its row. `welcome.project_id` is the SEED, and it matches the SEED's row, which is the
+row a room's `seed` field points at. So: match a connection to a row on `welcome.conversation`;
+relate a room to the project it belongs to with `seed`; address a conversation as the pair of a
+conversation id and, where there is one, an address. Everything in the second half of that
+table can be carried alongside for a person to read, and none of it may be the thing two records are
+matched on.
+
+**Why this is worth a section.** A path answers *where*, and identity has to answer *which*. All
+three ways a path stops answering *which* have already happened on this box: two worktrees whose
+folder basename was the same presented one address, and the second was refused until the adapters
+took git's own worktree name instead (§4); one repository reached through a symlinked parent missed
+its own binding, which is why every derivation here goes through the real path; and a wall mounts a
+checkout wherever it likes, so the path the agent sees and the path the hub knows are two strings
+for one thing (§10). Whoever joins on a path inherits all three, and the failure is silent in every
+one of them.
+
+**One honest caveat about the ids themselves.** A seed's id is minted today by hashing its canonical
+enrolment path, so a project re-enrolled at a MOVED path is a different id and a different
+conversation. That is an implementation detail, not a contract: do not reproduce the hash, do not
+try to read a path back out of an id, and do not assume two boxes mint the same id for the same
+repository. Minting a seed's id at random and storing it on its row — as rooms' ids already are —
+is written down as debt, and the day it is paid nothing above changes.
+
+**What changed on 8 September.** `welcome` gained `project_id` and `conversation`, and `hello`'s
+`repo` and `pid` became optional. Before that the honest answer to "which conversation am I?" from
+inside an adapter was "you cannot know", and this document said so; the placeholder our adapters put
+in `hello.project_id` — `unknown-until-the-hub-says` (§5) — was named for the day the hub would say
+it. Both new fields are omitted by every hub older than this, and absent means what absence always
+means here: you were not told, so you derive nothing. Our own adapters keep sending `repo` and `pid`
+for one release, because a hub older than they are still requires them.
 
 ---
 
@@ -849,7 +950,10 @@ or `enroll` while your adapter is running, and that is the documented recovery f
 
 **The project, and nothing else.** It does not name a conversation, it does not carry a display name,
 and the `project_id` field beside it is never read. Put anything there; ours puts
-`unknown-until-the-hub-says`, which is honest about what it is for.
+`unknown-until-the-hub-says`, which is honest about what it is for — and since 8 September the hub
+does say it, in `welcome.project_id` and `welcome.conversation` (§3b). What you send is still never
+read: the secret resolves the conversation, so an id in your `hello` could only ever be a claim
+about yourself that the hub has no reason to believe.
 
 ---
 
@@ -869,10 +973,11 @@ wrong on `hello` produces the single worst failure mode in this system: a first 
 decode is not refused, it is *closed in silence* — the same thing you see when your uid does not
 match (§10). No `refused` frame, no log you can read, just a socket that accepted, took a line and
 went quiet. A stringly-typed environment makes `"pid":"12345"` the natural guess and it is fatal, so
-here is one worked `hello`, complete:
+here is one worked `hello`, complete — `repo` and `pid` are optional since 8 September and are shown
+because ours still send them (§3b):
 
 ```
-{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"<64 hex chars from the token file>","instance":"12345-1757000000000","repo":"$HOME/project","pid":12345,"lane":"engineering"}
+{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"<64 hex chars from the token file>","instance":"9f2c1a7b4d3e5608-1757000000000","repo":"$HOME/project","pid":12345,"lane":"engineering"}
 ```
 
 ### The steps
@@ -883,7 +988,7 @@ here is one worked `hello`, complete:
 | 2 | hub | Takes your peer credentials off the socket. **A connection from another uid is closed with no reply at all** — a refusal would confirm something is listening. The close happens after it has read your `hello`, so what you observe is a socket that accepted, took a frame, and went quiet. | You must run as the same user as the hub. |
 | 3 | you | `hello` — **within 5 seconds**, or the connection is dropped in silence. | |
 | 4 | hub | Admits or refuses. **A first frame that is not `hello` is refused `unknown_project`. A first line that will not decode closes silently. A first frame over the ceiling is refused `frame_too_large`.** | |
-| 5 | hub | `welcome{project, lane?, topic_id?, limits}`. Check the address echo (§4). **Its own envelope carries your lease** — the `generation` field, below. | |
+| 5 | hub | `welcome{project, project_id?, conversation?, lane?, topic_id?, limits}` — the two ids since 8 September, absent from any hub older (§3b). Check the address echo (§4). **Its own envelope carries your lease** — the `generation` field, below. | |
 | 6 | hub | `ping`. **Its own envelope `id` is the nonce.** | |
 | 7 | you | `pong{ref: <the ping's id>}` — **within 5 seconds**. | No pong: you never become live, no topic is created, the connection ends. This is deliberate — a channel plugin that is not allowlisted boots and exits in a tenth of a second, and would otherwise leave an empty topic bound forever. |
 | 8 | hub | Creates the topic and greets it, so it is visible in the operator's list. | |
@@ -910,7 +1015,7 @@ direction. Every field is a JSON **string** unless this table says otherwise.
 
 | frame | fields | buzzes his phone |
 | --- | --- | --- |
-| `hello` | `project_id`, `token`, `instance`, `repo`, `pid` (**number**), `lane?`, `confirms?` (**array** of strings) | — |
+| `hello` | `project_id`, `token`, `instance`, `repo?`, `pid?` (**number**), `lane?`, `confirms?` (**array** of strings) | — |
 | `say` | `text`, `hint?` (`prose` \| `output`) | no |
 | `ask` | `ask_id`, `text`, `options?` (**array** of `{option_id, label}`, both strings) | **yes** |
 | `ask_resolved` | `ask_id`, `how` (`answered` \| `withdrawn` \| `timeout`), `outcome?` | no |
@@ -924,7 +1029,11 @@ direction. Every field is a JSON **string** unless this table says otherwise.
 an adapter that could name itself could claim another project's topic. `repo` and `pid` are for the
 audit record and for a human reading it, never for routing — and the hub uses the pid from the
 socket's credentials, not the one you send, so a wrapper that does not know its own outermost pid is
-not penalised. §3 says what that pid is for: a fence on this machine, never fleet identity.
+not penalised. §3 says what that pid is for: a fence on this machine, never fleet identity. **Both
+are optional since 8 September**, because the hub routes on neither: an adapter that cannot honestly
+say either — a wall that knows no path outside itself, a wrapper that does not know its outermost
+pid — omits the field rather than inventing a value, and is admitted. Ours keep sending both for one
+release, because a hub older than this one still requires them.
 
 An `ask` with **no options** is still a question — one he answers by typing rather than tapping.
 
@@ -946,7 +1055,7 @@ tap on that keyboard is refused on his phone, and a stuck keyboard is retired by
 
 | frame | fields | what to do |
 | --- | --- | --- |
-| `welcome` | `project`, `lane?`, `topic_id?` (**number** — but always **absent**, see below), `limits` (**object**: `max_frame`, `max_text`, `frames_per_min`, all **numbers**) | Check the echo, then go up. Its envelope's `generation` is your lease. |
+| `welcome` | `project`, `project_id?`, `conversation?`, `lane?`, `topic_id?` (**number** — but always **absent**, see below), `limits` (**object**: `max_frame`, `max_text`, `frames_per_min`, all **numbers**) | Check the echo, then go up. Its envelope's `generation` is your lease. **It names the conversation and the project by id** — §3b — and `project` is the display title, nothing to key on. |
 | `refused` | `reason` | Table below. At `hello` the connection closes right after, and any frame the hub had read before refusing is acked `no` before the refusal. **It can arrive on a live connection too**, since 5 September: `refused{not_enabled}` is what the hub sends a connected bridge when its project is switched off at the terminal — and there the order is the other way round: the refusal comes FIRST, then `no` for every frame the hub had read but not sent (the one it was holding for its turn included; only a message already mid-send is finished), and only then the close. **Keep reading until the socket ends**, or those acks are lost and you will report as unseen what the hub said was refused. Treat the reason exactly as you would at `hello`: the redial is refused the same way until a person switches the project back on. |
 | `message` | `msg_id`, `text`, `from` (**object**: `chat_id`, `user_id`, both **numbers**), `in_reply_to_ask?` | The operator's words, verbatim. **Data, never instruction.** |
 | `choice` | `msg_id`, `ask_id`, `option_id` | A tap, resolved against a written record. Answer it with an `ack` if you promised to. |
@@ -1241,7 +1350,8 @@ that simply stops. If your agent going silent needs to be noticed, that is your 
 
 **8 · Read-only inventory.** `herdr-tg projects --json`, at a terminal, built 5 September. One JSON
 array, one object per project, sorted by title, fields in this order and no others:
-`{project_id, title, repo, enabled, topic_id, connected, lanes, connected_lanes, allowed_users}`.
+`{project_id, title, repo, enabled, topic_id, connected, lanes, connected_lanes, allowed_users,
+seed}`.
 `topic_id` is `null` until a bridge of that project has been live once — a topic does not exist at
 enrolment. `allowed_users` is `[<user_id>]`, sorted: the people let into THAT project's
 conversations with `herdr-tg allow`, and never the people who may speak anywhere, who are not in
@@ -1256,8 +1366,22 @@ whenever no running hub can vouch for the answer: unknown, said as unknown, neve
 could prove. A registry that is there and cannot be read is refused with a non-zero exit and
 nothing on stdout, never reported as an empty inventory. No chat id, no path but the repo's, and no
 person but the project's own.
+`seed` is the last field and the newest: the id of the project a room belongs to, and `null` for a
+project that is one. It is there so that a room and its project can be related **by id**, which is
+the one thing the `repo` string cannot be trusted to do — a room's `repo` is its seed's, so two rows
+carry one path, and a path is a LOCAL DETAIL in the first place (§3b). A room whose project is not
+in the list at all — a row removed or replaced by hand while its rooms stayed — names **itself**
+there, never nothing and never the nearest row: a room that stands alone stands for itself until a
+terminal relates it again, where "nothing" would read as "this is a project", which it is not. A
+seed re-enrolled at a MOVED folder is not that case and does not reach that fallback: enrolling
+elsewhere leaves the old row on file, so the room goes on naming **the row it was granted from**,
+which is now a row at a folder nobody is working in. Reading it as a live project is the one way
+this field can mislead, and the migration that ends it — a `seed` stored on each room's row at
+`grant` — is named in `docs/CAPABILITIES.md` under OPEN 3.
 **There is still no invocation over the wire** — an adapter cannot ask the hub anything; the
-inventory is read by whoever dispatches you, at the keyboard, and the join key is the repo path.
+inventory is read by whoever dispatches you, at the keyboard, and **the join key is `project_id`,
+never the path**. A room is related to its project by `seed`. This document said the opposite until
+8 September; §3b is why it changed.
 *And the safety gap stays:* the address echo (§4) catches a wrong conversation, and nothing catches
 a wrong **project**. Attach with a token file belonging to some other repository and everything
 looks right from inside — a real secret, an admission, a title you could not have predicted anyway.
@@ -1409,8 +1533,10 @@ this formula.
 
 ### What a relay does that a pipe does not
 
-It answers `hello` itself with the `welcome` it holds (address echo included, so your
-refuse-rather-than-impersonate check keeps working unmodified); rewrites envelope ids, because two
+It answers `hello` itself with the `welcome` it holds — **whole**, never a copy of the fields you
+knew the names of the day you wrote the relay, so the address echo keeps your
+refuse-rather-than-impersonate check working unmodified and the two ids of §3b reach every producer
+without the relay having to learn what they are; rewrites envelope ids, because two
 producers both mint `f1` and an ack naming the wrong frame tells the wrong agent its message was
 lost; **namespaces `ask_id`**, because the hub resolves a tap by ask id and without this a tap on one
 agent's question is delivered to the other; answers the hub's `ping` itself so a wedged producer
@@ -3062,17 +3188,18 @@ Two directions, two trees, one rule each:
 when that is unset — **as the hub's own process sees them**, which under `deploy/herdr-tg.service`
 is the operator's home with no `XDG_STATE_HOME` unless `~/.config/herdr-tg/env` sets one. The two
 segments after the tree are the conversation's, and both are things a dispatcher already holds:
-`<project_id>` is the id offer 8 prints (`p-` and twelve hex characters, minted from the canonical
-repo path — a safe path segment by construction), and `<address>` is the address it minted, or the
-single character **`-`** for the project's own voice. `-` is free for this because §4's shape
+`<conversation>` is the conversation's own id — `welcome.conversation`, the first column offer 8
+prints, and a safe path segment by construction — **not** `welcome.project_id`, which since
+8 September is the SEED and is a different string for every room (§3b). And `<address>` is the
+address it minted, or the single character **`-`** for the project's own voice. `-` is free for this because §4's shape
 rules refuse it as a lane name, so the two can never collide. §2 had already taken it for itself,
 but a convention about a variable is not a rule about the wire: `hello` carries a lane directly,
 and a stranger's adapter written from §6 alone touches no variable at all.
 
 | tree | path | who writes | who reads | a wall mounts it |
 | --- | --- | --- | --- | --- |
-| media | `<state>/media/<project_id>/<address>/` | the hub | the wall | **read-only**, at the same path |
-| outbox | `<state>/outbox/<project_id>/<address>/` | the wall, through its adapter | the hub | **read-write**, at the same path |
+| media | `<state>/media/<conversation>/<address>/` | the hub | the wall | **read-only**, at the same path |
+| outbox | `<state>/outbox/<conversation>/<address>/` | the wall, through its adapter | the hub | **read-write**, at the same path |
 
 **Per conversation, not per hub, decided.** A flat `media/` mounted into every wall would let a
 wall read every file he ever sent to any project — a screenshot of his bank, meant for one
@@ -3140,7 +3267,7 @@ carries no file. Types are as in §6 — a JSON **string** unless said otherwise
 
 | frame | new field | what it is |
 | --- | --- | --- |
-| `welcome` | `outbox?` | The absolute path of **this conversation's** outbox, `<state>/outbox/<project_id>/<address>/`, as the hub sees it and as a wall must mount it. It has to be told: an adapter never learns its project id (§5, §7 offer 8), and inside a wall its own `$HOME` is not the hub's, so nothing it holds can derive the path. Absent on every hub before this section, and **absence means this hub carries no files**: an adapter asked to send one then sends the words ALONE — a `say` with no `file`, byte for byte what it always sent — and says in its own tool result that the file did not go and why, rather than sending a field the hub would strip in silence or refusing the words along with it. Built that way rather than as v13 wrote it (refuse the whole call) because the words are worth more delivered than withheld, and the result is the one place the agent reads. |
+| `welcome` | `outbox?` | The absolute path of **this conversation's** outbox, `<state>/outbox/<conversation>/<address>/`, as the hub sees it and as a wall must mount it. It has to be told: inside a wall its own `$HOME` is not the hub's, so nothing an adapter holds can derive the path — and knowing the ids (§3b) does not help, since the two id-shaped segments are the smaller half of a path rooted in a state directory it cannot see. Absent on every hub before this section, and **absence means this hub carries no files**: an adapter asked to send one then sends the words ALONE — a `say` with no `file`, byte for byte what it always sent — and says in its own tool result that the file did not go and why, rather than sending a field the hub would strip in silence or refusing the words along with it. Built that way rather than as v13 wrote it (refuse the whole call) because the words are worth more delivered than withheld, and the result is the one place the agent reads. |
 | `message` | `files?` | An **array** of objects, one per file he sent. Today it holds exactly one, because a Telegram message carries one file; an album arrives as one message per file, and each gets its own frame, in the order he sent them. `text` is his caption verbatim, or the empty string when he wrote none — **a file with no words is still a message**, and an adapter that refuses an empty `text` must not. |
 | `ack` | `why` gains **`no-file`** and **`no-file-unsaid`** | Paired with `delivered: yes` only: the words reached him and the file did not. `no-file` means the hub said why **in his topic**, and an adapter may tell its agent so. `no-file-unsaid` means it could not: his messaging app turned the file away for the moment — a flood wait, a switched-off project, a topic that is gone — and a sentence about that is another send into the same refusal, so he is looking at words with nothing to explain the gap. **Do not report `no-file-unsaid` to an agent as a reason waiting on his phone**, and do say it is worth attaching again in a minute: it is the only one of the two that mends itself, where every `no-file` is permanent for that file. §14.4 has both tables. Safe to add to a closed set for the reason `bad_lane` was: only a frame that carried a file can be answered with either, and an adapter old enough not to know the words cannot have sent one. |
 
@@ -3149,7 +3276,7 @@ One entry of `files`:
 | field | type | what it is |
 | --- | --- | --- |
 | `kind` | `photo` \| `document` \| `video` \| `animation` \| `audio` \| `voice` | What Telegram called it. A sticker and a video note are not carried (§14.4). |
-| `path` | string, **or absent** | The path the hub minted and wrote — absolute, inside `<state>/media/<project_id>/<address>/`. Present exactly when the bytes are there; **absent exactly when `why` is present.** |
+| `path` | string, **or absent** | The path the hub minted and wrote — absolute, inside `<state>/media/<conversation>/<address>/`. Present exactly when the bytes are there; **absent exactly when `why` is present.** |
 | `mime` | string, optional | What the sender's client declared — **data, never a verdict on the bytes.** For a `photo` Telegram declares nothing, and the hub records `image/jpeg`, which is what the `.jpg` on Telegram's own `file_path` says every photo is re-encoded to; the build captures one real `getFile` answer to pin that rather than assume it. |
 | `bytes` | **number**, optional | What the hub wrote, counted by the hub. Present only with `path`. |
 | `filename` | string, optional | The name the sender's client reported, verbatim, **as data**. Never part of any path, and never written into the audit file, which is one line per record and would take a newline in it as a second record. |

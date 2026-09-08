@@ -137,11 +137,18 @@ function repoKey(mainTop: string): string {
 }
 
 /**
- * The id the hub's own registry mints for a repository: `p-` and twelve hex characters of the
- * same hash the link is keyed on. It is what the repo's link names for every project adopted or
- * opened, so a relay keyed on it gets the same door whether the link is there yet or not.
+ * The key of the DOOR for a repository that has not been told which conversation it is: `p-` and
+ * twelve hex characters of the same hash the link is keyed on.
+ *
+ * Named for what it is used for, and not for what it happens to equal. It is byte for byte the id
+ * the hub's own registry mints for a seed, which is the whole reason it works — a relay and its
+ * producers derive the same door from the same directory whether or not either has read a secret
+ * yet, and the door does not move the day the link is finally written. But it is NOT a statement
+ * that this directory IS that seed: a room, a moved checkout or a re-enrolment can all make the
+ * hub's answer differ, and only the hub's answer names a conversation. Read the id off the
+ * `welcome`; use this to find a socket.
  */
-export function seedIdOf(mainTop: string): string {
+export function doorKeyFor(mainTop: string): string {
   return `p-${createHash('sha256').update(realPath(mainTop)).digest('hex').slice(0, 12)}`
 }
 

@@ -4851,12 +4851,17 @@ impl<S: Surface> Hub<S> {
         // Read through the crate's own helper and never as "was the field there": an adapter that
         // builds the list by filtering sends an empty one when it promises nothing.
         let confirms_choices = hub_proto::promises_to_confirm(&confirms, "choice");
-        if claimed_pid != who.fence() {
+        // Only when the bridge named one. A hello that says nothing about the machine it is on is
+        // not a bridge disagreeing with the kernel about its pid, and writing the disagreement
+        // down for one would put a line in the journal saying a number was offered when none was.
+        if let Some(claimed) = claimed_pid
+            && claimed != who.fence()
+        {
             // Not fatal — a bridge behind a wrapper legitimately does not know its own outermost
             // pid. It IS worth a line, because the audit trail should record which number was
             // believed and which was merely offered.
             tracing::debug!(
-                claimed = claimed_pid,
+                claimed,
                 actual = who.fence(),
                 "a bridge reported a pid that is not the one on its connection; using the \
                  connection's"
@@ -4865,13 +4870,22 @@ impl<S: Surface> Hub<S> {
         let pid = who.fence();
 
         // The name the REGISTRY holds, composed for the conversation this is — so a lane's own log
-        // says the same thing as the topic the operator is looking at.
-        let title = {
+        // says the same thing as the topic the operator is looking at — and beside it the project
+        // this conversation belongs to.
+        //
+        // Both read under one lock, because they are one answer about one row: a title and a
+        // relation taken from two separate reads could straddle a re-enrolment at the terminal and
+        // tell the bridge a name from before it and a project from after.
+        let (title, seed) = {
             let registry = self.registry.lock().await;
-            registry
+            let title = registry
                 .get(&addr.project)
                 .map(|p| self.display_title(p, addr.lane.as_ref()))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            // A seed is its own; a room's is the row it was granted in. `Registry::seed_of` is the
+            // only place that relation is worked out, so this and `projects --json` can never come
+            // to disagree about whose room this is.
+            (title, registry.seed_of(&addr.project).clone())
         };
 
         // The writer is a task of its own so that a slow Telegram send can never block reading the
@@ -4980,6 +4994,17 @@ impl<S: Surface> Hub<S> {
                     FrameId::new(format!("h{}", next_frame_seq())),
                     HubFrame::Welcome {
                         project: title,
+                        // The two ids, and both from the row the SECRET resolved to — never from
+                        // the `project_id` on the hello, which is a name a bridge chose for
+                        // itself and which the hub has ignored since the day it was added.
+                        //
+                        // They are here so that nothing downstream has to relate this connection
+                        // to a row of `projects --json` by the one string both ends could
+                        // otherwise see, the repo path: a path moves when a folder moves, differs
+                        // inside a wall, and is the operator's own filesystem going somewhere it
+                        // need not go.
+                        project_id: Some(seed),
+                        conversation: Some(addr.project.clone()),
                         // Echoed from the ADMITTED address, never from the wire. It is the only thing
                         // that tells a bridge which named a lane that this hub understood it, rather
                         // than ignoring the word and handing the worktree the project's own place.

@@ -100,6 +100,16 @@ check('two_producers_for_one_lane_share_one_hub_connection_rather_than_racing_fo
 check('and the hub was told the worktree, once, by the relay itself',
   hub.got.find(f => f.t === 'hello')!.lane === LANE)
 
+// The door's own name for this run, which the hub keys every open question on and which the ledger
+// carries across a restart of this process on purpose. That is precisely why it must not be built
+// out of a pid: a number that means something only to this kernel, handed out again once the
+// kernel's numbers wrap, travelling inside the one string a fleet reads back.
+const doorHello = hub.got.find(f => f.t === 'hello')!
+check('the_doors_instance_is_this_runs_own_name_and_never_the_pid_it_happens_to_be_running_under',
+  /^[0-9a-f]{16}-[0-9]{13,}$/.test(String(doorHello.instance)) &&
+    !String(doorHello.instance).split('-').includes(String(relay.pid)),
+  JSON.stringify({ instance: doorHello.instance, pid: relay.pid }))
+
 // A message that carries a FILE, at a door with three producers behind it — one of them older
 // than files, which is what any upgrade window and the ordinary opencode layout both look like.
 // The count in the one ack the hub hears decides whether it puts "that file did not reach the
@@ -494,6 +504,13 @@ const stranger = Bun.spawn(['bun', join(HERE, '..', '..', 'docs', 'examples', 'a
 })()
 await until('the stranger to be welcomed', () => strangerSaid.some(l => l.startsWith('WELCOME')), 15000)
   .catch(() => {})
+// And waited for at the HUB as well, not only at the stranger: being welcomed is the door's answer
+// and the say is a second hop behind it, so a check that took the welcome as its cue read the hub
+// a moment too early and failed a run that was about to pass. Still a real assertion — the wait is
+// bounded and the check below is what says whether the words arrived.
+await until('the stranger to be heard at the hub',
+  () => projHub.got.some(f => f.t === 'say' && f.text === 'attached from the document alone'), 15000)
+  .catch(() => {})
 check('an_adapter_written_from_the_document_alone_attaches_and_is_heard',
   strangerSaid.some(l => l.startsWith('WELCOME')) &&
     projHub.got.some(f => f.t === 'say' && f.text === 'attached from the document alone'),
@@ -505,6 +522,32 @@ check('and it still cost the hub exactly one claim, with three adapters behind i
   projHub.got.filter(f => f.t === 'hello').length === 1 && projHub.refusals.length === 0,
   `${projHub.got.filter(f => f.t === 'hello').length} hellos, ${projHub.refusals.length} refusals`)
 stranger.kill()
+
+// And the same file dialling the HUB, which is what it does when nothing sets `KICKOFF_HUB_RELAY`
+// — the shape a stranger who copies this example gets by default, and the only path in it no test
+// had ever walked. What is under test is the instance: `docs/ATTACHING.md` §3b says it carries no
+// pid, and this is the file the document hands a new adopter to copy, so a pid here is a pid in
+// every adapter written from it. It reaches the hub's ask ledger, which is persisted.
+{
+  const soloSock = join(dir, 'stranger-solo.sock')
+  const soloHub = claimingHub(soloSock)
+  const solo = Bun.spawn(['bun', join(HERE, '..', '..', 'docs', 'examples', 'attach-from-the-document.ts')], {
+    cwd: HERE,
+    env: { ...process.env, KICKOFF_HUB_PROJECT_DIR: repo, KICKOFF_HUB_SOCKET: soloSock,
+      KICKOFF_HUB_RELAY: '-', KICKOFF_HUB_RELAY_SOCKET: '-' },
+    stdout: 'ignore', stderr: 'inherit',
+  })
+  await until('the stranger dialling the hub itself to say hello', () => soloHub.got.some(f => f.t === 'hello'), 15000)
+    .catch(() => {})
+  const soloHello = soloHub.got.find(f => f.t === 'hello')
+  check('the_example_the_document_hands_a_stranger_to_copy_mints_an_instance_that_carries_no_pid',
+    !!soloHello && /^[0-9a-f]{16}-[0-9]{13,}$/.test(String(soloHello.instance)) &&
+      !String(soloHello.instance).split('-').includes(String(solo.pid)),
+    JSON.stringify({ instance: soloHello?.instance ?? null, pid: solo.pid }))
+  solo.kill()
+  soloHub.stop()
+  await Bun.sleep(200)
+}
 
 attachP.kill(); voice.child.kill(); oc.stop(true); projHub.stop()
 await Bun.sleep(200)
@@ -649,6 +692,62 @@ check('and it does not tell the agent to give up, because a relay can come back'
   !unheard.isError, unheard.text)
 check('the relay socket really was absent', !existsSync(join(emptyDir, 'nothing.sock')))
 orphan.child.kill()
+
+// ── Part 5: what the hub named, handed on whole ─────────────────────────────────────
+console.log('\nthe ids the hub named:')
+
+// The door answers `hello` on the hub's behalf, with the welcome it is holding — so what a producer
+// behind it knows about this conversation is whatever the door passes on. The hub now names the
+// conversation and the project BY ID there, and it will name more in time; a door that rebuilt the
+// frame out of the fields it happens to know about today would strip every one of them in silence,
+// and a producer joining a fleet record on an id would join on nothing. It forwards the frame
+// WHOLE, and this is the proof — written with ids the door's own code has never heard of.
+const namedSock = join(dir, 'named.sock')
+const namedDir = join(dir, 'named-fanin')
+let namedBuf = ''
+const namedHub = Bun.listen({
+  unix: namedSock,
+  socket: {
+    open() {},
+    data(s: any, chunk: any) {
+      namedBuf += chunk.toString()
+      for (;;) {
+        const nl = namedBuf.indexOf('\n')
+        if (nl < 0) break
+        const line = namedBuf.slice(0, nl)
+        namedBuf = namedBuf.slice(nl + 1)
+        if (!line.trim()) continue
+        const f = JSON.parse(line)
+        if (f.t === 'hello') {
+          s.write(JSON.stringify({
+            v: 1, id: 'h-w', t: 'welcome', project: 'repo',
+            project_id: 'p-0123456789ab', conversation: 'c-abcdef012345',
+            limits: { max_frame: 262144, max_text: 3500, frames_per_min: 20 },
+          }) + '\n')
+        } else if (f.t !== 'pong') {
+          s.write(JSON.stringify({ v: 1, id: `h-a${f.id}`, t: 'ack', ref: f.id, delivered: 'yes' }) + '\n')
+        }
+      }
+    },
+    close() {}, error() {},
+  },
+})
+const namedAttach = startAttach(repo, { KICKOFF_HUB_SOCKET: namedSock, KICKOFF_HUB_RELAY_DIR: namedDir })
+await until('the door to be open', () => existsSync(namedDir) && readdirSync(namedDir).some(f => f.endsWith('.sock')))
+const namedDoor = join(namedDir, readdirSync(namedDir).find(f => f.endsWith('.sock'))!)
+const reader = rawProducer(namedDoor)
+await reader.ready
+reader.send({ v: 1, id: 'n1', t: 'hello', project_id: 'p', token: 'a'.repeat(64),
+  instance: 'a-producer-that-reads-the-ids', repo, pid: process.pid })
+await until('the producer to be welcomed', () => reader.got.some(f => f.t === 'welcome'), 15000)
+const forwarded = reader.got.find(f => f.t === 'welcome')!
+check('the_relay_hands_every_producer_the_ids_the_hub_named',
+  forwarded.project_id === 'p-0123456789ab' && forwarded.conversation === 'c-abcdef012345',
+  JSON.stringify(forwarded))
+reader.end()
+namedAttach.kill()
+namedHub.stop()
+await Bun.sleep(200)
 
 rmSync(dir, { recursive: true, force: true })
 const n = failed()

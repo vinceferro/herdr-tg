@@ -14,7 +14,7 @@
  * the relay as it stood, and what each one printed then is recorded beside it.
  */
 
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 import {
@@ -319,6 +319,56 @@ console.log('\nwhen the relay itself restarts:')
     P2.got.some(f => f.t === 'choice' && f.ask_id === 'a7'), JSON.stringify(P2.got))
 
   P2.end(); again.kill(); s.hub!.stop()
+  await Bun.sleep(300)
+}
+
+// ── E2. and it stops carrying yesterday's name once nothing is open under it ──────────────────
+//
+// The name above is kept across a restart because the hub has questions open under it. That reason
+// runs out the moment there are none: a door that reads back a ledger with nothing waiting is a
+// door whose old name means nothing to anybody, and keeping it anyway is how a box that ran the
+// adapter before 8 September goes on saying a pid to the hub for ever — the ledger file outlives
+// every restart, so the one change that took the pid off this wire would never reach a deployed
+// box at all.
+//
+// RED, before the fix:
+//   FAIL a_door_whose_remembered_name_has_no_questions_under_it_comes_back_with_a_new_one
+//        {"remembered":"4242-1757000000000","said":"4242-1757000000000"}
+console.log('\nwhen the door restarts with nothing open under its old name:')
+
+{
+  const s = scenario('quiet', repo)
+  await until('the relay to reach its hub', () => s.hub!.got.some(f => f.t === 'hello'), 15000)
+  const sock = await s.sockOf()
+  const state = `${sock}.state`
+  // Ask nothing, but make the door write its file: a producer arriving is enough to give it a
+  // number to remember, and that is the file a restart reads back.
+  const P = rawProducer(sock)
+  await P.ready
+  P.send(hello({ instance: 'a-producer-with-no-questions' }))
+  P.send({ v: 1, id: 'p-say', t: 'say', text: 'nothing to decide' })
+  await until('the words at the hub', () => s.hub!.got.some(f => f.t === 'say'), 15000)
+  await until('the door to write down what a restart would need', () => existsSync(state), 15000)
+  P.end()
+  s.relay.kill()
+  await s.relay.exited
+  await Bun.sleep(300)
+
+  // What a box that ran the pre-change adapter has on disk: a name minted from a pid, and no
+  // question open under it.
+  const past = JSON.parse(readFileSync(state, 'utf8'))
+  const remembered = '4242-1757000000000'
+  writeFileSync(state, JSON.stringify({ ...past, instance: remembered, asks: [] }), { mode: 0o600 })
+
+  const again = startAttach(repo, { KICKOFF_HUB_SOCKET: s.hubSock, KICKOFF_HUB_RELAY_DIR: s.faninDir }, true)
+  await until('the relay to say hello again',
+    () => s.hub!.got.filter(f => f.t === 'hello').length >= 2, 20000)
+  const said = String(s.hub!.got.filter(f => f.t === 'hello')[1].instance)
+  check('a_door_whose_remembered_name_has_no_questions_under_it_comes_back_with_a_new_one',
+    said !== remembered && /^[0-9a-f]{16}-[0-9]{13,}$/.test(said),
+    JSON.stringify({ remembered, said }))
+
+  again.kill(); s.hub!.stop()
   await Bun.sleep(300)
 }
 

@@ -124,8 +124,17 @@ const LINK_DROPPED = VIA_FANIN
   ? 'The link to his phone dropped. Everything on this machine that carries it is still answering except the hub itself, so nothing reaches him until herdr-tg is running again.'
   : 'The link to his phone dropped and is being rebuilt.'
 
-/** This run of this worker. A new one invalidates every question drawn for the last. */
-const INSTANCE = `${process.pid}-${Date.now()}`
+/**
+ * This run of this worker. A new one invalidates every question drawn for the last.
+ *
+ * Random, then the millisecond — and NOT the pid it once opened with. This is the one name for a
+ * run that travels: the hub keys every open question on it, it is what a tap and an `ask_resolved`
+ * are matched on, and it outlives the connection it was first said on. A pid means something only
+ * to the kernel that issued it and is handed out again once that kernel's numbers wrap, so a fleet
+ * reading these strings side by side would be reading a local accident. The randomness makes it
+ * unique wherever it is read; the millisecond keeps it ordered for whoever is reading a log.
+ */
+const INSTANCE = `${randomBytes(8).toString('hex')}-${Date.now()}`
 
 /**
  * Why his typed words are refused on an engine that cannot hand them to the agent. It lands in the
@@ -353,7 +362,7 @@ const mcp = new Server(
   // The third place this number is written, and the only one no installer, marketplace or registry
   // ever reads — which is how it fell a week behind the two manifests. `the_bridge_announces_the_
   // version_its_manifests_carry` fails the suite if it is left out of a bump again.
-  { name: 'kickoff-channel', version: '0.2.0' },
+  { name: 'kickoff-channel', version: '0.2.1' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -799,6 +808,11 @@ function identify(): Identity {
       project_id: `unknown-until-the-hub-says`,
       token: project.token,
       instance: INSTANCE,
+      // Kept for one release, on purpose: the hub stopped requiring either of these when it learned
+      // to name a conversation by id, but a hub from before that still refuses a hello without
+      // them — and the box that has the old hub is exactly the box that gets the new bridge first.
+      // Neither is routed on at either end (the repo is informational, the pid is a local eviction
+      // fence), so they can both go the release after every hub in the fleet names its own ids.
       repo: project.repo,
       pid: process.pid,
       // Omitted entirely when there is no address, so a session speaking for the project puts byte

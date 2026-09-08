@@ -13,6 +13,11 @@
 //! (`presence.rs`), and they are `null` whenever no running hub stands behind that snapshot —
 //! unknown, said as unknown, rather than a `false` nobody could prove.
 //!
+//! `seed` is the tenth field and the last: which project a room belongs to, by id. It is
+//! appended, because the nine before it are read by dispatchers written before it existed. A room
+//! lives in its seed's folder and has none of its own, so the only way to relate the two rows used
+//! to be to join them on that path — a fact about this machine, not a name.
+//!
 //! `allowed_users` is the one list of people either surface shows, and it is a PROJECT's own: the
 //! people let into its conversations at the terminal. The people who may speak anywhere — the
 //! operator among them — live in the configuration and not in the file this reads, so no field
@@ -25,7 +30,7 @@ use hub_proto::{LaneId, ProjectId};
 use serde::Serialize;
 
 use crate::hub::Addr;
-use crate::registry::{Project, Registry, is_nothing_yet};
+use crate::registry::{Project, Registry, is_nothing_yet, is_room};
 
 /// One project, in the offered shape. Field order is the promise; `serde` keeps a struct's.
 #[derive(Debug, Serialize)]
@@ -52,6 +57,18 @@ pub(crate) struct Row<'a> {
     /// they cannot reach this surface. A room's dispatcher needs to know who its room admits;
     /// nobody needs to know who runs the box.
     pub allowed_users: &'a BTreeSet<i64>,
+    /// Which project this conversation belongs to: a room names the seed whose folder it was
+    /// granted in, and a seed names nothing, because it is one.
+    ///
+    /// APPENDED, after the nine fields the document already promised, and that is the whole of
+    /// what "appended" buys: a dispatcher written against the nine reads them in the same places
+    /// it always did. It is an id and never a path — the relation used to be available only by
+    /// joining two rows on the repo string they happen to share, which is a fact about this
+    /// machine and not a name anything may be addressed by.
+    ///
+    /// A room whose seed is not in the list names ITSELF here, never a folder and never nothing:
+    /// see `Registry::seed_of` for why that is the honest answer rather than a guess.
+    pub seed: Option<&'a ProjectId>,
 }
 
 /// `herdr-tg projects`, either shape.
@@ -159,6 +176,9 @@ pub(crate) fn inventory<'a>(registry: &'a Registry, state_dir: &Path) -> Vec<Row
                     .collect()
             }),
             allowed_users: &p.allowed_users,
+            // Asked of the registry, never worked out here: one relation, in one place, so the
+            // hub's welcome and this list can never come to disagree about whose room this is.
+            seed: is_room(&p.id).then(|| registry.seed_of(&p.id)),
         })
         .collect()
 }
@@ -486,6 +506,10 @@ mod tests {
             "lanes",
             "connected_lanes",
             "allowed_users",
+            // Appended, and appended is the whole of the promise about it: the nine above are
+            // read by a dispatcher written before it existed, and a field inserted among them
+            // moves every one after it.
+            "seed",
         ];
         for pair in order.windows(2) {
             assert!(
@@ -639,8 +663,8 @@ mod tests {
 
     #[test]
     fn vacant_rooms_are_not_listed_until_one_has_a_topic() {
-        // Both surfaces. The dispatcher reading `--json` joins on the repo path, and eight rows
-        // sharing the seed's repo would make that join ambiguous for rows that are nothing yet;
+        // Both surfaces. The dispatcher reading `--json` relates a room to its seed by `seed`,
+        // and eight rows of nothing sharing the seed's folder are eight rows it cannot use;
         // the person reading the table gets the same list the phone gets.
         let d = tempfile::tempdir().expect("tmp");
         let seed = enrol(d.path(), "org");
@@ -784,6 +808,173 @@ mod tests {
         assert!(
             !said.contains("not connected yet"),
             "a project with a worktree topic is listed as one that has never connected: {said}"
+        );
+    }
+
+    #[test]
+    fn projects_json_relates_a_room_to_its_seed_by_id_and_never_by_the_path() {
+        // A room has no folder of its own, so the only thing on file relating it to its seed was
+        // that they share one — and a dispatcher that wanted "which project is this room of"
+        // had to join two rows on a path string. The relation is an id now, and the seed's own
+        // row names nothing, because a seed is not a room of anything.
+        let d = tempfile::tempdir().expect("tmp");
+        let seed = enrol(d.path(), "org");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let rooms = r.grant(&seed.repo, 2).expect("grants");
+        // A room is hidden from every list until a topic binds it, the way the phone hides it.
+        r.bind_topic(&Addr::project_itself(rooms[0].id.clone()), 501)
+            .expect("binds");
+
+        let rows = inventory(&r, d.path());
+        let row_of = |id: &ProjectId| {
+            serde_json::to_string(
+                rows.iter()
+                    .find(|row| *row.project_id == *id)
+                    .unwrap_or_else(|| panic!("no row for {id}")),
+            )
+            .expect("json")
+        };
+        let room_row = row_of(&rooms[0].id);
+        let seed_row = row_of(&seed.id);
+        assert!(
+            room_row.contains(&format!("\"seed\":\"{}\"", seed.id)),
+            "a room's row does not name its seed by id: {room_row}"
+        );
+        assert!(
+            seed_row.contains("\"seed\":null"),
+            "a seed is listed as a room of something: {seed_row}"
+        );
+        // The relation is the id and nothing else. A reader must never be able to take it for a
+        // folder, which is exactly the join this replaces.
+        assert!(
+            !room_row.contains(&format!("\"seed\":\"{}\"", seed.repo.display())),
+            "the relation is a path: {room_row}"
+        );
+    }
+
+    #[test]
+    fn a_room_whose_seed_is_not_in_the_list_names_itself_rather_than_the_nearest_folder() {
+        // The state a moved or replaced seed row leaves behind: a room whose folder no longer
+        // names a seed. Guessing at another row would relate one org's room to another org's
+        // project and nothing would ever say so, and answering with nothing would read as "this
+        // is a seed", which it is not. It stands for itself until a terminal relates it again.
+        let d = tempfile::tempdir().expect("tmp");
+        let seed = enrol(d.path(), "org");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let rooms = r.grant(&seed.repo, 1).expect("grants");
+        r.bind_topic(&Addr::project_itself(rooms[0].id.clone()), 502)
+            .expect("binds");
+        let other = enrol(d.path(), "somebody-else");
+
+        // The seed's row taken out of the file, exactly as a hand-edit or a half-finished
+        // migration would leave it: the room stays, and its folder now names no seed at all.
+        let path = d.path().join("projects.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        doc.as_object_mut()
+            .expect("an object")
+            .remove(seed.id.as_str());
+        std::fs::write(&path, serde_json::to_string(&doc).expect("json")).expect("write");
+
+        let r = Registry::load(&path);
+        let rows = inventory(&r, d.path());
+        let room_row = serde_json::to_string(
+            rows.iter()
+                .find(|row| *row.project_id == rooms[0].id)
+                .expect("the room's row"),
+        )
+        .expect("json");
+        assert!(
+            room_row.contains(&format!("\"seed\":\"{}\"", rooms[0].id)),
+            "a room with no seed on file does not stand for itself: {room_row}"
+        );
+        assert!(
+            !room_row.contains(other.id.as_str()),
+            "a room was related to a project that is not its own: {room_row}"
+        );
+    }
+
+    /// The seed of a room, as the row and the `welcome` both read it, for one conversation.
+    fn seed_printed_for(r: &Registry, state: &Path, id: &ProjectId) -> String {
+        let rows = inventory(r, state);
+        serde_json::to_string(
+            rows.iter()
+                .find(|row| row.project_id == id)
+                .expect("its row"),
+        )
+        .expect("json")
+    }
+
+    #[test]
+    fn a_room_whose_seed_was_re_enrolled_at_a_moved_folder_keeps_naming_the_row_it_was_granted_from()
+     {
+        // Not the behaviour anybody wants, and written down here because both documents described
+        // the OPPOSITE of it until 8 September — they offered a moved seed as an example of a room
+        // that stands for itself, and it is not one. Enrolling elsewhere does not remove the old
+        // row (nothing does), so the room's folder still names it and `seed_of` answers with it:
+        // a live id for a checkout nobody is working in. Pinned rather than left implicit so that
+        // the day the migration lands (`registry.rs`: the seed's id stored on the room's row at
+        // `grant`) this test is what has to be rewritten, in the open, with the documents beside it.
+        let d = tempfile::tempdir().expect("tmp");
+        let seed = enrol(d.path(), "org");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let rooms = r.grant(&seed.repo, 1).expect("grants");
+        r.bind_topic(&Addr::project_itself(rooms[0].id.clone()), 777)
+            .expect("binds");
+
+        // The move an operator makes and re-enrols after, which the documentation calls ordinary.
+        std::fs::rename(d.path().join("org"), d.path().join("org-moved")).expect("moves");
+        let moved = enrol(d.path(), "org-moved");
+        assert_ne!(
+            moved.id, seed.id,
+            "a moved folder is a different row, which is the debt"
+        );
+
+        let r = Registry::load(d.path().join("projects.json"));
+        let row = seed_printed_for(&r, d.path(), &rooms[0].id);
+        assert!(
+            row.contains(&format!("\"seed\":\"{}\"", seed.id)),
+            "a room after its project moved does not name the row it was granted from: {row}"
+        );
+        assert!(
+            !row.contains(moved.id.as_str()),
+            "a room was quietly re-related to the row at the new folder: {row}"
+        );
+        // And the hub reads the same relation through the same call, so the wire and the list
+        // cannot disagree about it — they are wrong together or right together.
+        assert_eq!(*r.seed_of(&rooms[0].id), seed.id);
+    }
+
+    #[test]
+    fn a_project_enrolled_where_another_one_used_to_be_inherits_that_folders_rooms() {
+        // The second half of the same debt, and the one that costs something: a seed's id is a hash
+        // of its folder, so enrolling anything at a folder a project vacated mints the SAME id and
+        // takes over the row — its topic, its addresses and its people — and every room granted by
+        // the first project still shares that folder and is now related to the second. Nothing says
+        // so on the wire, in the list, or in the journal. It is here so the size of the debt is a
+        // failing test the day somebody changes the relation, and not a paragraph nobody re-reads.
+        let d = tempfile::tempdir().expect("tmp");
+        let first = enrol(d.path(), "org");
+        let mut r = Registry::load(d.path().join("projects.json"));
+        let rooms = r.grant(&first.repo, 1).expect("grants");
+        r.bind_topic(&Addr::project_itself(rooms[0].id.clone()), 778)
+            .expect("binds");
+        std::fs::rename(d.path().join("org"), d.path().join("org-moved")).expect("moves");
+        enrol(d.path(), "org-moved");
+
+        // Somebody else's checkout, at the folder the first project left.
+        std::fs::create_dir_all(d.path().join("org")).expect("dir");
+        let second = enrol(d.path(), "org");
+        assert_eq!(
+            second.id, first.id,
+            "the id is the folder's hash, so re-using the folder re-uses the id"
+        );
+
+        let r = Registry::load(d.path().join("projects.json"));
+        let row = seed_printed_for(&r, d.path(), &rooms[0].id);
+        assert!(
+            row.contains(&format!("\"seed\":\"{}\"", second.id)),
+            "the first project's room is no longer related to the row at its own folder: {row}"
         );
     }
 }

@@ -237,13 +237,16 @@ enum Cmd {
     ///
     /// `--json` is the read-only inventory another org's dispatcher reads topic ids from: one
     /// object per project, `{project_id, title, repo, enabled, topic_id, connected, lanes,
-    /// connected_lanes, allowed_users}`, in that order, sorted by title. `topic_id` is `null`
-    /// until a bridge has been live once; `connected` is the project's own voice and
+    /// connected_lanes, allowed_users, seed}`, in that order, sorted by title. `topic_id` is
+    /// `null` until a bridge has been live once; `connected` is the project's own voice and
     /// `connected_lanes` its addresses live now, both `null` whenever no running hub can vouch
     /// for the answer — unknown is said as unknown. `allowed_users` is the people let into that
-    /// project's conversations with `allow`, and never the people who may speak anywhere. A
-    /// registry that cannot be read is refused, never printed as empty. No chat id, no path but
-    /// the repo's.
+    /// project's conversations with `allow`, and never the people who may speak anywhere. `seed`
+    /// is which project a room belongs to, by id, and `null` for a project itself: it is the
+    /// tenth field and it was APPENDED, so the nine before it stay exactly where a dispatcher
+    /// written before it existed reads them. Relate a room to its project by that id and never by
+    /// the repo path the two rows share. A registry that cannot be read is refused, never printed
+    /// as empty. No chat id, no path but the repo's.
     Projects {
         /// Emit the inventory as JSON instead of the table.
         #[arg(long)]

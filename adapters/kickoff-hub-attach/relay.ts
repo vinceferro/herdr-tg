@@ -424,10 +424,14 @@ export function createRelay(cfg: RelayConfig): Relay {
           token: project.token,
           // Held across a hub reconnect AND across a restart of this process — see `ledger.ts`.
           instance: ledger.instance,
+          // Both kept for one release, on purpose: the hub stopped requiring the repo and the pid
+          // when it learned to name a conversation by id, but a hub from before that refuses a
+          // hello without them — and the box running the old hub is the one that gets this adapter
+          // first. They can both go the release after every hub in the fleet names its own ids.
           repo: project.repo,
           // This process's OWN pid, never a producer's: the hub evicts a claim whose pid has gone,
           // and a claim held under a pid that is not the one holding the socket is a claim the
-          // eviction rule cannot reason about.
+          // eviction rule cannot reason about. A fence on this machine, and nothing routes on it.
           pid: process.pid,
           // The door answers for every tap it is handed, so it promises for all of them. It can
           // keep that promise whoever is behind it: it folds the answer of the producer that holds
@@ -798,6 +802,10 @@ export function createRelay(cfg: RelayConfig): Relay {
   function greet(p: Producer): void {
     if (!p.checked || p.greeted || !welcomeFrame || !link.isUp) return
     p.greeted = true
+    // The hub's welcome, WHOLE, never a copy of the fields this file knows the names of today: the
+    // hub names the conversation and the project by id in it and will name more in time, and a
+    // producer that joins a fleet record on an id it never received joins on nothing. Pinned by
+    // `the_relay_hands_every_producer_the_ids_the_hub_named` in `test-two-producers.ts`.
     p.down.relay(welcomeFrame)
   }
 

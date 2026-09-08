@@ -495,6 +495,48 @@ impl Registry {
         self.projects.values()
     }
 
+    /// The project a conversation belongs to: a seed is its own, and a room's is the row whose
+    /// folder it was granted in.
+    ///
+    /// This is the one place that relation is worked out, so that nothing else has to. A room has
+    /// no folder of its own — `grant` mints it in the seed's repo — so the shared path is the only
+    /// thing on file that ties the two rows together, and everybody who needed the relation was
+    /// joining on that path themselves. A path is a fact about this machine; the id is the name.
+    ///
+    /// It falls back to the ROOM ITSELF when NO seed row holds that folder, rather than guessing
+    /// at the nearest one. That state is reachable — a hand-edited file, a seed row removed while
+    /// its rooms stayed — and the two other answers are both worse: picking whichever row is
+    /// nearest would relate one org's conversation to another org's project, and answering with
+    /// nothing reads as "this is a seed", which it is not. A room that stands alone stands for
+    /// itself until a terminal relates it again.
+    ///
+    /// **What this does NOT promise, said plainly because the fallback reads like it does.** The
+    /// answer is only ever as good as the shared folder, and the folder can lie in two ways that
+    /// no fallback here can see. A seed re-enrolled at a MOVED folder leaves its old row on file,
+    /// so its rooms match THAT and this answers with a live id for a checkout nobody works in —
+    /// the fallback never fires, because a row does hold the folder. And a project enrolled at a
+    /// folder another one vacated mints the same id from the same path, takes the old row over,
+    /// and inherits the first project's rooms along with its topic. Both are pinned as tests in
+    /// `cmd/projects.rs`, and both are the same debt: a room's row does not store the seed it was
+    /// granted from, and a seed's id is a hash of its path (see `seed_row_for`). The migration
+    /// that ends them is a stored `seed` on every room row, written at `grant`; until it lands,
+    /// this relation is honest exactly while a project stays where it was enrolled.
+    /// `docs/CAPABILITIES.md` OPEN 3 carries it, and both documents describe the behaviour above
+    /// rather than the one the fallback suggests.
+    pub fn seed_of<'a>(&'a self, id: &'a ProjectId) -> &'a ProjectId {
+        if !is_room(id) {
+            return id;
+        }
+        let Some(room) = self.projects.get(id) else {
+            return id;
+        };
+        self.projects
+            .values()
+            .find(|p| !is_room(&p.id) && p.repo == room.repo)
+            .map(|p| &p.id)
+            .unwrap_or(id)
+    }
+
     /// Which topic a conversation's messages already go to, if it has one.
     ///
     /// A conversation, not a project: a lane's topic is its own, and answering with the project's
@@ -725,6 +767,15 @@ impl Registry {
         }
         // Minted from the canonical path, never from a counter. A recycled counter silently
         // inheriting a dead agent's topic is a defect this repo has already shipped once.
+        //
+        // That the hash is OF the path is an implementation detail and not a promise: nothing may
+        // derive an id from a folder, and nothing may read a folder back out of one. It stays a
+        // hash because it is what makes a re-enrolment of the same folder keep its topic and its
+        // history, which is the whole point of a stable id. The debt it leaves is real and named
+        // here rather than pretended away: a seed enrolled at a MOVED folder gets a new id, and
+        // its rooms — which relate to it by that folder, see `seed_of` — are left pointing at the
+        // row it used to be. Random minting plus a `seed` stored on every room row at `grant` is
+        // the migration that ends it, and it has not been done.
         let id = ProjectId::new(format!(
             "p-{}",
             &sha256_hex(repo.as_os_str().as_encoded_bytes())[..12]

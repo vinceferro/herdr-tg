@@ -28,6 +28,7 @@
  * file into production; copy it into an understanding.
  */
 
+import { randomBytes } from 'crypto'
 import { existsSync, readFileSync } from 'fs'
 import { isAbsolute, join } from 'path'
 
@@ -132,7 +133,10 @@ const conn = await Bun.connect({
         t: 'hello',
         project_id: 'unknown-until-the-hub-says',
         token,
-        instance: `${process.pid}-${Date.now()}`,
+        // §3b: an instance may carry no pid, no path and no hostname. It is the one string a
+        // whole fleet reads back — every open question is keyed on it — and a pid means something
+        // only to this kernel and is handed out again once its numbers wrap. Random, then a clock.
+        instance: `${randomBytes(8).toString('hex')}-${Date.now()}`,
         repo: projectDir,
         pid: process.pid,
         // §4: never send `"lane": null`. Omit the field.

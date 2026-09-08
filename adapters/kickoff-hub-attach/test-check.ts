@@ -20,7 +20,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 import { relaySocketPath } from '../../plugins/kickoff-channel/attach.ts'
-import { seedIdOf } from '../../plugins/kickoff-channel/where.ts'
+import { doorKeyFor } from '../../plugins/kickoff-channel/where.ts'
 import { makeRepo } from './test-harness.ts'
 
 const ATTACH = join(import.meta.dir, 'main.ts')
@@ -123,6 +123,15 @@ console.log('\nwhen everything a worker needs is in place:')
     JSON.stringify(r.out))
   check('and the last line says everything is in place',
     r.out.at(-1) === 'everything a worker here needs is in place', JSON.stringify(r.out.at(-1)))
+  // The fourth place this repo mints an instance, and the one that dials a REAL hub the moment an
+  // operator types the command §13 tells him to type. `docs/ATTACHING.md` §3b says an instance
+  // carries no pid — a number this kernel hands out again once its numbers wrap, meaningless one
+  // box over, travelling inside the one string a whole fleet reads back. The door and the tool
+  // server were taken off the pid and this one was missed, so it is ratcheted here beside them.
+  const checkHello = hub.seen.find(f => f.t === 'hello')!
+  check('the_checks_own_instance_is_minted_from_randomness_and_never_from_the_pid_it_runs_under',
+    /^[0-9a-f]{16}-check-[0-9]{13,}$/.test(String(checkHello.instance)),
+    JSON.stringify(checkHello.instance))
   hub.stop()
 }
 
@@ -277,7 +286,7 @@ console.log('\nwhen the hub refuses, beside a live door:')
   const { mkdirSync: mk } = await import('fs')
   mk(relayDir, { recursive: true, mode: 0o700 })
   // Keyed on the CONVERSATION — the id the registry mints for this repo — not the repo path.
-  const doorPath = relaySocketPath(relayDir, seedIdOf(repo), lane)
+  const doorPath = relaySocketPath(relayDir, doorKeyFor(repo), lane)
   const holder = Bun.listen({ unix: doorPath, socket: { open() {}, data() {}, close() {}, error() {} } })
   const sentences: Record<string, RegExp> = {
     unknown_project: /the hub does not know this project.*herdr-tg open/,
@@ -365,7 +374,7 @@ console.log('\nwhen a worker already holds the door:')
   // A live socket at the derived door, so `--check`'s door fact finds it held. The check dials it
   // like the door-binder does, so a plain listener is enough to read as "held".
   const { relaySocketPath } = await import('../../plugins/kickoff-channel/attach.ts')
-  const doorPath = relaySocketPath(relayDir, seedIdOf(repo), lane)
+  const doorPath = relaySocketPath(relayDir, doorKeyFor(repo), lane)
   const { mkdirSync } = await import('fs')
   mkdirSync(relayDir, { recursive: true, mode: 0o700 })
   const holder = Bun.listen({ unix: doorPath, socket: { open() {}, data() {}, close() {}, error() {} } })
@@ -610,7 +619,7 @@ console.log('\nwhen attach is told a conversation:')
 console.log('\nwhen the secret the channel keeps is one the hub refuses:')
 {
   const xdg = join(dir, 'r-xdg')
-  const id = seedIdOf(repo)
+  const id = doorKeyFor(repo)
   const { createHash } = await import('crypto')
   const { realpathSync } = await import('fs')
   const key = createHash('sha256').update(realpathSync(repo)).digest('hex').slice(0, 16)

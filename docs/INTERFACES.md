@@ -77,6 +77,14 @@ The contract, in one line each:
 
 * **Identity is a secret, never a name.** `hello` carries no display name; the hub resolves the
   secret to a project and takes the title from its own registry.
+* **A name is an id, never a path. BUILT, 8 September.** The `welcome` says which conversation the
+  secret resolved to and which project that conversation belongs to, both as opaque ids, and the
+  read-only inventory relates a room to its project by `seed` — so two programs on two boxes join
+  their records on the same strings. A path answers *where* and no question a fleet asks: a room and
+  its seed share one, a wall mounts a checkout somewhere else, and a move makes a new one for the
+  same work. `docs/ATTACHING.md` §3b is the table of which things an adapter handles are fleet
+  identity and which are one machine's business; `hello`'s `repo` and `pid` are in the second half,
+  which is why both became optional in the same change.
 * **Authority flows one way.** No frame carries addressing. The hub knows which connection is which.
 * **Every frame is acked exactly once**, with three delivery values — `yes`, `no`, `unseen` —
   because a send that timed out may or may not have landed and there is no way to ask.
@@ -275,7 +283,12 @@ The hub does exactly these things, and adding a seventh is a decision, not a ref
 
 Each of these is a line, not an omission:
 
-* **Spawning, supervising, or killing anything.** There is no `Command` in the binary.
+* **Spawning, supervising, or killing anything.** Not from anything inbound: no message, no tap and
+  no frame reaches a process. The binary's only three shipped `Command` call sites are in
+  `cmd/enroll.rs`, reached from `argv` at the terminal, each naming `git` as a literal with a fixed
+  subcommand — `nothing_inbound_can_start_a_process.rs` goes red if a fourth appears, if a program is
+  built from a value, or if the door, the hub, the bot, the surface, the pacer or the registry names
+  a way to start anything at all.
 * **Knowing what a lane, a proof, a worktree, or a re-ground is.**
 * **Choosing a model, an engine, or a repository.**
 * **Enrolling a project or minting a secret.** Terminal-only, so a message cannot grant itself access.

@@ -109,7 +109,8 @@ screen-scraper could never have offered.
 
 ### 4. Starting things, without the hub gaining a shell
 
-The hub spawns nothing today — zero `Command` in the binary — and that is why §8 can say an inbound
+The hub spawns nothing today — nothing a message, a tap or a frame reaches names a `Command`, and
+the binary's only three are enrolment's, on `argv` at the terminal — and that is why §8 can say an inbound
 message cannot reach a shell. Keep it.
 
 Instead: **the hub starts named systemd units that already exist.**

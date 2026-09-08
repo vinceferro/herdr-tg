@@ -620,8 +620,15 @@ impl FakeBridge {
         let stream = UnixStream::connect(sock).await.expect("connect");
         let (r, w) = stream.into_split();
         let mut me = Self::over_halves(Box::new(r), Box::new(w));
-        me.say_hello(secret, instance, claimed_id, lane, pid, None)
-            .await;
+        me.say_hello(
+            secret,
+            instance,
+            claimed_id,
+            lane,
+            Some(("/wherever", pid)),
+            None,
+        )
+        .await;
         me
     }
 
@@ -655,6 +662,23 @@ impl FakeBridge {
             true,
         )
         .await
+    }
+
+    /// A bridge that names nothing about the machine it is on — no folder, no pid — which is what
+    /// a bridge inside a wall or on another box has to be. Through the one hello builder, because
+    /// two of them is how the two copies of `hub-link.ts` drifted.
+    async fn connect_naming_nothing_local(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        claimed_id: &str,
+    ) -> Self {
+        let stream = UnixStream::connect(sock).await.expect("connect");
+        let (r, w) = stream.into_split();
+        let mut me = Self::over_halves(Box::new(r), Box::new(w));
+        me.say_hello(secret, instance, claimed_id, None, None, None)
+            .await;
+        me
     }
 
     /// A bridge that promises to say what became of every choice it is handed.
@@ -695,7 +719,7 @@ impl FakeBridge {
             instance,
             claimed_id,
             None,
-            std::process::id(),
+            Some(("/wherever", std::process::id())),
             confirms,
         )
         .await;
@@ -750,8 +774,15 @@ impl FakeBridge {
         let (r, w) = tokio::io::split(mine);
         let mut me = Self::over_halves(Box::new(r), Box::new(w));
         me.stamps = stamps;
-        me.say_hello(secret, instance, claimed_id, None, std::process::id(), None)
-            .await;
+        me.say_hello(
+            secret,
+            instance,
+            claimed_id,
+            None,
+            Some(("/wherever", std::process::id())),
+            None,
+        )
+        .await;
         me
     }
 
@@ -775,7 +806,11 @@ impl FakeBridge {
         instance: &str,
         claimed_id: &str,
         lane: Option<&str>,
-        pid: u32,
+        // What this bridge chooses to say about the machine it is running on: its folder and its
+        // pid, or nothing at all. Both are the bridge's own facts, both are ignored by everything
+        // that decides anything, and `None` is a bridge on the far side of a wall or a network,
+        // which has no folder and no pid this hub could mean anything by.
+        local: Option<(&str, u32)>,
         // The harness bridge answers no down-frame by default, which is what every bridge shipped
         // so far does. The tests that need a promising bridge say so themselves.
         confirms: Option<Vec<String>>,
@@ -784,8 +819,8 @@ impl FakeBridge {
             project_id: ProjectId::new(claimed_id),
             token: secret.to_owned(),
             instance: instance.to_owned(),
-            repo: "/wherever".into(),
-            pid,
+            repo: local.map(|(repo, _)| repo.to_owned()),
+            pid: local.map(|(_, pid)| pid),
             lane: lane.map(hub_proto::LaneId::new),
             confirms,
         })
@@ -2303,8 +2338,8 @@ async fn a_frame_the_hub_cannot_read_before_the_pong_does_not_kill_the_connectio
                 project_id: ProjectId::new("whatever"),
                 token: h.secret.clone(),
                 instance: "i1".into(),
-                repo: "/wherever".into(),
-                pid: std::process::id(),
+                repo: Some("/wherever".to_owned()),
+                pid: Some(std::process::id()),
                 lane: None,
                 confirms: None,
             },
@@ -8824,9 +8859,10 @@ async fn last_said(h: &Harness) -> String {
 
 #[tokio::test]
 async fn a_file_the_agent_names_in_its_outbox_reaches_the_phone() {
-    // The welcome names THIS conversation's outbox — `<state>/outbox/<project>/-`, every segment
-    // 0700 and the hub's own — because an adapter never learns its project id and inside a wall
-    // its `$HOME` is not the hub's. A file copied there and named on a `say` reaches his phone
+    // The welcome names THIS conversation's outbox — `<state>/outbox/<conversation>/-`, every
+    // segment 0700 and the hub's own — because inside a wall an adapter's `$HOME` is not the
+    // hub's, so it cannot build the path even knowing which conversation it is. A file copied
+    // there and named on a `say` reaches his phone
     // as a picture with the words as its caption: ONE send, the bytes exactly as they were on
     // disk, called what the adapter said he should see it called. The agent's ack is `yes` with
     // nothing else, and the audit holds the pair it holds for every send.
@@ -9538,6 +9574,119 @@ async fn a_room_named_by_its_dispatcher_reaches_the_phone_under_that_name_or_the
         .expect("the seed")
         .icon_color;
     assert!(topics.iter().all(|t| t.1 == seed_colour), "{topics:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// Identity on the wire: the ids a bridge is told, and the local facts it need not tell.
+
+/// The two ids on a welcome, for the tests about what the hub names.
+fn ids_on(welcome: &HubFrame) -> (Option<ProjectId>, Option<ProjectId>) {
+    let HubFrame::Welcome {
+        project_id,
+        conversation,
+        ..
+    } = welcome
+    else {
+        panic!("expected a welcome, got {welcome:?}");
+    };
+    (project_id.clone(), conversation.clone())
+}
+
+#[tokio::test]
+async fn a_welcome_names_the_conversation_and_the_project_by_id_and_never_from_the_wire() {
+    // All a bridge ever learned about which conversation it had reached was `project` — a display
+    // title the registry owns, that two projects may share and no bridge can predict. So anything
+    // that had to join a fact about this connection to a row of `projects --json` joined them on
+    // the one string both ends could see, the repo path, and a path is not a name: it moves when a
+    // folder moves and it differs inside a wall. The ids are on the welcome now, and they come
+    // from the row the SECRET resolved to — this hello claims to be somebody else entirely.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    let welcome = bridge.become_live_with_welcome().await.expect("a welcome");
+    let (project_id, conversation) = ids_on(&welcome);
+    assert_eq!(
+        project_id.as_ref(),
+        Some(&h.project),
+        "the welcome does not name the project by id: {welcome:?}"
+    );
+    assert_eq!(
+        conversation.as_ref(),
+        Some(&h.project),
+        "the welcome does not name this conversation by id: {welcome:?}"
+    );
+    assert!(
+        project_id
+            .as_ref()
+            .is_none_or(|id| id.as_str() != "p-somebody-else")
+            && conversation
+                .as_ref()
+                .is_none_or(|id| id.as_str() != "p-somebody-else"),
+        "an id came off the wire: {welcome:?}"
+    );
+
+    // A worktree of it is the same conversation with a lane beside it, and the lane is the echo it
+    // always was — the ids do not become a second way of saying which worktree this is.
+    let mut lane = FakeBridge::connect_as(
+        &h.sock,
+        &h.secret,
+        "i2",
+        "p-somebody-else",
+        Some("lane-0908-101010-7"),
+    )
+    .await;
+    let welcome = lane.become_live_with_welcome().await.expect("a welcome");
+    let (project_id, conversation) = ids_on(&welcome);
+    assert_eq!(project_id.as_ref(), Some(&h.project), "{welcome:?}");
+    assert_eq!(conversation.as_ref(), Some(&h.project), "{welcome:?}");
+}
+
+#[tokio::test]
+async fn a_rooms_welcome_names_its_seed_as_the_project_and_itself_as_the_conversation() {
+    // A room is a conversation of its own with a project standing over it, and the two ids are
+    // the only place that relation is on the wire. Without them a dispatcher holding a room's
+    // secret could not tell which project it had reached except by the folder both rows share —
+    // and a room has no folder of its own, which is the whole reason that join was wrong.
+    let h = harness().await;
+    let rooms = rooms_of(&h, 2);
+    let (room, secret) = &rooms[0];
+    let mut bridge = FakeBridge::connect(&h.sock, secret, "room-0", "x").await;
+    let welcome = bridge.become_live_with_welcome().await.expect("a welcome");
+    let (project_id, conversation) = ids_on(&welcome);
+    assert_eq!(
+        project_id.as_ref(),
+        Some(&h.project),
+        "a room's welcome does not name the project it hangs off: {welcome:?}"
+    );
+    assert_eq!(
+        conversation.as_ref(),
+        Some(&room.id),
+        "a room's welcome does not name the room as the conversation: {welcome:?}"
+    );
+    assert_ne!(
+        project_id, conversation,
+        "a room was told it is its own project: {welcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hello_that_names_no_repo_and_no_pid_is_admitted() {
+    // Both are local facts, both were required, and neither ever decided anything: the token
+    // resolves the conversation and the kernel reports the pid of the process on the other end of
+    // the socket. A bridge inside a wall names a folder that is not the hub's, and one on another
+    // machine names a pid this hub could compare against nothing — so requiring them made a
+    // bridge either lie or refuse to start. It is admitted, it goes live, and it is told the same
+    // two ids as any other.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_naming_nothing_local(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    let welcome = bridge.become_live_with_welcome().await.expect("a welcome");
+    let (project_id, conversation) = ids_on(&welcome);
+    assert_eq!(project_id.as_ref(), Some(&h.project), "{welcome:?}");
+    assert_eq!(conversation.as_ref(), Some(&h.project), "{welcome:?}");
+    // Live, not merely admitted: the claim is held under the address the secret resolved to, and
+    // the topic the operator can see is there.
+    until(async || h.hub.connected_ids().await.contains(&h.own())).await;
+    until(async || !h.fake.topics.lock().await.is_empty()).await;
 }
 
 #[tokio::test]

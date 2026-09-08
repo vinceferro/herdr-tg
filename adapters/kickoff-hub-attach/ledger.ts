@@ -16,6 +16,7 @@
  * somebody still there". Nothing here knows what a socket is.
  */
 
+import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync } from 'fs'
 
 /** One question a producer is still waiting on: who asked it, the id THEY used, and when. */
@@ -96,7 +97,19 @@ export class Ledger {
   constructor(o: LedgerOptions) {
     this.o = o
     const past = this.readBack()
-    this.instance = past.instance ?? `${process.pid}-${Date.now()}`
+    // Random and then the millisecond, never a pid: this string is what the HUB knows this door by
+    // and keys every open question on, and a pid is meaningful only to this kernel and is issued
+    // again once its numbers wrap.
+    //
+    // A ledger left by the last run keeps the name it already had ONLY while a question is still
+    // open under it — that is the whole reason to keep it, because those buttons are on his phone
+    // under that name and the hub retires everything belonging to a name it has not heard before.
+    // With nothing open the old name means nothing to anybody, and holding it anyway is how a box
+    // that ran this adapter before the pid came off the wire would go on saying a pid for ever:
+    // the state file outlives every restart, so the migration would never reach a deployed box.
+    this.instance = past.asks.length && past.instance
+      ? past.instance
+      : `${randomBytes(8).toString('hex')}-${Date.now()}`
     for (const [k, n] of past.numbers) this.numbers.set(k, n)
     for (const [ns, a] of past.asks) this.open.set(ns, a)
     this.count = Math.max(past.count, ...[...this.numbers.values(), 0])

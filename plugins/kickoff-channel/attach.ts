@@ -49,12 +49,12 @@ import {
   boundConversationFor,
   channelHome,
   conversationSecret,
+  doorKeyFor,
   factsFor,
   findProject,
   isConversationId,
   legacyTokenFolder,
   readSecret,
-  seedIdOf,
   type Facts,
   type Project,
 } from './where.ts'
@@ -230,8 +230,8 @@ export function conversationKeyFor(conversation: string | null, home: string | n
   const bound = home ? boundConversationFor(home, projectDir, facts) : null
   if (bound) return bound.id
   const tokenAt = legacyTokenFolder(projectDir, facts)
-  if (tokenAt) return seedIdOf(tokenAt)
-  return seedIdOf(facts.mainTop)
+  if (tokenAt) return doorKeyFor(tokenAt)
+  return doorKeyFor(facts.mainTop)
 }
 
 /**

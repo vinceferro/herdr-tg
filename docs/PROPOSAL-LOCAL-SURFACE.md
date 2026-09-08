@@ -60,6 +60,12 @@ query, because every socket connection presents a secret proving one project and
 query would be a new frame kind; written whole under the hub's pid; believed by a reader only when
 the lock's holder is alive, is a herdr-tg, and wrote it, `presence.rs:148-166`).
 
+**The mirror is local, and it is never the contract.** It is one hub writing down, for a reader on
+its own box, what its claims map and its ledger say this second — a convenience of this machine, of
+exactly the kind `docs/ATTACHING.md` §3b calls LOCAL DETAIL. Nothing off this box may read it, join
+two records on it, or depend on its shape; the wire and `herdr-tg projects --json` are the contract,
+and what a fleet names a conversation by is the ids they carry.
+
 `herdr-tg status` reads that mirror beside herdr's snapshot and prints one table. Answering from the
 laptop is one verb, `herdr-tg answer`, that hands the hub a **selection** — conversation, address,
 ask id, option id — through the same terminal-to-running-hub channel `herdr-tg disable` already
@@ -187,7 +193,9 @@ name*), matched against the `lane_topics` keys (`registry.rs:92`). Two rules the
 keep or it becomes a guess:
 
 1. **A seed with rooms is refused, never guessed.** A room's `repo` is its seed's
-   (`docs/CAPABILITIES.md:131`: *"join on `project_id`, never on the path alone"*), so a pane in
+   (`docs/CAPABILITIES.md`, offer 8: *"Join on `project_id`, and relate a room to its project by
+   `seed` — never on a path"* — cited by section, because the line it was quoted by moved the first
+   time that offer was rewritten), so a pane in
    that repo could be the seed or any of its rooms; `status` prints *"several conversations here"*
    and joins nothing until slice 4 stamps the key.
 2. **Two panes in one repo both join the same seed**, and `status` shows a conversation with

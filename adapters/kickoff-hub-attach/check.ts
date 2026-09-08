@@ -30,6 +30,7 @@
  * never answered" — which is the hub's honest reading of a deliberate check.
  */
 
+import { randomBytes } from 'crypto'
 import { statSync } from 'fs'
 import { join } from 'path'
 
@@ -164,7 +165,12 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
             t: 'hello',
             project_id: 'unknown-until-the-hub-says',
             token: project.token,
-            instance: `${process.pid}-check-${Date.now()}`,
+            // Random and then the millisecond, never the pid: this is the one string the hub keys
+            // a run by, and a pid means something only to this kernel and is issued again once its
+            // numbers wrap. Same shape as `ledger.ts` and `server.ts`; see `docs/ATTACHING.md` §3b.
+            instance: `${randomBytes(8).toString('hex')}-check-${Date.now()}`,
+            // Both LOCAL DETAIL and both kept deliberately for one release: a hub older than
+            // 8 September still REQUIRES them, and nothing routes on either.
             repo: project.repo,
             pid: process.pid,
             ...(CONFIG.address ? { lane: CONFIG.address } : {}),

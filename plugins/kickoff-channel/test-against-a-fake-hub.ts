@@ -231,6 +231,16 @@ check('it says hello with the secret from the repo', hello.token === 'a'.repeat(
 check('the envelope carries the protocol version', hello.v === 1)
 check('hello carries no display name', !('name' in hello) && !('title' in hello))
 check('hello names its own repo and pid', hello.repo === repo && typeof hello.pid === 'number')
+// The ratchet on what leaves this machine. The repo and the pid above are the two local things an
+// older hub still REQUIRES, and they are informational there (a path nothing routes on, a fence
+// only this kernel can read). The instance is not one of them: it is minted here, it is the one
+// string a whole fleet reads back — every open question is keyed on it — and it used to open with
+// this process's pid. A number the kernel hands out again the moment its numbers wrap has no
+// business being part of a name a fleet keys on, so it is random and stamped with the millisecond.
+check('hello_from_this_bridge_names_nothing_local_but_what_an_old_hub_still_requires_and_its_instance_carries_no_pid',
+  /^[0-9a-f]{16}-[0-9]{13,}$/.test(String(hello.instance)) &&
+    !String(hello.instance).split('-').includes(String(b.child.pid)),
+  JSON.stringify({ instance: hello.instance, pid: b.child.pid }))
 check('it found that repo without being told its own directory',
   hello.repo !== import.meta.dir, hello.repo)
 

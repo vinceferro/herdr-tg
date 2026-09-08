@@ -7,9 +7,15 @@
 //! no topic anywhere. The hub knows which connection is which project because it resolved a token
 //! at `hello`, and a bridge that tries to name a project is refused.
 //!
-//! `hello` is the proof: it carries `repo` and `instance` for the audit log and for a human
-//! reading it, and it deliberately does NOT carry a display name. The name comes from the
-//! registry. A bridge that could name itself could impersonate another project's topic.
+//! `hello` is the proof: it carries `instance`, and MAY carry `repo` and `pid`, for the audit log
+//! and for a human reading it, and it deliberately does NOT carry a display name. The name comes
+//! from the registry. A bridge that could name itself could impersonate another project's topic.
+//!
+//! Both are optional for the same reason the display name is absent: a path and a pid are facts
+//! about one machine, and neither is who anybody is. Identity on this wire is the pair of ids the
+//! hub names in `welcome` — the project and the conversation — which a bridge is TOLD and never
+//! works out for itself. A bridge that filled an absent id in from its own directory would put
+//! that directory back at the centre of fleet identity, which is the whole of what they remove.
 //!
 //! # Version skew is first-class
 //!
@@ -62,8 +68,11 @@ pub struct Envelope<P> {
     /// and serde refuses to read that, while a peer that set only the payload's would have it
     /// swallowed by this one and read back as nothing. This protocol has met that collision once
     /// already, when ping and pong tried to name their nonce `id`. **No payload field in either
-    /// direction may be named `generation`**; `a_generation_rides_on_every_frame_in_both_directions_and_is_named_exactly_once`
-    /// fails the day one is.
+    /// direction may be named `generation`** — nor `v`, nor `id`, for exactly the same reason;
+    /// `no_field_of_any_frame_shares_a_name_with_a_field_of_the_envelope_it_flattens_into` fails
+    /// the day one is, over every frame in both directions, and
+    /// `a_generation_rides_on_every_frame_in_both_directions_and_is_named_exactly_once` fails
+    /// beside it for this field.
     ///
     /// Absent means "I hold no generation". A zero says the same thing and is read as absent: a
     /// zero is a number a fence can compare and it would lose every comparison it was ever in, and
@@ -419,9 +428,28 @@ pub enum BridgeFrame {
         /// This run of the worker. A new instance invalidates every outstanding ask, so a tap on a
         /// menu drawn for a dead session is refused with a reason the operator can read.
         instance: String,
-        /// The repo path, for the audit record and for a human reading it. Never for routing.
-        repo: String,
-        pid: u32,
+        /// The repo path, for the audit record and for a human reading it. Never for routing —
+        /// the token beside it resolves the conversation, and it always did.
+        ///
+        /// Absent because a path is a LOCAL fact and not every bridge has one worth saying: inside
+        /// a wall its own directory is not the hub's, and a bridge on another machine names a path
+        /// that exists nowhere the hub can look. A hub that routed on this would be routing on a
+        /// string the sender chose; a hub that merely logs it loses nothing when it is absent.
+        ///
+        /// Optional here is additive only for a NEW hub reading an OLD bridge. An old hub declares
+        /// it required and refuses a hello without it before anything else happens, so every
+        /// adapter this repo ships keeps naming it for one release — see
+        /// `a_hub_from_before_this_change_still_requires_the_repo_and_the_pid_so_an_adapter_keeps_sending_them`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        repo: Option<String>,
+        /// This bridge's process id on the hub's own machine, when it has one to give.
+        ///
+        /// The hub compares it against what the kernel says about the peer, and says so in the
+        /// journal when the two disagree — a debugging aid, never a decision. A bridge that is not
+        /// on this machine has no pid this comparison could mean anything about, and says nothing
+        /// rather than a number that would make the journal lie. Same one-release rule as `repo`.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pid: Option<u32>,
         /// Absent means the project's own voice — which is every bridge shipped before this field
         /// existed, and is why it is optional rather than required.
         ///
@@ -572,6 +600,36 @@ pub enum HubFrame {
     /// number is useful in a log when someone is working out where a message went.
     Welcome {
         project: String,
+        /// The fleet's name for the PROJECT this conversation belongs to: the seed's own id.
+        ///
+        /// For a project's own voice this is the same id as [`Self::Welcome::conversation`]. For a
+        /// room — a conversation minted beside a project — it is the project the room hangs off,
+        /// which is the only way a reader relates the two without looking at a directory.
+        ///
+        /// It is here because until now the only thing a bridge learned about which conversation
+        /// it was, was `project`: a display title the registry owns, that the bridge cannot
+        /// predict and two projects may share. So anything that had to join two facts about one
+        /// conversation joined them on the one string both ends could see — the repo path — and a
+        /// path is not identity. It moves when the operator moves a directory, it differs inside a
+        /// wall, and it is his own filesystem going somewhere it need not go.
+        ///
+        /// Opaque, exactly like every other id here. Nothing may be READ out of it, and nothing
+        /// may be DERIVED for it: absence means this hub does not name its ids, never "work it out
+        /// from your own path".
+        ///
+        /// `skip_serializing_if`, so a hub that names none puts BYTE FOR BYTE what it always put
+        /// on the wire. A `"project_id":null` would be a key an older bridge has to tolerate for
+        /// no reason at all, on the one frame whose failure is a project that can never connect.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        project_id: Option<ProjectId>,
+        /// The id the secret resolved to: THIS conversation, whether that is a project's own voice
+        /// or a room. With [`Self::Welcome::lane`] beside it, the whole of this connection's
+        /// address as the hub knows it.
+        ///
+        /// Same rules as [`Self::Welcome::project_id`]: opaque, never derived, absent on every hub
+        /// built before it and skipped when absent.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        conversation: Option<ProjectId>,
         /// The lane the hub actually admitted, echoed back.
         ///
         /// It exists so a bridge that NAMED a lane can tell it was heard. An unknown field inside a
@@ -592,9 +650,10 @@ pub enum HubFrame {
         /// The absolute path of THIS conversation's outbox, as the hub sees it and as a wall must
         /// mount it: where an adapter copies a file before it sends the name on a `say`.
         ///
-        /// It has to be told. An adapter never learns its project id — `hello` carries a
-        /// placeholder and this frame carries a title — and inside a wall its own `$HOME` is not
-        /// the hub's, so nothing it holds can derive the path. Absent on every hub before files,
+        /// It has to be told. Inside a wall an adapter's own `$HOME` is not the hub's, so nothing
+        /// it holds can derive the path — and the two ids above do not help, because the
+        /// id-shaped segments are the smaller half of a path rooted in a state directory the
+        /// adapter cannot see. Absent on every hub before files,
         /// and **absence means this hub carries no files**: an adapter asked to send one then
         /// sends the words alone and says so in its own tool result, rather than sending a field
         /// the hub would strip in silence.
@@ -683,6 +742,124 @@ mod tests {
         Envelope::new(FrameId::new("f1"), p)
     }
 
+    /// The envelope's own field names, which its payload flattens in beside.
+    ///
+    /// Read by `no_field_of_any_frame_shares_a_name_with_a_field_of_the_envelope_it_flattens_into`.
+    const ENVELOPE_FIELDS: [&str; 3] = ["v", "id", "generation"];
+
+    /// One of every frame a bridge can send, with every optional field filled.
+    ///
+    /// ONE list, shared by the two tests that have to walk all of them — the generation stamp and
+    /// the envelope-name guard. Two copies would drift, and a frame missing from either list is a
+    /// frame whose collision nobody finds until a peer cannot read it.
+    fn every_bridge_frame() -> Vec<BridgeFrame> {
+        vec![
+            BridgeFrame::Hello {
+                project_id: ProjectId::new("p"),
+                token: "s".into(),
+                instance: "i".into(),
+                repo: Some("/r".into()),
+                pid: Some(1),
+                lane: Some(crate::ids::LaneId::new("engineering")),
+                confirms: Some(vec!["choice".into()]),
+            },
+            BridgeFrame::Say {
+                text: "x".into(),
+                hint: Some(SayHint::Prose),
+                file: Some(SayFile {
+                    name: "3c9e1b7a.png".into(),
+                    mime: Some("image/png".into()),
+                    filename: Some("chart.png".into()),
+                    r#as: Some(FileAs::Document),
+                }),
+            },
+            BridgeFrame::Done {
+                text: "built it".into(),
+                file: None,
+            },
+            BridgeFrame::Ask {
+                ask_id: AskId::new("a1"),
+                text: "ok?".into(),
+                options: Some(vec![AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                }]),
+            },
+            BridgeFrame::AskResolved {
+                ask_id: AskId::new("a1"),
+                how: AskEnd::Answered,
+                outcome: Some("No".into()),
+            },
+            BridgeFrame::Beat {
+                state: BeatState::Blocked,
+                note: Some("waiting".into()),
+            },
+            BridgeFrame::Ack {
+                r#ref: FrameId::new("f3"),
+                status: AckStatus::Accepted,
+                reason: Some("busy".into()),
+                files: Some(1),
+            },
+            BridgeFrame::Bye {
+                reason: "refresh".into(),
+            },
+            BridgeFrame::Pong {
+                r#ref: FrameId::new("f4"),
+            },
+        ]
+    }
+
+    /// One of every frame the hub can send, with every optional field filled. See
+    /// [`every_bridge_frame`] for why there is only one list.
+    fn every_hub_frame() -> Vec<HubFrame> {
+        vec![
+            HubFrame::Welcome {
+                project: "A Title".into(),
+                project_id: Some(ProjectId::new("p-9f3a1c2e5b7d")),
+                conversation: Some(ProjectId::new("c-4d1e6b0a7c22")),
+                lane: Some(crate::ids::LaneId::new("engineering")),
+                topic_id: Some(41),
+                limits: Limits {
+                    max_frame: 65536,
+                    max_text: 3500,
+                    frames_per_min: 20,
+                },
+                outbox: Some("/state/outbox/p-9f3a1c2e5b7d/engineering".into()),
+            },
+            HubFrame::Refused {
+                reason: RefusedReason::StaleGeneration,
+            },
+            HubFrame::Message {
+                msg_id: MsgId::new("m1"),
+                text: "hi".into(),
+                from: From {
+                    chat_id: -1001,
+                    user_id: 7,
+                },
+                in_reply_to_ask: Some(AskId::new("a1")),
+                files: Some(vec![MessageFile {
+                    kind: FileKind::Photo,
+                    path: Some("/state/media/p-9f3a1c2e5b7d/-/shot.jpg".into()),
+                    mime: Some("image/jpeg".into()),
+                    bytes: Some(1024),
+                    filename: Some("shot.jpg".into()),
+                    why: None,
+                }]),
+            },
+            HubFrame::Choice {
+                msg_id: MsgId::new("m2"),
+                ask_id: AskId::new("a1"),
+                option_id: OptionId::new("y"),
+            },
+            HubFrame::Ack {
+                r#ref: FrameId::new("f7"),
+                delivered: Delivered::No,
+                why: Some(AckWhy::StaleGeneration),
+            },
+            HubFrame::Ping,
+        ]
+    }
+
     #[test]
     fn an_envelope_is_one_flat_object_carrying_v_and_id_and_the_kind() {
         let json = serde_json::to_string(&env(BridgeFrame::Done {
@@ -730,8 +907,8 @@ mod tests {
             project_id: ProjectId::new("p-herdr-tg"),
             token: "s3cret".into(),
             instance: "i1".into(),
-            repo: "/home/u/Projects/herdr-tg".into(),
-            pid: 42,
+            repo: Some("/home/u/Projects/herdr-tg".into()),
+            pid: Some(42),
             lane: Some(crate::ids::LaneId::new("lane-0902-201212-2783563")),
             confirms: None,
         }))
@@ -755,8 +932,8 @@ mod tests {
             project_id: ProjectId::new("unknown-until-the-hub-says"),
             token: "s3cret".into(),
             instance: "i1".into(),
-            repo: "/home/u/Projects/herdr-tg".into(),
-            pid: 42,
+            repo: Some("/home/u/Projects/herdr-tg".into()),
+            pid: Some(42),
             lane: None,
             confirms: None,
         }))
@@ -783,8 +960,8 @@ mod tests {
                 project_id: ProjectId::new("p"),
                 token: "s".into(),
                 instance: "i".into(),
-                repo: "/r".into(),
-                pid: 1,
+                repo: Some("/r".into()),
+                pid: Some(1),
                 lane: None,
                 confirms: None,
             },
@@ -1260,6 +1437,8 @@ mod tests {
     fn a_welcome_without_an_outbox_is_byte_for_byte_the_welcome_this_protocol_has_always_sent() {
         let json = serde_json::to_string(&env(HubFrame::Welcome {
             project: "A Title".into(),
+            project_id: None,
+            conversation: None,
             lane: None,
             topic_id: None,
             limits: Limits {
@@ -1298,6 +1477,8 @@ mod tests {
         }
         let sent = serde_json::to_string(&env(HubFrame::Welcome {
             project: "A Title".into(),
+            project_id: None,
+            conversation: None,
             lane: Some(crate::ids::LaneId::new("engineering")),
             topic_id: None,
             limits: Limits {
@@ -1523,8 +1704,8 @@ mod tests {
                 project_id: ProjectId::new("unknown-until-the-hub-says"),
                 token: "s3cret".into(),
                 instance: "i1".into(),
-                repo: "/home/u/Projects/herdr-tg".into(),
-                pid: 42,
+                repo: Some("/home/u/Projects/herdr-tg".into()),
+                pid: Some(42),
                 lane: None,
                 confirms,
             }))
@@ -1548,8 +1729,8 @@ mod tests {
             project_id: ProjectId::new("p"),
             token: "s".into(),
             instance: "i".into(),
-            repo: "/r".into(),
-            pid: 1,
+            repo: Some("/r".into()),
+            pid: Some(1),
             lane: None,
             confirms: Some(vec!["choice".into()]),
         }))
@@ -1585,8 +1766,8 @@ mod tests {
             project_id: ProjectId::new("p"),
             token: "s".into(),
             instance: "i".into(),
-            repo: "/r".into(),
-            pid: 1,
+            repo: Some("/r".into()),
+            pid: Some(1),
             lane: None,
             confirms: Some(vec!["choice".into()]),
         }))
@@ -1609,6 +1790,8 @@ mod tests {
         // that has never been written is the way a zero gets minted in the first place.
         let plain = env(HubFrame::Welcome {
             project: "A Title".into(),
+            project_id: None,
+            conversation: None,
             lane: None,
             topic_id: None,
             limits: Limits {
@@ -1664,6 +1847,8 @@ mod tests {
         let sent = serde_json::to_string(
             &env(HubFrame::Welcome {
                 project: "A Title".into(),
+                project_id: None,
+                conversation: None,
                 lane: None,
                 topic_id: None,
                 limits: Limits {
@@ -1700,8 +1885,8 @@ mod tests {
             project_id: ProjectId::new("p"),
             token: "s".into(),
             instance: "i".into(),
-            repo: "/r".into(),
-            pid: 1,
+            repo: Some("/r".into()),
+            pid: Some(1),
             lane: None,
             confirms: Some(vec![]),
         }))
@@ -1751,6 +1936,8 @@ mod tests {
         // payload's would have it swallowed by the envelope and read back as nothing.
         let stamped = env(HubFrame::Welcome {
             project: "A Title".into(),
+            project_id: None,
+            conversation: None,
             lane: None,
             topic_id: None,
             limits: Limits {
@@ -1783,52 +1970,7 @@ mod tests {
         // that matters later: the day somebody adds a payload field called `generation` to any
         // frame in either direction, that frame starts going out with the word twice and serde
         // refuses to read it back. This is the test that says so, rather than the operator.
-        let bridge = vec![
-            BridgeFrame::Hello {
-                project_id: ProjectId::new("p"),
-                token: "s".into(),
-                instance: "i".into(),
-                repo: "/r".into(),
-                pid: 1,
-                lane: None,
-                confirms: Some(vec!["choice".into()]),
-            },
-            BridgeFrame::Say {
-                text: "x".into(),
-                hint: None,
-                file: None,
-            },
-            BridgeFrame::Done {
-                text: "built it".into(),
-                file: None,
-            },
-            BridgeFrame::Ask {
-                ask_id: AskId::new("a1"),
-                text: "ok?".into(),
-                options: None,
-            },
-            BridgeFrame::AskResolved {
-                ask_id: AskId::new("a1"),
-                how: AskEnd::Answered,
-                outcome: None,
-            },
-            BridgeFrame::Beat {
-                state: BeatState::Blocked,
-                note: None,
-            },
-            BridgeFrame::Ack {
-                r#ref: FrameId::new("f3"),
-                status: AckStatus::Accepted,
-                reason: None,
-                files: None,
-            },
-            BridgeFrame::Bye {
-                reason: "refresh".into(),
-            },
-            BridgeFrame::Pong {
-                r#ref: FrameId::new("f4"),
-            },
-        ];
+        let bridge = every_bridge_frame();
         for f in bridge {
             let json =
                 serde_json::to_string(&env(f.clone()).with_generation(7)).expect("serialises");
@@ -1843,43 +1985,7 @@ mod tests {
             assert_eq!(back.payload, f, "the stamp changed the frame: {json}");
         }
 
-        let hub = vec![
-            HubFrame::Welcome {
-                project: "A Title".into(),
-                lane: None,
-                topic_id: None,
-                limits: Limits {
-                    max_frame: 65536,
-                    max_text: 3500,
-                    frames_per_min: 20,
-                },
-                outbox: None,
-            },
-            HubFrame::Refused {
-                reason: RefusedReason::StaleGeneration,
-            },
-            HubFrame::Message {
-                msg_id: MsgId::new("m1"),
-                text: "hi".into(),
-                from: From {
-                    chat_id: -1001,
-                    user_id: 7,
-                },
-                files: None,
-                in_reply_to_ask: None,
-            },
-            HubFrame::Choice {
-                msg_id: MsgId::new("m2"),
-                ask_id: AskId::new("a1"),
-                option_id: OptionId::new("y"),
-            },
-            HubFrame::Ack {
-                r#ref: FrameId::new("f7"),
-                delivered: Delivered::No,
-                why: Some(AckWhy::StaleGeneration),
-            },
-            HubFrame::Ping,
-        ];
+        let hub = every_hub_frame();
         for f in hub {
             let json =
                 serde_json::to_string(&env(f.clone()).with_generation(7)).expect("serialises");
@@ -1937,5 +2043,315 @@ mod tests {
             !promises_to_confirm(&Some(vec!["CHOICE".into()]), "choice"),
             "a name that is not the frame's own name promised something"
         );
+    }
+
+    // ── fleet identity ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_welcome_names_the_project_and_the_conversation_by_id_so_nothing_has_to_join_on_a_path() {
+        // What a bridge could learn about which conversation it is, before this: `project`, a
+        // display title the registry owns and the bridge cannot predict. So anything that had to
+        // relate two facts about one conversation related them on the only thing both sides could
+        // see — the repo path in its own `hello`. A path is not identity: it moves, it differs
+        // inside a wall, and it is the operator's own directory going somewhere it need not go.
+        // These two are the fleet's names for it: the seed's id, and the id the secret resolved to.
+        let json = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            project_id: Some(ProjectId::new("p-9f3a1c2e5b7d")),
+            conversation: Some(ProjectId::new("c-4d1e6b0a7c22")),
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","project_id":"p-9f3a1c2e5b7d","conversation":"c-4d1e6b0a7c22","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#
+        );
+        let back: Envelope<HubFrame> =
+            serde_json::from_str(&json).expect("the welcome that admits a bridge must be readable");
+        let HubFrame::Welcome {
+            project_id,
+            conversation,
+            ..
+        } = back.payload
+        else {
+            panic!("a welcome stopped being a welcome")
+        };
+        assert_eq!(project_id, Some(ProjectId::new("p-9f3a1c2e5b7d")));
+        assert_eq!(conversation, Some(ProjectId::new("c-4d1e6b0a7c22")));
+    }
+
+    #[test]
+    fn a_welcome_that_names_no_ids_is_byte_for_byte_the_welcome_this_protocol_has_always_sent() {
+        // Every hub built before these fields, and every path inside this one that cannot work out
+        // a seed, puts exactly this on the wire. Pinned as BYTES rather than as a round trip,
+        // because a round trip stays green when a `"project_id":null` has appeared — two keys an
+        // older bridge would have to tolerate for no reason at all, on the one frame whose failure
+        // is a project that can never connect.
+        let json = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            project_id: None,
+            conversation: None,
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#
+        );
+    }
+
+    #[test]
+    fn a_welcome_naming_its_ids_still_parses_on_a_bridge_that_has_never_heard_of_them() {
+        // The bridge in the operator's own session restarts only when his conversation does, so it
+        // will read a welcome carrying two words it has no field for. It must go on being welcomed
+        // — a parse error at `welcome` is a project that can never connect. Modelled as a TYPE:
+        // `welcome` exactly as this crate shipped it before the ids, same tag, same envelope, same
+        // flatten, so the tolerance is read off the shape the old bridge actually has.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum HubFrameBeforeIds {
+            Welcome {
+                project: String,
+                #[serde(default)]
+                lane: Option<crate::ids::LaneId>,
+                #[serde(default)]
+                topic_id: Option<i32>,
+                limits: Limits,
+                #[serde(default)]
+                outbox: Option<String>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            project_id: Some(ProjectId::new("p-9f3a1c2e5b7d")),
+            conversation: Some(ProjectId::new("c-4d1e6b0a7c22")),
+            lane: Some(crate::ids::LaneId::new("engineering")),
+            topic_id: Some(41),
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+        }))
+        .expect("serialises");
+        let old: Envelope<HubFrameBeforeIds> = serde_json::from_str(&sent)
+            .expect("a bridge older than the ids must still be welcomed");
+        assert!(
+            matches!(old.payload, HubFrameBeforeIds::Welcome { ref project, ref lane, .. }
+                if project == "A Title" && lane.as_ref().is_some_and(|l| l.as_str() == "engineering")),
+            "{old:?}"
+        );
+    }
+
+    #[test]
+    fn a_welcome_from_a_hub_that_names_no_ids_reads_back_as_naming_neither_rather_than_guessing_one()
+     {
+        // The other direction of the same skew, and the one that decides how a new bridge must be
+        // written: absence means "this hub does not know its own ids", never "the conversation is
+        // whatever I can work out from my own path". A bridge that filled the gap from a path
+        // would put the operator's directory back at the centre of fleet identity, which is the
+        // whole of what this change removes.
+        let read: Envelope<HubFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#,
+        )
+        .expect("the welcome every hub has always sent must not be a parse error");
+        assert_eq!(
+            read.payload,
+            HubFrame::Welcome {
+                project: "A Title".into(),
+                project_id: None,
+                conversation: None,
+                lane: None,
+                topic_id: None,
+                limits: Limits {
+                    max_frame: 65536,
+                    max_text: 3500,
+                    frames_per_min: 20,
+                },
+                outbox: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hello_that_names_no_repo_and_no_pid_is_a_hello_that_named_neither_and_not_a_parse_error() {
+        // A path and a pid are LOCAL facts. The hub never routed on either — the token resolves
+        // the conversation and the socket proves the peer — so a bridge that has neither to give,
+        // because it is inside a wall or on another machine, must still be able to say hello.
+        // Neither key goes on the wire when it has nothing to put there: a `"repo":null` is a key
+        // an older hub would have to tolerate for nothing, on the frame whose failure is a project
+        // that can never connect.
+        let json = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("unknown-until-the-hub-says"),
+            token: "s3cret".into(),
+            instance: "i1".into(),
+            repo: None,
+            pid: None,
+            lane: None,
+            confirms: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"s3cret","instance":"i1"}"#
+        );
+        let read: Envelope<BridgeFrame> = serde_json::from_str(&json).expect("round trips");
+        assert_eq!(
+            read.payload,
+            BridgeFrame::Hello {
+                project_id: ProjectId::new("unknown-until-the-hub-says"),
+                token: "s3cret".into(),
+                instance: "i1".into(),
+                repo: None,
+                pid: None,
+                lane: None,
+                confirms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hello_that_still_names_its_repo_and_its_pid_is_byte_for_byte_the_hello_it_always_was() {
+        // Optional is not gone. Every adapter this repo ships keeps naming both for one release,
+        // and the bytes it puts on the wire must not move by a single character while it does —
+        // a hub older than this change reads them as required fields.
+        let json = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("unknown-until-the-hub-says"),
+            token: "s3cret".into(),
+            instance: "i1".into(),
+            repo: Some("/srv/projects/herdr-tg".into()),
+            pid: Some(42),
+            lane: None,
+            confirms: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"s3cret","instance":"i1","repo":"/srv/projects/herdr-tg","pid":42}"#
+        );
+        // And the hello already on every wire today reads back as one that named both, never as
+        // one that named neither.
+        let read: Envelope<BridgeFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f2","t":"hello","project_id":"p","token":"s","instance":"i","repo":"/r","pid":1}"#,
+        )
+        .expect("the hello every bridge has always sent must not be a parse error");
+        assert_eq!(
+            read.payload,
+            BridgeFrame::Hello {
+                project_id: ProjectId::new("p"),
+                token: "s".into(),
+                instance: "i".into(),
+                repo: Some("/r".into()),
+                pid: Some(1),
+                lane: None,
+                confirms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_hub_from_before_this_change_still_requires_the_repo_and_the_pid_so_an_adapter_keeps_sending_them()
+     {
+        // The asymmetry that decides the rollout order, pinned so nobody drops the two fields from
+        // an adapter a release early. Making them optional here is additive for a NEW hub reading
+        // an OLD bridge; it is not additive the other way — an old hub declares both required, and
+        // a hello without them is refused before anything else can happen, leaving the operator a
+        // project that will not connect and a message about a secret that is perfectly good.
+        // Modelled as a TYPE: `hello` exactly as this crate shipped it, both required.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BridgeFrameBeforeIds {
+            Hello {
+                project_id: ProjectId,
+                token: String,
+                instance: String,
+                repo: String,
+                pid: u32,
+                #[serde(default)]
+                lane: Option<crate::ids::LaneId>,
+                #[serde(default)]
+                confirms: Option<Vec<String>>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let naming_both = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: Some("/r".into()),
+            pid: Some(1),
+            lane: None,
+            confirms: Some(vec!["choice".into()]),
+        }))
+        .expect("serialises");
+        let old: Envelope<BridgeFrameBeforeIds> = serde_json::from_str(&naming_both)
+            .expect("an old hub must still admit an adapter that names both");
+        assert!(
+            matches!(old.payload, BridgeFrameBeforeIds::Hello { ref instance, .. } if instance == "i"),
+            "{old:?}"
+        );
+
+        let naming_neither = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: None,
+            pid: None,
+            lane: None,
+            confirms: Some(vec!["choice".into()]),
+        }))
+        .expect("serialises");
+        let refused = serde_json::from_str::<Envelope<BridgeFrameBeforeIds>>(&naming_neither);
+        assert!(
+            refused.is_err(),
+            "an old hub read a hello that named no repo, so an adapter could drop it early: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn no_field_of_any_frame_shares_a_name_with_a_field_of_the_envelope_it_flattens_into() {
+        // The collision this crate has now met twice: ping and pong named their nonce `id`, and
+        // the generation could only ever live on the envelope. `flatten` puts the payload's keys
+        // and the envelope's in ONE object, so a name used by both is one key, not two — a sender
+        // that fills both emits a duplicate key serde refuses outright, and a sender that fills
+        // only the payload's has it swallowed on the way in and read back as nothing. Neither
+        // failure looks wrong until a round trip, which is why the guard is over EVERY frame in
+        // both directions rather than over the two that have already been caught by it.
+        for f in every_bridge_frame() {
+            let payload = serde_json::to_value(&f).expect("serialises");
+            for name in ENVELOPE_FIELDS {
+                assert!(
+                    payload.get(name).is_none(),
+                    "this frame has a field named after the envelope's own `{name}`: {payload}"
+                );
+            }
+        }
+        for f in every_hub_frame() {
+            let payload = serde_json::to_value(&f).expect("serialises");
+            for name in ENVELOPE_FIELDS {
+                assert!(
+                    payload.get(name).is_none(),
+                    "this frame has a field named after the envelope's own `{name}`: {payload}"
+                );
+            }
+        }
     }
 }

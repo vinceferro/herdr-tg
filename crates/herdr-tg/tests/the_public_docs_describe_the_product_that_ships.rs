@@ -405,3 +405,62 @@ fn the_tracker_points_at_what_is_maintained_instead_of_keeping_a_second_copy() {
         );
     }
 }
+
+/// Every `.rs` file under the workspace's crates, so a sentence cannot hide by moving one file over.
+fn every_rust_source() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![repo().join("crates")];
+    while let Some(dir) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// The premise the welcome's two ids overturned, still written down beside the field that overturned it.
+///
+/// This is not pedantry about a comment. The sentence was the reason a reader was given for why the
+/// outbox path has to be sent at all, and it sat three lines under `project_id` — the field that now
+/// names the very thing it says is unknowable. Somebody implementing `outbox` reads it first, and
+/// the whole point of the identity section in `docs/ATTACHING.md` is that a fleet name is knowable.
+/// The reason the path must still be told survives (a wall's `$HOME` is not the hub's); only the
+/// premise is dead, so the way to keep it dead is to refuse the sentence anywhere in the source.
+#[test]
+fn no_source_file_still_says_an_adapter_can_never_learn_which_conversation_it_is() {
+    let mut stale = Vec::new();
+    // This file is the one place the sentence is allowed to appear, because refusing a sentence
+    // means spelling it. Skipping it by name rather than by a cleverer needle keeps the needle a
+    // plain substring, which is what makes it survive a rewording of the comment it hunts.
+    let myself = repo().join(file!());
+    for path in every_rust_source() {
+        if path == myself {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for (n, line) in text.lines().enumerate() {
+            let l = line.to_ascii_lowercase();
+            if l.contains("never learns its project id") || l.contains("never learn its project id")
+            {
+                stale.push(format!(
+                    "{}:{}",
+                    path.strip_prefix(repo()).unwrap_or(&path).display(),
+                    n + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "the welcome now names the conversation and the project by id, and these still say it \
+         cannot be known: {stale:?}"
+    );
+}

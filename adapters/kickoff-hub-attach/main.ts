@@ -23,6 +23,7 @@
  * "the directory I was started in, and whoever typed this vouches for it".
  */
 
+import { randomBytes } from 'crypto'
 import { chmodSync, mkdtempSync, rmSync } from 'fs'
 import { join } from 'path'
 
@@ -206,8 +207,12 @@ note(`the door is ${door}`)
  * of the producers behind the door the watcher is the one that carries his typed words, and when
  * every producer refuses them the door forwards the watcher's reason over a tool server's. Null
  * without `--opencode`, and then there is no carrier to prefer.
+ *
+ * Random, then the millisecond — never this process's pid, which it once opened with. The `w`
+ * stays, because a person reading a ledger dump wants to see at a glance which of the voices at
+ * this door is the watcher; what goes is the number, which says nothing outside this kernel.
  */
-const WATCHER_INSTANCE = ARGS.opencode ? `${process.pid}-w-${Date.now()}` : null
+const WATCHER_INSTANCE = ARGS.opencode ? `${randomBytes(8).toString('hex')}-w-${Date.now()}` : null
 
 const relay = createRelay({
   projectDir: CONFIG.projectDir,
