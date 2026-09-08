@@ -6689,6 +6689,213 @@ async fn the_hub_writes_down_who_is_connected_for_a_process_that_is_not_the_hub(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_that_cannot_reach_the_disk_never_holds_the_lock_every_delivery_takes() {
+    // The same defect as the run number's, one door down. `deliver_under` reads the claims map to
+    // find the bridge a message is going to, so a file write held inside that lock is not this
+    // project's problem: it is every project's messages stopped behind one disk. Deciding WHAT to
+    // write has to happen under the lock — a snapshot of a map something else is changing is a
+    // snapshot of nothing — but writing it down does not.
+    //
+    // A full disk is hard to arrange and a slow one is worse to test against. A FIFO where the
+    // write's temp file goes is neither: `open` for writing blocks there until somebody reads it,
+    // which is a write that never lands, on demand and with no waiting.
+    let h = harness().await;
+    let stuck = h
+        .dir
+        .path()
+        .join(crate::presence::FILE)
+        .with_extension(format!("json.tmp.{}", std::process::id()));
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&stuck)
+            .status()
+            .expect("mkfifo is on the box")
+            .success(),
+        "the test could not arrange a write that blocks, so it proves nothing"
+    );
+
+    // Its `hello` takes the address, which changes the claims map, which is the write that cannot
+    // land.
+    let _bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+
+    // THE PROBE RUNS ON A THREAD OF ITS OWN, AND ASKS WITH `try_lock`, for the reason the run
+    // number's own probe does: a write blocking inside a task parks the runtime worker it is on,
+    // and a parked worker takes the timer wheel with it — so a probe that slept on the runtime
+    // would hang rather than fail, and a test that hangs says nothing about why.
+    let hub = Arc::clone(&h.hub);
+    let mine = h.own();
+    let probe = std::thread::spawn(move || {
+        for _ in 0..200 {
+            if let Ok(live) = hub.claims.try_lock()
+                && live.contains_key(&mine)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    });
+    let answered = probe.join().expect("the probe thread");
+
+    // Let the write land, and WAIT for it, before anything is asserted. A failed assertion takes
+    // the temp directory with it, and a FIFO whose name is gone can never be opened by a reader
+    // again — so the write would stay blocked on a thread the runtime waits for on its way out,
+    // and the test would hang instead of saying what was wrong.
+    std::thread::spawn(move || {
+        let _ = std::fs::read(&stuck);
+    })
+    .join()
+    .expect("the thread that lets the write land");
+    assert!(
+        answered,
+        "a bridge claimed the address and the claims lock never came free while the snapshot of \
+         who is connected sat in a write that could not land: every other project's delivery is \
+         behind that one file"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_that_reaches_the_disk_late_never_takes_the_file_back_to_what_it_said() {
+    // The half of moving the write off the lock that the run number's file did not need. Two
+    // changes to the claims map decide their snapshots in one order and then race for one file,
+    // and nothing about a disk says the first one there is the first one decided — a slow write
+    // and a fast one, two blocking threads, an unlucky scheduler. Whichever way they land, the
+    // file has to end up saying what the LATER one said: a stale snapshot winning leaves it
+    // naming a bridge that has gone, which is exactly what sends the operator to a conversation
+    // nothing is listening to.
+    //
+    // The ordering here is the worst case rather than a likely one, on purpose: the earlier
+    // snapshot reaches the disk after the later one has already been and gone.
+    let h = harness().await;
+    let presence = crate::presence::Presence::new(h.dir.path().join(crate::presence::FILE));
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || h.hub.is_claimed(&h.own()).await).await;
+
+    // Decided while the bridge is connected, and not written.
+    let older = {
+        let claims = h.hub.claims.lock().await;
+        h.hub.note_who_is_connected(&claims)
+    };
+
+    // The bridge goes, and the hub writes THAT down itself — a later snapshot, already on disk.
+    drop(bridge);
+    until(async || presence.read().is_ok_and(|s| s.connected.is_empty())).await;
+
+    // Now the earlier one finally reaches the disk.
+    h.hub.put_who_is_connected_on_disk(older).await;
+    assert!(
+        presence.read().expect("readable").connected.is_empty(),
+        "a snapshot taken while a bridge was connected landed after the one that said it had gone, \
+         and the file went back to naming a connection that is not there"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_the_hub_could_not_write_from_its_own_thread_is_removed_rather_than_left_stale()
+{
+    // The property that had to survive the write moving off the claims lock and onto a thread of
+    // its own. Temp-and-rename leaves the PREVIOUS file in place when a write fails, and that file
+    // carries this hub's own pid — so every check `projects --json` makes on it holds, and it goes
+    // on naming bridges that have since left for as long as this hub lives. `presence::write`
+    // unlinks it instead, and unknown is an answer a reader can act on where a confident lie is
+    // not. Proven here through the hub's real claim path rather than only at the file's own seam,
+    // because a write on a blocking thread whose error nobody reads would lose exactly this.
+    let h = harness().await;
+    let presence = crate::presence::Presence::new(h.dir.path().join(crate::presence::FILE));
+    // What `projects --json` demands before it will believe the file at all: a lock file naming a
+    // holder that is alive and is a herdr. This process is both.
+    std::fs::write(
+        h.dir.path().join("hub.lock"),
+        std::process::id().to_string(),
+    )
+    .expect("lock");
+    assert!(
+        crate::presence::vouched_for(h.dir.path()).is_some(),
+        "the snapshot written at construction is not believed, so this test would prove nothing"
+    );
+
+    // The rewrite cannot happen: a directory sits where the temp file goes, which is a write that
+    // fails the way a full partition or a read-only filesystem does.
+    let tmp = presence
+        .path()
+        .with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::create_dir(&tmp).expect("a directory in the way");
+
+    // A bridge arrives, so the map changes and the hub tries to write it down. The welcome is not
+    // sent until the claim has been through that write, so waiting for it is waiting for the write.
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()).await;
+    bridge.become_live().await;
+
+    assert!(
+        !presence.path().exists(),
+        "a snapshot the hub could not rewrite was left on disk, and it carries this hub's pid: \
+         `projects --json` will believe it and name whoever was connected when it was written"
+    );
+    assert!(
+        crate::presence::vouched_for(h.dir.path()).is_none(),
+        "a snapshot the hub could not rewrite is still believed"
+    );
+}
+
+/// What the snapshot on disk says, once it agrees with the claims map — or whatever it says after
+/// two seconds of not agreeing, so the assertion that follows can print BOTH sides instead of a
+/// bare timeout that names neither.
+async fn what_the_file_says_once_it_has_caught_up(
+    presence: &crate::presence::Presence,
+    hub: &Hub<FakeTelegram>,
+) -> BTreeSet<Addr> {
+    let on_disk = || -> BTreeSet<Addr> {
+        presence
+            .read()
+            .map(|s| s.connected.iter().map(|c| c.addr()).collect())
+            .unwrap_or_default()
+    };
+    for _ in 0..200 {
+        if on_disk() == hub.connected_ids().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    on_disk()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_file_catches_up_with_the_map_when_conversations_arrive_and_leave_at_the_same_moment() {
+    // The property the ordering guard must not cost. Dropping an older snapshot is only safe
+    // because the NEWEST one can never be the one dropped — nothing is minted above it — so
+    // however many changes race, the last word on disk is the last change to the map. A guard
+    // that got that wrong would leave the file permanently one arrival or one departure behind,
+    // which nothing else in this suite would notice: every other presence test changes the map
+    // once and waits.
+    let h = harness().await;
+    let presence = crate::presence::Presence::new(h.dir.path().join(crate::presence::FILE));
+
+    // Three conversations of one project, arriving together rather than in turn.
+    let (mut own, mut a, mut b) = tokio::join!(
+        FakeBridge::connect(&h.sock, &h.secret, "i0", h.project.as_str()),
+        FakeBridge::connect_as(&h.sock, &h.secret, "ia", h.project.as_str(), Some(LANE_A)),
+        FakeBridge::connect_as(&h.sock, &h.secret, "ib", h.project.as_str(), Some(LANE_B)),
+    );
+    tokio::join!(own.become_live(), a.become_live(), b.become_live());
+    until(async || h.hub.connected_ids().await.len() == 3).await;
+    assert_eq!(
+        what_the_file_says_once_it_has_caught_up(&presence, &h.hub).await,
+        h.hub.connected_ids().await,
+        "three arrivals racing and the file never caught up with the map"
+    );
+
+    // And one of them leaves while the map is busy.
+    drop(a);
+    until(async || !h.hub.is_claimed(&h.lane(LANE_A)).await).await;
+    assert_eq!(
+        what_the_file_says_once_it_has_caught_up(&presence, &h.hub).await,
+        h.hub.connected_ids().await,
+        "a conversation left and the file was still naming it"
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────────────────────────────────
 // Reactions as delivery receipts: a mark on HIS message, where he typed it, for each stage the hub
 // already knows. Measured free against the send ceiling (`docs/RATE-PROBE.md` §3).

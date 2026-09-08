@@ -550,10 +550,16 @@ Stated plainly, because everything above reads better than the evidence.
    bridges are outside of would still evict the fleet. Until that is replaced, the hub and its bridges
    **must share a pid namespace**. The module's own note says the repair "lands in a later slice"; the
    kick half of it has since landed, the `/proc` half has not, so read that comment as half-stale.
-6. **The run-number file is written inside the claim lock.** `Generations::mint` calls `write()`
-   (`hub.rs:1795`) while `claim_the_address` holds `self.claims` (`hub.rs:2655`, `:2709`), so a full
-   disk or a slow filesystem stalls delivery for every address. Named as an open risk in `b1d6c5a` and
-   **not** closed by `309756f`, which closed only the lease-stripping risk. Still true in the tree.
+6. **CLOSED since this document was written.** It read: the run-number file is written inside the
+   claim lock, so a full disk or a slow filesystem stalls delivery for every address. It was named as
+   an open risk in `b1d6c5a` and not closed by `309756f`. Both that write and the presence write have
+   since moved off the lock — the number and the snapshot are still decided under it, because two
+   claims microseconds apart must not be handed the same lease and a snapshot must be consistent, but
+   the writing happens on a blocking thread outside it, awaited, its error said. Presence needed more
+   than the run-number half: the writer never touches the claims lock at all, and a sequence minted
+   under it makes a later snapshot always win, so a slow write cannot put a list the hub has moved
+   past back on disk. A failed write still removes the file rather than leaving a stale one carrying
+   this hub's pid, which a reader would believe.
 7. **No leg of the heartbeat proves a tap was acted on.** A handler that took one and hung looks green
    until the wedge backs up far enough to stop the stream being driven. `heartbeat.rs` says so rather
    than implying it. The alarm still restarts nothing; that belongs to whoever dispatches.

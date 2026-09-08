@@ -1600,6 +1600,24 @@ struct Claim {
     kick: mpsc::Sender<Kick>,
 }
 
+/// Who was connected at one moment, and where that moment sits in the order the map changed.
+///
+/// It exists because the two halves of writing the presence file want opposite things. Deciding
+/// the list needs the claims lock — a list read off a map something else is changing is a list of
+/// no moment at all. Writing it must not hold that lock, because the same lock is how a message
+/// finds the bridge it is going to. So the list is decided under the lock, carried out of it, and
+/// written by [`Hub::put_who_is_connected_on_disk`] with nothing held that a delivery wants.
+#[must_use = "a snapshot decided under the claims lock and never written leaves the file naming \
+              connections that have since gone; hand it to `put_who_is_connected_on_disk`"]
+struct WhoIsConnected {
+    /// Which change to the map this is, minted under the claims lock — so this order IS the order
+    /// the map changed in. The order the writes reach the DISK is not, and cannot be made to be:
+    /// two writers let go of the lock and then race for one file. Comparing this is what makes a
+    /// later snapshot win over an earlier one whatever order they arrive in.
+    at: u64,
+    connected: Vec<Addr>,
+}
+
 /// What an arriving run said about itself at `hello`, and what its claim has to remember of it.
 ///
 /// One value rather than three arguments, because all three are the same fact — what this run
@@ -2104,11 +2122,28 @@ pub struct Hub<S: Surface> {
     /// The claims map, written down for a process that is not this one.
     ///
     /// `herdr-tg projects --json` runs at a terminal and has to say who is connected from the one
-    /// place that knows, which is here. Rewritten whole every time the map changes, under the
-    /// claims lock so two changes cannot publish out of order; a claim or release happens a dozen
-    /// times a day, so the write is nowhere near a hot path. See `presence.rs` for why a file and
-    /// what a reader must check before believing it.
+    /// place that knows, which is here. Rewritten whole every time the map changes — DECIDED under
+    /// the claims lock and written with it let go, which is [`WhoIsConnected`]'s whole reason to
+    /// exist. See `presence.rs` for why a file and what a reader must check before believing it.
     presence: crate::presence::Presence,
+    /// The order the claims map has actually changed in.
+    ///
+    /// Minted under the claims lock, so these numbers are handed out in the order the map really
+    /// changed. Nothing else about them is ordered and nothing else needs to be — the lock is what
+    /// gives them their meaning, and `Relaxed` is honest about the atomic contributing nothing
+    /// beyond a distinct number.
+    presence_order: AtomicU64,
+    /// Whose turn it is to put the claims map on disk, and the highest [`WhoIsConnected::at`] that
+    /// has already been taken to the disk.
+    ///
+    /// The number lives INSIDE the permit because the permit is the only thing allowed to read or
+    /// change it: one writer at a time, and each one decides against what the last one did.
+    ///
+    /// Taken with the claims lock let go, never inside it — that is the fix — and it never reaches
+    /// for the claims lock itself. That direction is deliberate: a writer that re-read the map
+    /// under this permit would be the neater code and would deadlock the whole hub the first time
+    /// a call site kept hold of the claims lock while asking for a write.
+    presence_writes: Arc<Mutex<u64>>,
     /// One outbound budget per chat, because Telegram's ceiling is per chat and forum topics do
     /// not get one of their own. Six busy projects share it.
     budgets: Arc<Mutex<crate::queue::Budgets>>,
@@ -2289,6 +2324,8 @@ impl<S: Surface> Hub<S> {
             audit: Arc::new(audit),
             claims: Arc::new(Mutex::new(BTreeMap::new())),
             presence,
+            presence_order: AtomicU64::new(0),
+            presence_writes: Arc::new(Mutex::new(0)),
             budgets: Arc::new(Mutex::new(crate::queue::Budgets::default())),
             send_permit: Arc::new(Mutex::new(())),
             throttle: Arc::new(Mutex::new(Throttle::default())),
@@ -2678,6 +2715,7 @@ impl<S: Surface> Hub<S> {
         let (kick, kicked) = mpsc::channel(1);
         let generation;
         let highest_was;
+        let who;
         {
             let mut claims = self.claims.lock().await;
             let highest = self
@@ -2769,7 +2807,7 @@ impl<S: Surface> Hub<S> {
                     kick,
                 },
             );
-            self.note_who_is_connected(&claims);
+            who = self.note_who_is_connected(&claims);
         }
         // WITH THE CLAIMS LOCK LET GO, and still before the number is handed to anybody. Deciding
         // the number needs the lock — two claims racing must not be given the same one, which is
@@ -2779,6 +2817,12 @@ impl<S: Surface> Hub<S> {
         // message is going to. What waits here now is this one connection's welcome, waiting for
         // its own number to reach the disk, which is the order that was always intended.
         self.write_down_the_run_numbers().await;
+        // The same move, for the file next door — and AFTER the numbers, deliberately. Both are
+        // out of the lock now, so neither is in anybody else's way; what the order decides is
+        // which one gets written when a disk takes a write and never finishes it. The numbers are
+        // the half that matters, because losing one can hand a second run the lease of the first
+        // after a restart, where losing this one only makes `projects --json` say unknown.
+        self.put_who_is_connected_on_disk(who).await;
         Ok((generation, highest_was, kicked))
     }
 
@@ -2842,19 +2886,77 @@ impl<S: Surface> Hub<S> {
         (highest > mine).then_some(highest)
     }
 
-    /// Write the claims map down for `projects --json`, which runs in another process.
+    /// Decide what `projects --json` should be told, with the claims lock HELD — and write nothing.
     ///
-    /// Called with the claims lock HELD, deliberately: two changes racing to write would otherwise
-    /// publish whichever finished last, and a snapshot that says a bridge is connected after it
-    /// has gone is the one thing the reader's own checks cannot catch. A failed write is logged
-    /// and nothing else — the map in memory is the truth and delivery does not depend on this.
-    fn note_who_is_connected(&self, claims: &BTreeMap<Addr, Claim>) {
-        if let Err(e) = self.presence.write(claims.keys()) {
-            tracing::error!(
-                error = %e, path = %self.presence.path().display(),
-                "could not write down who is connected; `projects --json` will be stale"
-            );
+    /// The snapshot has to be taken under the lock, because a list read off a map something else
+    /// is changing is a list of no moment at all. The write must not be: this file used to be put
+    /// on disk right here, so a disk that was slow or full stopped every project's delivery and
+    /// not just this claim — `deliver_under` reads the same map to find the bridge a message is
+    /// going to. What comes back is handed to [`Self::put_who_is_connected_on_disk`] once the lock
+    /// is let go, and it is `#[must_use]` so that forgetting to is a build failure rather than a
+    /// file that quietly stops following the map.
+    fn note_who_is_connected(&self, claims: &BTreeMap<Addr, Claim>) -> WhoIsConnected {
+        WhoIsConnected {
+            at: self.presence_order.fetch_add(1, Ordering::Relaxed) + 1,
+            connected: claims.keys().cloned().collect(),
         }
+    }
+
+    /// Put a snapshot of who is connected on disk, holding no lock a delivery wants.
+    ///
+    /// **Awaited and read, never spawned and forgotten**, for [`Self::write_down_the_run_numbers`]'s
+    /// reason: a hub whose disk is refusing writes would otherwise go on claiming and releasing
+    /// with nothing anywhere saying the file had stopped following it. What waits is this one
+    /// connection's own welcome or goodbye, and nothing else in the process waits with it.
+    ///
+    /// A write that fails does NOT refuse the claim, and it does not leave the last snapshot in
+    /// place either — `presence::Presence::write` unlinks the file, because a stale one carries
+    /// this hub's own pid and so passes every check a reader makes while naming bridges that have
+    /// gone. Unknown is the honest answer; nothing connected is not.
+    async fn put_who_is_connected_on_disk(&self, snapshot: WhoIsConnected) {
+        let mut latest = self.presence_writes.lock().await;
+        // A LATER SNAPSHOT ALWAYS WINS, and the turn above is not enough on its own to make it so.
+        // Two changes to the map decide their snapshots in the order the lock hands them out and
+        // then queue here in whatever order they get round to asking — the one decided FIRST can
+        // easily be the one that asks SECOND, and writing it would take the file back to naming a
+        // bridge that has since gone. So an older snapshot is dropped where it stands. The newest
+        // one can never be the one dropped, which is what makes the file end up agreeing with the
+        // map: nothing is minted above it.
+        //
+        // Against what has actually BEEN to the disk, and not against the newest number minted.
+        // Skipping because "a newer snapshot exists, let that one write" is the tempting version
+        // and it converges only for as long as every snapshot minted really does reach this
+        // function — so the day a call site decided one and returned without writing it, the file
+        // would stall for good rather than being one change behind. This comparison needs no such
+        // promise from anywhere else, which is why it is the one here.
+        if snapshot.at <= *latest {
+            return;
+        }
+        // Marked before the write and NOT after it, and it counts a failed write too. A write that
+        // failed unlinked the file; letting an older snapshot in afterwards would put a list this
+        // hub has already moved past back on disk, which is worse than the unknown the unlink
+        // leaves. The next change to the map writes the whole list again and repairs it.
+        *latest = snapshot.at;
+        // On a thread that is nobody's worker, for the reason measured at the run numbers: a
+        // blocking write inside a task parks the runtime worker it is running on, and a parked
+        // worker takes the timer wheel with it — every pacing wait, every deadline and every
+        // settling window in this process is that timer.
+        let presence = self.presence.clone();
+        let wrote =
+            tokio::task::spawn_blocking(move || presence.write(snapshot.connected.iter())).await;
+        let refused = match wrote {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            // The writer panicked, which is a bug rather than a disk; said the same way, because
+            // what the operator's hub does next is the same either way.
+            Err(e) => e.to_string(),
+        };
+        tracing::error!(
+            error = refused, path = %self.presence.path().display(),
+            "could not write down who is connected; the file was removed rather than left naming \
+             bridges that may have gone, so `projects --json` says unknown until the next claim or \
+             release writes it again"
+        );
     }
 
     /// End every live connection whose project has been switched off at the terminal.
@@ -2891,7 +2993,7 @@ impl<S: Surface> Hub<S> {
         }
         // Claims first, registry second, and never both at once — the same order every other
         // reader keeps. The kicks are cloned out and the guard dropped before anything is awaited.
-        let kicked: Vec<Addr> = {
+        let (kicked, who): (Vec<Addr>, WhoIsConnected) = {
             let mut claims = self.claims.lock().await;
             let mut kicked = Vec::new();
             claims.retain(|addr, claim| {
@@ -2923,9 +3025,9 @@ impl<S: Surface> Hub<S> {
                     }
                 }
             });
-            self.note_who_is_connected(&claims);
-            kicked
+            (kicked, self.note_who_is_connected(&claims))
         };
+        self.put_who_is_connected_on_disk(who).await;
         for addr in kicked {
             tracing::info!(
                 project = %addr.project, lane = addr.lane_field(),
@@ -3039,14 +3141,21 @@ impl<S: Surface> Hub<S> {
     /// run that was evicted and redialled is the same process, so its own shutdown would otherwise
     /// take its successor's claim away and leave a live worker unreachable.
     pub async fn release_this_run(&self, addr: &Addr, pid: u32, generation: u64) {
-        let mut claims = self.claims.lock().await;
-        if claims
-            .get(addr)
-            .is_some_and(|c| c.pid == pid && c.generation == generation)
-        {
+        let who = {
+            let mut claims = self.claims.lock().await;
+            if !claims
+                .get(addr)
+                .is_some_and(|c| c.pid == pid && c.generation == generation)
+            {
+                return;
+            }
             claims.remove(addr);
-            self.note_who_is_connected(&claims);
-        }
+            self.note_who_is_connected(&claims)
+        };
+        // Outside the block, so the lock is gone before the disk is touched. A departure is the
+        // half of this that MUST reach the file: a snapshot still naming a bridge that has left is
+        // what sends the operator to a conversation nothing is listening to.
+        self.put_who_is_connected_on_disk(who).await;
     }
 
     /// The same by pid alone — for a claim taken through the four-argument [`Self::claim`], whose
@@ -3054,11 +3163,15 @@ impl<S: Surface> Hub<S> {
     /// connection the hub really serves knows its own run number.
     #[cfg(test)]
     pub async fn release(&self, addr: &Addr, pid: u32) {
-        let mut claims = self.claims.lock().await;
-        if claims.get(addr).is_some_and(|c| c.pid == pid) {
+        let who = {
+            let mut claims = self.claims.lock().await;
+            if !claims.get(addr).is_some_and(|c| c.pid == pid) {
+                return;
+            }
             claims.remove(addr);
-            self.note_who_is_connected(&claims);
-        }
+            self.note_who_is_connected(&claims)
+        };
+        self.put_who_is_connected_on_disk(who).await;
     }
 
     /// Give the hub a different outbound budget. Test-only.
