@@ -28,6 +28,11 @@ EnvironmentFile=-%h/.config/herdr-tg/env
 Environment=HERDR_SOCKET_PATH=%h/.config/herdr/herdr.sock
 Environment=RUST_LOG=info
 
+# Not only so the bridge comes back. A hub that dies on the way up — the phone line unreachable —
+# writes down which half was down and exits, and the alarm quotes that note only while it is under
+# ninety seconds old. Nothing inside the binary can keep it young; this restart is what does. Stop
+# restarting, or wait as long as that window, and the operator's phone says "the herd has gone
+# quiet" about a machine that had already named its own failure.
 Restart=always
 RestartSec=5
 

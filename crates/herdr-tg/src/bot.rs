@@ -720,6 +720,54 @@ async fn knock_at(door: &Door, health: &Health) {
     }
 }
 
+/// Write down what the hub can say about itself so far, without stamping anything.
+///
+/// The tick is not the only writer of the note any more, and that is the point. The watchdog arms
+/// itself on this file as well as on the stamp — "a hub has run here and never earned a stamp" —
+/// so on a box where the stamp is never earned, this file is the entire difference between an
+/// alarm and silence for the life of the machine.
+///
+/// It puts down no stamp, and must not: nothing has been proved yet at the moment this is called,
+/// and a stamp that ran ahead of its proof is the alarm quietly switched off.
+fn what_the_hub_can_say_so_far(health: &Health, heartbeat: &Heartbeat) {
+    let verdict = health.verdict(Instant::now());
+    if let Err(e) = heartbeat.note(&verdict) {
+        tracing::error!(error = %e, path = %heartbeat.note_path().display(),
+            "could not write down which half of the hub is unwell");
+    }
+}
+
+/// Ask Telegram who this bot is — the first thing on the way up that can end the process.
+///
+/// The note is written on the way in and again on the way out, and both are load-bearing. On the
+/// way out, because a hub that boots while the phone line is down dies here and the note is the
+/// only thing that will ever say which half was down. On the way in, because the way this call
+/// fails on a real box is often that it does not fail: it hangs until its own timeout, and a
+/// machine stopped or power-cycled in that window leaves behind only what was already on disk.
+/// Either way the box ends up watched, which is the whole of what this function is for.
+///
+/// What the note SAYS, past the first ninety seconds, depends on something outside this binary:
+/// the alarm only quotes a note while it is young, and the process that would rewrite it has
+/// exited. `Restart=always` with `RestartSec=5` in `deploy/herdr-tg.service` is what keeps it
+/// young — every few seconds a fresh boot writes it again. Take that away and a box whose phone
+/// line is down still alarms, but with "the herd has gone quiet, and it is not saying which part
+/// stopped" instead of naming the phone line. The unit says so too, and a guard holds the two
+/// together (`a_boot_that_fails_is_restarted_before_the_alarm_stops_believing_the_note_it_left`).
+async fn the_phone_line_answers(
+    bot: &Bot,
+    health: &Health,
+    heartbeat: &Heartbeat,
+) -> anyhow::Result<teloxide::types::Me> {
+    what_the_hub_can_say_so_far(health, heartbeat);
+    let asked = bot.get_me().await;
+    match &asked {
+        Ok(_) => health.the_phone_line_answered(Instant::now()),
+        Err(_) => health.the_phone_line_did_not_answer(),
+    }
+    what_the_hub_can_say_so_far(health, heartbeat);
+    Ok(asked?)
+}
+
 /// Run the bot until the process is asked to stop.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let people = config.people();
@@ -735,8 +783,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     }
     announce_who_may_speak(&config.allowed_chat_ids, &config.allowed_user_ids, &gate);
 
+    // Before anything that can end this process. See `the_phone_line_answers` for why the order is
+    // the property: these two are what the watchdog arms itself on, and a boot that dies before
+    // they exist is a box that is never watched again.
+    let health = Arc::new(Health::new());
+    let heartbeat = Heartbeat::new(Heartbeat::default_path());
+
     let bot = Bot::new(config.token());
-    let me = bot.get_me().await?;
+    let me = the_phone_line_answers(&bot, &health, &heartbeat).await?;
     tracing::info!(bot = %me.username(), "connected to the Bot API; long-polling");
 
     // ── the hub ───────────────────────────────────────────────────────────────────────────────
@@ -746,7 +800,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Both halves of the watchdog contract are decided here, together, and that is deliberate:
     // every way this block can end without a door is a way the operator's agents reach nobody
     // while his phone still answers, and each of them hands the heartbeat a sentence saying so.
-    let health = Arc::new(Health::new());
     let (hub, door) = match config.forum_chat_id {
         None => {
             tracing::warn!(
@@ -849,7 +902,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // and hung looks healthy here until the wedge backs up far enough to stop the stream being
     // driven. That gap is named rather than overlooked, and claiming more here would be the exact
     // failure the watchdog exists to prevent — a healthy-looking report from something that is not.
-    let heartbeat = Heartbeat::new(Heartbeat::default_path());
     let hb_bot = bot.clone();
     let hb_health = Arc::clone(&health);
     tokio::spawn(async move {
@@ -3320,13 +3372,100 @@ mod tests {
         );
     }
 
-    /// The three lines of the note beside the heartbeat, as a reader gets them.
+    /// The four lines of the note beside the heartbeat, as a reader gets them.
     fn what_the_note_says(hb: &Heartbeat) -> Vec<String> {
         std::fs::read_to_string(hb.note_path())
             .expect("the note beside the heartbeat is readable")
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_hub_whose_first_call_to_telegram_fails_still_names_the_phone_line_and_arms_the_watchdog()
+     {
+        // The worst of the three states, and the one nothing announces. `serve` asked Telegram who
+        // it was before any of the health machinery existed, so a hub that booted while the phone
+        // line was down carried that error straight out of the process: no stamp, no note, and a
+        // watchdog that arms itself the first time it sees either of those files therefore never
+        // armed at all. The operator got silence from the service AND silence from the alarm, and a
+        // box that has never once been heard from looks exactly like a box that is fine.
+        let d = tempfile::tempdir().expect("tmp");
+        let hb = Heartbeat::new(d.path().join("hub.heartbeat"));
+        let health = Health::new();
+        let (bot, _) = a_telegram_that_only_counts().await;
+
+        the_phone_line_answers(&bot, &health, &hb)
+            .await
+            .expect_err("this test needs a Telegram that does not answer");
+
+        // The note is what the watchdog arms on when no stamp was ever earned
+        // (`deploy/herdr-tg-watchdog.sh`: "a hub has run here and never earned a stamp"), so
+        // writing it is the whole of the difference between an alarm and silence forever — and it
+        // has to name the half that is down, because a dead phone line is a machine to go and look
+        // at and a dead door is not.
+        assert_eq!(
+            what_the_note_says(&hb),
+            vec![
+                "not serving".to_string(),
+                "the phone line did not answer when the hub last called it".to_string(),
+                "the agents' door has let nothing through since this hub started".to_string(),
+                "the hub has not looked for your taps since it started".to_string(),
+            ],
+            "a hub that could not reach Telegram at boot left nothing behind to arm the alarm with, \
+             or did not say which half was down"
+        );
+        assert!(
+            !hb.path().exists(),
+            "the stamp was put down to make a failed boot tidy, which is the alarm switched off"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_is_armed_before_the_hub_has_finished_asking_telegram_who_it_is() {
+        // The other half of the same defect, and the one an error path alone does not close: a boot
+        // that never returns at all. A Telegram that accepts the connection and then says nothing
+        // holds this call open for as long as the request's own timeout, and a machine power-cycled
+        // or a service stopped in that window leaves behind whatever was on disk BEFORE the call —
+        // which is why the note is written on the way in and not only on the way out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = reqwest::Url::parse(&format!("http://{}/", listener.local_addr().expect("addr")))
+            .expect("url");
+        let (dialled, was_dialled) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let held = listener.accept().await;
+            let _ = dialled.send(());
+            // Held, unanswered, for as long as this test lives: the call under test must still be
+            // in flight when the note is looked for, or the test proves nothing about the order.
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let d = tempfile::tempdir().expect("tmp");
+        let hb = Heartbeat::new(d.path().join("hub.heartbeat"));
+        let health = Arc::new(Health::new());
+        let bot = Bot::new("1:not-a-token").set_api_url(url);
+
+        let in_flight = {
+            let bot = bot.clone();
+            let health = Arc::clone(&health);
+            let hb = hb.clone();
+            tokio::spawn(async move { the_phone_line_answers(&bot, &health, &hb).await })
+        };
+        was_dialled.await.expect("the hub called Telegram");
+
+        assert!(
+            hb.note_path().exists(),
+            "the hub asked Telegram who it was before leaving anything behind for the alarm to arm \
+             on, so a boot that never returns is never watched"
+        );
+        assert!(
+            !hb.path().exists(),
+            "the stamp was put down before a single leg had proved anything"
+        );
+        in_flight.abort();
     }
 
     #[tokio::test]

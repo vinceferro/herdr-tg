@@ -42,6 +42,8 @@ const WATCHDOG: &str = "deploy/herdr-tg-watchdog.sh";
 const DOCTOR: &str = "crates/herdr-tg/src/cmd/doctor.rs";
 /// How often the alarm is allowed to look, which is the last term in the wait he actually gets.
 const TIMER: &str = "deploy/herdr-tg-watchdog.timer";
+/// The unit that brings the hub back, which is what keeps a failed boot's note young enough to read.
+const SERVICE: &str = "deploy/herdr-tg.service";
 
 /// The workspace root: `crates/herdr-tg/` → up two.
 fn workspace_root() -> PathBuf {
@@ -564,23 +566,7 @@ fn a_stamp_is_written_only_where_the_verdict_earned_it_and_a_verdict_needs_both_
 /// hub's tick without moving the rest is the realistic edit, and it degrades the alarm silently.
 #[test]
 fn the_windows_the_hub_and_the_watchdog_keep_are_still_in_proportion_to_one_another() {
-    fn secs(text: &str, what: &str, needle: &str, open: &str, close: &str) -> u64 {
-        let at = text
-            .find(needle)
-            .unwrap_or_else(|| panic!("{what}: `{needle}` is gone; this guard cannot read it"));
-        let rest = &text[at..];
-        let from = rest.find(open).unwrap_or_else(|| {
-            panic!("{what}: `{needle}` no longer has a value this guard can read")
-        }) + open.len();
-        let to = from
-            + rest[from..]
-                .find(close)
-                .unwrap_or_else(|| panic!("{what}: `{needle}`'s value does not end"));
-        rest[from..to]
-            .trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("{what}: `{needle}` is not a whole number of seconds ({e})"))
-    }
+    let secs = secs_between;
 
     let fresh_for = secs(
         &read(HEARTBEAT),
@@ -593,13 +579,19 @@ fn the_windows_the_hub_and_the_watchdog_keep_are_still_in_proportion_to_one_anot
     let script = read(WATCHDOG);
     let stale_after = secs(&script, WATCHDOG, "STALE_AFTER=\"$", ":-", "}");
     let note_trusted = secs(&script, WATCHDOG, "NOTE_TRUSTED_FOR=\"$", ":-", "}");
-    let doctor_stale = secs(
-        &read(DOCTOR),
+    let doctor = read(DOCTOR);
+    let doctor_stale = secs(&doctor, DOCTOR, "const WATCHDOG_STALE_AFTER", "=", ";");
+    let disarm_expires = secs(&script, WATCHDOG, "DISARM_EXPIRES=\"$", ":-", "}");
+    let doctor_disarm = secs(&doctor, DOCTOR, "const WATCHDOG_DISARM_EXPIRES", "=", ";");
+    let doctor_note = secs(&doctor, DOCTOR, "const WATCHDOG_NOTE_TRUSTED_FOR", "=", ";");
+    let doctor_quiet = secs(
+        &doctor,
         DOCTOR,
-        "const WATCHDOG_STALE_AFTER",
+        "const WATCHDOG_QUIET_FOR_TOO_LONG",
         "=",
         ";",
     );
+    let checks_every = systemd_seconds(&directive(&read(TIMER), "OnUnitActiveSec", TIMER), TIMER);
 
     assert_eq!(
         fresh_for,
@@ -627,23 +619,102 @@ fn the_windows_the_hub_and_the_watchdog_keep_are_still_in_proportion_to_one_anot
          {stale_after}s. The operator reads doctor to find out whether his phone should have \
          buzzed."
     );
+    assert_eq!(
+        doctor_disarm, disarm_expires,
+        "`herdr-tg doctor` says a silence wears off after {doctor_disarm}s and the watchdog lets \
+         it run for {disarm_expires}s. Drift here has doctor calling a switched-off alarm one that \
+         will buzz him, which is the morning this whole reading was added to prevent."
+    );
+    assert_eq!(
+        doctor_note, note_trusted,
+        "`herdr-tg doctor` believes the hub's note for {doctor_note}s and the watchdog believes it \
+         for {note_trusted}s. Wider, and doctor quotes a dead hub's last words in the present \
+         tense while the alarm has already stopped doing so."
+    );
+    assert_eq!(
+        doctor_quiet,
+        3 * checks_every,
+        "`herdr-tg doctor` calls the alarm stopped after {doctor_quiet}s of not looking, and the \
+         timer runs it every {checks_every}s. Three missed checks is what makes that a stopped \
+         unit rather than a slow minute; any other multiple says 'the alarm has stopped' about one \
+         that is simply between checks, or stays silent about one that really has."
+    );
 }
 
-/// `1min`, `10s`, `2min` — the only shapes this project's timer uses, in seconds.
+/// A hub that dies on the way up leaves a note naming the half that failed, and the alarm reads
+/// that note only while it is young. Nothing inside the binary keeps it young — the process is
+/// gone. What keeps it young is this unit bringing the hub back to write it again.
+///
+/// Without that, a box whose phone line is down alarms with "the herd has gone quiet, and it is
+/// not saying which part stopped" instead of naming the phone line, which is the difference
+/// between a machine he has to go and look at and one he already knows the answer for. So the
+/// coupling is checked rather than trusted: restart always, and sooner than the alarm stops
+/// believing what the last boot managed to say.
+#[test]
+fn a_boot_that_fails_is_restarted_before_the_alarm_stops_believing_the_note_it_left() {
+    let unit = read(SERVICE);
+    let restart = directive(&unit, "Restart", SERVICE);
+    assert_eq!(
+        restart, "always",
+        "{SERVICE} restarts `{restart}`. A hub that cannot reach Telegram writes down which half \
+         is down and exits; only a restart rewrites that note, and the alarm reads it for ninety \
+         seconds. Stop restarting and the operator gets `the herd has gone quiet` about a machine \
+         that told him exactly what was wrong."
+    );
+    let restart_after = systemd_seconds(&directive(&unit, "RestartSec", SERVICE), SERVICE);
+    let note_trusted = secs_between(&read(WATCHDOG), WATCHDOG, "NOTE_TRUSTED_FOR=\"$", ":-", "}");
+    assert!(
+        restart_after < note_trusted,
+        "{SERVICE} waits {restart_after}s before trying again and the alarm believes the note for \
+         {note_trusted}s. A wait as long as that window leaves the note stale between attempts, so \
+         a check landing in the gap has a hub that named its own failure and an alarm that will \
+         not say it."
+    );
+}
+
+/// `1min`, `10s`, `2min`, `5` — the only shapes this project's units use, in seconds.
 ///
 /// A shape it does not know is a failure, not a zero: reading an unfamiliar interval as nothing
-/// would quietly shrink the wait this guard computes and let a false promise through.
+/// would quietly shrink the wait this guard computes and let a false promise through. A bare
+/// number is seconds to systemd, and `RestartSec=5` is written that way.
 fn systemd_seconds(value: &str, what: &str) -> u64 {
     let v = value.trim();
     let (n, mult) = match () {
         _ if v.ends_with("min") => (v.trim_end_matches("min"), 60),
         _ if v.ends_with('s') => (v.trim_end_matches('s'), 1),
+        _ if v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty() => (v, 1),
         _ => panic!("{what}: `{v}` is not an interval this guard knows how to read"),
     };
     n.trim()
         .parse::<u64>()
         .unwrap_or_else(|e| panic!("{what}: `{v}` has no whole number in it ({e})"))
         * mult
+}
+
+/// One number out of a literal in either language, however it is punctuated.
+///
+/// The same reader the proportions test uses, as a free function because two guards now depend on
+/// the watchdog's own constants and a second copy of this would be the drift it exists to catch.
+fn secs_between(text: &str, what: &str, needle: &str, open: &str, close: &str) -> u64 {
+    let at = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("{what}: `{needle}` is gone; this guard cannot read it"));
+    let rest = &text[at..];
+    let from = rest
+        .find(open)
+        .unwrap_or_else(|| panic!("{what}: `{needle}` no longer has a value this guard can read"))
+        + open.len();
+    let to = from
+        + rest[from..]
+            .find(close)
+            .unwrap_or_else(|| panic!("{what}: `{needle}`'s value does not end"));
+    // `86_400` in Rust and `86400` in shell are the same number said two ways, and a guard that
+    // could not read one of them would be a guard nobody could keep readable.
+    rest[from..to]
+        .trim()
+        .replace('_', "")
+        .parse()
+        .unwrap_or_else(|e| panic!("{what}: `{needle}` is not a whole number of seconds ({e})"))
 }
 
 /// One directive out of a systemd unit, or a failure saying this guard is blind.

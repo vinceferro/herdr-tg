@@ -362,6 +362,10 @@ export function fakeOpencode() {
   // with no such route — and it is the DEFAULT, because that is what every suite written before the
   // question was asked stood on, and nothing may be refused on an answer nobody gave.
   let agents: string[] | null = null
+  // How many times the watcher has ASKED which agents this server knows. A test that changes the
+  // answer proves nothing unless the question was put again — the set is remembered for the run,
+  // so a check standing on a stale one passes whatever the server now says.
+  let agentQueries = 0
 
   const server = Bun.serve({
     port: 0,
@@ -386,6 +390,7 @@ export function fakeOpencode() {
       // `{name, description, mode, native, permission, options}` — the whole server's set, not one
       // session's. Only `name` is read here; the rest is carried so the shape is the real one.
       if (url.pathname === '/agent' && req.method === 'GET') {
+        agentQueries++
         if (agents === null) return new Response('not found', { status: 404 })
         return Response.json(agents.map(name => ({ name, description: '', mode: 'primary', native: true })))
       }
@@ -465,6 +470,8 @@ export function fakeOpencode() {
     set ignoreDirectoryFilter(v: boolean) { ignoreDirectoryFilter = v },
     /** The agent names this server resolves; `null` answers 404, as a server without the route. */
     set agents(v: string[] | null) { agents = v },
+    /** How many `GET /agent` requests have been made, so a test can see the question was put. */
+    get agentQueries() { return agentQueries },
     /** Push one event down the stream; null until the watcher has subscribed. */
     get pushing() { return push !== null },
     push: (e: unknown) => push?.(e),

@@ -1,11 +1,21 @@
-<!-- INTERFACE, v23, 7 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v24, 8 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v24 moves no frame and corrects §13.11 where it described behaviour that has changed. A
+     PERMISSION prompt this side cannot place is now turned down like a question, not withheld and
+     left — withholding it blocked the tool call that asked for ever, on exactly the wall the fence
+     is written for, and `reject` can never let an action happen. A request from a session the note
+     says has been ARCHIVED is turned down too, and it is the only refusal about somebody else's
+     session that is. The second sentence has a third ending for a request that named nothing to
+     refuse, and it is said again whenever the ending changes rather than once per reason. And the
+     agent pre-flight refuses nothing on a listing it could not get: only an answer from the server
+     can say an agent does not exist.
 
      v23 moves one sentence and no frame. It also finishes §13.10 and §13.11 for the reverse
      agent fence in `kickoff-hub-attach`: two rows for a turn this side cannot place at all, and
      the rule that a QUESTION nobody can place is turned down while a PERMISSION prompt is not —
      a question's refusal says nobody is coming, a permission's says No in the operator's name to
-     a tool call he was never shown. Offer 7 in §7 told an adapter the alarm was always on
+     a tool call he was never shown. (v24 reversed that second half: see above.) Offer 7 in §7 told an adapter the alarm was always on
      and left it at that, which read as "something watches the process". It watches the CONTROL
      PLANE now: the hub touches the watchdog's file only when Telegram answered it, a connection
      came out the far end of the agents' door, and the dispatcher is still being handed his taps
@@ -2938,7 +2948,7 @@ for word.
 | `message` | `nothing is attached to the worker yet that can take typed words` | the door has no producer to hand them to |
 | `message` | `everything attached to the worker went away before taking it` | every producer the words went to had gone |
 | `message` | `the worker has no session open, so there was nothing to hand it to` · `the worker's server would not say which session is open` | the watcher, with nowhere to put them |
-| `message` | `the worker is set to run as an agent its server does not know` | the note binds an agent the server cannot resolve. Asked BEFORE his words are posted (`GET /agent`, once per run and remembered), because a prompt naming an unknown agent is answered 204 with no message written at all: the words are gone, and an ack saying they were taken is a thumb on his line that the topic then contradicts |
+| `message` | `the worker is set to run as an agent its server does not know` | the note binds an agent the server cannot resolve. Asked BEFORE his words are posted (`GET /agent`; a name it has already resolved is remembered for the run and costs no request, a name it has not is asked about again, and a server that will not answer refuses nothing — only an answer from the server can say an agent does not exist), because a prompt naming an unknown agent is answered 204 with no message written at all: the words are gone, and an ack saying they were taken is a thumb on his line that the topic then contradicts |
 
 Two more the tool server writes, and neither is an `ack`: the tool result an agent reads when its
 run has been replaced —
@@ -2958,24 +2968,35 @@ And three lines the watcher puts in the topic on its own, where no `ack` can car
   of §13.10's table, and **three** of them belong to this line alone, all three being a turn of the
   bound session that this side cannot place: *the worker is answering under a different agent from
   the one it should be*, *there is no way to tell which of the worker's agents asked this*, and
-  *the worker's server would not say which of its agents asked this*. Those three, and no other row,
-  carry a second sentence, because they are the cases where this side also tells opencode nobody is
-  coming: the session was already proved to be this conversation's own, so the request is the
-  watcher's to turn down, and withholding alone would leave the agent blocked on a keyboard nobody
-  will ever draw. The second sentence says what actually happened rather than what was attempted —
-  *"It has been turned down, so the worker is not left waiting on it"* when the server took the
-  refusal, and *"The worker's server would not take the refusal, so it may still be waiting on
-  it."* when it did not, which is the same server that had just declined to say which agent was
-  answering. **A permission prompt is turned down only for the first of the three.** A question's
-  refusal says nobody is coming; a permission's says *No*, in the operator's name, to a tool call he
-  was never shown — so it is given only where the turn was positively placed under somebody else's
-  agent, and never where the turn could not be placed at all. For those two the second sentence is
-  instead *"Nothing here has answered it, because answering it here would be answering for you. The
-  worker is still waiting."* — the prompt is withheld and the worker waits visibly rather than being
-  answered for. "Once per spell" is per SENTENCE, so a wall in that state hears about a withheld
-  question and a withheld permission prompt separately: whether the worker was released or is still
-  stopped is the one thing he would act on, and one of those standing in for the other is a false
-  report.
+  *the worker's server would not say which of its agents asked this*. A **fourth** row carries the
+  second sentence too, and only when it is about the request's OWN session: *the session named for
+  this worker has been archived*. Those four, and no other row, carry a second sentence, because
+  they are the cases where this side also tells opencode nobody is coming: the session was already
+  proved to be this conversation's own, so the request is the watcher's to turn down, and
+  withholding alone would leave the agent blocked on a keyboard nobody will ever draw. Every other
+  refusal says the session is somebody else's — another project's, a helper's, a newer one — and a
+  turn-down there would be this project speaking inside a conversation it is not part of.
+
+  The second sentence says what actually happened rather than what was attempted, and it has three
+  endings: *"It has been turned down, so the worker is not left waiting on it"* when the server took
+  the refusal, *"The worker's server would not take the refusal, so it may still be waiting on it."*
+  when it did not, and *"There was not enough in what the worker sent for the refusal to be sent at
+  all, so it may still be waiting on it."* when the event named no request to refuse — nothing is
+  sent in that case, and blaming his server for it names a machine that was never asked.
+
+  **A permission prompt is turned down for all four too**, and its taken ending carries one clause
+  more: *"It has been turned down — nothing here can allow what you were never shown — so the worker
+  is not left waiting on it."* Withholding one and stopping there was tried first, on the ground
+  that refusing a permission says *No* in the operator's name to a tool call he was never shown; it
+  left the tool call that asked waiting for ever, on exactly the wall this fence is written for,
+  where every `permission.v2.asked` names no message to look up. `reject` can never let an action
+  happen, so turning one down is the safe direction rather than a guess at his answer, and it is
+  what the first of the four had always done.
+
+  "Once per spell" is per SENTENCE, so the key is the reason, the shape AND the ending: a wall in
+  that state hears about a withheld question and a withheld permission prompt separately, and hears
+  again when the ending changes. Whether the worker was released or is still stopped is the one
+  thing he would act on, and one of those standing in for the other is a false report.
 * `The agent could not act on what you typed: <what the server said>` — opencode's `session.error`
   for a session his words went to. One of those failures is this adapter's own doing and does not
   travel in the server's words: a prompt naming an agent the server cannot resolve is answered 204

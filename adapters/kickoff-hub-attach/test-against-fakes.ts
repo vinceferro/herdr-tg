@@ -1243,6 +1243,29 @@ try {
           /agent its server does not know/.test(gone) && prompts().length === beforeGone,
           `${gone} · ${prompts().length - beforeGone} prompt(s)`,
         )
+        // A set from BEFORE is not evidence about a name that is not in it. The refusal above
+        // remembered {build, plan}; a server that will not say now — an older one with no such
+        // route, or one that answered 500 — leaves this side unable to find out, and an agent added
+        // since the last good listing is precisely the name a remembered set is wrong about.
+        // Refusing his words on it is a line silenced for a fact nobody observed, and the refusal
+        // it imitates is the one the server would give if the agent really were gone.
+        //
+        // The count of questions PUT is checked, not just the words arriving: the words arrive
+        // whenever the name is in the remembered set, so a check that never made this side look
+        // things up again would pass whatever the server now says.
+        //
+        // RED, before the fix:
+        //   FAIL an_agent_missing_from_the_last_good_listing_is_not_refused_when_the_server_cannot_say_now
+        //        the worker is set to run as an agent its server does not know · 0 prompt(s) · 1 asked
+        nOc.agents = null
+        const askedBeforeStale = nOc.agentQueries
+        const beforeStale = prompts().length
+        const stale = await reasonFor(typeAt('is the door still open?'))
+        check(
+          'an_agent_missing_from_the_last_good_listing_is_not_refused_when_the_server_cannot_say_now',
+          prompts().length > beforeStale && nOc.agentQueries > askedBeforeStale,
+          `${stale} · ${prompts().length - beforeStale} prompt(s) · ${nOc.agentQueries - askedBeforeStale} asked`,
+        )
         // The set the server answers with is the whole server's, so it is asked once for a run and
         // remembered — and a name missing from what was remembered is asked about again before
         // anything is refused on it, or an agent added while the wall ran would be refused for ever.
@@ -1254,16 +1277,19 @@ try {
           await until('the prompt', () => prompts().length > beforeKnown, 8000),
           `${prompts().length - beforeKnown} prompt(s)`,
         )
-        // A server that will not say — an older one with no such route — refuses nothing. Withholding
-        // his words on a fact nobody could observe would silence every line typed at such a server,
-        // and what it guards against is still said after the fact, in his own register.
+        // And once the server HAS said the name resolves, that is remembered for the run: the
+        // ordinary typed line costs no request at all. Proved by the question NOT being put again
+        // rather than by the words arriving — the words arrive either way, which is how a check
+        // written here on a server that had stopped answering passed without ever reaching it.
         nOc.agents = null
-        const beforeSilent = prompts().length
-        typeAt('and at a server that will not say?')
+        const askedBeforeRemembered = nOc.agentQueries
+        const beforeRemembered = prompts().length
+        typeAt('and at a server that has stopped saying?')
         check(
-          'and_a_server_that_will_not_say_which_agents_it_knows_still_carries_his_words',
-          await until('the prompt', () => prompts().length > beforeSilent, 8000),
-          `${prompts().length - beforeSilent} prompt(s)`,
+          'and_a_name_the_server_already_resolved_comes_from_what_was_remembered_without_asking_again',
+          (await until('the prompt', () => prompts().length > beforeRemembered, 8000)) &&
+            nOc.agentQueries === askedBeforeRemembered,
+          `${prompts().length - beforeRemembered} prompt(s) · ${nOc.agentQueries - askedBeforeRemembered} asked`,
         )
       }
 
@@ -1473,14 +1499,26 @@ try {
             await until('the other kept question', () => nFrames('ask').some(f => String(f.ask_id).endsWith('qque_twice2')), 25000)
           }
 
-          // ── a permission nothing can place is never answered NO on his behalf ────────────────
+          // ── and a permission nothing can place is turned down too, not left hanging ─────────
           //
-          // A question's turn-down says "nobody is coming". A permission's says No — it is the
-          // operator's own answer, given in his name, to a tool call he was never shown. Every
-          // `permission.v2.asked` this suite has ever carried names no message to look up, which is
-          // the shape that reaches the never-knowable branch, and nothing here or anywhere else
-          // proves a real one does better. Refusing to guess is what fail-closed means here: the
-          // worker waits, visibly, and he is told why.
+          // This branch used to withhold a permission request and stop there, on the ground that
+          // refusing one is the operator's own No to a tool call he was never shown. But withheld
+          // is not handled: nothing else answers the request, so the tool call that asked for it
+          // waits for ever — and it waits on exactly the wall this fence was written for, where
+          // every `permission.v2.asked` names no message to look up and so lands here. Turning it
+          // down is the only answer that can be given without showing it to him: it can never let
+          // an action happen, it is what the sibling branch already does when the turn is placed
+          // under somebody else's agent, and he is told in the same breath that it was given.
+          //
+          // RED, before the fix (the three paths are the three QUESTIONS that were turned down;
+          // nothing at all was posted about the permission):
+          //   FAIL a_permission_whose_turn_nothing_can_place_is_turned_down_rather_than_left_waiting_for_ever
+          //        [… "/question/que_nomessage/reject", … "/question/que_silentmessage/reject", … "/question/que_slowlookup/reject"]
+          //   FAIL and_the_word_it_is_turned_down_with_is_the_one_the_workers_server_takes
+          //        []
+          //   FAIL and_it_is_withheld_and_he_is_told_it_was_turned_down_rather_than_that_it_is_still_waiting
+          //        0 ask(s) · ["… Nothing here has answered it, because answering it here would be
+          //        answering for you. The worker is still waiting."]
           {
             const asksBeforePermission = nFrames('ask').length
             const saysBeforePermission = nFrames('say').length
@@ -1488,15 +1526,29 @@ try {
               type: 'permission.v2.asked',
               properties: { id: 'per_unplaceable', sessionID: BOUND, action: 'run a command', resources: ['rm -rf /'] },
             })
-            await new Promise(r => setTimeout(r, 2500))
             check(
-              'a_permission_whose_turn_nothing_can_place_is_never_answered_no_on_his_behalf',
-              !nOc.posted.some(p => p.path.includes('per_unplaceable')),
+              'a_permission_whose_turn_nothing_can_place_is_turned_down_rather_than_left_waiting_for_ever',
+              await until('the permission to be turned down',
+                () => nOc.posted.some(p => p.path.endsWith('/permission/per_unplaceable/reply')), 8000),
+              JSON.stringify(nOc.posted.map(p => p.path).slice(-3)),
+            )
+            // The word is opencode's own, from the closed set of three its reply endpoint takes. A
+            // fourth invented here is a request the server answers 400 to, and the worker would go
+            // on waiting with the topic saying it had been released.
+            check(
+              'and_the_word_it_is_turned_down_with_is_the_one_the_workers_server_takes',
+              nOc.posted.find(p => p.path.endsWith('/permission/per_unplaceable/reply'))?.body?.reply === 'reject',
               JSON.stringify(nOc.posted.filter(p => p.path.includes('per_unplaceable'))),
             )
             check(
-              'and_it_is_withheld_and_said_out_loud_rather_than_shown_or_decided',
-              nFrames('ask').length === asksBeforePermission && nFrames('say').length > saysBeforePermission,
+              'and_it_is_withheld_and_he_is_told_it_was_turned_down_rather_than_that_it_is_still_waiting',
+              nFrames('ask').length === asksBeforePermission &&
+                nFrames('say').slice(saysBeforePermission).some(f =>
+                  // The permission's OWN clause, not merely the words "turned down": a question's
+                  // sentence carries those too, so grepping for them let the one sentence this
+                  // change added be replaced by the question's and nothing go red.
+                  /nothing here can allow what you were never shown/.test(String(f.text))) &&
+                !nFrames('say').slice(saysBeforePermission).some(f => /still waiting/.test(String(f.text))),
               `${nFrames('ask').length - asksBeforePermission} ask(s) · ${JSON.stringify(nFrames('say').slice(saysBeforePermission).map(f => f.text))}`,
             )
           }
@@ -1546,6 +1598,158 @@ try {
               words,
             )
             nOc.refusalStatus = 200
+          }
+
+          // ── and the second withheld request of a spell is still reported when it ends
+          //    differently from the first ─────────────────────────────────────────────────────
+          //
+          // "Once per spell" is meant to be per SENTENCE: the one thing he would act on is whether
+          // the worker was released or is still stopped, and one of those standing in for the
+          // other is a false report. The key was the reason and the shape and nothing else, so the
+          // second permission of a spell was swallowed however differently it ended — and on this
+          // wall that is the steady state rather than an edge, because a permission never gets
+          // through, so nothing ever clears the record of what he has been told.
+          //
+          // RED, before the fix:
+          //   FAIL a_second_withheld_request_that_ends_differently_from_the_first_is_still_reported
+          //        tried=true · []
+          {
+            const saysBeforeReleased = nFrames('say').length
+            nOc.push({
+              type: 'permission.v2.asked',
+              properties: { id: 'per_released', sessionID: BOUND, action: 'read a file', resources: ['notes.md'] },
+            })
+            await until('the first permission of the spell', () =>
+              nFrames('say').slice(saysBeforeReleased).some(f => /turned down/.test(String(f.text))), 8000)
+
+            const saysBeforeStuck = nFrames('say').length
+            nOc.refusalStatus = 500
+            nOc.push({
+              type: 'permission.v2.asked',
+              properties: { id: 'per_stuck', sessionID: BOUND, action: 'run a command', resources: ['drop the table'] },
+            })
+            const tried = await until('the second permission to be refused', () =>
+              nOc.posted.some(p => p.path.endsWith('/permission/per_stuck/reply')), 8000)
+            check(
+              'a_second_withheld_request_that_ends_differently_from_the_first_is_still_reported',
+              tried &&
+                nFrames('say').slice(saysBeforeStuck).some(f => /may still be waiting/.test(String(f.text))),
+              `tried=${tried} · ${JSON.stringify(nFrames('say').slice(saysBeforeStuck).map(f => f.text))}`,
+            )
+            nOc.refusalStatus = 200
+          }
+
+          // ── a request that carries nothing to turn it down BY is not reported as one the
+          //    worker's server refused ────────────────────────────────────────────────────────
+          //
+          // Nothing is sent at all in that case — there is no id to send it about — so telling him
+          // the server would not take the refusal names a machine that was never asked, and sends
+          // him to look at a server that is perfectly well.
+          //
+          // RED, before the fix:
+          //   FAIL a_request_with_nothing_to_turn_it_down_by_is_not_blamed_on_the_workers_server
+          //        posted=0 · ["… The worker's server would not take the refusal, so it may still
+          //        be waiting on it."]
+          {
+            const saysBeforeNoId = nFrames('say').length
+            const postedBeforeNoId = nOc.posted.length
+            nOc.push({ type: 'permission.v2.asked', properties: { sessionID: BOUND, action: 'something' } })
+            const said = await until('a word about the request that named nothing', () =>
+              nFrames('say').length > saysBeforeNoId, 8000)
+            const words = nFrames('say').slice(saysBeforeNoId).map(f => String(f.text)).join(' ')
+            check(
+              'a_request_with_nothing_to_turn_it_down_by_is_not_blamed_on_the_workers_server',
+              said &&
+                !/would not take the refusal/.test(words) &&
+                /may still be waiting/.test(words) &&
+                nOc.posted.length === postedBeforeNoId,
+              `posted=${nOc.posted.length - postedBeforeNoId} · ${JSON.stringify(nFrames('say').slice(saysBeforeNoId).map(f => f.text))}`,
+            )
+          }
+
+          // ── the older event shapes are turned down at the endpoints THEY have ───────────────
+          //
+          // Two of the four turn-down URLs had never been driven by anything. The fake answers any
+          // POST, so a wrong path here would have looked exactly like a turn-down that worked, and
+          // the operator would have been told a worker was released while it went on waiting.
+          {
+            const postedBeforeV1 = nOc.posted.length
+            nOc.push({
+              type: 'permission.asked',
+              properties: { id: 'per_v1', sessionID: BOUND, action: 'read a file', resources: ['old.md'] },
+            })
+            const permV1 = await until('the older permission shape to be turned down', () =>
+              nOc.posted.slice(postedBeforeV1).some(p => p.path === '/permission/per_v1/reply'), 8000)
+            nOc.push({
+              type: 'question.asked',
+              properties: {
+                id: 'que_v1',
+                sessionID: BOUND,
+                questions: [{ question: 'Old shape?', header: 'H', options: [{ label: 'yes' }] }],
+              },
+            })
+            check(
+              'the_event_shapes_from_before_v2_are_turned_down_at_the_endpoints_those_shapes_have',
+              permV1 &&
+                (await until('the older question shape to be turned down', () =>
+                  nOc.posted.slice(postedBeforeV1).some(p => p.path === '/question/que_v1/reject'), 8000)),
+              JSON.stringify(nOc.posted.slice(postedBeforeV1).map(p => p.path)),
+            )
+          }
+
+          // ── a permission whose own session the note says is gone is turned down too ─────────
+          //
+          // One branch upstream of the fence: the note names this worker's session and the server
+          // says that session has been archived. Nothing was turned down there and the sentence he
+          // got ended with no statement of what became of the request at all, so a launcher that
+          // archives a session — or a note left stale by a restart — while a tool call sits on a
+          // permission left that call waiting for ever with nothing on the phone saying so.
+          //
+          // Only when the refusal is about the very session the request came from. A note naming
+          // ANOTHER project's session, or a helper's, refuses for a reason that says the request is
+          // not ours to answer, and turning one of those down would be answering in a conversation
+          // nobody here is part of.
+          //
+          // RED, before the fix:
+          //   FAIL a_permission_from_the_very_session_the_note_says_is_archived_is_turned_down
+          //        [] · ["The worker asked something and it cannot be shown here — the session
+          //        named for this worker has been archived."]
+          {
+            const saysBeforeArchived = nFrames('say').length
+            const postedBeforeArchived = nOc.posted.length
+            nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115, { time: { created: 1, updated: 1788607585115, archived: 1788607586000 } })]
+            nOc.push({
+              type: 'permission.v2.asked',
+              properties: { id: 'per_archived', sessionID: BOUND, action: 'run a command', resources: ['ls'] },
+            })
+            const turned = await until('the permission in the archived session to be turned down', () =>
+              nOc.posted.slice(postedBeforeArchived).some(p => p.path.endsWith('/permission/per_archived/reply')), 8000)
+            check(
+              'a_permission_from_the_very_session_the_note_says_is_archived_is_turned_down',
+              turned &&
+                nFrames('say').slice(saysBeforeArchived).some(f => /has been archived/.test(String(f.text)) && /turned down/.test(String(f.text))),
+              `${JSON.stringify(nOc.posted.slice(postedBeforeArchived).map(p => p.path))} · ${JSON.stringify(nFrames('say').slice(saysBeforeArchived).map(f => f.text))}`,
+            )
+          }
+
+          // And a refusal that says the request is somebody ELSE's is still left alone: turning it
+          // down would be this project answering inside another project's conversation.
+          {
+            const postedBeforeElsewhere = nOc.posted.length
+            const saysBeforeElsewhere = nFrames('say').length
+            nOc.sessions = [listedSession(BOUND, elsewhere, 1788607585115)]
+            nOc.push({
+              type: 'permission.v2.asked',
+              properties: { id: 'per_elsewhere', sessionID: BOUND, action: 'run a command', resources: ['ls'] },
+            })
+            await until('a word about the session in another project', () =>
+              nFrames('say').slice(saysBeforeElsewhere).some(f => /different project/.test(String(f.text))), 8000)
+            check(
+              'but_a_request_the_note_says_belongs_to_another_project_is_never_answered_from_here',
+              !nOc.posted.slice(postedBeforeElsewhere).some(p => p.path.includes('per_elsewhere')),
+              JSON.stringify(nOc.posted.slice(postedBeforeElsewhere).map(p => p.path)),
+            )
+            nOc.sessions = [listedSession(BOUND, noteRepo, 1788607585115)]
           }
         }
       }

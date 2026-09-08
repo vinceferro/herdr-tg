@@ -463,6 +463,15 @@ export function startWatcher(cfg: WatcherConfig): void {
       if (bound.couldNotFindOut && keepForLater(ev)) return null
       keptQuestions.delete(ev)
       note(`a question from ${sessionID} was not passed on: ${bound.refused}`)
+      // An archived session is the one refusal here that is about THIS request's own session and
+      // says it will never answer again. Withholding and stopping left the tool call that asked
+      // waiting for ever — a launcher that archives a session, or a note gone stale over a
+      // restart, does that to whatever was mid-permission — and the sentence he got ended without
+      // saying what had become of it at all.
+      if (bound.sessionThatIsGone === sessionID) {
+        await sayWhatBecameOfIt(sessionID, ev, bound.refused)
+        return null
+      }
       tellHimOnce(bound.refused, `The worker asked something and it cannot be shown here — ${bound.refused}.`)
       return null
     }
@@ -495,9 +504,9 @@ export function startWatcher(cfg: WatcherConfig): void {
         keptQuestions.delete(ev)
         note(`a question from ${sessionID} was not passed on: the server never said which agent the turn ran under`)
         // It has waited as long as it may. The session was already proved to be this conversation's
-        // own, so turning a QUESTION down is this watcher's to do — and doing it is the whole
+        // own, so turning the request down is this watcher's to do — and doing it is the whole
         // difference between a worker that can carry on and one blocked for ever on a keyboard that
-        // is never coming. A permission is not turned down here: see NOBODY_HAS_ANSWERED_IT.
+        // is never coming.
         await sayWhatBecameOfIt(sessionID, ev, THE_SERVER_WOULD_NOT_SAY_WHICH_AGENT)
         return null
       }
@@ -518,12 +527,7 @@ export function startWatcher(cfg: WatcherConfig): void {
         // Turning it down is this watcher's to do here and nowhere else: the session was already
         // proved to be this conversation's own, and a question from somebody else's session is
         // left alone precisely because it is not ours to answer.
-        const taken = await turnDown(sessionID, ev)
-        tellHimOnce(
-          A_DIFFERENT_AGENT_IS_ANSWERING,
-          `The worker asked something and it cannot be shown here — ${A_DIFFERENT_AGENT_IS_ANSWERING}. ` +
-            whatBecameOfIt(taken),
-        )
+        await sayWhatBecameOfIt(sessionID, ev, A_DIFFERENT_AGENT_IS_ANSWERING)
         return null
       }
     } else {
@@ -534,23 +538,34 @@ export function startWatcher(cfg: WatcherConfig): void {
   }
 
   /**
+   * What became of an attempt to turn a request down. Three, not two: nothing is sent at all when
+   * the event names no request, and reporting that as a server that refused blames a machine that
+   * was never asked.
+   */
+  type Refusal = 'taken' | 'not taken' | 'nothing to send'
+
+  /**
    * Tell opencode nobody is going to answer this request, so the turn that asked can move on.
    *
    * Both shapes, measured against a real opencode 1.18.25 on 7 September: a question has its own
    * `reject` endpoint and takes no body at all, and a permission is rejected through the reply it
    * already has, with the one word opencode's own closed set uses. Best effort — a server that
    * will not take it leaves the worker exactly where withholding alone would have left it — and
-   * the answer says WHICH of the two happened, because the sentence the operator gets ends either
-   * "so the worker is not left waiting on it" or "so it may still be waiting on it", and those are
-   * not the same morning. Saying the first regardless is the more likely mistake than it sounds:
-   * every branch that reaches here is a branch where something about this request could not be
-   * established, and the empty `id` that makes the refusal impossible comes from the same event
-   * shape nobody understood.
+   * the answer says WHICH of the three happened, because the sentence the operator gets ends
+   * "so the worker is not left waiting on it", or names his server as the thing that refused, or
+   * says there was nothing to send — and those are three different mornings. Saying the first
+   * regardless is the more likely mistake than it sounds: every branch that reaches here is a
+   * branch where something about this request could not be established, and the empty `id` that
+   * makes the refusal impossible comes from the same event shape nobody understood. Blaming his
+   * server for that one was its own false report — nothing was ever sent to be refused.
    */
-  async function turnDown(sessionID: string, ev: Record<string, any>): Promise<boolean> {
+  async function turnDown(sessionID: string, ev: Record<string, any>): Promise<Refusal> {
     const data = ev?.properties ?? ev?.data ?? {}
     const requestID = String(data.id ?? '')
-    if (!requestID) return false
+    if (!requestID) {
+      note('a request that named nothing to refuse could not be turned down; the worker may still be waiting on it')
+      return 'nothing to send'
+    }
     const type = String(ev?.type ?? '')
     const kind: Open['kind'] = type.startsWith('question') ? 'question' : 'permission'
     const v2 = type.includes('.v2.')
@@ -572,41 +587,53 @@ export function startWatcher(cfg: WatcherConfig): void {
       })
       if (!r.ok) {
         note(`opencode would not take the refusal of ${requestID} (${r.status})`)
-        return false
+        return 'not taken'
       }
       note(`${requestID} was turned down so the worker is not left waiting on it`)
-      return true
+      return 'taken'
     } catch (e) {
       note(`could not tell opencode nobody will answer ${requestID}: ${(e as Error)?.message ?? e}`)
-      return false
+      return 'not taken'
     }
   }
 
+  /** A question or a permission prompt — the one thing every sentence about a withheld one turns on. */
+  const itIsAQuestion = (ev: Record<string, any>): boolean => String(ev?.type ?? '').startsWith('question')
+
   /**
-   * Withhold a request nothing could place, do whatever is right about it, and say so once.
+   * Withhold a request nothing could place, turn it down, and say so once.
    *
-   * The two branches that get here are the two shapes of not knowing, and the rule is the same for
-   * both: a QUESTION is turned down, because nobody is coming and the agent that asked would
-   * otherwise block for ever on a keyboard nobody will draw; a PERMISSION is not, because opencode
-   * has no way to say "nobody is coming" about one — the only refusal it takes is `reject`, which
-   * is the operator's own No to a tool call he was never shown. Every `permission.v2.asked` this
-   * adapter has been handed names no message to look up, which is exactly the branch above, so
-   * guessing here would answer No to every tool call a bound wall ever makes.
+   * The branches that get here are the shapes of not knowing whose answer cannot change — nothing
+   * says which agent asked, the server would not say, the turn ran under somebody else's agent, or
+   * the note's own session is archived — and they all end the same way: nothing here will ever
+   * answer this request, so opencode is told so and the turn that asked moves on. WITHHELD IS NOT
+   * HANDLED — nothing else answers a request this side has hidden, and a
+   * permission prompt was for a while withheld and then left, on the ground that refusing one is
+   * the operator's own No to a tool call he was never shown. It left the worker blocked for ever,
+   * and it did so on exactly the wall this fence was written for, where every `permission.v2.asked`
+   * names no message to look up and so reaches this branch every time.
    *
-   * Said once per spell per shape, not per request: the two sentences differ in the one thing he
-   * would act on — whether the worker was released or is still stopped — so one standing in for
-   * the other is the false report this whole change is about.
+   * Turning one down is the only answer that can be given without showing it to him, and it is the
+   * safe direction rather than a guess at his: `reject` can never let an action happen, and the
+   * branch that withholds a turn placed under somebody ELSE's agent has always given it. What he
+   * is told says which of the two it was and what became of the refusal.
+   *
+   * Said once per SENTENCE, which is why the key carries the ending and not only the reason: the
+   * two endings differ in the one thing he would act on — whether the worker was released or is
+   * still stopped — so keying on the reason alone let the second request of a spell be swallowed
+   * however differently it ended. On a wall bound to an agent that is the steady state and not an
+   * edge, because a permission never gets through, so nothing ever clears the record.
    */
   async function sayWhatBecameOfIt(
     sessionID: string,
     ev: Record<string, any>,
     why: string,
   ): Promise<void> {
-    const itIsAQuestion = String(ev?.type ?? '').startsWith('question')
-    const ending = itIsAQuestion ? whatBecameOfIt(await turnDown(sessionID, ev)) : NOBODY_HAS_ANSWERED_IT
+    const shape = itIsAQuestion(ev) ? 'question' : 'permission'
+    const outcome = await turnDown(sessionID, ev)
     tellHimOnce(
-      `${why} · ${itIsAQuestion ? 'question' : 'permission'}`,
-      `The worker asked something and it cannot be shown here — ${why}. ${ending}`,
+      `${why} · ${shape} · ${outcome}`,
+      `The worker asked something and it cannot be shown here — ${why}. ${whatBecameOfIt(outcome, itIsAQuestion(ev))}`,
     )
   }
 
@@ -988,12 +1015,19 @@ export function startWatcher(cfg: WatcherConfig): void {
    * would not answer. Nothing is refused on that. Withholding his words on a fact nobody could
    * observe would silence every line typed at such a server, and the failure it guards against is
    * still caught after the fact by `session.error`.
+   *
+   * And a set from before is not an answer about a name that is missing from it. Falling back on
+   * one when the fresh ask failed turned "could not find out" into "does not exist", which is the
+   * refusal this whole route was added to avoid: an agent added to the tree since the last good
+   * listing had every line typed at it refused, and the check that was supposed to catch that
+   * passed because the name it tried happened to be in the remembered set already. Only an ANSWER
+   * from the server decides a name it has not already resolved.
    */
   let agentsKnown: Set<string> | null = null
   async function thisServerResolves(name: string): Promise<boolean | null> {
     if (agentsKnown?.has(name)) return true
     const fresh = await agentsThisServerKnows()
-    if (fresh === null) return agentsKnown === null ? null : agentsKnown.has(name)
+    if (fresh === null) return null
     agentsKnown = fresh
     return fresh.has(name)
   }
@@ -1108,25 +1142,27 @@ export function startWatcher(cfg: WatcherConfig): void {
   const NOTHING_SAYS_WHICH_AGENT = 'there is no way to tell which of the worker\'s agents asked this'
   const THE_SERVER_WOULD_NOT_SAY_WHICH_AGENT = 'the worker\'s server would not say which of its agents asked this'
   /**
-   * What became of the request, which finishes every one of those three sentences.
+   * What became of the request, which finishes every one of those sentences.
    *
    * The claim and the world have to agree: "it has been turned down" was said whether opencode took
    * the refusal or answered 500, and the operator has no other way to find out that a worker he was
    * told had moved on is in fact still stopped.
-   */
-  const whatBecameOfIt = (taken: boolean): string =>
-    taken
-      ? 'It has been turned down, so the worker is not left waiting on it.'
-      : 'The worker\'s server would not take the refusal, so it may still be waiting on it.'
-  /**
-   * And what is said instead where refusing would be answering FOR him.
    *
-   * A question's turn-down means nobody is coming. A permission's means No — his own answer, in his
-   * name, to a tool call he was never shown — so it is given only where the turn was positively
-   * placed under somebody else's agent, and never where nothing could place the turn at all.
+   * A permission's turn-down carries one clause more, because turning one down is the nearest thing
+   * to an answer in his name this side ever gives: it says that nothing was allowed. A question's
+   * turn-down decides nothing he would have decided — it only says nobody is coming.
+   *
+   * Three endings and not two, because "his server would not take the refusal" sent him to look at
+   * a server nothing was ever asked of: a request that names no id has nothing to be refused about.
    */
-  const NOBODY_HAS_ANSWERED_IT =
-    'Nothing here has answered it, because answering it here would be answering for you. The worker is still waiting.'
+  const whatBecameOfIt = (r: Refusal, aQuestion: boolean): string =>
+    r === 'taken'
+      ? aQuestion
+        ? 'It has been turned down, so the worker is not left waiting on it.'
+        : 'It has been turned down — nothing here can allow what you were never shown — so the worker is not left waiting on it.'
+      : r === 'not taken'
+        ? 'The worker\'s server would not take the refusal, so it may still be waiting on it.'
+        : 'There was not enough in what the worker sent for the refusal to be sent at all, so it may still be waiting on it.'
   const THE_SERVER_DOES_NOT_KNOW_THE_AGENT = 'the worker is set to run as an agent its server does not know'
   const THE_QUESTION_HAS_MOVED_ON = 'the question you replied to was asked by a session this worker no longer speaks to'
   const MOVED_WHILE_ON_ITS_WAY = 'the worker moved to another session while that was on its way, so it was not delivered; send it again'
@@ -1201,7 +1237,10 @@ export function startWatcher(cfg: WatcherConfig): void {
    */
   async function theSessionTheNoteNames(
     inReplyTo: string | null,
-  ): Promise<{ sessionID: string; how: string; agent: string | null } | { refused: string; couldNotFindOut?: true }> {
+  ): Promise<
+    | { sessionID: string; how: string; agent: string | null }
+    | { refused: string; couldNotFindOut?: true; sessionThatIsGone?: string }
+  > {
     const b = bindingNow()
     if ('refused' in b) {
       // A question THIS watcher drew had its session proved against the note when the keyboard went
@@ -1240,8 +1279,16 @@ export function startWatcher(cfg: WatcherConfig): void {
     if ('refused' in still) return still
     if (still.binding.sessionID !== want.sessionID) return { refused: MOVED_WHILE_ON_ITS_WAY }
     const found = listed.list.find((s: any) => s && String(s.id) === want.sessionID)
-    if (!found) return { refused: await whyItIsNotListed(want.sessionID) }
-    if (found.time?.archived) return { refused: HAS_BEEN_ARCHIVED }
+    // `sessionThatIsGone` is named ONLY for the archived answers, and it is what lets a request
+    // that came out of that very session be turned down rather than left blocked. Every other
+    // refusal here says the session is somebody else's — another project's, a helper's, a newer
+    // one — and answering inside one of those would be this project speaking in a conversation it
+    // is not part of, which is the whole reason a request from an unbound session is left alone.
+    if (!found) {
+      const why = await whyItIsNotListed(want.sessionID)
+      return why === HAS_BEEN_ARCHIVED ? { refused: why, sessionThatIsGone: want.sessionID } : { refused: why }
+    }
+    if (found.time?.archived) return { refused: HAS_BEEN_ARCHIVED, sessionThatIsGone: want.sessionID }
     // `roots=true` already drops these, and it is checked again because the cost of being wrong is
     // the operator steering a subagent that nobody is reading.
     if (found.parentID) return { refused: IS_A_HELPERS_SESSION }

@@ -1,4 +1,11 @@
-<!-- SURFACE, v19, 7 September 2026. v19 changes one offer and opens one question, and nothing
+<!-- SURFACE, v20, 8 September 2026. v20 corrects answer 6 and moves nothing on the wire.
+     `herdr-tg doctor` used to answer "is anything watching?" and "would it fire?" out of the
+     HUB's two files, so every machine with a hub on it read as armed whether the watchdog had
+     ever been installed there or not, and a note a dead hub left behind was quoted in the
+     present tense. Both are read now — the watchdog's own four files, and the note's age — and
+     answer 6 says so, including the shape `--json` reports them in.
+
+     v19 changes one offer and opens one question, and nothing
      on the wire moves. Offer 7 said the alarm required nothing because it was always on, which
      was true and useless: the stamp behind it proved a Bot API round trip and NOTHING about the
      door agents arrive at, so a hub whose socket never opened answered Telegram every forty-five
@@ -392,7 +399,12 @@ Each is a line, not an omission. Several were paid for.
    the code settles is the **source**: the hub's own state directory, and nothing else.
    `hub.heartbeat`, whose modification time is the alarm and whose staleness is the whole signal, and
    `hub.health` beside it — the word, then one sentence per leg, rewritten on every tick so it can
-   never be a stale account of a hub that has since recovered. Every other surface is a **reader** of
+   never be a stale account of a hub that has since recovered. Of a hub that has since DIED it is
+   exactly that, and a reader has to know it: nothing rewrites the file once the process is gone,
+   and the sentences carry ages frozen at the moment it wrote them, so a hub killed on Friday still
+   says "the phone line answered 12 seconds ago" on Monday. Both readers therefore hold it to the
+   same ninety seconds the hub's own tick keeps, and past that it is the last thing a hub managed to
+   say and is reported as that. Every other surface is a **reader** of
    those two files and never a second source: a hub that answered "am I healthy?" about itself would
    be answering the one question it is not a witness to, which is why the watchdog does its own
    reading rather than asking the hub, and why `herdr-tg doctor` reports the stamp by opening the
@@ -403,10 +415,22 @@ Each is a line, not an omission. Several were paid for.
    command** — `herdr-tg doctor --json`, which carries how long ago the hub stamped, whether the
    alarm is armed and whether it would fire, and, under `watchdog.health`, the word and one sentence
    per leg read straight out of the note — is a shape that could survive a transport which is not
-   this machine, and it costs a process per poll and answers only where there is a terminal. Both of
-   its two "is anything watching" answers follow the watchdog's own arming rather than the stamp
-   alone: a hub that has run all week and never earned one is `armed` and `would_alarm`, because
-   that is the box the alarm was extended to cover and the one the command used to call empty. Both are readable today. Neither is the contract until the
+   this machine, and it costs a process per poll and answers only where there is a terminal. Its two
+   "is anything watching" answers are read from the watchdog's OWN files — `watchdog.armed`,
+   `watchdog.tick`, `watchdog.disarmed` and `watchdog.latch` in the same directory — and never
+   worked out from the hub's: a machine the watchdog was never installed on has a hub stamping away
+   on it and nothing watching, and reporting that as armed is a controller waiting for an alarm
+   nobody can send. The shape says which is which. Under `watchdog.observed` are the facts as read —
+   `watchdog_has_run_here`, `armed`, `checked_seconds_ago`, `silenced`, `silenced_seconds_ago`,
+   `alarm_already_sent`, `holding_the_hub_a_window` and `window_ends_in_seconds` beside it,
+   `stamped_seconds_ago`, `note_seconds_ago`,
+   `health` and, when the note is older than that ninety seconds, `last_thing_the_hub_said` in its
+   place; under `watchdog.inferred` are the two judgements this command makes of them —
+   `the_hub_has_gone_quiet` and `would_alarm`, which is false whenever nothing is watching, the
+   alarm has been silenced, nothing has looked for three of its own checks, or it has written down
+   that it is giving the hub one more window to come back. `armed`, `stamped_seconds_ago`,
+   `would_alarm` and `health` stay where they were at the top of the block, with the corrected
+   values, so a reader written before the split still finds them. Both are readable today. Neither is the contract until the
    operator says which, and what does not change either way is the words: they are written in one
    place and read from it.
 
