@@ -125,7 +125,7 @@ commit still carrying the working tree's version and compares that commit's byte
 a change without a bump turns the whole workspace red and a bump not yet committed is not punished. A
 hand-bumped number was chosen over a content hash because the version is also what the tool lists,
 what the box records, and the only thing that can answer "is the copy here **older**". The plugin is
-now `0.2.0` in both `.claude-plugin/plugin.json` and `package.json`, and a third test pins that the
+now `0.2.1` in both `.claude-plugin/plugin.json` and `package.json`, and a third test pins that the
 bridge announces the version its manifests carry.
 
 `scripts/install-channel-plugin.sh` fails loud: no swallowed exit codes, and after installing it
@@ -300,7 +300,8 @@ the release, the deadlines), `plan.ts` +508 −3 (`readBindingFile` and the file
 
 **Plugin (`plugins/kickoff-channel/`)** — `server.ts` +181 −12 (promises `confirms: ['choice']`, acks a
 tap, stops dialling on `stale_generation`), `hub-link.ts` +85 −7 (remembers the lease, stamps it,
-deletes any inherited one), `test-against-a-fake-hub.ts` +204, and the two manifests bumped to `0.2.0`.
+deletes any inherited one), `test-against-a-fake-hub.ts` +204, and the two manifests bumped (0.2.0 at the time; 0.2.1 since,
+when the identity slice touched the plugin — which is the rule working).
 
 **Deploy and scripts** — `deploy/herdr-tg-watchdog.sh` +212 −8, `deploy/kickoff-hub-attach@.service`
 +33 −3, `deploy/herdr-tg.service` +5, `scripts/install-channel-plugin.sh` +486 −26,
@@ -513,7 +514,7 @@ Authority: `CLAUDE.md`, *Build and test*; the gate is
 The installed copy is cached by version. A change that does not move the number never reaches a box
 that already has the plugin, silently. That is how a bridge from 1 September was still running on
 7 September while the source had grown five times over. The whole workspace goes red until the number
-moves. Current version: **0.2.0**. If you carry this bridge on another box, reinstall it — an older
+moves. Current version: **0.2.1**. If you carry this bridge on another box, reinstall it — an older
 copy stamps no lease and promises no confirmation, so every tap there reads *Sent* for ever and the
 run-replaced fence never engages.
 
