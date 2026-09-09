@@ -85,9 +85,10 @@ the commit too, or it is refused with seven red tests you did not break.
 Thirteen tests are `#[ignore]`d — eleven need bun (one runs the plugin from before conversations
 existed against the new hub, one dispatches three rooms with the real adapter, one is the fleet
 trial below), one is a proxy-driven child, one runs the pre-change bridge against the new hub.
-`scripts/install-channel-plugin.sh` runs them and refuses to install a bridge that disagrees with
-the hub — it runs the fleet trial **by name**, because that one shares no substring with the
-`the_real_plugin` filter:
+`scripts/install-channel-plugin.sh` runs the bun ones and refuses to install a bridge that
+disagrees with the hub. It does NOT run the fleet trial: four conversations crossing is a property
+of the hub and the adapter, which installing a bridge can neither break nor fix, so failing an
+install on it told the operator his plugin was unsafe when his plugin was fine:
 
 ```
 cargo test -p herdr-tg the_real_plugin -- --ignored
@@ -218,9 +219,10 @@ until the number moves, which is the point.
   is `four_rooms_of_one_repo_reach_only_the_session_their_own_note_names_and_the_room_paired_off_by_one_reaches_nobody`.
   It exists so another org can run a fleet against the real wire without a Telegram account; what it
   cannot prove is what only a live forum can — the Bot API's own refusals and what it really charges.
-  **A filter that matches nothing is a pass to `cargo test`**, so both the trial and the installer
-  now refuse a run that matched no test rather than reporting green — that shape had been sitting in
-  the step that decides whether a bridge is installed at all.
+  **A filter that matches nothing is a pass to `cargo test`**, so the trial refuses a run that
+  matched no test rather than reporting green. That shape was found in the installer, where it sat
+  in the step that decides whether a bridge is installed at all; the installer's own proofs keep the
+  refusal, and the trial itself is no longer run there.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
