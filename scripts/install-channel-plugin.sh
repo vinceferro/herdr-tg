@@ -115,16 +115,22 @@ run() {
 
 # A `claude plugin …` call, under a deadline. Only these get one: a cold `bun install` or a first
 # build of this workspace legitimately takes longer than two minutes, and killing either would look
-# exactly like the failure this script exists to report. A plugin command that is still going after
-# two minutes is waiting for something nobody is going to give it.
+# exactly like the failure this script exists to report.
+#
+# STDIN IS CLOSED, and the deadline is five minutes rather than two. Measured on 9 September: the
+# update step ran to 120 seconds and was killed, reported as "did not finish within two minutes",
+# and the operator read that as the plugin being broken. Run again with stdin at /dev/null it
+# finished in under a hundred seconds and said what it had done. A command that inherits a terminal
+# can wait on a person who is not there, and a deadline that sits near the honest running time
+# turns a slow success into a false failure — so close the one and widen the other.
 run_claude() {
   local what="$1"; shift
   local log="$WORK/step.log" rc=0
-  timeout 120 claude "$@" > "$log" 2>&1 || rc=$?
+  timeout 300 claude "$@" < /dev/null > "$log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     say
     if [ "$rc" -eq 124 ]; then
-      say "$what did not finish within two minutes. It said:"
+      say "$what did not finish within five minutes. It said:"
     else
       say "$what failed (exit $rc). It said:"
     fi
