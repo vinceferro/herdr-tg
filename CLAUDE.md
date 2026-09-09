@@ -194,6 +194,20 @@ until the number moves, which is the point.
   `confirms: ["choice"]` now answers every tap `accepted` or `refused`, so the line on his
   phone is edited from `Sent: X` to `Taken: X`, or to why it was not taken — it said "Sent"
   for ever before, whatever the far side did with the answer.
+- **A conversation is named by an id, never by a path** (8 September). The `welcome` carries
+  `project_id` (the seed) and `conversation` (the id the secret resolved to); a `hello` need name
+  neither a repo nor a pid, and an instance no longer embeds one. `projects --json` gains a tenth
+  field, `seed`, appended. A room whose seed was re-enrolled at a moved path stands for itself
+  rather than guessing at the nearest folder. Seed ids are still a path hash — an implementation
+  detail, with random minting named as debt. `docs/ATTACHING.md` §3b is the table: for sixteen
+  things, whether it is fleet identity or a local detail. **A dispatcher joins on the ids.**
+- **"No `Command` in the binary" was false, and is now a guard.** Five `git` call sites run during
+  enrolment and one re-runs this binary for the summariser. The true property —Nothing reachable
+  from a message, a tap or a frame can start a process — is held by
+  `tests/nothing_inbound_can_start_a_process.rs`: a fixed program name at every allowed site, a
+  program built from a value refused even there, the test-only sites proved gated. Six evasions
+  planted and killed, including a module mounted from outside the walk and a renamed file. Four
+  documents that overstated it now say what the guard proves.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.
