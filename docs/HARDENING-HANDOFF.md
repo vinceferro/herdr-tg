@@ -518,6 +518,39 @@ moves. Current version: **0.2.1**. If you carry this bridge on another box, rein
 copy stamps no lease and promises no confirmation, so every tap there reads *Sent* for ever and the
 run-replaced fence never engages.
 
+### 5.7 The hermetic fleet trial — run it before your Runner exists
+
+Authority: `docs/ATTACHING.md` §13.12; the door is `bash scripts/fleet-trial.sh`.
+
+Four conversations of one repo, live at once, against a **real** hub over a real Unix socket and
+four **real** `kickoff-hub-attach` processes — with Telegram counted instead of called and one fake
+engine instead of four opencodes. It needs no bot token, no opencode, and no share of a forum's
+minute. Point a dispatcher at what it proves: each wall speaks only to the session its binding
+names, a question from a session no binding names reaches nobody, a tap answers only the session
+that asked, a line he types is routed from the topic he typed it in, and a run of an address that
+has been replaced is refused `stale_generation` while its siblings keep their claims, their process
+ids and their topics — while a wall that only lost its socket is let back in with the lease it
+still holds, however many siblings restarted around it.
+
+**One of its four rooms is deliberately paired off by one** — its note names its own session under
+the conversation next door, which is what a dispatcher writes when it mints four rooms and pairs
+them wrong. Both directions of §13.10 are proved on it: the question it cannot show draws no
+keyboard and earns one plain line in its own topic, and a line typed at it is refused with the
+reason under it. If your Runner writes bindings, this is the case to write a test against.
+
+It also **measures the spend and prints it**: twelve of the seventeen an agent may have in a
+trailing minute to open four conversations and speak in each, four more for the receipts under his
+taps and the one line saying his refused words were not taken, one left. A refusal costs what a
+delivery costs. Progress is deliberately out of it — one progress line per room is over the ceiling,
+and the trial goes red if one appears. And then **the minute is gone**: a wall restarting inside the
+same minute as four conversations opening is held, silent, for the rest of it.
+
+This repo is integration support, not a fleet controller. The trial starts four fixed processes
+once and stops: no scheduler, no spec resolution, no supervision, no health inference. What it
+cannot prove is written at the top of the test itself — the real Bot API's refusals, real timing, a
+real engine's event shapes, that an agent **acted**, the last hop to a phone, and the pid fence in
+the hard case.
+
 ---
 
 ## 6. What is NOT proven

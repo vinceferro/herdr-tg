@@ -82,10 +82,12 @@ overrides `rust-toolchain.toml`. `TMPDIR` because an agent session inherits it a
 The same applies to `git commit`: the pre-commit hook runs six gates in your environment, so prefix
 the commit too, or it is refused with seven red tests you did not break.
 
-Twelve tests are `#[ignore]`d — ten need bun (one of those runs the plugin from before
-conversations existed against the new hub, one dispatches three rooms with the real adapter), one
-is a proxy-driven child, one runs the pre-change bridge against the new hub. `scripts/install-channel-plugin.sh` runs them, and refuses to install
-a bridge that disagrees with the hub:
+Thirteen tests are `#[ignore]`d — eleven need bun (one runs the plugin from before conversations
+existed against the new hub, one dispatches three rooms with the real adapter, one is the fleet
+trial below), one is a proxy-driven child, one runs the pre-change bridge against the new hub.
+`scripts/install-channel-plugin.sh` runs them and refuses to install a bridge that disagrees with
+the hub — it runs the fleet trial **by name**, because that one shares no substring with the
+`the_real_plugin` filter:
 
 ```
 cargo test -p herdr-tg the_real_plugin -- --ignored
@@ -208,6 +210,17 @@ until the number moves, which is the point.
   program built from a value refused even there, the test-only sites proved gated. Six evasions
   planted and killed, including a module mounted from outside the walk and a renamed file. Four
   documents that overstated it now say what the guard proves.
+- **A fleet trial runs hermetically: `bash scripts/fleet-trial.sh`** (9 September). Four
+  conversations of one repo, live at once, each bound to its own engine session — a real hub over a
+  real socket, four real adapters, fake Telegram and fake engines, nothing spent and nothing sent.
+  It proves each conversation's words reach only its own session, a question from an unbound one
+  reaches nobody, a tap answers only the session that asked, and four at once do not cross. The test
+  is `four_rooms_of_one_repo_reach_only_the_session_their_own_note_names_and_the_room_paired_off_by_one_reaches_nobody`.
+  It exists so another org can run a fleet against the real wire without a Telegram account; what it
+  cannot prove is what only a live forum can — the Bot API's own refusals and what it really charges.
+  **A filter that matches nothing is a pass to `cargo test`**, so both the trial and the installer
+  now refuse a run that matched no test rather than reporting green — that shape had been sitting in
+  the step that decides whether a bridge is installed at all.
 - **The screen-scraper is deleted, not disabled.** `permission.rs`, `deliver.rs`, `mirror.rs`,
   `voice.rs`, `notify.rs`, `audit.rs` and `routing.rs` are gone, along with the `HERDR_TG_PANES`
   flag that briefly gated them. `there_is_no_way_from_telegram_to_a_keyboard.rs` pins the deletion.

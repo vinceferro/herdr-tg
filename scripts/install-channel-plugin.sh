@@ -313,6 +313,51 @@ if ! ( cd "$REPO" && env -u RUSTUP_TOOLCHAIN TMPDIR="$PROOF_TMPDIR" PATH="$HOME/
 fi
 show "$WORK/older.log"
 
+# And the promise made to another org: four conversations at once, against a real hub and the real
+# adapter, with Telegram counted instead of called. It is here for one reason — a fixture nothing
+# runs is a fixture that rots, which is the same reason the first proof above shares its filter with
+# the install — and it earns its place by costing about three seconds. Named rather than folded into
+# a filter, because its name shares no substring with the others; if it ever stops being cheap, take
+# it out of the install and leave `scripts/fleet-trial.sh` as the only door.
+#
+# With a state home of its own, and refused if anything lands in it — the same trap
+# `scripts/fleet-trial.sh` sets, written out here rather than borrowed, because this call site would
+# otherwise run the trial with none of the wrapper's guards: an install writing into the operator's
+# own state directory while proving a fixture is hermetic is the one outcome nobody would look for.
+FLEET_AMBIENT="$WORK/fleet-ambient"
+mkdir -p "$FLEET_AMBIENT"
+say
+say "Proving four conversations still stand up at once against this hub…"
+if ! ( cd "$REPO" && env -u RUSTUP_TOOLCHAIN TMPDIR="$PROOF_TMPDIR" XDG_STATE_HOME="$FLEET_AMBIENT" \
+         PATH="$HOME/.cargo/bin:$PATH" \
+         cargo test -q -p herdr-tg --bins -- --ignored --exact \
+         hub::tests::four_rooms_of_one_repo_reach_only_the_session_their_own_note_names_and_the_room_paired_off_by_one_reaches_nobody \
+         > "$WORK/fleet.log" 2>&1 ); then
+  say
+  say "It said:"
+  show "$WORK/fleet.log"
+  die "four conversations no longer stand up at once; the fleet trial another org runs is broken. Not installing it"
+fi
+if [ -n "$(find "$FLEET_AMBIENT" -mindepth 1 2>/dev/null || true)" ]; then
+  say
+  find "$FLEET_AMBIENT" -mindepth 1
+  die "the fleet trial worked out where to keep its state from the environment instead of being told; on this box that is the operator's own state directory. Not installing it"
+fi
+# And it RAN. `cargo test` calls a filter that matches nothing a pass and exits 0, so a trial
+# renamed or moved out of `hub::tests` would be reported green here by a step that ran no test at
+# all — and this is the step that decides whether a bridge is installed.
+#
+# Read as "it said nothing ran" rather than "it said one test ran", which is the weaker of the two
+# and deliberately so: this script is driven in tests by a `cargo` that stands in for the real one
+# and prints no result line at all, and a check that demanded one would refuse every one of those
+# runs. `scripts/fleet-trial.sh` — the door another org is pointed at — demands the number.
+if grep -qE '^test result: ok\. 0 passed' "$WORK/fleet.log"; then
+  say
+  show "$WORK/fleet.log"
+  die "the fleet trial did not run: nothing matched its name, and a filter that matches nothing is reported as a pass. Not installing it"
+fi
+show "$WORK/fleet.log"
+
 # The tree AFTER the proofs is the tree that gets copied, and it is also the tree the proofs ran
 # against — `bun install` writes a lockfile this repo tracks, so a fingerprint taken before it would
 # describe a tree that no longer exists. Reading it again here is what makes the verification at the

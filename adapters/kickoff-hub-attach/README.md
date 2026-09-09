@@ -165,3 +165,15 @@ Real tool-server processes, the real stranger's adapter, real Unix sockets, a fa
 one claim per address, and a fake opencode over real HTTP. Nothing inside a producer is mocked: a
 fixture invented here would only prove this file agrees with itself, which is how the event bridge
 once came to read its payload out of the wrong field and pass every test it had.
+
+Two files here are fixtures rather than suites, and neither is a command:
+
+* `fake-opencode.ts` — the fake server itself, and the session shape captured from a real 1.18.25.
+  It is imported by every suite above through `test-harness.ts`, which re-exports it. It lives in a
+  file of its own because the harness points `XDG_STATE_HOME` somewhere of its own the moment it is
+  imported, and a fixture started as somebody else's child must take its state home from its parent.
+* `fake-engine.ts` — one of those servers as a PROCESS, driven one JSON line at a time down a pipe.
+  It exists for the hermetic fleet trial (`bash scripts/fleet-trial.sh`, `docs/ATTACHING.md`
+  §13.12), which runs four of these adapters against a real hub from a Rust test — the only place a
+  hub with a faked Telegram can be built at all. It starts nothing, reads no binding, resolves no
+  spec and chooses no session; there is still exactly one thing to run under `adapters/`.

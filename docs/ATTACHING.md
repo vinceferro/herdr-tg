@@ -1,5 +1,11 @@
-<!-- INTERFACE, v26, 8 September 2026. The one abstract surface an adapter attaches to: one
+<!-- INTERFACE, v27, 9 September 2026. The one abstract surface an adapter attaches to: one
      configuration namespace, one wire, one document.
+
+     v27 adds §13.12 and moves no frame, no variable and no rule: the hermetic fleet trial, which
+     is how another org runs four conversations against a real hub and this real adapter with no
+     bot token, no opencode and no share of a forum's minute. It documents a fixture, what it
+     proves — including both directions of §13.10, because one of its four rooms is deliberately
+     paired off by one — what it spends, and what it cannot prove.
 
      v26 corrects v25 where review found it wrong or half-said, and moves no frame. `project_id`
      names two different things — the SEED on `welcome`, each row's OWN conversation id in the
@@ -3130,6 +3136,118 @@ And three lines the watcher puts in the topic on its own, where no `ack` can car
   `the worker is set to run as an agent its server does not know` rather than as the server's
   `Agent not found: "…". Available agents: …`, which is a quoted identifier and an internal roster
   on a phone.
+
+### 13.12 The hermetic fleet trial — a real hub and this command, without a bot token
+
+Another org is building the thing that dispatches walls, and it wanted to run a fleet against a
+**real** hub and this **real** adapter before that thing existed: no Telegram account, no opencode,
+and no share of a forum's send budget. That trial exists and is a fixture of this repo:
+
+```
+bash scripts/fleet-trial.sh
+```
+
+It is the documented door and it is stable. Behind it is one `#[ignore]`d test,
+`hub::tests::four_rooms_of_one_repo_reach_only_the_session_their_own_note_names_and_the_room_paired_off_by_one_reaches_nobody`, run
+with `--nocapture` so the trial prints what it spent. The script gives the run a TMPDIR of its own,
+sets the environment variables an agent session gets wrong, refuses — before it makes
+anything — to run with its work pointed at the real state directory, gives the run a **state home
+of its own** and fails if a single entry appears in it, and lists the real state directory before
+and after to fail if a path appeared or vanished. So "hermetic" is proved rather than promised.
+It also refuses a run in which nothing matched the trial's name: `cargo test` reports a filter that
+matches nothing as a pass and exits 0, so a trial renamed or moved would otherwise print a clean
+fleet run at you having run no test at all. The script reads the number, not the exit code.
+The state home of its own is the load-bearing half: it catches by name the one way a run leaks,
+which is code that works out where to keep its state from the environment instead of being told.
+The listing is by PATH and not by size or modification time on purpose — a hub serving the operator
+re-stamps its own status files every tick, and reporting that as the trial's leak told another org
+a good run could not be trusted, on exactly the box this fixture is for.
+
+**What is real in it.** The hub, built over its own `Surface` trait, listening on the production
+`LocalSocket` at a real Unix path; the registry, the channel home, the ask ledger and the audit, on
+disk; four `bun main.ts` processes, which are this command; their claims, their leases, their doors
+at the path §9's formula gives, their bindings read by §13.10's own reader, and their subscriptions
+to one engine's event stream.
+
+**What is faked, and only this.** Telegram — a surface that counts instead of calling, so nothing
+reaches the Bot API and nothing is spent. And the engine —
+`adapters/kickoff-hub-attach/fake-engine.ts`, a **fixture and not a command**: it starts one
+`fakeOpencode()`, the same fake every bun suite here uses, prints where it is, and then does exactly
+what it is told, one JSON line at a time. Nothing under `adapters/` gained a second thing to run.
+
+**The shape.** Four rooms of one repo, minted the way `herdr-tg grant` mints them, each with its own
+secret, its own topic and its own door. **One** engine for all four, with four root sessions in
+**one** directory running **one** agent — so the four bindings differ in exactly one thing, which
+session each names. That is deliberate: give each room its own directory or its own agent and "each
+spoke only to its own" stops being a proof.
+
+Three of the four notes name a session of their own. **The fourth names its own session under the
+conversation next door** — what a dispatcher writes when it pairs its rooms off by one, and the
+§13.10 case in which every particular a machine can check is right. It is in the trial from the
+start rather than swapped in halfway, because a fence only ever asked the question it passes is a
+branch nothing runs: with four notes each naming their own room, §13.10's refusal is dead code here
+and this adapter could lose it with no red line anywhere in the repo.
+
+**What it asserts.** Four topics, four greetings, four claims, four doors, four watchers. A question
+from each bound session reaches that room's topic and no other. A question from a fifth root session
+that no binding names reaches nobody — neither as a question nor as a permission prompt. A tap is
+posted to `/api/session/<the session that asked>/question/<its own>/reply` and to nothing else. A
+typed line is posted to `/session/<the session the note names>/prompt_async` and to nothing else,
+and is routed the way `bot.rs` routes it — from the **topic** he typed in, through the hub's own
+scan — rather than from an address the test already knows, because four rooms is the first place a
+scan that answers "the first row" and a scan that answers "the row that owns this topic" differ.
+
+Both directions of §13.10, from the room paired off by one: its question draws **no keyboard** and
+puts one line in **its own** topic saying the session named for this worker belongs to a different
+conversation; a line typed at it is refused, said under the line it refuses, and marked with the
+cross; and the session that note names is never posted to at all.
+
+And the two directions of a run's lease. A run of an address that has been replaced is refused
+`stale_generation` — not `already_claimed` — while its siblings keep their claims, **their process
+ids** and their topics. And a wall that only lost its socket, redialling with the lease it still
+holds after a **sibling** restarted in the meantime, is let back in: the numbers come from one clock
+for the whole box, so a fence that asked "has anything been claimed since?" rather than "has this
+been claimed since?" is invisible in a repo of one conversation and walls a room out of its own
+conversation for ever in a fleet, with `Restart=always` bringing it back every few seconds to be
+refused again.
+
+**The spend, measured and printed.** A new conversation costs three turns before its agent's own
+words land — the topic, the greeting, then the message — so four of them cost twelve of the
+seventeen an agent may have in a trailing minute (`queue.rs`: eighteen, one held back for the hub).
+Three receipts under his taps and the one line saying his refused words were not taken bring it to
+sixteen. One left. **A refusal is not free** — the room paired off by one costs the chat exactly
+what a working room costs it. **Progress is kept out**: the trial relays no per-line beat, and every
+acknowledgement the operator reads in it is an in-place edit or a reaction, both of which are free.
+One progress line per room is measured to be over the ceiling — four go out as twelve plus one, and
+the rest are shed.
+
+Measured means the trial **drains the budget and counts what is left**, a second apart, rather than
+spending one and asking. `would_refuse` answers the one-a-second rhythm before it answers the
+ceiling, so a spend and an immediate ask are answered "not yet" whatever the count is — an assertion
+of that shape is satisfied at every spend there is, nought included, and it said sixteen under a hub
+that had stopped charging for a topic at all.
+
+**And then the minute is gone.** Everything the trial does after its sixteenth send — a wall
+restarting, the greeting for the run that replaces it — is HELD for the rest of that minute, not
+shed and not audited. A wall restarting inside the same minute as four conversations opening is
+silent for the best part of a minute; that is a fleet fact a dispatcher should size for, and it is
+why no assertion past the spend block is about anything reaching a phone.
+
+**What it is not, on purpose.** No scheduler: four processes are started once, in order, and every
+wait asserts a condition and panics. No spec resolution: the four bindings are constants the test
+writes and never interprets, and `agent` is an opaque string. No process supervision and no health
+inference: nothing in the trial reads or writes `hub.health`. And no `serve --fake-telegram` — the
+hub with a faked surface is built only inside the test module, because `herdr-tg` ships no library
+and a fake Telegram in the shipped binary would be a fake Telegram in the egress owner's file set.
+
+**What no fake here can prove** is written at the top of the test itself, where the next person to
+run it will meet it: the real Bot API's refusals (and whether `createForumTopic` is charged at all
+is still unmeasured, so one of the three turns above is an assumption); real network timing; a real
+engine's event shapes, which are fixtures captured from opencode 1.18.25; that any agent **acted**;
+the last hop to a phone; the pid fence in the hard case, since every process here shares one
+namespace; and retirement across a fleet, which is held at lane scope by four other tests and left
+out of this one deliberately — leaving a question open costs the tap that would have answered it,
+and this rig has one send left, not two.
 
 ## 14. Files
 

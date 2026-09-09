@@ -202,6 +202,13 @@ impl Surface for FakeTelegram {
             .lock()
             .await
             .push((topic_id, text.to_owned(), buttons.to_vec()));
+        // KEEP THESE TWO LINES WITHOUT AN AWAIT BETWEEN THEM. Every test below finds the message a
+        // question landed on by counting rows — `sends[k]` is `m{k+1}` — and nothing enforces that
+        // but the fact that a task cannot be taken off the runtime here. Put an await in the middle
+        // and, the moment two conversations send at once, a tap lands on another conversation's
+        // question and the failure looks like the hub's. The fleet trial is where four of them do
+        // send at once; it asserts that nothing else is minting from this counter, which is the
+        // other half of what makes the position honest.
         let n = self.next_msg.fetch_add(1, Ordering::Relaxed) + 1;
         SendOutcome::Sent(MsgId::new(format!("m{n}")))
     }
@@ -9936,7 +9943,11 @@ async fn the_real_plugin_finds_its_conversation_from_a_lane_with_no_token_in_any
 // nothing runs.
 
 /// Longer than `until`: three bun processes starting at once take more than two seconds.
-async fn until_within(secs: u64, mut cond: impl AsyncFnMut() -> bool) {
+///
+/// `what` is what it is waiting FOR, in words, and it is the whole of what a reader gets when this
+/// gives up. It said "the hub never reached the state this test was waiting for" and nothing else,
+/// which in a test with a dozen of these is a timeout with no name on it.
+async fn until_within(what: &str, secs: u64, mut cond: impl AsyncFnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     while tokio::time::Instant::now() < deadline {
         if cond().await {
@@ -9944,7 +9955,7 @@ async fn until_within(secs: u64, mut cond: impl AsyncFnMut() -> bool) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("the hub never reached the state this test was waiting for");
+    panic!("waited {secs}s and never saw {what}");
 }
 
 /// One `kickoff-hub-attach`, holding a claim for a conversation it was TOLD, and its stderr.
@@ -9966,10 +9977,13 @@ fn start_attach(
     xdg: &std::path::Path,
     relay_dir: &std::path::Path,
     conversation: &str,
+    extra: &[&str],
 ) -> AttachRun {
     use tokio::io::AsyncBufReadExt;
     let mut cmd = tokio::process::Command::new("bun");
-    cmd.arg("main.ts").current_dir(attach);
+    // One builder, and the flags a caller needs go on the end of it. A second copy of this for the
+    // bound-worker case is how the two copies of `hub-link.ts` drifted by thirteen fixed defects.
+    cmd.arg("main.ts").args(extra).current_dir(attach);
     // Nothing of this session's own attachment may leak into the one under test.
     for v in [
         "KICKOFF_HUB_PROJECT_DIR",
@@ -10068,11 +10082,24 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
 
     let mut runs: Vec<AttachRun> = rooms
         .iter()
-        .map(|(room, _)| start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room.id.as_str()))
+        .map(|(room, _)| {
+            start_attach(
+                &attach,
+                &repo,
+                &h.sock,
+                &xdg,
+                &relay_dir,
+                room.id.as_str(),
+                &[],
+            )
+        })
         .collect();
 
     // Three topics, three names, and the dispatcher's title on the one that has it.
-    until_within(30, async || h.fake.topics.lock().await.len() >= 3).await;
+    until_within("three topics", 30, async || {
+        h.fake.topics.lock().await.len() >= 3
+    })
+    .await;
     let topics = h.fake.topics.lock().await.clone();
     assert_eq!(topics.len(), 3, "{topics:?}");
     let names: std::collections::BTreeSet<&str> = topics.iter().map(|t| t.0.as_str()).collect();
@@ -10083,7 +10110,10 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
     );
 
     // Three claims, each on the room's own address; the seed's own voice untouched.
-    until_within(10, async || h.hub.connected_ids().await.len() >= 3).await;
+    until_within("three claims", 10, async || {
+        h.hub.connected_ids().await.len() >= 3
+    })
+    .await;
     let connected = h.hub.connected_ids().await;
     assert_eq!(connected.len(), 3, "{connected:?}");
     for (room, _) in &rooms {
@@ -10131,7 +10161,7 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
 
     // A fourth dispatch reusing room 0, at the same door: turned away at the door, before hello.
     let room0 = rooms[0].0.id.as_str();
-    let mut fourth = start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room0);
+    let mut fourth = start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room0, &[]);
     let status = tokio::time::timeout(Duration::from_secs(20), fourth.child.wait())
         .await
         .expect("the fourth attach exits")
@@ -10152,8 +10182,14 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
         &xdg,
         &h.dir.path().join("fanin-2"),
         room0,
+        &[],
     );
-    until_within(20, async || fifth.said().contains("already_claimed")).await;
+    until_within(
+        "the fifth dispatch told the address is already claimed",
+        20,
+        async || fifth.said().contains("already_claimed"),
+    )
+    .await;
     assert_eq!(
         h.hub.connected_ids().await,
         connected,
@@ -10182,15 +10218,26 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
     // lands in the SAME topic — the fourth topic that would prove the id moved never appears.
     let _ = runs[0].child.kill().await;
     let addr0 = Addr::project_itself(rooms[0].0.id.clone());
-    until_within(10, async || !h.hub.connected_ids().await.contains(&addr0)).await;
-    let again = start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room0);
-    until_within(30, async || h.hub.connected_ids().await.contains(&addr0)).await;
+    until_within(
+        "room 0's claim released after its session was killed",
+        10,
+        async || !h.hub.connected_ids().await.contains(&addr0),
+    )
+    .await;
+    let again = start_attach(&attach, &repo, &h.sock, &xdg, &relay_dir, room0, &[]);
+    until_within("room 0's second session admitted", 30, async || {
+        h.hub.connected_ids().await.contains(&addr0)
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Copied out before it is judged, for the reason the fleet trial's counts are: an assertion
+    // whose failure message takes the lock its own first argument is still holding deadlocks, and
+    // this one would hang for ever at the exact moment it had something to say.
+    let topics_now = h.fake.topics.lock().await.clone();
     assert_eq!(
-        h.fake.topics.lock().await.len(),
+        topics_now.len(),
         3,
-        "a room's second session minted a second topic: {:?}",
-        h.fake.topics.lock().await
+        "a room's second session minted a second topic: {topics_now:?}"
     );
     assert!(
         !again.said().contains("refused"),
@@ -10201,6 +10248,1158 @@ async fn the_real_plugin_attach_dispatches_three_rooms_of_one_repo_and_a_fourth_
     for r in runs.iter_mut() {
         let _ = r.child.kill().await;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// The hermetic fleet trial: four conversations of one repo, four walls, one engine, and nothing
+// whatever reaching Telegram.
+//
+// It exists for another org. They are building the thing that dispatches walls, and they wanted to
+// run a fleet against a REAL hub and a REAL adapter before their dispatcher exists — without a bot
+// token, without an opencode, and without spending a send. So the only faked things here are the
+// two nobody may fake honestly on a test box: Telegram, and the engine.
+//
+// THREE of the four walls are bound to a session of their own. The fourth is bound to its own
+// session under the conversation NEXT DOOR, which is what a dispatcher writes when it pairs its
+// rooms off by one — and it is in the trial from the start rather than mutated in, because a fence
+// only ever asked the question it passes is a branch nothing runs. So the trial is three workers
+// proving nothing crosses between them, and a fourth proving what a wall does with a note written
+// for somebody else: it draws no keyboard, hands on no words, and says so in its own topic, twice.
+//
+// What is real: the hub, over the production listener, on a real Unix socket; the registry, the
+// channel home, the ledger and the audit on disk; four `bun main.ts` processes, which are the
+// adapter itself; their doors, their claims, their bindings and their event stream. What is faked:
+// `FakeTelegram`, which counts instead of sending, and `fake-engine.ts`, which is the same
+// `fakeOpencode()` every bun suite in the adapter uses, started as a process so this side can drive
+// it.
+//
+// **What no fake here can prove**, said where the next reader of this rig will meet it, because a
+// green fleet trial is not a fleet:
+//
+//   * the real Bot API's refusals — the two 429 shapes, a real `retry_after`, a topic Telegram
+//     will not make, an edit past the forty-eight-hour window, a reaction a forum forbids. And
+//     whether `createForumTopic` is charged against the group ceiling at all is UNMEASURED
+//     (`docs/RATE-PROBE.md`), so one of the three turns a new conversation costs below is an
+//     assumption, not a measurement;
+//   * real network timing — this runs at a five-millisecond gap and a half-second settling window,
+//     so the order an edit and a tap land in is modelled, not observed;
+//   * a real engine's event shapes: the fixtures are captured from opencode 1.18.25 on 6–7
+//     September, and a version that renames a field passes here and fails on the box. The Claude
+//     Code side is not in this rig at all;
+//   * that any agent ACTED. A fake server confirms the destination and the body of what was
+//     posted; nothing here observes a turn running;
+//   * the last hop. No hermetic run proves a question reached a phone or that a thumb came back;
+//   * the pid fence in the hard case — every process here shares one pid namespace;
+//   * retirement across a fleet. When the wall that restarts below is killed, no question is open
+//     anywhere — all three were tapped — so the sweep that takes a dead session's keyboards off
+//     runs over nothing here. It is held at lane scope by
+//     `a_lane_arriving_never_takes_another_live_lanes_questions_off_the_phone` and three tests
+//     beside it, and left out of this trial ON PURPOSE: leaving a question open costs the tap that
+//     would have answered it, and this rig has one send left, not two. Whoever reasons about a
+//     fleet from this file should read that as untested HERE rather than untested;
+//   * anything at all after the sixteenth send. The minute is gone by then, so the restart phase's
+//     greetings are held rather than delivered, and no assertion past the spend block is about
+//     something reaching a phone.
+//
+// **What is deliberately NOT built here**, because this repo is integration support and not a fleet
+// controller: no scheduler (four processes are started once, in order; there is no queue, no retry
+// and no backoff — every wait below asserts a condition and panics), no spec resolution (the four
+// bindings are constants this test writes and never interprets; `agent` is an opaque string), no
+// process supervision, no health inference (nothing here reads or writes `hub.health`), and no
+// `serve --fake-telegram` — a hub with a faked Telegram is built only in this module, because
+// putting one in the shipped binary would put a fake Telegram in the egress owner's file set.
+
+/// The fake opencode server as a CHILD PROCESS, and the pipe this test drives it down.
+///
+/// `adapters/kickoff-hub-attach/fake-engine.ts` starts one `fakeOpencode()` — the same fake every
+/// bun suite in the adapter uses, so a fleet trial and the adapter's own suites cannot come to
+/// disagree about what an opencode server does — prints where it is, and then does exactly what it
+/// is told, one JSON line at a time. Every command is answered, and this side waits for the answer:
+/// a driver that pushed an event and then slept would be timing the fixture rather than waiting for
+/// it.
+struct FakeEngine {
+    child: tokio::process::Child,
+    to: tokio::process::ChildStdin,
+    from: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    url: String,
+}
+
+impl FakeEngine {
+    async fn start(attach: &std::path::Path) -> Self {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new("bun")
+            .arg("fake-engine.ts")
+            .current_dir(attach)
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("bun is on PATH");
+        let to = child.stdin.take().expect("stdin");
+        let mut from = tokio::io::BufReader::new(child.stdout.take().expect("stdout")).lines();
+        let hello = tokio::time::timeout(Duration::from_secs(30), from.next_line())
+            .await
+            .expect("the fake engine says where it is")
+            .expect("a line")
+            .expect("the fake engine printed nothing");
+        let url =
+            serde_json::from_str::<serde_json::Value>(&hello).expect("one JSON object")["url"]
+                .as_str()
+                .expect("a url")
+                .to_owned();
+        Self {
+            child,
+            to,
+            from,
+            url,
+        }
+    }
+
+    /// One command down, one answer back. The answer is what makes every step below a wait on the
+    /// fixture rather than a guess at how long it takes.
+    async fn tell(&mut self, command: serde_json::Value) -> serde_json::Value {
+        use tokio::io::AsyncWriteExt as _;
+        self.to
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .expect("the fake engine is still there");
+        self.to.flush().await.expect("flush");
+        let line = tokio::time::timeout(Duration::from_secs(30), self.from.next_line())
+            .await
+            .expect("the fake engine answers")
+            .expect("a line")
+            .expect("the fake engine stopped answering");
+        let answer: serde_json::Value = serde_json::from_str(&line).expect("one JSON object");
+        assert_eq!(
+            answer["ok"],
+            serde_json::Value::Bool(true),
+            "the fake engine refused a command: {answer}"
+        );
+        answer
+    }
+
+    /// Every path posted to this server so far, in order.
+    async fn posted(&mut self) -> Vec<String> {
+        self.tell(serde_json::json!({ "dump": true })).await["posted"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|p| p["path"].as_str().expect("a path").to_owned())
+            .collect()
+    }
+
+    /// How many watchers are subscribed to the event stream.
+    async fn watchers(&mut self) -> u64 {
+        self.tell(serde_json::json!({ "dump": true })).await["watchers"]
+            .as_u64()
+            .expect("a count")
+    }
+}
+
+/// One session as this engine lists it: a root, in the repo, running the agent every room runs.
+///
+/// The SAME agent and the SAME directory for all four on purpose. Four rooms of one repo share one
+/// project directory, so their four bindings differ in exactly one thing — which session they name
+/// — and that is the case §13.10 was written for: "a binding written for the room next door can
+/// name a directory that resolves perfectly well here". Give each room its own directory or its own
+/// agent and "each spoke only to its own" stops being a proof and becomes a tautology.
+fn a_root_session(id: &str, repo: &std::path::Path, updated: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "directory": repo.to_str().expect("a path"),
+        "updated": updated,
+        "extra": { "agent": THE_AGENT_EVERY_ROOM_RUNS },
+    })
+}
+
+/// What the four bindings all say the session runs. One name, so the only thing that tells the four
+/// workers apart is which session each was bound to.
+const THE_AGENT_EVERY_ROOM_RUNS: &str = "kickoff-room-steering";
+
+/// How many of the four rooms are bound to a session of their own: the first three.
+///
+/// The fourth is not. Its note names its own session under the conversation NEXT DOOR, which is the
+/// §13.10 case a dispatcher reaches by pairing its rooms off by one — so this trial has three
+/// workers proving that nothing crosses between them, and a fourth proving what a wall does with a
+/// note that was written for somebody else. Named rather than spelt `3` in a dozen places, because
+/// every count below turns on it.
+const THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION: usize = 3;
+
+/// The room whose note is written for the room next door — the fourth, so it is also the first
+/// index past the ones that are bound.
+const THE_ROOM_PAIRED_OFF_BY_ONE: usize = THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION;
+
+/// One `question.v2.asked` as opencode 1.18.25 publishes it: the turn it belongs to, never the
+/// agent — which is why the engine has to be able to describe `turn` for the note's fence to pass.
+fn a_question_from(session: &str, turn: &str, id: &str, asking: &str) -> serde_json::Value {
+    serde_json::json!({
+        "push": {
+            "type": "question.v2.asked",
+            "properties": {
+                "id": id,
+                "sessionID": session,
+                "tool": { "messageID": turn },
+                "questions": [{
+                    "question": asking,
+                    "header": "Pick",
+                    "options": [{ "label": "Ship it" }, { "label": "Hold" }],
+                }],
+            },
+        },
+    })
+}
+
+/// The note a launcher writes, in the launcher's own key names, whole and by rename at 0600.
+///
+/// Written by this test and interpreted by it in no way whatever: `agent` is an opaque string, and
+/// nothing here resolves a spec, picks a session or decides what a room should be running. That
+/// belongs to whoever dispatches, and doing any of it here would make this repo a fleet controller.
+fn write_a_binding(
+    path: &std::path::Path,
+    conversation: &str,
+    repo: &std::path::Path,
+    session: &str,
+) {
+    let note = serde_json::json!({
+        "version": 1,
+        "conversation": conversation,
+        "canonical_project_dir": repo.to_str().expect("a path"),
+        "session_id": session,
+        "agent": THE_AGENT_EVERY_ROOM_RUNS,
+        "generation": 1,
+    });
+    let scratch = path.with_extension("new");
+    std::fs::write(&scratch, format!("{note}\n")).expect("a binding");
+    std::fs::set_permissions(
+        &scratch,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("0600, or the adapter refuses to read it");
+    std::fs::rename(&scratch, path).expect("whole, by rename");
+}
+
+#[tokio::test]
+#[ignore = "the hermetic fleet trial: needs bun and the adapter's dependencies; \
+            run it with scripts/fleet-trial.sh"]
+async fn four_rooms_of_one_repo_reach_only_the_session_their_own_note_names_and_the_room_paired_off_by_one_reaches_nobody()
+ {
+    let h = harness().await;
+    let attach = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../adapters/kickoff-hub-attach")
+        .canonicalize()
+        .expect("the adapter is in the repo");
+    let repo = h
+        .dir
+        .path()
+        .join("herdr-tg")
+        .canonicalize()
+        .expect("the harness made it");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(ok.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "x",
+    ]);
+
+    // Four rooms, minted at a terminal after the hub started, exactly as a dispatcher would: four
+    // rows, four secrets, four slots in the seed's book, and not a byte written into the repo.
+    let rooms = rooms_of(&h, 4);
+    let xdg = h.dir.path().join("xdg");
+    let attach_home = crate::conversations::ChannelHome::at(xdg.join("herdr-tg"));
+    let hub_home = crate::conversations::ChannelHome::at(h.dir.path());
+    for (i, (room, secret)) in rooms.iter().enumerate() {
+        attach_home
+            .write_secret(&room.id, secret)
+            .expect("the adapter's copy");
+        // A name per room, so every assertion below can say WHICH room a topic, a question or a
+        // typed line belongs to. A dispatcher writes these; nothing reads them back as a decision.
+        std::fs::write(
+            hub_home
+                .conversations()
+                .join(room.id.as_str())
+                .join(crate::conversations::TITLE),
+            format!("Fleet room {}\n", i + 1),
+        )
+        .expect("a title");
+    }
+
+    // One engine for four walls, which is the harder rig and the honest one: under a shared server
+    // the recency rule would hand three of the four the wrong session, so "each posted only to its
+    // own" is a proof rather than an accident of there being one session to find.
+    let mut engine = FakeEngine::start(&attach).await;
+    let sessions: Vec<String> = (0..4).map(|i| format!("ses_room{i}fleettrial")).collect();
+    /// A fifth root session in the same directory, running the same agent, that no binding names.
+    const NOBODYS: &str = "ses_nobodysfleettrial";
+    engine
+        .tell(serde_json::json!({
+            "sessions": sessions
+                .iter()
+                .enumerate()
+                .map(|(i, s)| a_root_session(s, &repo, 1_788_607_585_000 + i as u64))
+                .chain(std::iter::once(a_root_session(NOBODYS, &repo, 1_788_607_589_000)))
+                .collect::<Vec<_>>(),
+        }))
+        .await;
+    // What each turn ran under. An asked event carries no agent — measured against 1.18.25's own
+    // OpenAPI — it names the MESSAGE the tool call belongs to, and the message carries the agent. A
+    // note that narrows to an agent therefore cannot place a question whose turn the server will
+    // not describe, and turns it down rather than showing it: five questions below would have been
+    // five turn-downs, which is a green fence proving nothing about which session asked.
+    engine
+        .tell(serde_json::json!({
+            "messages": sessions
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    (
+                        format!("msg_room{i}"),
+                        serde_json::json!({
+                            "id": format!("msg_room{i}"),
+                            "role": "assistant",
+                            "agent": THE_AGENT_EVERY_ROOM_RUNS,
+                        }),
+                    )
+                })
+                .chain(std::iter::once((
+                    "msg_nobodys".to_owned(),
+                    serde_json::json!({
+                        "id": "msg_nobodys",
+                        "role": "assistant",
+                        "agent": THE_AGENT_EVERY_ROOM_RUNS,
+                    }),
+                )))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        }))
+        .await;
+
+    // The four notes, in a directory only this user can enter — the adapter refuses to read one
+    // anybody else could have written, and a world-readable directory is a note anybody could have
+    // replaced.
+    let bindings = h.dir.path().join("bindings");
+    std::fs::create_dir_all(&bindings).expect("a place for the notes");
+    std::fs::set_permissions(
+        &bindings,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("0700");
+    let note_for: Vec<std::path::PathBuf> = (0..4)
+        .map(|i| bindings.join(format!("room-{i}.json")))
+        .collect();
+    for i in 0..THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION {
+        write_a_binding(&note_for[i], rooms[i].0.id.as_str(), &repo, &sessions[i]);
+    }
+    // And the fourth note is written for the room NEXT DOOR: room 4's own session, under room 3's
+    // conversation.
+    //
+    // This is §13.10's hard case, and it is here because a dispatcher will reach it by accident.
+    // A launcher that mints four rooms and pairs them off by one writes a note that is right in
+    // every particular a machine can check — the id resolves, the directory is this repo, the
+    // agent is the one this worker runs — and the conversation is the ONLY thing that tells the
+    // two apart. Steering another room's worker with the operator's words while telling him they
+    // were delivered is the failure the whole binding exists to refuse.
+    //
+    // Written from the START rather than swapped in halfway, because a fence that is only ever
+    // asked the question it passes is a branch this trial never runs: with four notes each naming
+    // their own room, the refusal below is dead code, and the adapter could lose it with no red
+    // line anywhere in this repo.
+    write_a_binding(
+        &note_for[THE_ROOM_PAIRED_OFF_BY_ONE],
+        rooms[THE_ROOM_PAIRED_OFF_BY_ONE - 1].0.id.as_str(),
+        &repo,
+        &sessions[THE_ROOM_PAIRED_OFF_BY_ONE],
+    );
+
+    // Four walls, one relay directory, one hub, one engine. Started once, in order; nothing here
+    // decides when, retries, or backs off.
+    let relay_dir = h.dir.path().join("fanin");
+    let mut runs: Vec<AttachRun> = (0..4)
+        .map(|i| {
+            start_attach(
+                &attach,
+                &repo,
+                &h.sock,
+                &xdg,
+                &relay_dir,
+                rooms[i].0.id.as_str(),
+                &[
+                    "--opencode",
+                    &engine.url,
+                    "--opencode-binding-file",
+                    note_for[i].to_str().expect("a path"),
+                ],
+            )
+        })
+        .collect();
+
+    // ── the fleet stands up ────────────────────────────────────────────────────────────────────
+    until_within("four topics", 40, async || {
+        h.fake.topics.lock().await.len() >= 4
+    })
+    .await;
+    let topics = h.fake.topics.lock().await.clone();
+    assert_eq!(topics.len(), 4, "{topics:?}");
+    // Telegram's own numbering in the fake: the nth topic made is 1000 + n.
+    let topic_of: BTreeMap<String, i32> = topics
+        .iter()
+        .enumerate()
+        .map(|(n, (title, _))| (title.clone(), 1000 + n as i32 + 1))
+        .collect();
+    for i in 0..4 {
+        assert!(
+            topic_of.contains_key(&format!("Fleet room {}", i + 1)),
+            "room {} has no topic of its own: {topics:?}",
+            i + 1
+        );
+    }
+
+    until_within("four claims", 20, async || {
+        h.hub.connected_ids().await.len() >= 4
+    })
+    .await;
+    let connected = h.hub.connected_ids().await;
+    assert_eq!(connected.len(), 4, "{connected:?}");
+    for (room, _) in &rooms {
+        assert!(
+            connected.contains(&Addr::project_itself(room.id.clone())),
+            "{} is not connected as itself: {connected:?}",
+            room.id
+        );
+    }
+    assert!(
+        !connected.contains(&h.own()),
+        "a room took the seed's own address"
+    );
+
+    // Four doors, one per conversation, at the path §9's formula gives.
+    for (room, _) in &rooms {
+        let want = relay_dir.join(format!(
+            "{}.sock",
+            &crate::registry::sha256_hex(format!("{}\0", room.id).as_bytes())[..16]
+        ));
+        UnixStream::connect(&want)
+            .await
+            .unwrap_or_else(|e| panic!("{}'s door does not answer: {e}", room.id));
+    }
+
+    // Four greetings, and nothing else yet. Waited for before a single question is pushed: a
+    // greeting still in flight would be counted as an answer to one, and the question phase below
+    // asserts that one question puts exactly one message on the phone.
+    until_within("four greetings", 30, async || {
+        h.fake.sends.lock().await.len() >= 4
+    })
+    .await;
+    let greetings = h.fake.sends.lock().await.clone();
+    assert_eq!(
+        greetings.len(),
+        4,
+        "the fleet said more than one thing per conversation before it was asked anything: \
+         {greetings:?}"
+    );
+    for (_, text, buttons) in &greetings {
+        assert!(
+            text.contains("is connected") && buttons.is_empty(),
+            "something that is not a greeting went out before any question: {text:?}"
+        );
+    }
+
+    // All four watching, not one. With a single-subscriber event stream three of these were
+    // subscribed, quiet, and looked healthy while every question went to the fourth — which passes
+    // any check that only ever asserts a question did NOT arrive.
+    until_within(
+        "all four walls subscribed to the engine's event stream",
+        30,
+        async || engine.watchers().await >= 4,
+    )
+    .await;
+    assert_eq!(engine.watchers().await, 4, "not every wall is watching");
+
+    // ── the room paired off by one: its question is refused, and he is told so ─────────────────
+    //
+    // FIRST of the questions, because a wall says this once per reason and the sentence goes to
+    // whichever question it sees first — asking it with the session its OWN note names is what
+    // makes the refusal about the note rather than about a session that was never this room's.
+    //
+    // Three things at once: room 4 is told, in words with no jargon in them; no keyboard is drawn,
+    // so there is no tap to answer into a conversation that has moved on; and the three rooms
+    // beside it stay silent, because this session is not theirs either.
+    let before_misbound = h.fake.sends.lock().await.len();
+    engine
+        .tell(a_question_from(
+            &sessions[THE_ROOM_PAIRED_OFF_BY_ONE],
+            &format!("msg_room{THE_ROOM_PAIRED_OFF_BY_ONE}"),
+            "que_paired_off",
+            &format!("Room {} asks: ship it?", THE_ROOM_PAIRED_OFF_BY_ONE + 1),
+        ))
+        .await;
+    until_within(
+        "the wall whose note is for the room next door saying so on the phone",
+        20,
+        async || h.fake.sends.lock().await.len() > before_misbound,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after_misbound = h.fake.sends.lock().await.clone();
+    assert_eq!(
+        after_misbound.len(),
+        before_misbound + 1,
+        "a question no wall may draw put more than one line on the phone: {:?}",
+        &after_misbound[before_misbound..]
+    );
+    let (misbound_topic, misbound_text, misbound_buttons) = after_misbound[before_misbound].clone();
+    assert_eq!(
+        misbound_topic,
+        topic_of[&format!("Fleet room {}", THE_ROOM_PAIRED_OFF_BY_ONE + 1)],
+        "the wall whose note is for the room next door said so in another room's topic"
+    );
+    assert!(
+        misbound_text.contains("belongs to a different conversation"),
+        "the room paired off by one was told something else: {misbound_text:?}"
+    );
+    assert!(
+        misbound_buttons.is_empty(),
+        "a question refused for belonging to another conversation still drew a keyboard, and a \
+         tap on it would answer into the room next door: {misbound_text:?}"
+    );
+
+    // ── a question each, and each in its own topic ─────────────────────────────────────────────
+    //
+    // Three questions from three sessions on one server. Every wall sees every event; only the wall
+    // whose note names that session may draw it — and the fourth wall, which has already said its
+    // piece, stays silent for all three.
+    let mut asked_in: Vec<(MsgId, i32, OptionId, String)> = Vec::new();
+    for i in 0..THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION {
+        let before = h.fake.sends.lock().await.len();
+        engine
+            .tell(a_question_from(
+                &sessions[i],
+                &format!("msg_room{i}"),
+                &format!("que_{i}"),
+                &format!("Room {} asks: ship it?", i + 1),
+            ))
+            .await;
+        until_within(
+            &format!("room {}'s question on the phone", i + 1),
+            20,
+            async || h.fake.sends.lock().await.len() > before,
+        )
+        .await;
+        // Settled before the row is read, so a fifth send that should never exist is caught here
+        // rather than in the count at the end.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let sends = h.fake.sends.lock().await.clone();
+        assert_eq!(
+            sends.len(),
+            before + 1,
+            "one question put more than one message on the phone: {:?}",
+            &sends[before..]
+        );
+        let (topic, text, buttons) = sends[before].clone();
+        assert_eq!(
+            topic,
+            topic_of[&format!("Fleet room {}", i + 1)],
+            "room {}'s question landed in another room's topic",
+            i + 1
+        );
+        assert!(
+            text.contains(&format!("Room {} asks", i + 1)),
+            "room {}'s topic carries another room's question: {text:?}",
+            i + 1
+        );
+        assert_eq!(
+            buttons.iter().map(|b| b.label.as_str()).collect::<Vec<_>>(),
+            vec!["Ship it", "Hold"],
+            "the buttons are not the labels the engine published"
+        );
+        // The message the question landed on. Its position IS its id — see the note on the count
+        // at the end of this test, which is what keeps that true.
+        asked_in.push((
+            MsgId::new(format!("m{}", before + 1)),
+            topic,
+            buttons[0].option_id.clone(),
+            "Ship it".to_owned(),
+        ));
+    }
+
+    // ── a question from a session nobody bound reaches nobody ──────────────────────────────────
+    let before_stranger = h.fake.sends.lock().await.len();
+    engine
+        .tell(serde_json::json!({
+            "push": {
+                "type": "question.v2.asked",
+                "properties": {
+                    "id": "que_nobodys",
+                    "sessionID": NOBODYS,
+                    "tool": { "messageID": "msg_nobodys" },
+                    "questions": [{
+                        "question": "Delete the staging database?",
+                        "header": "Destructive",
+                        "options": [{ "label": "Delete it" }],
+                    }],
+                },
+            },
+        }))
+        .await;
+    // A permission prompt too: the other half of what a watcher maps onto `ask`.
+    engine
+        .tell(serde_json::json!({
+            "push": {
+                "type": "permission.v2.asked",
+                "properties": {
+                    "id": "per_nobodys",
+                    "sessionID": NOBODYS,
+                    "tool": { "messageID": "msg_nobodys" },
+                    "action": "run a command",
+                    "resources": ["rm -rf /"],
+                },
+            },
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Copied out from under the lock before it is judged. An `assert_eq!` whose failure message
+    // takes the same lock again holds its own guard until the end of the statement, so the moment
+    // this fails it deadlocks — and a rig that HANGS instead of failing is a rig whose red is
+    // indistinguishable from a slow box.
+    let after_stranger = h.fake.sends.lock().await.clone();
+    assert_eq!(
+        after_stranger.len(),
+        before_stranger,
+        "a question from a session no note names reached the phone: {:?}",
+        &after_stranger[before_stranger..]
+    );
+
+    // ── a tap answers only the session that asked ──────────────────────────────────────────────
+    for i in 0..THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION {
+        let (msg, _, option, label) = asked_in[i].clone();
+        let before = engine.posted().await.len();
+        let (addr, ask_id, option_id) = h
+            .hub
+            .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &option)
+            .await
+            .unwrap_or_else(|e| panic!("room {}'s tap did not resolve: {e:?}", i + 1));
+        assert_eq!(
+            addr,
+            Addr::project_itself(rooms[i].0.id.clone()),
+            "room {}'s tap resolved to another conversation",
+            i + 1
+        );
+        let went = h
+            .hub
+            .deliver_tap(&addr, ALLOWED_CHAT, &msg, ask_id, option_id, &label)
+            .await
+            .unwrap_or_else(|| panic!("room {}'s answer went nowhere", i + 1));
+        // What `bot.rs` does next, in its order: take the keyboard off — an edit, which costs
+        // nothing — send the receipt he reads, and tell the hub which message that receipt is. The
+        // receipt is a send the hub may not refuse; it never reaches this surface, so it is charged
+        // here exactly as the bot charges for it, or the budget below would be a fiction.
+        h.hub.answered_from_phone(ALLOWED_CHAT, &msg, &label).await;
+        h.hub
+            .account_for_a_send_that_could_not_be_refused(ALLOWED_CHAT)
+            .await;
+        h.hub
+            .his_receipt_for_a_tap(&went, &MsgId::new(format!("receipt-{i}")))
+            .await;
+        until_within(
+            &format!("room {}'s tap posted to its engine", i + 1),
+            20,
+            async || engine.posted().await.len() > before,
+        )
+        .await;
+        let posted = engine.posted().await;
+        assert_eq!(
+            posted.len(),
+            before + 1,
+            "one tap was posted more than once: {:?}",
+            &posted[before..]
+        );
+        assert_eq!(
+            posted[before],
+            format!("/api/session/{}/question/que_{i}/reply", sessions[i]),
+            "room {}'s tap was answered into another room's session",
+            i + 1
+        );
+    }
+
+    // Every one of the receipts is corrected in place — `Sent: X` becoming `Taken: X` — and an
+    // edit is free. A confirmation sent as a NEW message would be three more of the seventeen,
+    // which is the difference between this trial fitting in a minute and shedding.
+    until_within("the answers confirmed in place", 20, async || {
+        h.fake
+            .rewrites
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, text)| text.starts_with("Taken:"))
+            .count()
+            >= THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION
+    })
+    .await;
+    for i in 0..THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION {
+        let receipt = MsgId::new(format!("receipt-{i}"));
+        assert!(
+            h.fake
+                .rewrites
+                .lock()
+                .await
+                .iter()
+                .any(|(m, text)| *m == receipt && text.starts_with("Taken:")),
+            "room {}'s answer was never confirmed on the line he is looking at",
+            i + 1
+        );
+    }
+
+    // ── a typed line reaches its own session and no other ──────────────────────────────────────
+    //
+    // The binding fence at four, with one directory, one agent and four sessions: the ONE thing
+    // that says a note is not this worker's is the conversation it was written for.
+    //
+    // Routed the way `bot.rs` routes it — from the TOPIC he typed in, through the hub's own scan —
+    // rather than from the address this test already knows. That scan is the whole of inbound
+    // routing (`addr_for_topic`) and every other test of it has one conversation in the registry,
+    // where a scan that answers "the first row" and a scan that answers "the row that owns this
+    // topic" are the same scan. Four rooms is the first place they differ, and the difference is
+    // his words landing in the room next door.
+    for i in 0..THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION {
+        let before = engine.posted().await.len();
+        let typed_in = asked_in[i].1;
+        let from_the_topic =
+            h.hub.addr_for_topic(typed_in).await.unwrap_or_else(|| {
+                panic!("no conversation owns the topic room {} asked in", i + 1)
+            });
+        assert_eq!(
+            from_the_topic,
+            Addr::project_itself(rooms[i].0.id.clone()),
+            "the topic room {} asked in belongs to another conversation, so what he typed there \
+             would be handed to the wrong worker",
+            i + 1
+        );
+        let delivered = h
+            .hub
+            .relay(
+                &from_the_topic,
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &MsgId::new(format!("typed-{i}")),
+                &format!("room {} only", i + 1),
+                None,
+            )
+            .await;
+        assert!(delivered, "room {}'s typed line reached nobody", i + 1);
+        until_within(
+            &format!("room {}'s typed line posted to its engine", i + 1),
+            20,
+            async || engine.posted().await.len() > before,
+        )
+        .await;
+        let posted = engine.posted().await;
+        assert_eq!(
+            posted.len(),
+            before + 1,
+            "one typed line was posted more than once: {:?}",
+            &posted[before..]
+        );
+        assert_eq!(
+            posted[before],
+            format!("/session/{}/prompt_async", sessions[i]),
+            "room {}'s words went to another room's session",
+            i + 1
+        );
+    }
+
+    // ── and his words for the room paired off by one are refused, out loud ─────────────────────
+    //
+    // The other direction of the same fence, and the one the operator can actually see go wrong: a
+    // line typed at a wall whose note was written for the room next door must not be handed to the
+    // session that note names. Refused, said under the line it refuses, and marked with the cross
+    // — never "Sent" over a silence.
+    let paired_off_topic = topic_of[&format!("Fleet room {}", THE_ROOM_PAIRED_OFF_BY_ONE + 1)];
+    let paired_off_addr = h
+        .hub
+        .addr_for_topic(paired_off_topic)
+        .await
+        .expect("a conversation owns the topic the fourth room greeted in");
+    let typed_at_it = MsgId::new(format!("typed-{THE_ROOM_PAIRED_OFF_BY_ONE}"));
+    let posted_before_typing = engine.posted().await.len();
+    let sends_before_typing = h.fake.sends.lock().await.len();
+    assert!(
+        h.hub
+            .relay(
+                &paired_off_addr,
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &typed_at_it,
+                &format!("room {} only", THE_ROOM_PAIRED_OFF_BY_ONE + 1),
+                None,
+            )
+            .await,
+        "the wall whose note is for the room next door was not even handed the words to refuse"
+    );
+    until_within(
+        "his words for the room paired off by one answered",
+        20,
+        async || h.fake.sends.lock().await.len() > sends_before_typing,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after_typing = h.fake.sends.lock().await.clone();
+    assert_eq!(
+        after_typing.len(),
+        sends_before_typing + 1,
+        "one refused line put more than one message on the phone: {:?}",
+        &after_typing[sends_before_typing..]
+    );
+    let (refusal_topic, refusal_text, _) = after_typing[sends_before_typing].clone();
+    assert_eq!(
+        refusal_topic, paired_off_topic,
+        "the line saying his words were not taken landed in another room's topic"
+    );
+    assert!(
+        refusal_text.contains("did not reach the agent")
+            && refusal_text.contains("belongs to a different conversation"),
+        "he was not told why his words were not taken: {refusal_text:?}"
+    );
+    assert!(
+        h.fake
+            .marks
+            .lock()
+            .await
+            .iter()
+            .any(|(_, m, mark)| *m == typed_at_it && *mark == Mark::Refused),
+        "the line that was refused never got the cross, so it reads as delivered"
+    );
+
+    // Nothing crossed, said as one fact over the whole run rather than four times in a row: every
+    // path this engine was asked for names the session of the room that asked for it.
+    let every_path = engine.posted().await;
+    assert_eq!(
+        every_path.len(),
+        posted_before_typing,
+        "words for a room whose note was written for its neighbour were posted anyway: {:?}",
+        &every_path[posted_before_typing..]
+    );
+    for (i, session) in sessions
+        .iter()
+        .enumerate()
+        .take(THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION)
+    {
+        let mine: Vec<&String> = every_path.iter().filter(|p| p.contains(session)).collect();
+        assert_eq!(
+            mine.len(),
+            2,
+            "room {} did not get exactly its own tap and its own words: {mine:?}",
+            i + 1
+        );
+    }
+    assert!(
+        !every_path
+            .iter()
+            .any(|p| p.contains(&sessions[THE_ROOM_PAIRED_OFF_BY_ONE])),
+        "the session named by the note written for the room next door was spoken to: {every_path:?}"
+    );
+    assert!(
+        !every_path.iter().any(|p| p.contains(NOBODYS)),
+        "something was posted into the session no note names: {every_path:?}"
+    );
+
+    // ── what the trial spent ───────────────────────────────────────────────────────────────────
+    //
+    // The number, asserted rather than intended. A new conversation costs THREE turns before its
+    // agent's own words land — the topic, the greeting, then the message — so four conversations
+    // that each open and are spoken to once cost twelve of the seventeen an agent may have in a
+    // trailing minute (`queue.rs`: eighteen, one held back for the hub). Three receipts and the
+    // one line saying a refused message was not taken bring it to sixteen, and there is one left.
+    //
+    // A refusal is not free, and that is the fleet fact hiding in this count: the room paired off
+    // by one costs the chat exactly what a working room costs it — a line for the question it
+    // could not show, and a line for the words it would not take.
+    //
+    // Progress is kept OUT: nothing in this test relays a per-line beat, and every acknowledgement
+    // the operator reads here is an EDIT or a REACTION, both of which are free (`docs/RATE-PROBE.md`
+    // §2, §3). One progress line per room would be twenty against seventeen, and three of them
+    // would be shed.
+    let sends = h.fake.sends.lock().await.clone();
+    assert_eq!(
+        sends.len(),
+        9,
+        "the trial sent something other than four greetings, three questions and the two lines the \
+         room paired off by one earns: {sends:?}"
+    );
+    let attempts = h.fake.create_attempts.lock().await.len();
+    assert_eq!(
+        attempts, 4,
+        "the trial asked Telegram for {attempts} topics, and four conversations need four"
+    );
+    // These two are also what keeps the message ids above honest: the fake mints one number for
+    // topic messages, forum lines and uploads alike, so a row's position implies its id only while
+    // nothing else is minting. Both of the others are nothing, and here is where that is asserted.
+    let general = h.fake.general.lock().await.clone();
+    assert!(
+        general.is_empty(),
+        "something was said in the forum itself: {general:?}"
+    );
+    assert_eq!(
+        *h.fake.upload_attempts.lock().await,
+        0,
+        "the trial tried to upload a file"
+    );
+    assert_eq!(
+        h.fake.retired.lock().await.len(),
+        THE_ROOMS_BOUND_TO_THEIR_OWN_SESSION,
+        "a keyboard was not taken off in place — and the room paired off by one never had one"
+    );
+    let marks = h.fake.marks.lock().await.len();
+    assert!(
+        marks <= crate::queue::REACTIONS_PER_MINUTE as usize,
+        "the trial went over the reaction ceiling: {marks}"
+    );
+    // Twelve for the conversations, four for the receipts: sixteen of the seventeen, with one left
+    // for an agent. Read off the budget itself, so the arithmetic above cannot drift from the code.
+    //
+    // Counted by TAKING what is left, a second and a bit apart, rather than by asking twice at one
+    // instant. `would_refuse` answers the one-a-second rhythm before it answers the ceiling
+    // (`queue.rs`), so a spend and an immediate ask are answered "not yet" whatever the count is —
+    // which made this pass at every spend there is, nought included. It said sixteen while the real
+    // number was twelve under a hub that had stopped charging for a topic, and sixteen is the
+    // number another org is sizing a fleet against.
+    let left = {
+        let mut budgets = h.hub.budgets.lock().await;
+        let mut now = std::time::Instant::now();
+        let mut left: u32 = 0;
+        while budgets
+            .would_refuse(ALLOWED_CHAT, now, crate::queue::Spender::AnAgent)
+            .is_none()
+        {
+            budgets.spend(ALLOWED_CHAT, now);
+            left += 1;
+            now += crate::queue::MIN_GAP + Duration::from_millis(100);
+            assert!(
+                left <= crate::queue::PER_MINUTE,
+                "the budget never filled up, so nothing the trial sent is being counted against it"
+            );
+        }
+        left
+    };
+    assert_eq!(
+        left, 1,
+        "the trial did not spend the sixteen of seventeen it says it spends: an agent has {left} \
+         of the minute left, and this test is what tells another org how big a fleet fits"
+    );
+    // And nothing was shed: a `TooFast` in the audit is a message he will never see.
+    let audit = std::fs::read_to_string(h.dir.path().join("hub.audit.log")).expect("the audit");
+    assert!(
+        !audit.contains("TooFast"),
+        "the trial shed a message: it is over the ceiling it says it fits inside"
+    );
+
+    // Printed, not only asserted. Whoever runs this trial is deciding whether a fleet of theirs
+    // fits in a forum's minute, and a number they have to derive from a passing test is a number
+    // they will get wrong. `scripts/fleet-trial.sh` runs this with `--nocapture` so it lands.
+    println!(
+        "\nthe trial spent, of the 17 an agent may have in a trailing minute:\n  \
+         4 topics + 4 greetings + 3 questions + 1 line for the question that could not be shown = 12\n  \
+         3 receipts for his taps + 1 line saying his words were not taken = 4\n  \
+         --------------------------------------------------\n  \
+         16 spent, 1 left. Free and uncounted: {} in-place edits, {} reactions.\n\
+         \n  and the minute is then GONE: everything after this point in the trial — a wall\n  \
+         restarting, a greeting for the run that replaces it — is HELD, not shed and not\n  \
+         audited, for the rest of that minute. A wall that restarts inside the same minute as\n  \
+         four conversations opening is silent for the best part of a minute, and no assertion\n  \
+         past here is about anything reaching a phone.\n",
+        h.fake.rewrites.lock().await.len() + h.fake.retired.lock().await.len(),
+        marks,
+    );
+
+    // ── a run that has been replaced is over, and its siblings are undisturbed ─────────────────
+    //
+    // The fleet fact, not the single-conversation one: a wall that comes back from the dead must be
+    // refused for what it is, and the three walls beside it must not notice.
+    let addr0 = Addr::project_itself(rooms[0].0.id.clone());
+    let _ = runs[0].child.kill().await;
+    until_within("room 1's claim released", 20, async || {
+        !h.hub.connected_ids().await.contains(&addr0)
+    })
+    .await;
+    let mut had_the_address = FakeBridge::connect_remembering_its_lease(
+        &h.sock,
+        &rooms[0].1,
+        "gone",
+        rooms[0].0.id.as_str(),
+    )
+    .await;
+    had_the_address.become_live().await;
+    let stale = had_the_address.generation.expect("a lease");
+    drop(had_the_address);
+    until_within("room 1's claim released", 20, async || {
+        !h.hub.connected_ids().await.contains(&addr0)
+    })
+    .await;
+    let back = start_attach(
+        &attach,
+        &repo,
+        &h.sock,
+        &xdg,
+        &relay_dir,
+        rooms[0].0.id.as_str(),
+        &[
+            "--opencode",
+            &engine.url,
+            "--opencode-binding-file",
+            note_for[0].to_str().expect("a path"),
+        ],
+    );
+    until_within("room 1's replacement session admitted", 40, async || {
+        h.hub.connected_ids().await.contains(&addr0)
+    })
+    .await;
+    // Whose claims and whose processes, before the ghost knocks. Counted, the whole of this could
+    // hold with three siblings swapped for each other; a count is not a fleet property.
+    let claims_before_the_ghost: BTreeMap<Addr, u32> = h
+        .hub
+        .claims
+        .lock()
+        .await
+        .iter()
+        .map(|(a, c)| (a.clone(), c.pid))
+        .collect();
+    let mut ghost =
+        FakeBridge::connect_stamping(&h.sock, &rooms[0].1, "gone", rooms[0].0.id.as_str(), stale)
+            .await;
+    let refused = ghost
+        .wait_for(|f| match f {
+            HubFrame::Refused { reason } => Some(*reason),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        refused,
+        RefusedReason::StaleGeneration,
+        "a run of this address that has been replaced was turned away as a rival rather than as \
+         what it is, and would redial for ever"
+    );
+    let claims_after_the_ghost: BTreeMap<Addr, u32> = h
+        .hub
+        .claims
+        .lock()
+        .await
+        .iter()
+        .map(|(a, c)| (a.clone(), c.pid))
+        .collect();
+    assert_eq!(
+        claims_after_the_ghost, claims_before_the_ghost,
+        "a run that was refused for being over moved a claim: the four addresses and the four \
+         processes holding them must be the ones that were there before it knocked"
+    );
+    let addresses: std::collections::BTreeSet<Addr> = rooms
+        .iter()
+        .map(|(room, _)| Addr::project_itself(room.id.clone()))
+        .collect();
+    assert_eq!(
+        claims_after_the_ghost
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        addresses,
+        "the four rooms are no longer the four conversations that are connected"
+    );
+    assert_eq!(
+        h.fake.topics.lock().await.len(),
+        4,
+        "the walls that never restarted grew a topic between them"
+    );
+
+    // ── and a wall that only lost its SOCKET is let back in, however many siblings restarted ───
+    //
+    // The complement, and the expensive half to get wrong. The fence above is per ADDRESS, and the
+    // numbers it compares are minted from one clock for the whole box — so a fence that asked "has
+    // anything been claimed since?" instead of "has THIS been claimed since?" is invisible in a
+    // repo of one conversation and refuses a wall its own address for ever in a fleet, while
+    // `Restart=always` brings it back every few seconds to be refused again. Nothing else here
+    // reaches it: every other lease in this trial arrives fresh.
+    let addr_last = Addr::project_itself(rooms[THE_ROOM_PAIRED_OFF_BY_ONE].0.id.clone());
+    let _ = runs[THE_ROOM_PAIRED_OFF_BY_ONE].child.kill().await;
+    until_within("the last room's claim released", 20, async || {
+        !h.hub.connected_ids().await.contains(&addr_last)
+    })
+    .await;
+    let mut lost_its_socket = FakeBridge::connect_remembering_its_lease(
+        &h.sock,
+        &rooms[THE_ROOM_PAIRED_OFF_BY_ONE].1,
+        "lost-its-socket",
+        rooms[THE_ROOM_PAIRED_OFF_BY_ONE].0.id.as_str(),
+    )
+    .await;
+    lost_its_socket.become_live().await;
+    let lease_it_holds = lost_its_socket.generation.expect("a lease");
+    drop(lost_its_socket);
+    until_within("the last room's claim released again", 20, async || {
+        !h.hub.connected_ids().await.contains(&addr_last)
+    })
+    .await;
+
+    // A SIBLING restarts in the meantime, and takes a number of its own — later than the one the
+    // wall above is still holding, because every number comes from the same clock.
+    let addr_of_the_sibling = Addr::project_itself(rooms[1].0.id.clone());
+    let _ = runs[1].child.kill().await;
+    until_within("the sibling's claim released", 20, async || {
+        !h.hub.connected_ids().await.contains(&addr_of_the_sibling)
+    })
+    .await;
+    let mut sibling = FakeBridge::connect_remembering_its_lease(
+        &h.sock,
+        &rooms[1].1,
+        "restarted",
+        rooms[1].0.id.as_str(),
+    )
+    .await;
+    sibling.become_live().await;
+    let the_siblings_lease = sibling.generation.expect("a lease");
+    assert!(
+        the_siblings_lease > lease_it_holds,
+        "the sibling's run was not numbered after the other room's, so this proves nothing: \
+         {the_siblings_lease} against {lease_it_holds}"
+    );
+
+    // And now the wall redials with the lease it never lost. Admitted, or a room is walled out of
+    // its own conversation because the room next door restarted.
+    let mut redialled = FakeBridge::connect_stamping(
+        &h.sock,
+        &rooms[THE_ROOM_PAIRED_OFF_BY_ONE].1,
+        "lost-its-socket",
+        rooms[THE_ROOM_PAIRED_OFF_BY_ONE].0.id.as_str(),
+        lease_it_holds,
+    )
+    .await;
+    let first = redialled.next().await.expect("a welcome or a refusal");
+    assert!(
+        matches!(first.payload, HubFrame::Welcome { .. }),
+        "a wall that only lost its socket was refused its own conversation because a SIBLING had \
+         restarted in the meantime: {:?}",
+        first.payload
+    );
+    drop(redialled);
+    drop(sibling);
+
+    drop(back);
+    for r in runs.iter_mut() {
+        let _ = r.child.kill().await;
+    }
+    let _ = engine.tell(serde_json::json!({ "stop": true })).await;
+    let _ = engine.child.kill().await;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
