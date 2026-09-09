@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use hub_proto::frame::{Control, IntentStatus, Op};
+use hub_proto::ids::{IntentId, SpecId};
 use hub_proto::{
     AckStatus, AskEnd, AskOption, BridgeFrame, Delivered, Envelope, FrameId, FrameReader, HubFrame,
     MsgId, OptionId, write_frame,
@@ -634,6 +636,7 @@ impl FakeBridge {
             lane,
             Some(("/wherever", pid)),
             None,
+            None,
         )
         .await;
         me
@@ -683,7 +686,7 @@ impl FakeBridge {
         let stream = UnixStream::connect(sock).await.expect("connect");
         let (r, w) = stream.into_split();
         let mut me = Self::over_halves(Box::new(r), Box::new(w));
-        me.say_hello(secret, instance, claimed_id, None, None, None)
+        me.say_hello(secret, instance, claimed_id, None, None, None, None)
             .await;
         me
     }
@@ -707,6 +710,44 @@ impl FakeBridge {
         .await
     }
 
+    /// A controller: a bridge that says in advance what it can be asked to do.
+    ///
+    /// Its lane is the project's own voice, which is where a controller for a whole project sits.
+    /// What it declares is the test's, because every test in this section is about which parts of
+    /// a declaration survive.
+    async fn connect_declaring(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        controls: Vec<Control>,
+    ) -> Self {
+        Self::connect_declaring_as(sock, secret, instance, None, controls).await
+    }
+
+    /// The same, for a controller that holds one worktree of the project rather than its own voice.
+    async fn connect_declaring_as(
+        sock: &Path,
+        secret: &str,
+        instance: &str,
+        lane: Option<&str>,
+        controls: Vec<Control>,
+    ) -> Self {
+        let stream = UnixStream::connect(sock).await.expect("connect");
+        let (r, w) = stream.into_split();
+        let mut me = Self::over_halves(Box::new(r), Box::new(w));
+        me.say_hello(
+            secret,
+            instance,
+            "p",
+            lane,
+            Some(("/wherever", std::process::id())),
+            None,
+            Some(controls),
+        )
+        .await;
+        me
+    }
+
     async fn connect_shaped(
         sock: &Path,
         secret: &str,
@@ -728,6 +769,7 @@ impl FakeBridge {
             None,
             Some(("/wherever", std::process::id())),
             confirms,
+            None,
         )
         .await;
         me
@@ -788,6 +830,7 @@ impl FakeBridge {
             None,
             Some(("/wherever", std::process::id())),
             None,
+            None,
         )
         .await;
         me
@@ -807,6 +850,10 @@ impl FakeBridge {
     }
 
     /// The one hello builder. Two of them is how the two copies of `hub-link.ts` drifted.
+    ///
+    /// Eight arguments, deliberately: a `hello` has eight things a bridge may say about itself, and
+    /// splitting the builder to shorten the list is exactly the drift this comment is about.
+    #[allow(clippy::too_many_arguments)]
     async fn say_hello(
         &mut self,
         secret: &str,
@@ -821,6 +868,10 @@ impl FakeBridge {
         // The harness bridge answers no down-frame by default, which is what every bridge shipped
         // so far does. The tests that need a promising bridge say so themselves.
         confirms: Option<Vec<String>>,
+        // And it declares no controls, which is what every bridge shipped before them does and
+        // what all but a handful of tests below are. A bridge that declares nothing is not a
+        // controller and can never be sent an intent.
+        controls: Option<Vec<Control>>,
     ) {
         self.send(BridgeFrame::Hello {
             project_id: ProjectId::new(claimed_id),
@@ -830,6 +881,7 @@ impl FakeBridge {
             pid: local.map(|(_, pid)| pid),
             lane: lane.map(hub_proto::LaneId::new),
             confirms,
+            controls,
         })
         .await;
     }
@@ -2349,6 +2401,7 @@ async fn a_frame_the_hub_cannot_read_before_the_pong_does_not_kill_the_connectio
                 pid: Some(std::process::id()),
                 lane: None,
                 confirms: None,
+                controls: None,
             },
         ),
     )
@@ -13811,5 +13864,1742 @@ async fn a_run_number_that_cannot_reach_the_disk_never_holds_the_lock_every_deli
         "a bridge claimed the address and the claims lock never came free while the run number it \
          minted sat in a write that could not land: every other project's delivery is behind that \
          one file"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The lifecycle-intent contract: what a controller declares, what the hub carries, and what it
+// refuses. `docs/PROPOSAL-LIFECYCLE-INTENT.md` is the design; every refusal here is fail-closed
+// and nothing in this section can start, stop or name a process.
+
+/// A control as a controller would declare it, with everything the hub may drop left to the test.
+fn control(spec: &str, domain: Option<&str>, allowed: &[&str], max: Option<u32>) -> Control {
+    Control {
+        spec_id: SpecId::new(spec),
+        domain: domain.map(hub_proto::LaneId::new),
+        allowed: allowed.iter().map(|s| (*s).to_owned()).collect(),
+        max,
+    }
+}
+
+/// The controls a welcome echoed back, or `None` when the hub admitted nothing.
+fn echoed(welcome: &HubFrame) -> Option<Vec<Control>> {
+    match welcome {
+        HubFrame::Welcome { controls, .. } => controls.clone(),
+        other => panic!("expected a welcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_control_naming_an_operation_this_hub_does_not_know_is_dropped_and_the_connection_is_kept()
+ {
+    let h = harness().await;
+    // A controller shipped after this hub: it can do one thing this build knows and one it has
+    // never heard of. Refusing the connection over the second would be a controller that cannot
+    // connect because it was newer, which is the failure `confirms` already fails towards.
+    let mut bridge = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "i1",
+        vec![control(
+            "spec-worker",
+            None,
+            &["scale", "teleport", "stop"],
+            Some(4),
+        )],
+    )
+    .await;
+    let welcome = bridge
+        .become_live_with_welcome()
+        .await
+        .expect("a controller is welcomed");
+
+    assert_eq!(
+        echoed(&welcome),
+        Some(vec![control(
+            "spec-worker",
+            None,
+            &["scale", "stop"],
+            Some(4)
+        )]),
+        "the echo is what the hub ADMITTED: the op it has never heard of is gone from it, and the \
+         two it knows are still there, so the controller can read the difference"
+    );
+    assert!(
+        !bridge.is_closed_within(Duration::from_millis(300)).await,
+        "a name this hub does not know is a declaration about nothing, not a reason to hang up"
+    );
+}
+
+#[tokio::test]
+async fn a_control_whose_domain_or_spec_would_forge_a_line_in_the_audit_is_dropped_at_admission() {
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "i1",
+        vec![
+            // A newline in the spec: the audit is one tab-separated record per line and it
+            // interpolates what it is given, so this one would write a record of its own choosing.
+            control("spec\nrefused\tproject=someone-else", None, &["stop"], None),
+            // A tab in the domain, for the same reason.
+            control("spec-a", Some("lane\tforged"), &["stop"], None),
+            // `-` IS the project's own voice on disk in both file trees, so a domain admitted
+            // under that name would be handed the project's own media and outbox directories.
+            control("spec-b", Some("-"), &["stop"], None),
+            // Over the bound a spec id is written down at.
+            control(&"s".repeat(MAX_SPEC + 1), None, &["stop"], None),
+            // A control left with no op this hub knows authorises nothing at all.
+            control("spec-c", None, &["teleport"], None),
+            // The one that survives all of it.
+            control("spec-d", Some("engineering"), &["drain"], None),
+        ],
+    )
+    .await;
+    let welcome = bridge
+        .become_live_with_welcome()
+        .await
+        .expect("a controller is welcomed");
+
+    assert_eq!(
+        echoed(&welcome),
+        Some(vec![control(
+            "spec-d",
+            Some("engineering"),
+            &["drain"],
+            None
+        )]),
+        "only the control whose spec and domain the hub can write down survives, and the \
+         controller reads which of its declarations were refused"
+    );
+}
+
+#[tokio::test]
+async fn a_bridge_that_declares_nothing_is_welcomed_exactly_as_it_always_was() {
+    let h = harness().await;
+    // Every bridge shipped before controls existed. Its welcome must carry no echo at all — a
+    // controller reads the ABSENCE of one as "this hub is older than I am", so an echo of nothing
+    // sent to a bridge that declared nothing would be a hub saying something it does not mean.
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p").await;
+    let welcome = bridge.become_live_with_welcome().await.expect("a welcome");
+    assert_eq!(
+        echoed(&welcome),
+        None,
+        "a bridge that is not a controller is welcomed byte for byte as it always was"
+    );
+}
+
+/// One thing off a keyboard the hub drew, with everything the tests vary named at the call site.
+///
+/// Every field is either a selection from what a controller declared or a number the hub minted.
+/// Nothing here is anything the operator could type, which is the whole shape of the contract.
+fn wants(
+    project: &ProjectId,
+    op: Op,
+    spec: &str,
+    domain: Option<&str>,
+    count: Option<u32>,
+    for_run: Option<u64>,
+    on: (&str, &str),
+) -> Wanted {
+    Wanted {
+        project: project.clone(),
+        op,
+        spec: SpecId::new(spec),
+        domain: domain.map(hub_proto::LaneId::new),
+        count,
+        for_run,
+        offer: (ALLOWED_CHAT, MsgId::new(on.0)),
+        option_id: OptionId::new(on.1),
+        from: hub_proto::From {
+            chat_id: ALLOWED_CHAT,
+            user_id: OPERATOR,
+        },
+    }
+}
+
+/// Which run of an address is live right now, as the hub itself would answer it.
+async fn run_of(hub: &Arc<Hub<FakeTelegram>>, addr: &Addr) -> u64 {
+    hub.claims
+        .lock()
+        .await
+        .get(addr)
+        .map(|c| c.generation)
+        .expect("the address this test needs is not claimed")
+}
+
+impl FakeBridge {
+    /// The next intention the hub carries to this connection, whole.
+    async fn next_intent(&mut self) -> HubFrame {
+        for _ in 0..20 {
+            let Some(env) = self.next().await else { break };
+            match env.payload {
+                intent @ HubFrame::Intent { .. } => return intent,
+                HubFrame::Ping => {
+                    self.send(BridgeFrame::Pong { r#ref: env.id }).await;
+                }
+                _ => {}
+            }
+        }
+        panic!("the hub never carried the intention this test was waiting for");
+    }
+}
+
+#[tokio::test]
+async fn an_intent_is_routed_by_the_declaring_claims_address_and_never_by_a_field_on_the_frame() {
+    let h = harness().await;
+    // The controller is the project's own voice, and what it can be asked about is a DOMAIN beside
+    // it — which is the ordinary shape, since the thing being operated on need not be the thing
+    // that operates it.
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![control("spec-w", Some("engineering"), &["inspect"], None)],
+    )
+    .await;
+    controller.become_live().await;
+    // And an ordinary bridge is sitting at exactly the address the frame names. It declared
+    // nothing, so it is not a controller; if the domain on the frame decided the route, this is
+    // where the intention would land.
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "worktree", "p", Some("engineering")).await;
+    lane.become_live().await;
+
+    let carried = h
+        .hub
+        .intend(wants(
+            &h.project,
+            Op::Inspect,
+            "spec-w",
+            Some("engineering"),
+            None,
+            None,
+            ("m1", "b1"),
+        ))
+        .await
+        .expect("the controller declared it, so it is carried");
+    assert!(matches!(carried, Intended::Carried(_)));
+
+    match controller.next_intent().await {
+        HubFrame::Intent { domain, op, .. } => {
+            assert_eq!(domain, Some(hub_proto::LaneId::new("engineering")));
+            assert_eq!(op, Op::Inspect);
+        }
+        other => panic!("expected an intent, got {other:?}"),
+    }
+    let at_the_lane = lane.drain_for(Duration::from_millis(200)).await;
+    assert!(
+        !at_the_lane
+            .iter()
+            .any(|f| matches!(f, HubFrame::Intent { .. })),
+        "the domain on the frame retargeted it: an intention reached the address it NAMES rather \
+         than the connection that declared it"
+    );
+}
+
+#[tokio::test]
+async fn a_controller_that_did_not_declare_a_capability_is_never_sent_an_intent_for_it() {
+    let h = harness().await;
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![control("spec-w", None, &["inspect"], None)],
+    )
+    .await;
+    controller.become_live().await;
+
+    // A spec it never named, an op it never named, and a domain it never named. The hub cannot
+    // invent any of the three: what it may ask for is exactly what was declared on a connection
+    // that had already proved a secret.
+    for (op, spec, domain, sentence) in [
+        (Op::Inspect, "spec-somebody-else", None, "a spec"),
+        // `start` rather than `stop`, so this is the DECLARATION check answering and not the
+        // `for_run` rule, which fires first and would make the assertion prove something else.
+        (Op::Start, "spec-w", None, "an op"),
+        (Op::Inspect, "spec-w", Some("engineering"), "a domain"),
+    ] {
+        assert_eq!(
+            h.hub
+                .intend(wants(
+                    &h.project,
+                    op,
+                    spec,
+                    domain,
+                    None,
+                    None,
+                    ("m1", "b1")
+                ))
+                .await,
+            Err(IntentRefusal::NotDeclared),
+            "the hub invented {sentence} nothing had declared"
+        );
+    }
+    let seen = controller.drain_for(Duration::from_millis(200)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Intent { .. })),
+        "an intention reached a controller that never said it could do it"
+    );
+
+    // And a project with nothing connected at all is a different answer, because it is a different
+    // thing that happened and the audit has to be able to tell them apart.
+    drop(controller);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert_eq!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Inspect,
+                "spec-w",
+                None,
+                None,
+                None,
+                ("m1", "b1")
+            ))
+            .await,
+        Err(IntentRefusal::NotConnected)
+    );
+}
+
+#[tokio::test]
+async fn two_live_claims_declaring_one_operation_are_refused_rather_than_disambiguated() {
+    let h = harness().await;
+    // The project's own voice and one of its lanes, each saying it can do the same thing to the
+    // same handle. There is no answer to "which did he mean", so the hub does not invent one.
+    let mut first = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "one",
+        vec![control("spec-w", None, &["inspect"], None)],
+    )
+    .await;
+    first.become_live().await;
+    let mut second = FakeBridge::connect_declaring_as(
+        &h.sock,
+        &h.secret,
+        "two",
+        Some("engineering"),
+        vec![control("spec-w", None, &["inspect"], None)],
+    )
+    .await;
+    second.become_live().await;
+
+    assert_eq!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Inspect,
+                "spec-w",
+                None,
+                None,
+                None,
+                ("m1", "b1")
+            ))
+            .await,
+        Err(IntentRefusal::MoreThanOneCouldDoIt),
+        "the hub picked one of two connections that both said they could do it"
+    );
+    for bridge in [&mut first, &mut second] {
+        let seen = bridge.drain_for(Duration::from_millis(150)).await;
+        assert!(
+            !seen.iter().any(|f| matches!(f, HubFrame::Intent { .. })),
+            "silence and a refusal, never a guess: an intention was carried anyway"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_count_past_the_bound_a_controller_set_on_itself_is_refused_and_the_bound_is_never_raised()
+ {
+    let h = harness().await;
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![
+            control("spec-w", None, &["scale"], Some(4)),
+            // A controller that declared `scale` and named no bound has named no bound. A count
+            // against nothing is a number nothing checked, so it is refused rather than waved
+            // through — the hub compares against a bound and never invents one.
+            control("spec-unbounded", None, &["scale"], None),
+        ],
+    )
+    .await;
+    controller.become_live().await;
+    let mine = run_of(&h.hub, &h.own()).await;
+
+    for (spec, count, why) in [
+        (
+            "spec-w",
+            Some(5),
+            "a count past the bound the controller set",
+        ),
+        ("spec-unbounded", Some(1), "a count against no bound at all"),
+        ("spec-w", None, "a scale with no count in it"),
+    ] {
+        assert_eq!(
+            h.hub
+                .intend(wants(
+                    &h.project,
+                    Op::Scale,
+                    spec,
+                    None,
+                    count,
+                    Some(mine),
+                    ("m1", "b1")
+                ))
+                .await,
+            Err(IntentRefusal::CountRefused),
+            "the hub carried {why}"
+        );
+    }
+    // The bound itself still holds, and zero is inside it: "none of them running" is a thing the
+    // operator can mean, and refusing it would be the hub deciding what he meant.
+    for count in [0, 4] {
+        assert!(
+            matches!(
+                h.hub
+                    .intend(wants(
+                        &h.project,
+                        Op::Scale,
+                        "spec-w",
+                        None,
+                        Some(count),
+                        Some(mine),
+                        ("m1", &format!("b{count}"))
+                    ))
+                    .await,
+                Ok(Intended::Carried(_))
+            ),
+            "a count of {count} is inside the bound the controller set and was refused anyway"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_sessions_in_one_directory_are_two_addresses_and_an_intent_for_one_never_reaches_the_other()
+ {
+    let h = harness().await;
+    // One process holding two worktrees, which is the real shape: the opencode adapter holds every
+    // lane, so its lanes share an instance and the instance check cannot tell them apart. The
+    // ADDRESS is what separates them, and it is the only thing that does.
+    let mut a = FakeBridge::connect_declaring_as(
+        &h.sock,
+        &h.secret,
+        "one-process",
+        Some("a"),
+        vec![control("spec-w", Some("a"), &["inspect"], None)],
+    )
+    .await;
+    a.become_live().await;
+    let mut b = FakeBridge::connect_declaring_as(
+        &h.sock,
+        &h.secret,
+        "one-process",
+        Some("b"),
+        vec![control("spec-w", Some("b"), &["inspect"], None)],
+    )
+    .await;
+    b.become_live().await;
+
+    h.hub
+        .intend(wants(
+            &h.project,
+            Op::Inspect,
+            "spec-w",
+            Some("a"),
+            None,
+            None,
+            ("m1", "b1"),
+        ))
+        .await
+        .expect("the worktree that declared it is asked");
+
+    match a.next_intent().await {
+        HubFrame::Intent { domain, .. } => {
+            assert_eq!(domain, Some(hub_proto::LaneId::new("a")))
+        }
+        other => panic!("expected an intent, got {other:?}"),
+    }
+    let at_b = b.drain_for(Duration::from_millis(200)).await;
+    assert!(
+        !at_b.iter().any(|f| matches!(f, HubFrame::Intent { .. })),
+        "one worktree was handed the other's intention: two sessions in one directory share an \
+         instance, so the instance can never be what separates them"
+    );
+}
+
+#[tokio::test]
+async fn an_intent_with_a_stale_expected_generation_is_refused_before_delivery() {
+    let h = harness().await;
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![
+            control(
+                "spec-w",
+                Some("engineering"),
+                &["scale", "restart"],
+                Some(4),
+            ),
+            // A domain nothing has ever claimed. Declared, so the refusal below cannot be the
+            // declaration check answering for the fence.
+            control("spec-w", Some("nowhere"), &["restart"], None),
+            // The conversation ITSELF, spelled the only way this wire spells it: by omission.
+            control("spec-w", None, &["restart", "start"], None),
+        ],
+    )
+    .await;
+    controller.become_live().await;
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "worktree", "p", Some("engineering")).await;
+    lane.become_live().await;
+    let g = run_of(&h.hub, &h.lane("engineering")).await;
+
+    // ── one behind ────────────────────────────────────────────────────────────────────────────
+    assert_eq!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Scale,
+                "spec-w",
+                Some("engineering"),
+                Some(1),
+                Some(g - 1),
+                ("m1", "b1")
+            ))
+            .await,
+        Err(IntentRefusal::TheWorldMoved),
+        "a number behind the one that is running was carried anyway"
+    );
+    // ── the run that is actually there ────────────────────────────────────────────────────────
+    assert!(matches!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Scale,
+                "spec-w",
+                Some("engineering"),
+                Some(1),
+                Some(g),
+                ("m1", "b2")
+            ))
+            .await,
+        Ok(Intended::Carried(_))
+    ));
+    // ── and after the subject restarts, the same view is stale ────────────────────────────────
+    drop(lane);
+    until(async || !h.hub.is_claimed(&h.lane("engineering")).await).await;
+    let mut again =
+        FakeBridge::connect_as(&h.sock, &h.secret, "worktree-2", "p", Some("engineering")).await;
+    again.become_live().await;
+    let g2 = run_of(&h.hub, &h.lane("engineering")).await;
+    assert!(g2 > g, "this test needs the subject to have moved on");
+    assert_eq!(
+        h.hub
+            // The SAME button on the same message as the accepted one above, which is what he is
+            // still looking at. The fence answers before the record does, so a stale view is told
+            // it is stale rather than told it already asked.
+            .intend(wants(
+                &h.project,
+                Op::Scale,
+                "spec-w",
+                Some("engineering"),
+                Some(1),
+                Some(g),
+                ("m1", "b2")
+            ))
+            .await,
+        Err(IntentRefusal::TheWorldMoved)
+    );
+    // ── a subject with no run at all is its own refusal, and NEVER a comparison against zero ──
+    for named in [Some(0), Some(1), Some(g2)] {
+        assert_eq!(
+            h.hub
+                .intend(wants(
+                    &h.project,
+                    Op::Restart,
+                    "spec-w",
+                    Some("nowhere"),
+                    None,
+                    named,
+                    ("m1", "b3")
+                ))
+                .await,
+            Err(IntentRefusal::NothingIsRunningThere),
+            "a domain nothing has ever claimed was compared against the zero the generations map \
+             answers with — a zero is read as 'holds none' everywhere else on this wire"
+        );
+    }
+    // ── the hub refusing itself, both ways round ──────────────────────────────────────────────
+    assert_eq!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Restart,
+                "spec-w",
+                None,
+                None,
+                None,
+                ("m1", "b4")
+            ))
+            .await,
+        Err(IntentRefusal::CouldNotBuildIt),
+        "an op that changes something running was carried with no run named"
+    );
+    assert_eq!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Start,
+                "spec-w",
+                None,
+                None,
+                Some(g2),
+                ("m1", "b5")
+            ))
+            .await,
+        Err(IntentRefusal::CouldNotBuildIt),
+        "an op with nothing running to be about was carried with a run named"
+    );
+    // ── both spellings of the conversation itself ─────────────────────────────────────────────
+    let mine = run_of(&h.hub, &h.own()).await;
+    assert!(
+        matches!(
+            h.hub
+                .intend(wants(
+                    &h.project,
+                    Op::Restart,
+                    "spec-w",
+                    None,
+                    None,
+                    Some(mine),
+                    ("m1", "b6")
+                ))
+                .await,
+            Ok(Intended::Carried(_))
+        ),
+        "an omitted domain is the conversation itself and its own run is what the fence compares"
+    );
+    assert_eq!(
+        h.hub
+            .intend(wants(
+                &h.project,
+                Op::Restart,
+                "spec-w",
+                Some("-"),
+                None,
+                Some(mine),
+                ("m1", "b7")
+            ))
+            .await,
+        Err(IntentRefusal::HandleRefused),
+        "`-` got past the door: it IS the project's own voice on disk, so a domain admitted under \
+         that name would be handed the project's own media and outbox directories — and it is \
+         also what every field in the audit writes for `there is none`, which is why it is now \
+         refused by the shape check at the top of `intend` rather than by finding no declaration"
+    );
+}
+
+#[tokio::test]
+async fn an_intent_repeated_with_the_same_key_is_answered_from_the_record_and_never_redelivered() {
+    let h = harness().await;
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![control("spec-w", None, &["restart"], None)],
+    )
+    .await;
+    controller.become_live().await;
+    let mine = run_of(&h.hub, &h.own()).await;
+
+    // He taps, the receipt is slow, he taps again. Without the key that is two restarts, and the
+    // hub cannot know whether the first landed — Telegram has no idempotency key either.
+    let tap = || {
+        wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            None,
+            None,
+            Some(mine),
+            ("m1", "b1"),
+        )
+    };
+    let Ok(Intended::Carried(first)) = h.hub.intend(tap()).await else {
+        panic!("the first tap was not carried");
+    };
+    assert_eq!(
+        h.hub.intend(tap()).await,
+        Ok(Intended::AlreadyAsked(first.clone(), IntentState::Sent)),
+        "the second tap was not answered from the record"
+    );
+
+    controller.next_intent().await;
+    let again = controller.drain_for(Duration::from_millis(300)).await;
+    assert!(
+        !again.iter().any(|f| matches!(f, HubFrame::Intent { .. })),
+        "one button, tapped twice, became two intentions on the wire"
+    );
+}
+
+#[tokio::test]
+async fn an_intent_key_minted_before_a_rollover_is_not_the_key_minted_after_it() {
+    let h = harness().await;
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![control("spec-w", Some("engineering"), &["restart"], None)],
+    )
+    .await;
+    controller.become_live().await;
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "worktree", "p", Some("engineering")).await;
+    lane.become_live().await;
+    let g = run_of(&h.hub, &h.lane("engineering")).await;
+
+    h.hub
+        .intend(wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            Some("engineering"),
+            None,
+            Some(g),
+            ("m1", "b1"),
+        ))
+        .await
+        .expect("the first is carried");
+    let first_key = key_of(&controller.next_intent().await);
+
+    // The subject restarts and the keyboard is drawn again — the same message, edited in place,
+    // and the same button. A key minted from the button alone would deduplicate this into the one
+    // above and silently drop it; it is a different operation on a different run.
+    drop(lane);
+    until(async || !h.hub.is_claimed(&h.lane("engineering")).await).await;
+    let mut again =
+        FakeBridge::connect_as(&h.sock, &h.secret, "worktree-2", "p", Some("engineering")).await;
+    again.become_live().await;
+    let g2 = run_of(&h.hub, &h.lane("engineering")).await;
+
+    h.hub
+        .intend(wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            Some("engineering"),
+            None,
+            Some(g2),
+            ("m1", "b1"),
+        ))
+        .await
+        .expect("the second is a different operation and is carried");
+    let second_key = key_of(&controller.next_intent().await);
+
+    assert_ne!(
+        first_key, second_key,
+        "the same button before and after a rollover minted one key: the second tap would be \
+         deduplicated into the first and never carried out"
+    );
+}
+
+/// The key an intention went down under, read off the wire as a controller reads it.
+fn key_of(frame: &HubFrame) -> hub_proto::ids::IdempotencyKey {
+    match frame {
+        HubFrame::Intent {
+            idempotency_key, ..
+        } => idempotency_key.clone(),
+        other => panic!("expected an intent, got {other:?}"),
+    }
+}
+
+/// Every line the hub has written to its own log, as an incident would read it.
+///
+/// A hub that has written nothing yet has no file at all, and that is not an error: it is the
+/// state every one of these tests starts in.
+fn audit_of(h: &Harness) -> Vec<String> {
+    std::fs::read_to_string(h.dir.path().join("hub.audit.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A controller holding the project's own voice, able to do one thing to one handle.
+async fn one_controller(h: &Harness, instance: &str) -> FakeBridge {
+    let mut bridge = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        instance,
+        vec![control("spec-w", None, &["restart"], None)],
+    )
+    .await;
+    bridge.become_live().await;
+    // Wait the hub's own greeting out before the test looks at anything it counts. Becoming live
+    // creates a topic and says hello in it, which is a send and two audit lines that land AFTER
+    // the pong — so a count taken here would otherwise be a count of a race.
+    until(async || {
+        audit_of(h)
+            .iter()
+            .any(|l| l.contains("\tdelivered\tmessage="))
+    })
+    .await;
+    bridge
+}
+
+/// Carry one intention to that controller, and hand back the id it went under.
+async fn one_intent(h: &Harness, on: (&str, &str)) -> IntentId {
+    let mine = run_of(&h.hub, &h.own()).await;
+    match h
+        .hub
+        .intend(wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            None,
+            None,
+            Some(mine),
+            on,
+        ))
+        .await
+    {
+        Ok(Intended::Carried(id)) => id,
+        other => panic!("the intention this test needs was not carried: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_outcome_for_an_intent_this_hub_never_sent_writes_nothing_in_the_topic_and_one_line_in_the_audit()
+ {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let said_before = h.fake.sends.lock().await.len();
+
+    // An id nobody minted. A controller that could put words in his topic by naming one would be a
+    // way to reach the operator's phone that nothing authorised.
+    let asked = controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: IntentId::new("i-made-this-up"),
+            status: IntentStatus::Completed,
+            reason: Some("all done".to_owned()),
+        })
+        .await;
+    let (delivered, _) = controller
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref,
+                delivered,
+                why,
+            } if r#ref == &asked => Some((*delivered, *why)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        delivered,
+        Delivered::No,
+        "an outcome for an intention this hub never sent was taken"
+    );
+    assert_eq!(
+        h.fake.sends.lock().await.len(),
+        said_before,
+        "a made-up id put a line on the operator's phone"
+    );
+    let strays: Vec<_> = audit_of(&h)
+        .into_iter()
+        .filter(|l| l.contains("i-made-this-up") || l.contains("did not send"))
+        .collect();
+    assert_eq!(
+        strays.len(),
+        1,
+        "a branch that carries nothing still writes exactly one line: {strays:?}"
+    );
+    assert!(
+        !strays[0].contains("all done"),
+        "the controller's own sentence reached the audit, where a newline in it would be a second \
+         record of its choosing: {}",
+        strays[0]
+    );
+}
+
+#[tokio::test]
+async fn an_outcome_arriving_at_an_address_the_intent_was_never_sent_to_is_refused() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+
+    // A second conversation of the same project, on the same secret. It is entitled to speak for
+    // ITSELF and to nothing else: a lane that could answer for another lane's intention would be a
+    // worktree closing a question asked somewhere it cannot see.
+    let mut other =
+        FakeBridge::connect_as(&h.sock, &h.secret, "elsewhere", "p", Some("engineering")).await;
+    other.become_live().await;
+    let asked = other
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Completed,
+            reason: None,
+        })
+        .await;
+    let delivered = other
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+    assert_eq!(delivered, Delivered::No);
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Sent),
+        "one conversation answered for another conversation's intention"
+    );
+    // The still-live path, where the address is NOT the only thing standing in the way: the record
+    // is `Sent`, so `may_speak_about` would refuse this lane over the run as well. The path where
+    // the address is the only refusal is the test below, and it is the one that pins the guard.
+}
+
+/// The late-correction path, where the address is the ONLY thing that refuses.
+///
+/// Once a connection has ended with the word still owed, `may_speak_about` stops asking which RUN
+/// is speaking and asks what it DECLARED — that is the whole point of the branch, because a
+/// controller answering late from its own record after its own restart is a different run by
+/// definition. A sibling worktree that declared the same control passes that branch honestly. All
+/// that stands between it and settling work asked in a conversation it cannot see is the address
+/// the intention was carried to.
+#[tokio::test]
+async fn a_sibling_lane_declaring_the_same_control_cannot_settle_an_intention_carried_elsewhere() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+
+    // The connection it was carried to ends with the word still owed, which is what puts the
+    // record on the late-correction path.
+    drop(controller);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Unknown),
+        "this test is about the late-correction path and the record never reached it"
+    );
+
+    // A sibling worktree of the same project, on the same secret, declaring the very same control.
+    // It is a real controller for that spec — nothing about its declaration is a lie — and the
+    // intention went to the project's own voice, not to it.
+    let mut sibling = FakeBridge::connect_declaring_as(
+        &h.sock,
+        &h.secret,
+        "sibling",
+        Some("engineering"),
+        vec![control("spec-w", None, &["restart"], None)],
+    )
+    .await;
+    sibling.become_live().await;
+    let asked = sibling
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Completed,
+            reason: None,
+        })
+        .await;
+    let delivered = sibling
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+
+    assert_eq!(
+        delivered,
+        Delivered::No,
+        "a sibling lane was allowed to settle an intention this hub carried to another address"
+    );
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Unknown),
+        "a sibling lane that declared the same control turned another conversation's honest \"I \
+         do not know\" into an answer"
+    );
+    // WHICH refusal it was, and not merely that there was one. A test that only reads the ack
+    // cannot tell the address apart from the declaration, and telling them apart is the property.
+    let lines = audit_of(&h);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("carried to another conversation")),
+        "the outcome was refused, but for some reason other than the address it arrived at: \
+         {lines:?}"
+    );
+}
+
+/// The other half of the same guard: it must not refuse the run that is entitled to correct.
+///
+/// A controller that restarts comes back as a NEW run of the address it held, and the intention it
+/// left owing a word is exactly the thing it now has to correct. A guard that read "not the run it
+/// was handed to" instead of "not the address it was carried to" would leave the operator's phone
+/// on "I do not know" for ever, which is the failure the late-correction branch exists to prevent.
+#[tokio::test]
+async fn a_late_correction_from_a_new_run_of_the_address_it_was_carried_to_is_still_heard() {
+    let h = harness().await;
+    // On a lane rather than the project's own voice, so this test and the one above differ in the
+    // one thing they are about — the address the record names — and in nothing else.
+    let mut lane = FakeBridge::connect_declaring_as(
+        &h.sock,
+        &h.secret,
+        "lane",
+        Some("engineering"),
+        vec![control("spec-w", Some("engineering"), &["restart"], None)],
+    )
+    .await;
+    lane.become_live().await;
+    let running = run_of(&h.hub, &h.lane("engineering")).await;
+    let id = match h
+        .hub
+        .intend(wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            Some("engineering"),
+            None,
+            Some(running),
+            ("m1", "b1"),
+        ))
+        .await
+    {
+        Ok(Intended::Carried(id)) => id,
+        other => panic!("the intention this test needs was not carried: {other:?}"),
+    };
+    lane.next_intent().await;
+
+    drop(lane);
+    until(async || !h.hub.is_claimed(&h.lane("engineering")).await).await;
+    assert_eq!(h.hub.what_became_of(&id).await, Some(IntentState::Unknown));
+
+    // The same worktree back, which is a different run of the same address, declaring what it
+    // declared before. This is the one connection in the project that may close this record.
+    let mut back = FakeBridge::connect_declaring_as(
+        &h.sock,
+        &h.secret,
+        "lane-2",
+        Some("engineering"),
+        vec![control("spec-w", Some("engineering"), &["restart"], None)],
+    )
+    .await;
+    back.become_live().await;
+    let asked = back
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Completed,
+            reason: None,
+        })
+        .await;
+    let delivered = back
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+
+    assert_eq!(
+        delivered,
+        Delivered::Yes,
+        "the run that came back to correct its own record was turned away"
+    );
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Settled(IntentStatus::Completed)),
+        "a controller correcting an intention carried to its own address was not heard, and the \
+         operator is left on \"I do not know\" for ever"
+    );
+}
+
+#[tokio::test]
+async fn an_outcome_the_controller_sent_is_relayed_and_a_second_terminal_word_is_dropped() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+
+    // `accepted` means the work has STARTED, and exactly one terminal word follows it.
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Accepted,
+            reason: None,
+        })
+        .await;
+    until(async || h.hub.what_became_of(&id).await == Some(IntentState::Accepted)).await;
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Completed,
+            reason: Some("it came back up".to_owned()),
+        })
+        .await;
+    until(async || {
+        h.hub.what_became_of(&id).await == Some(IntentState::Settled(IntentStatus::Completed))
+    })
+    .await;
+
+    // Nothing follows a terminal word. A second one is dropped with one line, because a controller
+    // that could keep re-answering could turn one intention into a stream of them.
+    let asked = controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Failed,
+            reason: None,
+        })
+        .await;
+    let delivered = controller
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+    assert_eq!(delivered, Delivered::No);
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Settled(IntentStatus::Completed)),
+        "a second terminal word overwrote the first: `completed` became `failed` after the fact"
+    );
+}
+
+#[tokio::test]
+async fn an_intent_survives_a_controller_restart_as_an_unknown_outcome_and_never_as_a_failure() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Accepted,
+            reason: None,
+        })
+        .await;
+    until(async || h.hub.what_became_of(&id).await == Some(IntentState::Accepted)).await;
+
+    // And then the connection ends with the terminal word still owed. What the hub knows is what
+    // became of the CONVERSATION; it knows nothing at all about the work, and saying `failed` here
+    // would tell him something changed when nothing may have.
+    drop(controller);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Unknown),
+        "a disconnect was read as a failure of the work"
+    );
+
+    // A redial does not resurrect it either — but the controller answering late, from its own
+    // record, still corrects the line.
+    let mut back = one_controller(&h, "controller-2").await;
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Unknown),
+        "a reconnection invented an outcome nobody reported"
+    );
+    back.send(BridgeFrame::IntentOutcome {
+        intent_id: id.clone(),
+        status: IntentStatus::Completed,
+        reason: None,
+    })
+    .await;
+    until(async || {
+        h.hub.what_became_of(&id).await == Some(IntentState::Settled(IntentStatus::Completed))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_outcome_reason_carrying_a_newline_writes_no_second_line_in_the_audit() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+    let before = audit_of(&h).len();
+
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Failed,
+            // A whole record of the sender's choosing, if this file ever interpolated it.
+            reason: Some(
+                "no\nt=1\trefused\tproject=someone-else\twhy=a line I wrote myself".to_owned(),
+            ),
+        })
+        .await;
+    until(async || {
+        h.hub.what_became_of(&id).await == Some(IntentState::Settled(IntentStatus::Failed))
+    })
+    .await;
+
+    let after = audit_of(&h);
+    assert_eq!(
+        after.len(),
+        before + 1,
+        "one outcome wrote more than one record: {:?}",
+        &after[before..]
+    );
+    assert!(
+        !after.iter().any(|l| l.contains("a line I wrote myself")),
+        "the controller's sentence reached the audit at all"
+    );
+}
+
+#[tokio::test]
+async fn an_intent_that_could_not_be_handed_on_leaves_the_key_free_to_be_used_again() {
+    let h = harness().await;
+    // A controller whose outbox this test owns, so it can be full at the moment it matters. A full
+    // outbox is what "the controller is not keeping up" is, and it needs nothing to go wrong.
+    let (tx, mut outbox) = mpsc::channel::<Envelope<HubFrame>>(1);
+    let _kicked = h
+        .hub
+        .claim_declaring(
+            h.own(),
+            std::process::id(),
+            "controller".into(),
+            tx.clone(),
+            Some(vec![control("spec-w", None, &["restart"], None)]),
+        )
+        .await
+        .expect("the address is free");
+    let mine = run_of(&h.hub, &h.own()).await;
+    tx.try_send(Envelope::new(FrameId::new("h-filler"), HubFrame::Ping))
+        .expect("the outbox holds one");
+
+    let tap = || {
+        wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            None,
+            None,
+            Some(mine),
+            ("m1", "b1"),
+        )
+    };
+    assert_eq!(
+        h.hub.intend(tap()).await,
+        Err(IntentRefusal::CouldNotHandItOn),
+        "a frame the outbox would not take was reported as carried"
+    );
+
+    // And the record went with it. An intention nothing received must not answer the next tap on
+    // the same button from a record of something that never happened — which is the same move
+    // `deliver_tap` makes when a choice reaches nobody.
+    outbox.recv().await.expect("the filler comes off");
+    assert!(
+        matches!(h.hub.intend(tap()).await, Ok(Intended::Carried(_))),
+        "the key stayed spent after a delivery that never happened, so the button is dead for good"
+    );
+    assert!(
+        matches!(
+            outbox.recv().await.map(|e| e.payload),
+            Some(HubFrame::Intent { .. })
+        ),
+        "nothing was carried the second time either"
+    );
+}
+
+#[tokio::test]
+async fn both_directions_of_one_intention_are_written_down_and_neither_line_carries_a_word_anybody_else_chose()
+ {
+    let h = harness().await;
+    let mut controller = FakeBridge::connect_declaring(
+        &h.sock,
+        &h.secret,
+        "controller",
+        vec![control("spec-w", Some("engineering"), &["scale"], Some(4))],
+    )
+    .await;
+    controller.become_live().await;
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "worktree", "p", Some("engineering")).await;
+    lane.become_live().await;
+    let g = run_of(&h.hub, &h.lane("engineering")).await;
+
+    let Ok(Intended::Carried(id)) = h
+        .hub
+        .intend(wants(
+            &h.project,
+            Op::Scale,
+            "spec-w",
+            Some("engineering"),
+            Some(3),
+            Some(g),
+            ("m1", "b1"),
+        ))
+        .await
+    else {
+        panic!("the intention was not carried");
+    };
+    let key = key_of(&controller.next_intent().await);
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Completed,
+            reason: Some("three are running".to_owned()),
+        })
+        .await;
+    until(async || {
+        h.hub.what_became_of(&id).await == Some(IntentState::Settled(IntentStatus::Completed))
+    })
+    .await;
+
+    let lines = audit_of(&h);
+    // Going out: what was asked, of what, on whose behalf. The sender is written for the reason a
+    // stranger's is — an id in this file is one the operator can copy.
+    let out = lines
+        .iter()
+        .find(|l| l.contains("\tintent\t"))
+        .unwrap_or_else(|| panic!("nothing was written down about an intention: {lines:?}"));
+    for field in [
+        &format!("project={}", h.project),
+        "domain=engineering",
+        "op=scale",
+        "spec=spec-w",
+        &format!("intent={id}"),
+        &format!("key={key}"),
+        &format!("for_run={g}"),
+        "count=3",
+        &format!("sender={OPERATOR}"),
+    ] {
+        assert!(out.contains(field), "the line does not name {field}: {out}");
+    }
+    // Coming back: which intention, and the one word from the closed set. The controller's own
+    // sentence is not here and never is.
+    let back = lines
+        .iter()
+        .find(|l| l.contains("\tintent-outcome\t"))
+        .unwrap_or_else(|| panic!("nothing was written down about an outcome: {lines:?}"));
+    assert!(back.contains(&format!("intent={id}")) && back.contains("status=completed"));
+    assert!(
+        !lines.iter().any(|l| l.contains("three are running")),
+        "a sentence from another process reached the file that has to stay unforgeable"
+    );
+}
+
+// ── what the review round attacked, and what now holds ────────────────────────────────────────
+//
+// Every test below was written RED against the first build of this contract and names, in its own
+// sentence, the thing that build let happen.
+
+#[tokio::test]
+async fn an_intention_built_against_one_run_is_never_handed_to_the_run_that_replaced_it() {
+    let h = harness().await;
+    let controller = one_controller(&h, "controller").await;
+    let mine = run_of(&h.hub, &h.own()).await;
+
+    // The window this attacks is the one between the fence and the delivery: the fence reads the
+    // claims map, lets it go, and the frame goes out afterwards. Held open at the ledger's door
+    // rather than by a sleep, so the interleaving is decided here and not by a race.
+    let gate = h.hub.intents.lock().await;
+    let carrying = {
+        let hub = Arc::clone(&h.hub);
+        let project = h.project.clone();
+        tokio::spawn(async move {
+            hub.intend(wants(
+                &project,
+                Op::Restart,
+                "spec-w",
+                None,
+                None,
+                Some(mine),
+                ("m1", "b1"),
+            ))
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // And in that window the wall restarts: the run he was shown is gone and a new one holds the
+    // address. This is the exact story the fence exists for, arriving one moment later than the
+    // fence looks.
+    drop(controller);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut successor = one_controller(&h, "controller-2").await;
+    drop(gate);
+    let answer = carrying.await.expect("the task ran");
+
+    let at_the_successor = successor.drain_for(Duration::from_millis(300)).await;
+    assert!(
+        !at_the_successor
+            .iter()
+            .any(|f| matches!(f, HubFrame::Intent { .. })),
+        "an intention naming run {mine} was handed to the run that replaced it, stamped with the \
+         successor's own number so nothing downstream could tell: {answer:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_intention_from_somebody_on_no_list_is_never_carried_and_never_written_down_as_his() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let mine = run_of(&h.hub, &h.own()).await;
+    let before = audit_of(&h).len();
+
+    // Every other operator-initiated path asks who this is before it acts. A second door that
+    // does not is a second way around the first.
+    let mut his = wants(
+        &h.project,
+        Op::Restart,
+        "spec-w",
+        None,
+        None,
+        Some(mine),
+        ("m1", "b1"),
+    );
+    his.from.user_id = A_STRANGER;
+    assert_eq!(
+        h.hub.intend(his).await,
+        Err(IntentRefusal::Stranger),
+        "an intention naming somebody on no list was carried"
+    );
+
+    let after = audit_of(&h);
+    assert!(
+        after[before..]
+            .iter()
+            .any(|l| l.contains(&format!("sender={A_STRANGER}"))
+                && l.contains("not allowed to speak here")),
+        "the one line a stranger leaves was not written: {:?}",
+        &after[before..]
+    );
+    assert!(
+        !after.iter().any(|l| l.contains("\tintent\t")),
+        "it was written down as an intention this hub carried, in his name"
+    );
+    let nothing = controller.drain_for(Duration::from_millis(300)).await;
+    assert!(
+        !nothing.iter().any(|f| matches!(f, HubFrame::Intent { .. })),
+        "a stranger's intention reached the controller"
+    );
+}
+
+#[tokio::test]
+async fn a_handle_this_hub_will_not_write_down_forges_no_line_in_the_audit_when_it_is_refused() {
+    let h = harness().await;
+    let _controller = one_controller(&h, "controller").await;
+
+    // A whole second record of the caller's choosing, in the one file an incident is read from.
+    // The refusal path writes the domain before anything has compared it against a declaration,
+    // so the shape check every admitted handle passes has to be at this door too.
+    let forged = "engineering\nintent\tproject=p\tdomain=-\top=stop\tspec=alpine\tintent=i0\t\
+                  key=k0\tfor_run=-\tcount=-\tsender=1";
+    for (op, spec, domain, for_run) in [
+        (Op::Stop, "spec-w", Some(forged), None),
+        (Op::Start, "alpine\nintent\tspec=alpine", None, None),
+    ] {
+        let before = audit_of(&h).len();
+        assert_eq!(
+            h.hub
+                .intend(wants(
+                    &h.project,
+                    op,
+                    spec,
+                    domain,
+                    None,
+                    for_run,
+                    ("m1", "b1")
+                ))
+                .await,
+            Err(IntentRefusal::HandleRefused),
+            "a handle this hub will not write down got past the door"
+        );
+        let after = audit_of(&h);
+        assert_eq!(
+            after.len(),
+            before + 1,
+            "one refusal wrote more than one record: {:?}",
+            &after[before..]
+        );
+        assert!(
+            !after.iter().any(|l| l.contains("spec=alpine")),
+            "a refused handle wrote a record of its own choosing: {:?}",
+            &after[before..]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_controller_that_answers_with_a_page_of_prose_has_it_cut_to_what_a_topic_can_carry() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+
+    // The one free sentence in the family, and the only string a bridge sends that does not go
+    // through the clamp every other one does. The slice that draws it on his phone must not be the
+    // first place anybody notices.
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Failed,
+            reason: Some("x".repeat(crate::queue::MAX_TEXT * 10)),
+        })
+        .await;
+    until(async || {
+        h.hub.what_became_of(&id).await == Some(IntentState::Settled(IntentStatus::Failed))
+    })
+    .await;
+
+    let kept = h
+        .hub
+        .what_was_said_about(&id)
+        .await
+        .expect("the controller's sentence was kept");
+    assert!(
+        kept.chars().count() <= crate::queue::MAX_TEXT,
+        "the hub kept {} characters of another process's prose, in a record it holds \
+         {INTENTS_KEPT} of",
+        kept.chars().count()
+    );
+}
+
+#[tokio::test]
+async fn a_second_tap_is_never_told_a_button_was_carried_while_the_first_is_still_being_handed_on()
+{
+    let h = harness().await;
+    // A controller whose outbox this test owns and keeps full, so the first tap's delivery fails
+    // and takes its own record back — which is the state the second tap must not read as "carried".
+    let (tx, _outbox) = mpsc::channel::<Envelope<HubFrame>>(1);
+    let _kicked = h
+        .hub
+        .claim_declaring(
+            h.own(),
+            std::process::id(),
+            "controller".into(),
+            tx.clone(),
+            Some(vec![control("spec-w", None, &["restart"], None)]),
+        )
+        .await
+        .expect("the address is free");
+    let mine = run_of(&h.hub, &h.own()).await;
+    tx.try_send(Envelope::new(FrameId::new("h-filler"), HubFrame::Ping))
+        .expect("the outbox holds one");
+
+    // The receipt is slow BECAUSE the controller is not keeping up, and that is why he taps again:
+    // the two conditions are the same condition, so this is the ordinary shape and not a contrived
+    // one. Both taps are queued at the ledger's door so which reads it first is decided here.
+    let gate = h.hub.intents.lock().await;
+    let taps: Vec<_> = (0..2)
+        .map(|_| {
+            let hub = Arc::clone(&h.hub);
+            let project = h.project.clone();
+            tokio::spawn(async move {
+                hub.intend(wants(
+                    &project,
+                    Op::Restart,
+                    "spec-w",
+                    None,
+                    None,
+                    Some(mine),
+                    ("m1", "b1"),
+                ))
+                .await
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drop(gate);
+
+    for (which, tap) in taps.into_iter().enumerate() {
+        assert_eq!(
+            tap.await.expect("the task ran"),
+            Err(IntentRefusal::CouldNotHandItOn),
+            "tap {which} was told the button had been carried when nothing took it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_record_still_waiting_for_a_word_is_never_pushed_out_of_the_ledger_to_make_room() {
+    let h = harness().await;
+    // An outbox big enough that every one of these is really carried: what is being attacked is
+    // the ledger's bound, not the wire's.
+    let (tx, _outbox) = mpsc::channel::<Envelope<HubFrame>>(INTENTS_KEPT + 8);
+    let _kicked = h
+        .hub
+        .claim_declaring(
+            h.own(),
+            std::process::id(),
+            "controller".into(),
+            tx,
+            Some(vec![control("spec-w", None, &["restart"], None)]),
+        )
+        .await
+        .expect("the address is free");
+    let mine = run_of(&h.hub, &h.own()).await;
+    let tap = |on: &str| {
+        wants(
+            &h.project,
+            Op::Restart,
+            "spec-w",
+            None,
+            None,
+            Some(mine),
+            (on, "b1"),
+        )
+    };
+
+    let Ok(Intended::Carried(first)) = h.hub.intend(tap("m0")).await else {
+        panic!("the first intention was not carried");
+    };
+    for n in 1..INTENTS_KEPT {
+        h.hub
+            .intend(tap(&format!("m{n}")))
+            .await
+            .expect("the ledger holds this many");
+    }
+    // The ledger is now full of intentions still waiting for a word. A record dropped to make room
+    // for this one is a button whose second tap is carried out a second time.
+    let one_too_many = h.hub.intend(tap("m-past-the-end")).await;
+
+    assert_eq!(
+        h.hub.intend(tap("m0")).await,
+        Ok(Intended::AlreadyAsked(first, IntentState::Sent)),
+        "one button was carried twice once its record aged out"
+    );
+    assert_eq!(
+        one_too_many,
+        Err(IntentRefusal::TooManyWaiting),
+        "an intention was carried by forgetting one nobody has answered for"
+    );
+}
+
+#[tokio::test]
+async fn a_button_whose_outcome_is_unknown_is_offered_again_and_never_answered_from_the_record() {
+    let h = harness().await;
+    // `start` is the op this matters for: it carries no run, so its key does not move when the
+    // world does, and a record that answers for ever is a button that is dead for ever.
+    let declared = vec![control("spec-w", None, &["start"], None)];
+    let mut controller =
+        FakeBridge::connect_declaring(&h.sock, &h.secret, "c1", declared.clone()).await;
+    controller.become_live().await;
+    let tap = || {
+        wants(
+            &h.project,
+            Op::Start,
+            "spec-w",
+            None,
+            None,
+            None,
+            ("m1", "b1"),
+        )
+    };
+    let Ok(Intended::Carried(first)) = h.hub.intend(tap()).await else {
+        panic!("the first intention was not carried");
+    };
+    controller.next_intent().await;
+
+    drop(controller);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert_eq!(
+        h.hub.what_became_of(&first).await,
+        Some(IntentState::Unknown)
+    );
+    let mut back = FakeBridge::connect_declaring(&h.sock, &h.secret, "c2", declared).await;
+    back.become_live().await;
+
+    // A fresh controller is connected and willing, and the hub knows nothing about what became of
+    // the first. Answering from that record is the hub claiming knowledge it has not got.
+    match h.hub.intend(tap()).await {
+        Ok(Intended::Carried(again)) => assert_ne!(again, first),
+        other => panic!(
+            "the button is dead for good after the controller that took it went away: {other:?}"
+        ),
+    }
+    back.next_intent().await;
+}
+
+#[tokio::test]
+async fn a_connection_that_never_declared_it_cannot_settle_an_intention_it_was_never_handed() {
+    let h = harness().await;
+    let controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    drop(controller);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    assert_eq!(h.hub.what_became_of(&id).await, Some(IntentState::Unknown));
+
+    // An ordinary bridge takes the address. It proved the project's secret, which is exactly what
+    // makes this worth guarding: inside the project's trust boundary is not inside the
+    // controller's, and the id counter is one anybody on the wire can follow.
+    let mut plain = FakeBridge::connect_as(&h.sock, &h.secret, "plain", "p", None).await;
+    plain.become_live().await;
+    let asked = plain
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Completed,
+            reason: None,
+        })
+        .await;
+    let delivered = plain
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+
+    assert_eq!(delivered, Delivered::No);
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Unknown),
+        "a connection that declared no capability settled an intention it was never handed, and \
+         an honest `I do not know` became `Done` on his phone"
+    );
+}
+
+#[tokio::test]
+async fn a_word_saying_nothing_happened_can_never_follow_one_saying_something_did() {
+    let h = harness().await;
+    let mut controller = one_controller(&h, "controller").await;
+    let id = one_intent(&h, ("m1", "b1")).await;
+    controller.next_intent().await;
+    controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Accepted,
+            reason: None,
+        })
+        .await;
+    until(async || h.hub.what_became_of(&id).await == Some(IntentState::Accepted)).await;
+
+    // `refused` means NOTHING happened, and by then something had. It is the whole reason there
+    // are four words rather than two, and taking it here would rewrite a started thing as one
+    // that never began.
+    let asked = controller
+        .send(BridgeFrame::IntentOutcome {
+            intent_id: id.clone(),
+            status: IntentStatus::Refused,
+            reason: None,
+        })
+        .await;
+    let delivered = controller
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+    assert_eq!(delivered, Delivered::No);
+    assert_eq!(
+        h.hub.what_became_of(&id).await,
+        Some(IntentState::Accepted),
+        "a word that says nothing happened was taken after one that says something did"
     );
 }

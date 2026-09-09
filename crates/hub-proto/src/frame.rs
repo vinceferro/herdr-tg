@@ -32,7 +32,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AskId, FrameId, MsgId, OptionId, ProjectId};
+use crate::ids::{AskId, FrameId, IdempotencyKey, IntentId, MsgId, OptionId, ProjectId, SpecId};
 
 /// The protocol version carried in every envelope's `v`.
 ///
@@ -72,7 +72,10 @@ pub struct Envelope<P> {
     /// `no_field_of_any_frame_shares_a_name_with_a_field_of_the_envelope_it_flattens_into` fails
     /// the day one is, over every frame in both directions, and
     /// `a_generation_rides_on_every_frame_in_both_directions_and_is_named_exactly_once` fails
-    /// beside it for this field.
+    /// beside it for this field. A field whose name merely CONTAINS it — `expected_generation`,
+    /// say — does not collide today and is one careless shortening away from doing so, so
+    /// `no_payload_field_may_contain_the_one_name_the_envelope_owns_even_with_a_qualifier_in_front_of_it`
+    /// refuses that whole family too.
     ///
     /// Absent means "I hold no generation". A zero says the same thing and is read as absent: a
     /// zero is a number a fence can compare and it would lose every comparison it was ever in, and
@@ -171,6 +174,186 @@ fn promises_nothing(confirms: &Option<Vec<String>>) -> bool {
     !matches!(confirms, Some(c) if !c.is_empty())
 }
 
+/// The control that covers this (spec, domain, op), or `None` when the connection declared none.
+///
+/// The only way to read [`BridgeFrame::Hello::controls`], and it takes the whole question rather
+/// than answering half of it. A reader that asks whether the field was PRESENT rather than whether
+/// it names THIS operation would carry an intention to a controller that never said it could do
+/// that thing — and a controller answering "I cannot" to something it never declared is the polite
+/// spelling of the hub having invented the request. `promises_to_confirm` above is the same rule
+/// for the same reason; this one returns the control itself because the caller also needs the
+/// bound the controller set on itself.
+///
+/// A name this build has never heard of can never match, because the match runs through
+/// [`Op::named`] rather than over the raw strings.
+///
+/// `None` when MORE THAN ONE entry matches, too. Two entries naming one (spec, domain, op) set two
+/// different bounds on one operation, and picking either is the hub guessing which bound the
+/// controller meant. It declines to guess; the controller reads the difference in the echo.
+pub fn control_for<'a>(
+    controls: &'a Option<Vec<Control>>,
+    spec_id: &SpecId,
+    domain: Option<&crate::ids::LaneId>,
+    op: Op,
+) -> Option<&'a Control> {
+    let mut matched = controls.iter().flatten().filter(|c| {
+        &c.spec_id == spec_id
+            && c.domain.as_ref() == domain
+            && c.allowed.iter().any(|name| Op::named(name) == Some(op))
+    });
+    match (matched.next(), matched.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+/// Reads a declaration, taking an empty list for silence. See [`BridgeFrame::Hello::controls`].
+fn an_empty_declaration_is_no_declaration<'de, D>(d: D) -> Result<Option<Vec<Control>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<Control>>::deserialize(d)?.filter(|c| !c.is_empty()))
+}
+
+/// True when this peer declared no controls at all — unsaid, or the empty list that says it.
+fn declares_nothing(controls: &Option<Vec<Control>>) -> bool {
+    !matches!(controls, Some(c) if !c.is_empty())
+}
+
+/// One of the six things a controller can be asked to do. A CLOSED set, compiled in.
+///
+/// It is an enum and never a string from the wire, because a string is how an arbitrary command
+/// surface begins: a hub that carried the op as text would carry whatever the sender wrote. Adding
+/// a seventh is a decision, not a refactor.
+///
+/// **No catch-all**, like every closed set this wire branches on. `#[serde(other)]` compiles and
+/// looks right and DISCARDS the wire string — measured in this repo, on herdr's own status enum —
+/// so a word this build has never heard of would come back out as one it has. A controller names
+/// what it can do in [`Control::allowed`], which is a list of plain strings for exactly that
+/// reason: an unknown name there is dropped and the declaration survives, where inventing an op
+/// from an unknown word would have the hub ask for something nobody described.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Op {
+    /// Bring up a predeclared spec. The one op whose domain may not exist yet.
+    Start,
+    /// Change how many of a predeclared spec are running. The only op that carries a count.
+    Scale,
+    /// Stop taking new work, finish what is in hand.
+    Drain,
+    /// Stop.
+    Stop,
+    /// Stop and start again, as one operation the controller owns the meaning of.
+    Restart,
+    /// Report what is running. Changes nothing.
+    Inspect,
+}
+
+impl Op {
+    /// Every op, so a walk over them cannot silently miss the seventh the day there is one.
+    pub const EVERY: [Op; 6] = [
+        Op::Start,
+        Op::Scale,
+        Op::Drain,
+        Op::Stop,
+        Op::Restart,
+        Op::Inspect,
+    ];
+
+    /// This op's name on the wire, which is also the name a controller declares it by.
+    ///
+    /// One spelling for both directions. Two would drift, and a declaration that no longer matched
+    /// the frame it authorises would take capabilities away from a controller silently.
+    pub fn name(self) -> &'static str {
+        match self {
+            Op::Start => "start",
+            Op::Scale => "scale",
+            Op::Drain => "drain",
+            Op::Stop => "stop",
+            Op::Restart => "restart",
+            Op::Inspect => "inspect",
+        }
+    }
+
+    /// The op a declared name means, or `None` when this build has never heard of it.
+    ///
+    /// `promises_to_confirm`'s rule in another spelling: a name this hub does not know is a
+    /// declaration about nothing, which is the same as declaring nothing, and both fail towards
+    /// offering the operator less rather than more. Refusing the connection instead would be a
+    /// controller that cannot connect because it was newer than the hub.
+    pub fn named(name: &str) -> Option<Op> {
+        Op::EVERY.into_iter().find(|op| op.name() == name)
+    }
+}
+
+/// What became of an intention, in the controller's own words about its own work.
+///
+/// Four rather than two, for the reason [`Delivered`] is three rather than two: a vocabulary that
+/// cannot express a state the system really enters is a vocabulary that lies about it. `refused`
+/// means nothing happened and nothing will; `failed` means something did happen and did not
+/// finish. Collapsing those two tells the operator nothing changed when something did, which is
+/// the worst thing this system can tell him, because his next action is chosen on it.
+///
+/// Every one of these is RELAYED by the hub and none is minted by it. There is deliberately no
+/// word here for "the connection ended and I do not know what became of it": that is a fact about
+/// this wire rather than about the work, and a controller that could assert it would have the hub
+/// repeat to the operator a rung it never observed. [`Delivered::Unseen`] exists for the same
+/// reason on the other side of the same argument.
+///
+/// **No catch-all** — see [`Op`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntentStatus {
+    /// The work has started, and exactly one terminal status will follow.
+    ///
+    /// It means *started*, not *I read the frame*. Without it a controller that has begun a
+    /// thirty-second restart has to choose between two lies, because the only other words it holds
+    /// are "done" and "not done".
+    Accepted,
+    /// It is not happening, and it will not happen later. Nothing was done.
+    Refused,
+    /// It finished, and did what was asked.
+    Completed,
+    /// It started and did not finish.
+    Failed,
+}
+
+/// One thing a controller says IN ADVANCE it can be asked to do.
+///
+/// The whole capability handshake, and deliberately the same shape as
+/// [`BridgeFrame::Hello::confirms`]: a declaration belonging to the connection that made it, read
+/// only by asking whether it names this exact operation.
+///
+/// Nothing the operator types can add to this list. He picks from what a controller already
+/// declared on a connection that had already proved a secret; he never names anything. That is the
+/// oldest line in this repo — inbound content SELECTS, it never NAMES — and this type is what
+/// makes it structural for lifecycle work rather than a rule someone remembers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Control {
+    /// Which predeclared thing this is about. Opaque here — see [`crate::ids::SpecId`].
+    pub spec_id: SpecId,
+    /// Which conversation of the project it is about. Absent means the conversation itself.
+    ///
+    /// Absence is the ONLY spelling of that meaning, exactly as it is for `hello.lane`. The hub
+    /// refuses `-` as a lane name because `-` IS the project's own voice on disk in both of its
+    /// file trees, so a lane admitted under that name would be handed the project's own media and
+    /// outbox directories.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub domain: Option<crate::ids::LaneId>,
+    /// The ops this controller can really perform for that pair, by name.
+    ///
+    /// Plain strings rather than [`Op`]s, so that a controller shipped after this hub is dropped a
+    /// name and kept as a controller, instead of being unreadable. Read through [`control_for`],
+    /// which maps a name to an op and therefore can never match one this build does not know.
+    pub allowed: Vec<String>,
+    /// A bound the controller sets on ITSELF, for the one op that carries a count.
+    ///
+    /// The hub only ever compares against it and refuses; it never raises it and never invents
+    /// one. Absent means the controller named no bound, which is not the same as a bound of zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max: Option<u32>,
+}
+
 /// How a send ended, in the only three values that can be told apart.
 ///
 /// Two values would be a lie. Telegram has no idempotency key, so a send that times out may or may
@@ -231,6 +414,18 @@ pub enum AckWhy {
     /// messaging app refused a frame his phone never saw. Such a connection is fenced by its
     /// socket and its pid alone, which is what it was before this field existed.
     StaleGeneration,
+    /// An [`BridgeFrame::IntentOutcome`] naming an intention this hub did not send to this
+    /// connection. Nothing was put in the operator's topic. Paired with [`Delivered::No`].
+    ///
+    /// It is an `ack` and not a [`HubFrame::Refused`] on purpose: a refusal closes the connection,
+    /// and one stray outcome — a controller answering late from its own ledger after a redial, or
+    /// answering for a lane that is not this one — is not a reason to end a conversation. The
+    /// frame is dropped, the connection lives, and the controller is told which frame died.
+    ///
+    /// Safe to add to a closed set the bridge branches on, for the reason [`AckWhy::NoFile`] gives:
+    /// only a peer that SENT an outcome can ever be told this, and a peer old enough not to know
+    /// the word cannot have sent one.
+    NoSuchIntent,
 }
 
 /// Why the hub refused a connection outright. The frame is followed by a close.
@@ -490,6 +685,29 @@ pub enum BridgeFrame {
             skip_serializing_if = "promises_nothing"
         )]
         confirms: Option<Vec<String>>,
+        /// What this connection can be ASKED to do, declared in advance — see [`Control`].
+        ///
+        /// A bridge that names none is not a controller and will never be sent a
+        /// [`HubFrame::Intent`], which is every bridge shipped before this field existed. Read it
+        /// with [`control_for`] and never by asking whether it is present: a reader that asked
+        /// only whether something was declared would carry an intention to a connection that
+        /// declared something else entirely.
+        ///
+        /// An EMPTY list says the same as silence and is read as silence, for the reason
+        /// `confirms` gives above it — a controller that builds the list by filtering writes the
+        /// empty one every time it can do nothing, and two spellings of one meaning is how a
+        /// reader ends up branching on the wrong one.
+        ///
+        /// Skipped when it declares nothing, so a bridge that is not a controller puts BYTE FOR
+        /// BYTE what it always put on the wire. A `"controls":null` would be a key an older hub
+        /// has to tolerate for no reason at all, on the one frame whose failure is a project that
+        /// can never connect.
+        #[serde(
+            default,
+            deserialize_with = "an_empty_declaration_is_no_declaration",
+            skip_serializing_if = "declares_nothing"
+        )]
+        controls: Option<Vec<Control>>,
     },
     /// Something the agent said. Does not buzz.
     Say {
@@ -567,6 +785,27 @@ pub enum BridgeFrame {
     Pong {
         #[serde(rename = "ref")]
         r#ref: FrameId,
+    },
+    /// What became of a [`HubFrame::Intent`]. Every intent gets one, and then one more.
+    ///
+    /// The correlation is `intent_id` and not the intent frame's `ref`, because the two answer
+    /// different questions: the `ack` says the frame arrived and is bookkeeping the hub does not
+    /// act on, while this says what became of the WORK, arrives later, and may arrive twice —
+    /// `accepted` and then one terminal status.
+    ///
+    /// A controller answers this from its own record. An outcome for an intention this hub never
+    /// sent reaches nobody's phone: the hub carries words to the operator only for things it
+    /// asked for, or a controller could put a line in his topic by naming an id.
+    IntentOutcome {
+        intent_id: IntentId,
+        status: IntentStatus,
+        /// One short sentence a person can read, in the controller's words.
+        ///
+        /// Never written to the audit by the hub — that file is one record per line and a
+        /// sentence from another process can carry a newline, which would be a second record of
+        /// the sender's choosing. It is for his topic, where a newline is only a newline.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        reason: Option<String>,
     },
     /// A kind this build does not know.
     ///
@@ -659,6 +898,30 @@ pub enum HubFrame {
         /// the hub would strip in silence.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         outbox: Option<String>,
+        /// The controls the hub actually ADMITTED, echoed back — see [`Control`].
+        ///
+        /// Echoed as admitted and never as sent, so the difference is readable: an op missing from
+        /// the echo is one this hub does not know and will never ask for, and a control missing
+        /// altogether had a shape the hub refused.
+        ///
+        /// It exists for the same reason the `lane` echo above it does. An unknown field inside a
+        /// known kind is ignored on purpose, which is what lets a new bridge talk to an old hub —
+        /// but it also means an OLD hub takes a declaration of controls in silence, and nothing
+        /// else in this frame can tell that apart from having been heard. **A controller that
+        /// declared controls and gets no echo has learned the hub is older than it is, and must
+        /// say so in its own log and behave as an ordinary bridge**: a hub that will never send an
+        /// intent looks exactly like one that has not decided to yet, and a controller that
+        /// assumed the second would wait for ever while the operator's phone showed nothing.
+        ///
+        /// Absent means no controls were admitted, which is what every hub built before them says
+        /// about everything, and it is skipped when absent so such a hub's welcome is BYTE FOR
+        /// BYTE the one it always sent.
+        #[serde(
+            default,
+            deserialize_with = "an_empty_declaration_is_no_declaration",
+            skip_serializing_if = "declares_nothing"
+        )]
+        controls: Option<Vec<Control>>,
         //
         // The generation this welcome grants is [`Envelope::generation`] on the welcome itself,
         // and there is deliberately no field for it here: the envelope's own `generation` and a
@@ -695,6 +958,77 @@ pub enum HubFrame {
         msg_id: MsgId,
         ask_id: AskId,
         option_id: OptionId,
+    },
+    /// One thing the operator picked off a keyboard the hub drew, carried to the controller that
+    /// declared it could do that thing.
+    ///
+    /// This is the first frame the hub sends BECAUSE A PERSON ASKED IT TO that is not the answer
+    /// to a question the far side posed — everything else the hub sends unprompted is a ping. That
+    /// is a real change in the direction of authority, and it is why the field set below is closed
+    /// and why every field is either one the hub itself minted or one a controller gave it back
+    /// verbatim.
+    ///
+    /// **What it cannot carry, which is the whole point of the frame having a type at all:** an
+    /// image, a command, an argv, an entrypoint, a mount, a secret, an environment variable, a
+    /// host path, a port, a unit name, or any free-form map. There is no field for one, and
+    /// `the_hub_carries_no_field_that_could_name_an_image_a_command_a_mount_a_secret_an_environment_variable_or_a_host_path`
+    /// fails the day one is added. The hub carries a handle and a verb; whoever holds the approved
+    /// spec owns everything the handle resolves to. The hub cannot look inside a spec because it
+    /// has no table to resolve one against and no way to get one.
+    ///
+    /// Delivery is at-least-once and nothing here claims otherwise, which is what
+    /// `idempotency_key` is for.
+    Intent {
+        /// What an [`BridgeFrame::IntentOutcome`] names. Written down before this frame goes out.
+        intent_id: IntentId,
+        /// What makes receiving this twice safe — see [`crate::ids::IdempotencyKey`].
+        ///
+        /// The failure it prevents is ordinary: the receipt is slow, he taps *Restart* again.
+        /// Without the key that is two restarts, and the hub cannot tell whether the first one
+        /// landed — Telegram has no idempotency key either.
+        idempotency_key: IdempotencyKey,
+        /// Which of the six things. A variant the hub selected from its own closed set because he
+        /// tapped a button the hub drew from an admitted control — never a word from anywhere.
+        op: Op,
+        /// Which predeclared thing, exactly as the controller declared it. Opaque here.
+        spec_id: SpecId,
+        /// Which conversation of the project. Absent means the conversation itself, and absence is
+        /// the only spelling of that — see [`Control::domain`].
+        ///
+        /// It does NOT route this frame. Routing reads the address off the claim the hub is
+        /// delivering to, so a domain named here cannot retarget the frame it rides on.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        domain: Option<crate::ids::LaneId>,
+        /// How many, for the one op that has a number in it. Bounded by [`Control::max`], which
+        /// the controller set on itself and the hub only ever compares against.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        count: Option<u32>,
+        /// Which run of the subject this was built against: the generation the operator's view was
+        /// drawn from, minted by this hub and believed from nowhere else.
+        ///
+        /// The failure it prevents: he is shown three workers, walks away, the wall restarts, he
+        /// comes back and taps *Scale to 1*. Without this that scales the NEW run to one. With it
+        /// he is told what he was looking at has changed, in words, and nothing is carried.
+        ///
+        /// Named `for_run` and not `expected_generation` deliberately. The envelope owns
+        /// `generation` (see [`Envelope::generation`]) and a payload field of that name is a
+        /// duplicate key no reader can read; a name one qualifier away from the reserved one is
+        /// one careless shortening from that failure, on the frame whose whole job is fencing.
+        /// `no_payload_field_may_contain_the_one_name_the_envelope_owns_even_with_a_qualifier_in_front_of_it`
+        /// now refuses the whole family of names rather than the one word.
+        ///
+        /// Absent for the ops that have no run to be about, present for the ones that change
+        /// something already running. Which is which is the hub's rule, not this crate's.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        for_run: Option<u64>,
+        /// Who tapped, for the audit record. The same type and the same spelling the hub already
+        /// puts on every [`HubFrame::Message`]: one type, one spelling in the log, no new exposure.
+        from: From,
+        /// How long the hub is willing for this to be acted on, as a DURATION from arrival.
+        ///
+        /// Not an instant. A deadline compares two clocks, and the two ends of this wire are two
+        /// processes that have never agreed on one; a duration compares one clock with itself.
+        valid_for_ms: u64,
     },
     /// What became of one of the bridge's frames. Every frame gets exactly one.
     ///
@@ -762,6 +1096,7 @@ mod tests {
                 pid: Some(1),
                 lane: Some(crate::ids::LaneId::new("engineering")),
                 confirms: Some(vec!["choice".into()]),
+                controls: Some(vec![one_control()]),
             },
             BridgeFrame::Say {
                 text: "x".into(),
@@ -806,6 +1141,11 @@ mod tests {
             BridgeFrame::Pong {
                 r#ref: FrameId::new("f4"),
             },
+            BridgeFrame::IntentOutcome {
+                intent_id: IntentId::new("i-7a1c"),
+                status: IntentStatus::Completed,
+                reason: Some("three are running".into()),
+            },
         ]
     }
 
@@ -825,6 +1165,7 @@ mod tests {
                     frames_per_min: 20,
                 },
                 outbox: Some("/state/outbox/p-9f3a1c2e5b7d/engineering".into()),
+                controls: Some(vec![one_control()]),
             },
             HubFrame::Refused {
                 reason: RefusedReason::StaleGeneration,
@@ -857,6 +1198,7 @@ mod tests {
                 why: Some(AckWhy::StaleGeneration),
             },
             HubFrame::Ping,
+            an_intent_with_every_field(),
         ]
     }
 
@@ -911,6 +1253,7 @@ mod tests {
             pid: Some(42),
             lane: Some(crate::ids::LaneId::new("lane-0902-201212-2783563")),
             confirms: None,
+            controls: None,
         }))
         .expect("serialises");
         for forbidden in ["\"name\"", "\"project\":", "\"title\"", "\"topic\""] {
@@ -936,6 +1279,7 @@ mod tests {
             pid: Some(42),
             lane: None,
             confirms: None,
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -964,6 +1308,7 @@ mod tests {
                 pid: Some(1),
                 lane: None,
                 confirms: None,
+                controls: None,
             },
             "a bridge that named no lane stopped being the project's own voice"
         );
@@ -1447,6 +1792,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: None,
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -1487,6 +1833,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: Some("/state/outbox/p-9f3a1c2e5b7d/engineering".into()),
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -1708,6 +2055,7 @@ mod tests {
                 pid: Some(42),
                 lane: None,
                 confirms,
+                controls: None,
             }))
             .expect("serialises")
         };
@@ -1733,6 +2081,7 @@ mod tests {
             pid: Some(1),
             lane: None,
             confirms: Some(vec!["choice".into()]),
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -1770,6 +2119,7 @@ mod tests {
             pid: Some(1),
             lane: None,
             confirms: Some(vec!["choice".into()]),
+            controls: None,
         }))
         .expect("serialises");
         let old: Envelope<BridgeFrameBeforeConfirming> =
@@ -1800,6 +2150,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: None,
+            controls: None,
         });
         let json = serde_json::to_string(&plain).expect("serialises");
         assert_eq!(
@@ -1857,6 +2208,7 @@ mod tests {
                     frames_per_min: 20,
                 },
                 outbox: None,
+                controls: None,
             })
             .with_generation(1_757_000_000_000),
         )
@@ -1889,6 +2241,7 @@ mod tests {
             pid: Some(1),
             lane: None,
             confirms: Some(vec![]),
+            controls: None,
         }))
         .expect("serialises");
         assert!(
@@ -1946,6 +2299,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: None,
+            controls: None,
         })
         .with_generation(5);
         let json = serde_json::to_string(&stamped).expect("serialises");
@@ -2067,6 +2421,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: None,
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -2106,6 +2461,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: None,
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -2149,6 +2505,7 @@ mod tests {
                 frames_per_min: 20,
             },
             outbox: None,
+            controls: None,
         }))
         .expect("serialises");
         let old: Envelope<HubFrameBeforeIds> = serde_json::from_str(&sent)
@@ -2186,6 +2543,7 @@ mod tests {
                     frames_per_min: 20,
                 },
                 outbox: None,
+                controls: None,
             }
         );
     }
@@ -2206,6 +2564,7 @@ mod tests {
             pid: None,
             lane: None,
             confirms: None,
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -2223,6 +2582,7 @@ mod tests {
                 pid: None,
                 lane: None,
                 confirms: None,
+                controls: None,
             }
         );
     }
@@ -2240,6 +2600,7 @@ mod tests {
             pid: Some(42),
             lane: None,
             confirms: None,
+            controls: None,
         }))
         .expect("serialises");
         assert_eq!(
@@ -2262,6 +2623,7 @@ mod tests {
                 pid: Some(1),
                 lane: None,
                 confirms: None,
+                controls: None,
             }
         );
     }
@@ -2300,6 +2662,7 @@ mod tests {
             pid: Some(1),
             lane: None,
             confirms: Some(vec!["choice".into()]),
+            controls: None,
         }))
         .expect("serialises");
         let old: Envelope<BridgeFrameBeforeIds> = serde_json::from_str(&naming_both)
@@ -2317,6 +2680,7 @@ mod tests {
             pid: None,
             lane: None,
             confirms: Some(vec!["choice".into()]),
+            controls: None,
         }))
         .expect("serialises");
         let refused = serde_json::from_str::<Envelope<BridgeFrameBeforeIds>>(&naming_neither);
@@ -2353,5 +2717,874 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── the lifecycle-intent contract ─────────────────────────────────────────────────────────
+
+    /// A controller's declaration, as the worked example in the document writes it.
+    ///
+    /// One helper, so the pins below cannot drift apart from each other into two ideas of what a
+    /// declaration looks like.
+    fn one_control() -> Control {
+        Control {
+            spec_id: SpecId::new("spec-worker"),
+            domain: Some(crate::ids::LaneId::new("engineering")),
+            allowed: vec![
+                "start".into(),
+                "scale".into(),
+                "drain".into(),
+                "stop".into(),
+            ],
+            max: Some(4),
+        }
+    }
+
+    /// An intention with every optional field filled, which is what makes the closed-field-set
+    /// guard below non-vacuous: a field that only appears when it has a value cannot hide from it.
+    ///
+    /// "Every optional field filled" is not a promise this literal can keep on its own — `None` is
+    /// a legal answer to a new field and the compiler accepts it here without a word. The guard
+    /// destructures what this returns, naming every field and requiring `Some` of each optional
+    /// one, so the day one is added the decision is forced beside the key list rather than here.
+    fn an_intent_with_every_field() -> HubFrame {
+        HubFrame::Intent {
+            intent_id: IntentId::new("i-7a1c"),
+            idempotency_key: IdempotencyKey::new("k-3f9e2b18"),
+            op: Op::Scale,
+            spec_id: SpecId::new("spec-worker"),
+            domain: Some(crate::ids::LaneId::new("engineering")),
+            count: Some(3),
+            for_run: Some(1_757_000_000_098),
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            valid_for_ms: 120_000,
+        }
+    }
+
+    /// The answer coming back, with its one optional field filled, for the same reason.
+    fn an_outcome_with_every_field() -> BridgeFrame {
+        BridgeFrame::IntentOutcome {
+            intent_id: IntentId::new("i-7a1c"),
+            status: IntentStatus::Failed,
+            reason: Some("the wall would not come up".into()),
+        }
+    }
+
+    #[test]
+    fn a_hello_without_controls_is_byte_for_byte_the_hello_this_protocol_has_always_sent() {
+        // Every bridge on the box is an ordinary bridge and not a controller, and a channel plugin
+        // restarts only when the operator's session does — so the hello this field appears on is
+        // the one nobody will re-issue for days. Pinned as BYTES rather than as a round trip,
+        // because a round trip stays green when a `"controls":null` or a `"controls":[]` has
+        // appeared, and either would be a key an older hub has to tolerate for no reason at all,
+        // on the one frame whose failure is a project that can never connect. Both spellings of
+        // "I am not a controller" are pinned to the same bytes.
+        let hello = |controls| {
+            serde_json::to_string(&env(BridgeFrame::Hello {
+                project_id: ProjectId::new("unknown-until-the-hub-says"),
+                token: "s3cret".into(),
+                instance: "i1".into(),
+                repo: Some("/home/u/Projects/herdr-tg".into()),
+                pid: Some(42),
+                lane: None,
+                confirms: None,
+                controls,
+            }))
+            .expect("serialises")
+        };
+        let always = r#"{"v":1,"id":"f1","t":"hello","project_id":"unknown-until-the-hub-says","token":"s3cret","instance":"i1","repo":"/home/u/Projects/herdr-tg","pid":42}"#;
+        assert_eq!(hello(None), always);
+        assert_eq!(
+            hello(Some(vec![])),
+            always,
+            "a bridge that is not a controller still said something about controlling"
+        );
+    }
+
+    #[test]
+    fn a_welcome_without_controls_is_byte_for_byte_the_welcome_this_protocol_has_always_sent() {
+        // The other half, and the more expensive one to get wrong: `welcome` is the frame whose
+        // failure is a project that can never connect, and every bridge in the fleet reads one
+        // before it can do anything at all.
+        let welcome = |controls| {
+            serde_json::to_string(&env(HubFrame::Welcome {
+                project: "A Title".into(),
+                project_id: None,
+                conversation: None,
+                lane: None,
+                topic_id: None,
+                limits: Limits {
+                    max_frame: 65536,
+                    max_text: 3500,
+                    frames_per_min: 20,
+                },
+                outbox: None,
+                controls,
+            }))
+            .expect("serialises")
+        };
+        let always = r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#;
+        assert_eq!(welcome(None), always);
+        assert_eq!(
+            welcome(Some(vec![])),
+            always,
+            "a hub that admitted no controls still put an echo on the wire"
+        );
+    }
+
+    #[test]
+    fn a_controller_that_declares_an_empty_list_of_controls_has_declared_nothing() {
+        // The `confirms` failure in a new place: an adapter that builds the list by filtering
+        // writes the empty one every time it can do nothing, so the empty list is the ordinary
+        // case rather than the odd one. Two spellings of one meaning is how a reader ends up
+        // branching on "did it say anything about controls" instead of "can it do THIS", and the
+        // second is the only question worth asking.
+        let read: Envelope<BridgeFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"p","token":"s","instance":"i","controls":[]}"#,
+        )
+        .expect("an empty declaration must not be a parse error");
+        let BridgeFrame::Hello { controls, .. } = read.payload else {
+            panic!("a hello stopped being a hello")
+        };
+        assert_eq!(
+            controls, None,
+            "an empty list of controls read back as a declaration"
+        );
+    }
+
+    #[test]
+    fn a_hello_that_declares_what_it_can_be_asked_to_do_carries_it_on_the_wire() {
+        // The capability handshake has to be ON the wire, for the reason `confirms` is: the only
+        // alternative is inferring it from a version number nobody sends, and a hub that assumed
+        // would sooner or later offer the operator a button for something nothing can do.
+        let json = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: None,
+            pid: None,
+            lane: None,
+            confirms: Some(vec!["choice".into()]),
+            controls: Some(vec![one_control()]),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"hello","project_id":"p","token":"s","instance":"i","confirms":["choice"],"controls":[{"spec_id":"spec-worker","domain":"engineering","allowed":["start","scale","drain","stop"],"max":4}]}"#
+        );
+    }
+
+    #[test]
+    fn a_welcome_echoes_the_controls_the_hub_admitted_so_a_controller_can_tell_it_was_heard() {
+        // Without the echo, a controller cannot tell a hub that will never ask it for anything
+        // from one that has not asked yet — an unknown field inside a known kind is ignored on
+        // purpose, so an older hub takes the whole declaration in silence. A controller that got
+        // no echo must behave as an ordinary bridge rather than waiting for an intent that is
+        // never coming.
+        let json = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            project_id: None,
+            conversation: None,
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+            controls: Some(vec![one_control()]),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20},"controls":[{"spec_id":"spec-worker","domain":"engineering","allowed":["start","scale","drain","stop"],"max":4}]}"#
+        );
+
+        let older: Envelope<HubFrame> = serde_json::from_str(
+            r#"{"v":1,"id":"h1","t":"welcome","project":"A Title","limits":{"max_frame":65536,"max_text":3500,"frames_per_min":20}}"#,
+        )
+        .expect("a welcome from a hub older than controls must still parse");
+        let HubFrame::Welcome { controls, .. } = older.payload else {
+            panic!("a welcome stopped being a welcome")
+        };
+        assert_eq!(
+            controls, None,
+            "an older hub's silence read back as an echo, so a controller would have acted"
+        );
+    }
+
+    #[test]
+    fn an_intent_puts_a_handle_and_a_verb_on_the_wire_and_never_the_thing_the_handle_names() {
+        // The shape a stranger implements from, pinned as bytes. `spec_id` is a handle the hub
+        // cannot dereference — it holds no table of specs and has no way to get one — so the image,
+        // the command, the mounts and the environment stay entirely on the side that approved them.
+        let json = serde_json::to_string(
+            &Envelope::new(FrameId::new("h44"), an_intent_with_every_field())
+                .with_generation(1_757_000_000_123),
+        )
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"h44","generation":1757000000123,"t":"intent","intent_id":"i-7a1c","idempotency_key":"k-3f9e2b18","op":"scale","spec_id":"spec-worker","domain":"engineering","count":3,"for_run":1757000000098,"from":{"chat_id":-1001,"user_id":7},"valid_for_ms":120000}"#
+        );
+
+        // The other end of the same frame: an op with no run to be about and no count, in a
+        // conversation named by its absence rather than by a word. Absence is the only spelling —
+        // the hub refuses `-` as a lane name, because `-` IS the project's own voice on disk.
+        let starting = serde_json::to_string(&env(HubFrame::Intent {
+            intent_id: IntentId::new("i-9b02"),
+            idempotency_key: IdempotencyKey::new("k-11ff"),
+            op: Op::Start,
+            spec_id: SpecId::new("spec-coordinator"),
+            domain: None,
+            count: None,
+            for_run: None,
+            from: From {
+                chat_id: -1001,
+                user_id: 7,
+            },
+            valid_for_ms: 120_000,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            starting,
+            r#"{"v":1,"id":"f1","t":"intent","intent_id":"i-9b02","idempotency_key":"k-11ff","op":"start","spec_id":"spec-coordinator","from":{"chat_id":-1001,"user_id":7},"valid_for_ms":120000}"#
+        );
+    }
+
+    #[test]
+    fn an_intent_outcome_names_the_intention_it_is_about_and_carries_nothing_else() {
+        // One correlation and not two. The `ack` for the intent frame says the frame arrived and
+        // is bookkeeping; THIS says what became of the work, and joining the two on one id is what
+        // keeps there being one place to look an intention up rather than two, one of which wins.
+        let accepted = serde_json::to_string(&env(BridgeFrame::IntentOutcome {
+            intent_id: IntentId::new("i-7a1c"),
+            status: IntentStatus::Accepted,
+            reason: None,
+        }))
+        .expect("serialises");
+        assert_eq!(
+            accepted,
+            r#"{"v":1,"id":"f1","t":"intent_outcome","intent_id":"i-7a1c","status":"accepted"}"#
+        );
+
+        let done = serde_json::to_string(&env(BridgeFrame::IntentOutcome {
+            intent_id: IntentId::new("i-7a1c"),
+            status: IntentStatus::Completed,
+            reason: Some("three are running".into()),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            done,
+            r#"{"v":1,"id":"f1","t":"intent_outcome","intent_id":"i-7a1c","status":"completed","reason":"three are running"}"#
+        );
+    }
+
+    #[test]
+    fn an_intent_and_its_outcome_carry_the_generation_exactly_once_and_name_no_field_the_envelope_owns()
+     {
+        // The two guards that walk every frame are worth exactly as much as the lists they walk,
+        // and a frame missing from a list is a frame nobody checks — which is invisible, because
+        // both guards stay green over a shorter list. So membership is asserted here, by the test
+        // whose subject is the new frames, rather than left to whoever adds the next one.
+        assert!(
+            every_hub_frame()
+                .iter()
+                .any(|f| matches!(f, HubFrame::Intent { .. })),
+            "the intent is not in the list the envelope guards walk, so nothing guards it"
+        );
+        assert!(
+            every_bridge_frame()
+                .iter()
+                .any(|f| matches!(f, BridgeFrame::IntentOutcome { .. })),
+            "the outcome is not in the list the envelope guards walk, so nothing guards it"
+        );
+
+        let intent = serde_json::to_string(&env(an_intent_with_every_field()).with_generation(7))
+            .expect("serialises");
+        assert_eq!(
+            intent.matches(r#""generation""#).count(),
+            1,
+            "the frame that fences a run named the generation more than once: {intent}"
+        );
+        let back: Envelope<HubFrame> =
+            serde_json::from_str(&intent).expect("a stamped intent must be readable");
+        assert_eq!(back.generation, Some(7), "the stamp was lost: {intent}");
+        assert_eq!(
+            back.payload,
+            an_intent_with_every_field(),
+            "the stamp changed the intention: {intent}"
+        );
+    }
+
+    #[test]
+    fn a_status_this_build_has_never_heard_of_is_one_unreadable_frame_and_never_a_fifth_status() {
+        // `#[serde(other)]` compiles, looks right, and DISCARDS the wire string — measured in this
+        // repo on herdr's own status enum, where an unmodelled word re-serialised as the literal
+        // name of the catch-all. On this frame that would be worse than a lost string: the hub
+        // would hold a value it could branch on, for a state a controller never claimed, and go on
+        // to tell the operator a rung nobody observed. A word this build does not know must not
+        // become a value at all. What a reader does with the decode failure is the reader's
+        // decision; what this crate guarantees is that there is no fifth status to act on.
+        let unreadable = serde_json::from_str::<Envelope<BridgeFrame>>(
+            r#"{"v":1,"id":"f1","t":"intent_outcome","intent_id":"i-1","status":"partly"}"#,
+        );
+        assert!(
+            unreadable.is_err(),
+            "a status nobody defined became a status this hub could act on: {unreadable:?}"
+        );
+
+        // The same rule downward, where getting it wrong would have the hub ask for an operation
+        // it has no word for.
+        let no_such_op = serde_json::from_str::<Envelope<HubFrame>>(
+            r#"{"v":1,"id":"h1","t":"intent","intent_id":"i-1","idempotency_key":"k-1","op":"delete","spec_id":"s","from":{"chat_id":-1,"user_id":1},"valid_for_ms":1}"#,
+        );
+        assert!(
+            no_such_op.is_err(),
+            "an op nobody defined became an op: {no_such_op:?}"
+        );
+    }
+
+    #[test]
+    fn no_payload_field_may_contain_the_one_name_the_envelope_owns_even_with_a_qualifier_in_front_of_it()
+     {
+        // Its neighbour above pins the EXACT names, which is the collision that actually breaks a
+        // reader today. This one is about the next one: `expected_generation` does not collide, and
+        // is one careless shortening away from a duplicate key nobody can read, on the frames whose
+        // whole job is fencing. The guard is deliberately asymmetric — a substring rule for
+        // `generation` alone, and exact match for the other two — because `_id` is a suffix half
+        // this wire's fields legitimately carry (`msg_id`, `ask_id`, `option_id`, `intent_id`) and
+        // `v` is a single letter that appears inside `valid_for_ms`. A rule that cried wolf on
+        // either would be deleted by the first person it inconvenienced. `generation` is a
+        // nine-letter word no field has another reason to contain, and it is the one whose
+        // shadowing is silent.
+        const THE_NAME_THE_ENVELOPE_OWNS: &str = "generation";
+        let mut walked = 0;
+        for payload in every_bridge_frame()
+            .iter()
+            .map(|f| serde_json::to_value(f).expect("serialises"))
+            .chain(
+                every_hub_frame()
+                    .iter()
+                    .map(|f| serde_json::to_value(f).expect("serialises")),
+            )
+        {
+            for name in payload
+                .as_object()
+                .expect("every frame is one flat object")
+                .keys()
+            {
+                walked += 1;
+                assert!(
+                    !name.contains(THE_NAME_THE_ENVELOPE_OWNS),
+                    "the payload field `{name}` is one rename away from shadowing the \
+                     envelope's own `{THE_NAME_THE_ENVELOPE_OWNS}`: {payload}"
+                );
+            }
+        }
+        assert!(
+            walked > 0,
+            "the guard walked no fields at all, which is how a scan passes vacuously"
+        );
+    }
+
+    #[test]
+    fn the_hub_carries_no_field_that_could_name_an_image_a_command_a_mount_a_secret_an_environment_variable_or_a_host_path()
+     {
+        // The line the whole contract turns on, held as a property of the TYPES rather than as a
+        // promise in a document. The hub carries a handle and a verb; everything the handle
+        // resolves to — the image, the command, the mounts, the secrets, the environment, the host
+        // paths — belongs to whoever approved the spec, and there is no field here for any of it.
+        //
+        // Three halves, and the first two are what stop the third passing vacuously.
+        //
+        // ONE, at COMPILE TIME: the three patterns below name every field of the three shapes this
+        // contract adds, and require `Some` of every optional one. Without them the scan is blind
+        // to exactly the change that most needs watching — an optional field carrying
+        // `skip_serializing_if`, which is the house style for every optional field on this wire. A
+        // new one is absent from `to_value` whenever the fixture answers it `None`, and `None` is
+        // the free answer the compiler drags an author to when it makes them name the field. That
+        // was measured, not imagined: an `env_for_the_run: Option<String>` planted on the intent
+        // put a database URL with its password on the wire with this whole suite green.
+        //
+        // TWO, the KEY SET, asserted exactly over what those patterns just proved complete, so a
+        // typo in the list cannot quietly check nothing. THREE, each key's SHAPE: a string that is
+        // an opaque id or a variant of a hub-owned enum, or a bounded number — never an array,
+        // never a nested map, because one free-form map defeats every row of this at once.
+        let HubFrame::Intent {
+            intent_id: _,
+            idempotency_key: _,
+            op: _,
+            spec_id: _,
+            domain: Some(_),
+            count: Some(_),
+            for_run: Some(_),
+            from: _,
+            valid_for_ms: _,
+        } = an_intent_with_every_field()
+        else {
+            panic!("the fixture stopped being an intent with every optional field filled")
+        };
+        let Control {
+            spec_id: _,
+            domain: Some(_),
+            allowed: _,
+            max: Some(_),
+        } = one_control()
+        else {
+            panic!("the declaration fixture stopped filling every optional field")
+        };
+        let BridgeFrame::IntentOutcome {
+            intent_id: _,
+            status: _,
+            reason: Some(_),
+        } = an_outcome_with_every_field()
+        else {
+            panic!("the outcome fixture stopped filling every optional field")
+        };
+
+        let forbidden = [
+            "image",
+            "img",
+            "digest",
+            "tag",
+            "registry",
+            "blob",
+            "command",
+            "cmd",
+            "argv",
+            "arg",
+            "exec",
+            "entrypoint",
+            "shell",
+            "script",
+            "mount",
+            "volume",
+            "bind",
+            "secret",
+            "token",
+            "credential",
+            "password",
+            "env",
+            "path",
+            "dir",
+            "cwd",
+            "url",
+            "host",
+            "port",
+            "socket",
+            "unit",
+            "user_data",
+            "extra",
+            "meta",
+        ];
+
+        let intent = serde_json::to_value(an_intent_with_every_field()).expect("serialises");
+        let intent = intent.as_object().expect("a frame is one flat object");
+        let mut keys: Vec<&str> = intent.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "count",
+                "domain",
+                "for_run",
+                "from",
+                "idempotency_key",
+                "intent_id",
+                "op",
+                "spec_id",
+                "t",
+                "valid_for_ms",
+            ],
+            "the field set of an intent is CLOSED. Adding one is a decision about what this hub \
+             is allowed to carry, and this list is where that decision is made."
+        );
+        for (name, value) in intent {
+            for word in forbidden {
+                assert!(
+                    !name.contains(word),
+                    "`{name}` on an intent could name the thing itself rather than a handle to it"
+                );
+            }
+            match name.as_str() {
+                // Opaque strings the hub minted or echoed back verbatim, plus the kind. Nothing is
+                // read out of any of them here; `spec_id` in particular is a handle this hub has
+                // no table to resolve and no way to get one.
+                "t" | "intent_id" | "idempotency_key" | "spec_id" | "domain" => {
+                    assert!(value.is_string(), "`{name}` stopped being an opaque string")
+                }
+                // A variant of a set compiled into this binary, never a word from the wire.
+                "op" => assert!(
+                    Op::EVERY.iter().any(|o| value == o.name()),
+                    "`op` carried something that is not one of this hub's own six verbs: {value}"
+                ),
+                // Numbers, bounded by their own types.
+                "count" | "for_run" | "valid_for_ms" => {
+                    assert!(value.is_number(), "`{name}` stopped being a number")
+                }
+                // The one nested object, and it is the type the hub already puts on every message:
+                // who tapped, for the audit. Its own field set is pinned here too, because a map
+                // that grew a third field would be a map that could grow a fourth.
+                "from" => {
+                    let mut inner: Vec<&str> = value
+                        .as_object()
+                        .expect("`from` is an object")
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    inner.sort_unstable();
+                    assert_eq!(inner, ["chat_id", "user_id"], "`from` grew a field");
+                }
+                other => panic!("`{other}` is a field of an intent that nothing here classifies"),
+            }
+        }
+
+        // The declaration the intent is built from, both directions: it rides up on a `hello` and
+        // the hub echoes it back down on a `welcome`, so a free-form field here would be one the
+        // hub carries too.
+        let control = serde_json::to_value(one_control()).expect("serialises");
+        let control = control.as_object().expect("a control is an object");
+        let mut declared: Vec<&str> = control.keys().map(String::as_str).collect();
+        declared.sort_unstable();
+        assert_eq!(
+            declared,
+            ["allowed", "domain", "max", "spec_id"],
+            "the field set of a control is CLOSED for the same reason an intent's is"
+        );
+        for name in control.keys() {
+            for word in forbidden {
+                assert!(
+                    !name.contains(word),
+                    "`{name}` on a control could name the thing itself rather than a handle to it"
+                );
+            }
+        }
+        assert!(
+            control["allowed"]
+                .as_array()
+                .expect("`allowed` is a list of names")
+                .iter()
+                .all(serde_json::Value::is_string),
+            "`allowed` stopped being a list of plain names"
+        );
+
+        // The answer coming back. `reason` is the one free sentence in the family and it is safe
+        // for a different argument than the rest: it travels UP, it names nothing — it is shown to
+        // a person and read by nobody else — and the hub never writes it to the audit, which is
+        // one record per line and would otherwise take a second record of the sender's choosing.
+        let outcome = serde_json::to_value(an_outcome_with_every_field()).expect("serialises");
+        let outcome = outcome.as_object().expect("a frame is one flat object");
+        let mut answered: Vec<&str> = outcome.keys().map(String::as_str).collect();
+        answered.sort_unstable();
+        assert_eq!(
+            answered,
+            ["intent_id", "reason", "status", "t"],
+            "the field set of an outcome is CLOSED"
+        );
+        for name in outcome.keys() {
+            for word in forbidden {
+                assert!(
+                    !name.contains(word),
+                    "`{name}` on an outcome could name a thing rather than describe what happened"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_controller_that_declared_another_operation_declared_nothing_about_this_one() {
+        // The reading that must be impossible to get wrong, and the exact shape of the `confirms`
+        // one: the hub asks whether this connection said it could do THIS, never whether it said
+        // anything. Getting it wrong carries an intention to a controller that never offered it,
+        // and a controller refusing something it never declared is the polite spelling of the hub
+        // having invented the request.
+        let declared = Some(vec![one_control()]);
+        let engineering = crate::ids::LaneId::new("engineering");
+        let worker = SpecId::new("spec-worker");
+
+        assert!(control_for(&declared, &worker, Some(&engineering), Op::Scale).is_some());
+        assert!(
+            control_for(&declared, &worker, Some(&engineering), Op::Restart).is_none(),
+            "an op this controller never listed was covered by the ones it did"
+        );
+        assert!(
+            control_for(&declared, &worker, None, Op::Scale).is_none(),
+            "a control for one domain covered the conversation itself"
+        );
+        assert!(
+            control_for(
+                &declared,
+                &worker,
+                Some(&crate::ids::LaneId::new("design")),
+                Op::Scale
+            )
+            .is_none(),
+            "a control for one domain covered another"
+        );
+        assert!(
+            control_for(
+                &declared,
+                &SpecId::new("spec-other"),
+                Some(&engineering),
+                Op::Scale
+            )
+            .is_none(),
+            "a control for one spec covered another"
+        );
+        assert!(
+            control_for(&None, &worker, Some(&engineering), Op::Scale).is_none(),
+            "a bridge that is not a controller was treated as one"
+        );
+        assert!(
+            control_for(&Some(vec![]), &worker, Some(&engineering), Op::Scale).is_none(),
+            "an empty declaration covered an operation"
+        );
+        assert_eq!(
+            control_for(&declared, &worker, Some(&engineering), Op::Scale).and_then(|c| c.max),
+            Some(4),
+            "the bound the controller set on itself did not come back with the control"
+        );
+    }
+
+    #[test]
+    fn a_control_naming_an_operation_this_hub_has_no_word_for_keeps_the_rest_of_the_declaration() {
+        // Forward compatibility, on the pattern `confirms` set: a controller shipped after this
+        // hub names something newer, and the answer is to drop the NAME rather than the
+        // controller. Refusing would be a controller that cannot connect because it was too new;
+        // inventing an op from an unknown word would be the hub asking for something nobody
+        // described. Dropping fails towards offering the operator less, which is the safe way for
+        // this to be wrong.
+        let newer = Some(vec![Control {
+            spec_id: SpecId::new("spec-worker"),
+            domain: None,
+            allowed: vec!["teleport".into(), "stop".into()],
+            max: None,
+        }]);
+        let worker = SpecId::new("spec-worker");
+        assert!(
+            control_for(&newer, &worker, None, Op::Stop).is_some(),
+            "a name this hub does not know cost the controller the ops it does know"
+        );
+        for op in Op::EVERY {
+            if op != Op::Stop {
+                assert!(
+                    control_for(&newer, &worker, None, op).is_none(),
+                    "an unknown name was read as {op:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_entries_setting_two_bounds_on_one_operation_are_not_a_bound_this_hub_will_guess_at() {
+        // A controller that lists one (spec, domain, op) twice has told the hub two different
+        // things about how far it may go. Taking the first is picking a bound nobody set; taking
+        // the larger is raising a bound the controller set on itself. The hub declines, and the
+        // controller sees the difference in the echo.
+        let twice = Some(vec![
+            Control {
+                spec_id: SpecId::new("spec-worker"),
+                domain: None,
+                allowed: vec!["scale".into()],
+                max: Some(2),
+            },
+            Control {
+                spec_id: SpecId::new("spec-worker"),
+                domain: None,
+                allowed: vec!["scale".into()],
+                max: Some(9),
+            },
+        ]);
+        assert!(
+            control_for(&twice, &SpecId::new("spec-worker"), None, Op::Scale).is_none(),
+            "the hub picked one of two bounds a controller set on one operation"
+        );
+    }
+
+    #[test]
+    fn every_op_is_spelt_on_the_wire_exactly_as_a_controller_declares_it() {
+        // One spelling for both directions. Two would drift, and the day they did, a controller
+        // would keep declaring `restart` while the hub stopped recognising the word — taking a
+        // capability away in silence, which is the failure mode this whole handshake exists to
+        // avoid.
+        for op in Op::EVERY {
+            let on_the_wire = serde_json::to_string(&op).expect("serialises");
+            assert_eq!(
+                on_the_wire,
+                format!("\"{}\"", op.name()),
+                "an op is spelt one way in a frame and another in a declaration"
+            );
+            assert_eq!(Op::named(op.name()), Some(op));
+        }
+        assert_eq!(
+            Op::named("teleport"),
+            None,
+            "a word this hub has never heard of became one of its own verbs"
+        );
+        assert_eq!(
+            Op::named("Scale"),
+            None,
+            "a name that is not the op's own name declared something"
+        );
+        assert_eq!(Op::EVERY.len(), 6, "adding a seventh op is a decision");
+    }
+
+    #[test]
+    fn an_ack_that_knows_of_no_such_intention_is_spelt_the_way_the_document_does() {
+        // It is an `ack` and not a refusal on purpose: a refusal closes the connection, and one
+        // stray outcome — a controller answering late from its own ledger after a redial — is not
+        // a reason to end a conversation.
+        let json = serde_json::to_string(&env(HubFrame::Ack {
+            r#ref: FrameId::new("f7"),
+            delivered: Delivered::No,
+            why: Some(AckWhy::NoSuchIntent),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"ack","ref":"f7","delivered":"no","why":"no-such-intent"}"#
+        );
+    }
+
+    #[test]
+    fn a_hello_declaring_controls_still_parses_on_a_hub_that_has_never_heard_of_them() {
+        // The skew that cannot be run end to end, because the hub that would have to be old is the
+        // one being replaced. `hello` is where a wrong answer costs most: refused before anything
+        // else can happen, and the bridge left with a closed socket and no reason.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BridgeFrameBeforeControls {
+            Hello {
+                project_id: ProjectId,
+                token: String,
+                instance: String,
+                #[serde(default)]
+                confirms: Option<Vec<String>>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(BridgeFrame::Hello {
+            project_id: ProjectId::new("p"),
+            token: "s".into(),
+            instance: "i".into(),
+            repo: None,
+            pid: None,
+            lane: None,
+            confirms: Some(vec!["choice".into()]),
+            controls: Some(vec![one_control()]),
+        }))
+        .expect("serialises");
+        let old: Envelope<BridgeFrameBeforeControls> =
+            serde_json::from_str(&sent).expect("a hub older than controls must still welcome it");
+        assert_eq!(
+            old.payload,
+            BridgeFrameBeforeControls::Hello {
+                project_id: ProjectId::new("p"),
+                token: "s".into(),
+                instance: "i".into(),
+                confirms: Some(vec!["choice".into()]),
+            },
+            "an older hub could not read a controller's hello"
+        );
+    }
+
+    #[test]
+    fn a_welcome_echoing_controls_still_parses_on_a_bridge_that_has_never_heard_of_them() {
+        // The upgrade day that actually happens: the hub is replaced and the bridge is not,
+        // because a channel plugin restarts only when its session does. Every bridge in the fleet
+        // reads a welcome before it can do anything at all.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum HubFrameBeforeControls {
+            Welcome {
+                project: String,
+                limits: Limits,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(HubFrame::Welcome {
+            project: "A Title".into(),
+            project_id: None,
+            conversation: None,
+            lane: None,
+            topic_id: None,
+            limits: Limits {
+                max_frame: 65536,
+                max_text: 3500,
+                frames_per_min: 20,
+            },
+            outbox: None,
+            controls: Some(vec![one_control()]),
+        }))
+        .expect("serialises");
+        let old: Envelope<HubFrameBeforeControls> =
+            serde_json::from_str(&sent).expect("an older bridge must still read its welcome");
+        assert!(
+            matches!(old.payload, HubFrameBeforeControls::Welcome { ref project, .. } if project == "A Title"),
+            "{old:?}"
+        );
+    }
+
+    #[test]
+    fn an_intent_reaches_a_bridge_from_before_intents_as_a_kind_it_can_hold_and_not_a_parse_error()
+    {
+        // A frame KIND is a value and never a parse error, which is what lets a hub that has grown
+        // a new frame go on talking to every bridge already installed on the box — and a channel
+        // plugin restarts only when the operator's session does, so those bridges are the ordinary
+        // case for days. An ordinary bridge declares no controls and will never be sent one of
+        // these; it must survive reading one anyway, because the day it cannot is the day one
+        // misrouted frame takes a working project off the air.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum HubFrameBeforeIntents {
+            Ping,
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(an_intent_with_every_field())).expect("serialises");
+        let old: Envelope<HubFrameBeforeIntents> =
+            serde_json::from_str(&sent).expect("an intent must be a value on a build without one");
+        assert_eq!(
+            old.payload,
+            HubFrameBeforeIntents::Unknown,
+            "a frame kind killed a connection instead of being logged and ignored"
+        );
+    }
+
+    #[test]
+    fn an_intent_outcome_reaches_a_hub_from_before_intents_as_a_kind_it_can_hold_and_not_an_error()
+    {
+        // The same in the other direction, and the one that matters more: a controller upgraded
+        // ahead of the hub answers an intention nobody asked for, and the hub has to ignore the
+        // frame rather than drop the connection under a project that is working perfectly well.
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(tag = "t", rename_all = "snake_case")]
+        enum BridgeFrameBeforeIntents {
+            Pong {
+                #[serde(rename = "ref")]
+                r#ref: FrameId,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let sent = serde_json::to_string(&env(BridgeFrame::IntentOutcome {
+            intent_id: IntentId::new("i-7a1c"),
+            status: IntentStatus::Accepted,
+            reason: None,
+        }))
+        .expect("serialises");
+        let old: Envelope<BridgeFrameBeforeIntents> =
+            serde_json::from_str(&sent).expect("an outcome must be a value on a build without one");
+        assert_eq!(
+            old.payload,
+            BridgeFrameBeforeIntents::Unknown,
+            "a frame kind killed a connection instead of being logged and ignored"
+        );
     }
 }

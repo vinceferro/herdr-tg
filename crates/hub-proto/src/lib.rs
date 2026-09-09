@@ -28,11 +28,13 @@ pub mod ids;
 pub use codec::{FrameReader, write_frame};
 pub use error::ProtoError;
 pub use frame::{
-    AckStatus, AckWhy, AskEnd, AskOption, BeatState, BridgeFrame, Delivered, Envelope, FileAs,
-    FileKind, FileWhy, From, HubFrame, Limits, MAX_GENERATION, MessageFile, RefusedReason, SayFile,
-    SayHint, VERSION, promises_to_confirm,
+    AckStatus, AckWhy, AskEnd, AskOption, BeatState, BridgeFrame, Control, Delivered, Envelope,
+    FileAs, FileKind, FileWhy, From, HubFrame, IntentStatus, Limits, MAX_GENERATION, MessageFile,
+    Op, RefusedReason, SayFile, SayHint, VERSION, control_for, promises_to_confirm,
 };
-pub use ids::{AskId, FrameId, LaneId, MsgId, OptionId, ProjectId};
+pub use ids::{
+    AskId, FrameId, IdempotencyKey, IntentId, LaneId, MsgId, OptionId, ProjectId, SpecId,
+};
 
 /// Hard ceiling on one frame, terminator included.
 ///

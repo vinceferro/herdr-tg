@@ -88,6 +88,39 @@ Its SHAPE is checked in the hub, in the same place the 64-byte button check live
 reason: a lane carrying a newline or a tab would forge a line in the audit, and the audit is the one
 record that has to stay unforgeable."
 );
+opaque_id!(
+    SpecId,
+    "One thing a controller has already approved and can be asked to run, named.
+
+Opaque here in the strongest sense this crate has: the hub holds no table to resolve it against and
+no way to get one. That is what stops an image, a command or a mount ever travelling on this wire —
+what travels is a HANDLE, and only the party that already holds the approved thing can turn a handle
+back into the thing. A hub that could dereference one would be a hub that had to be told what the
+thing is.
+
+Its SHAPE is checked in the hub, exactly as a lane's is and for the same reason: it is written into
+the audit, and the audit is the one record that has to stay unforgeable."
+);
+opaque_id!(
+    IntentId,
+    "One intention the hub carried to a controller, minted by the hub before the frame is on the wire.
+
+The correlation an outcome names, and the ONLY one. A second id to look the same thing up by is a
+second place for one of them to win, which is the reason there is one list of what the hub is
+waiting to hear about rather than two."
+);
+opaque_id!(
+    IdempotencyKey,
+    "What makes a repeated intention safe to receive twice.
+
+Minted by the HUB, from what the operator was looking at when he tapped — so two taps on one button
+are one key, and the same button drawn again after the address moved is a different one. Delivery
+here is at-least-once and nothing pretends otherwise; this is what makes that survivable.
+
+A separate type from `IntentId` because the two ride in one frame and are both id-shaped strings.
+Transposed, every intention becomes its own duplicate and nothing is ever carried out — a defect a
+reviewer would have to catch by eye, which the compiler now refuses instead."
+);
 
 #[cfg(test)]
 mod tests {
