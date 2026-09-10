@@ -426,6 +426,23 @@ pub enum AckWhy {
     /// only a peer that SENT an outcome can ever be told this, and a peer old enough not to know
     /// the word cannot have sent one.
     NoSuchIntent,
+    /// A [`BridgeFrame::IntentOutcome`] about an intention this hub has already written a word
+    /// down for, saying something DIFFERENT from the word it holds. Paired with [`Delivered::No`],
+    /// and the word already written is the one that stands.
+    ///
+    /// It exists because a bare `no` with no reason cannot be told apart from the answer a
+    /// correct controller gets, and this wire is at-least-once in both directions: an `ack` can
+    /// die on a socket that ends before it lands, and a controller that then replays the outcome
+    /// from its own record is doing exactly what the late-correction rule invites. That replay is
+    /// the SAME observation and is answered `yes` with no reason at all — nothing is written a
+    /// second time and nothing moves. This word is for the other case only: a controller that
+    /// said `completed` and then says `failed` has contradicted itself, and telling it so is what
+    /// lets it find its own defect instead of reading a lost frame.
+    ///
+    /// Safe to add to a closed set the bridge branches on, for the reason [`AckWhy::NoFile`]
+    /// gives: only a peer that SENT an outcome can ever be told this, and a peer old enough not to
+    /// know the word cannot have sent one.
+    AlreadyAnswered,
 }
 
 /// Why the hub refused a connection outright. The frame is followed by a close.
@@ -976,6 +993,16 @@ pub enum HubFrame {
     /// spec owns everything the handle resolves to. The hub cannot look inside a spec because it
     /// has no table to resolve one against and no way to get one.
     ///
+    /// **"Closed" is a promise about what this hub WRITES, and never about what a reader will
+    /// accept.** The guard named above runs over a constructed frame and pins the exact key set
+    /// that goes out. On the way IN the rule is the opposite one, deliberately: an unknown field
+    /// inside a known kind is ignored — see this module's header — because a reader that refused
+    /// one would turn every additive change on the other side into a dead worker. Nothing is
+    /// stored and nothing is forwarded, so a controller cannot smuggle a field through either.
+    /// `the_closed_field_set_is_a_promise_about_what_the_hub_writes_and_never_about_what_it_will_read`
+    /// holds the two apart. The surface in this project that genuinely refuses an unknown key is a
+    /// launcher's binding file, which has one writer and is not a wire between two builds.
+    ///
     /// Delivery is at-least-once and nothing here claims otherwise, which is what
     /// `idempotency_key` is for.
     Intent {
@@ -1003,24 +1030,44 @@ pub enum HubFrame {
         /// the controller set on itself and the hub only ever compares against.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         count: Option<u32>,
-        /// Which run of the subject this was built against: the generation the operator's view was
-        /// drawn from, minted by this hub and believed from nowhere else.
+        /// **The hub's own delivery lease for the conversation this operation is about**, as it
+        /// stood when the keyboard was drawn — minted by this hub and believed from nowhere else.
         ///
-        /// The failure it prevents: he is shown three workers, walks away, the wall restarts, he
-        /// comes back and taps *Scale to 1*. Without this that scales the NEW run to one. With it
-        /// he is told what he was looking at has changed, in words, and nothing is carried.
+        /// The failure it prevents: he is shown a conversation's buttons, walks away, that
+        /// conversation's connection is replaced, he comes back and taps *Scale to 1*. Without
+        /// this the tap is carried into a conversation that has moved on. With it he is told what
+        /// he was looking at has changed, in words, and nothing is carried.
         ///
-        /// Named `for_run` and not `expected_generation` deliberately. The envelope owns
+        /// **What it does NOT fence, and this is the whole reason for the name.** It says nothing
+        /// about the WORKLOAD. A connection can drop and redial while the work it manages never
+        /// stops, and a workload can be replaced while the connection holding it never drops — so
+        /// a controller that read this as "the run of my work" would be fencing against a number
+        /// that moves when a socket does and stands still when a workload is replaced. It was
+        /// called `for_run` and read exactly that way; the name now says which number it is.
+        ///
+        /// **Four numbers fence a fleet, and this hub mints one of them:**
+        ///
+        /// | axis | who mints it | on this wire |
+        /// |---|---|---|
+        /// | the hub's delivery lease for a conversation | **this hub** | [`Envelope::generation`], and this field |
+        /// | the dispatcher's slot generation | whoever dispatches | not here — carry it in the opaque handle, or fence on the idempotency key |
+        /// | the launcher's note revision | the launcher | deliberately off the wire; it is a fact about one machine |
+        /// | the desired object's spec revision | whoever approved the spec | inside [`crate::ids::SpecId`], which this hub cannot look into |
+        ///
+        /// A controller that needs the last three fenced must fence them **itself**, against its
+        /// own numbers, before it acts. The hub cannot: it holds no table for any of them, and a
+        /// check on a number nobody mints is a check that gets deleted the first time it is wrong.
+        ///
+        /// Not `expected_generation`, and not any name with `generation` in it: the envelope owns
         /// `generation` (see [`Envelope::generation`]) and a payload field of that name is a
-        /// duplicate key no reader can read; a name one qualifier away from the reserved one is
-        /// one careless shortening from that failure, on the frame whose whole job is fencing.
+        /// duplicate key no reader can read.
         /// `no_payload_field_may_contain_the_one_name_the_envelope_owns_even_with_a_qualifier_in_front_of_it`
-        /// now refuses the whole family of names rather than the one word.
+        /// refuses the whole family of names rather than the one word.
         ///
-        /// Absent for the ops that have no run to be about, present for the ones that change
-        /// something already running. Which is which is the hub's rule, not this crate's.
+        /// Absent for the ops that change nothing already connected, present for the ones that do.
+        /// Which is which is the hub's rule, not this crate's.
         #[serde(skip_serializing_if = "Option::is_none", default)]
-        for_run: Option<u64>,
+        for_lease: Option<u64>,
         /// Who tapped, for the audit record. The same type and the same spelling the hub already
         /// puts on every [`HubFrame::Message`]: one type, one spelling in the log, no new exposure.
         from: From,
@@ -2754,7 +2801,7 @@ mod tests {
             spec_id: SpecId::new("spec-worker"),
             domain: Some(crate::ids::LaneId::new("engineering")),
             count: Some(3),
-            for_run: Some(1_757_000_000_098),
+            for_lease: Some(1_757_000_000_098),
             from: From {
                 chat_id: -1001,
                 user_id: 7,
@@ -2928,7 +2975,7 @@ mod tests {
         .expect("serialises");
         assert_eq!(
             json,
-            r#"{"v":1,"id":"h44","generation":1757000000123,"t":"intent","intent_id":"i-7a1c","idempotency_key":"k-3f9e2b18","op":"scale","spec_id":"spec-worker","domain":"engineering","count":3,"for_run":1757000000098,"from":{"chat_id":-1001,"user_id":7},"valid_for_ms":120000}"#
+            r#"{"v":1,"id":"h44","generation":1757000000123,"t":"intent","intent_id":"i-7a1c","idempotency_key":"k-3f9e2b18","op":"scale","spec_id":"spec-worker","domain":"engineering","count":3,"for_lease":1757000000098,"from":{"chat_id":-1001,"user_id":7},"valid_for_ms":120000}"#
         );
 
         // The other end of the same frame: an op with no run to be about and no count, in a
@@ -2941,7 +2988,7 @@ mod tests {
             spec_id: SpecId::new("spec-coordinator"),
             domain: None,
             count: None,
-            for_run: None,
+            for_lease: None,
             from: From {
                 chat_id: -1001,
                 user_id: 7,
@@ -3091,6 +3138,120 @@ mod tests {
         );
     }
 
+    /// Four numbers fence a fleet that runs work through this hub, and exactly ONE of them is
+    /// this hub's: the delivery lease it mints for a conversation. The other three — the
+    /// dispatcher's slot generation, the launcher's note revision, the desired object's spec
+    /// revision — belong to whoever holds them, and a field on this frame that LOOKED like one of
+    /// them would be a fence nobody is minting for.
+    ///
+    /// So the fence carries the lease's own name. `for_run` read as the run of the SUBJECT — the
+    /// workload the operator is looking at — and the number in it was never that: it is the
+    /// generation of the connection the hub is speaking to. A controller reading the old name
+    /// would fence its workload against a number that moves when a socket does.
+    #[test]
+    fn the_intent_fences_the_hubs_own_lease_under_a_name_that_says_so_and_carries_no_field_claiming_a_run_of_the_work()
+     {
+        let intent = serde_json::to_value(an_intent_with_every_field()).expect("serialises");
+        let intent = intent.as_object().expect("a frame is one flat object");
+        assert!(
+            intent.contains_key("for_lease"),
+            "the fence on an intent is the hub's own delivery lease and must be named for it: \
+             {intent:?}"
+        );
+        assert!(
+            !intent.contains_key("for_run"),
+            "`for_run` says the run of the thing being operated on. The hub holds no such number \
+             — it compares against the generation of a CONNECTION — so the name promises a fence \
+             nobody mints: {intent:?}"
+        );
+    }
+
+    /// The receiving side of the same contract, and it is the OPPOSITE rule to the emitting side.
+    ///
+    /// A field this build has never heard of is read past and dropped — serde's default, left
+    /// alone deliberately (see this module's own header), because `deny_unknown_fields` here would
+    /// turn every additive change on the other side into a dead worker. It is also not merely
+    /// policy: the payload is `#[serde(flatten)]`ed into the envelope, and a variant reached
+    /// through a flatten cannot carry that attribute at all.
+    #[test]
+    fn an_intent_carrying_a_field_this_build_has_never_heard_of_is_read_and_the_field_is_dropped() {
+        let from_a_newer_hub = r#"{"v":1,"id":"h44","t":"intent","intent_id":"i-7a1c","idempotency_key":"k-3f9e2b18","op":"scale","spec_id":"spec-worker","count":3,"for_lease":1757000000098,"from":{"chat_id":-1001,"user_id":7},"valid_for_ms":120000,"a_field_from_a_later_build":"anything at all"}"#;
+        let read: Envelope<HubFrame> =
+            serde_json::from_str(from_a_newer_hub).expect("a newer hub's intent still parses");
+        let HubFrame::Intent { intent_id, op, .. } = &read.payload else {
+            panic!("the frame stopped being an intent");
+        };
+        assert_eq!((intent_id.as_str(), *op), ("i-7a1c", Op::Scale));
+        // And the field reaches nothing: there is nowhere in the type for it to have gone, so a
+        // controller cannot smuggle one through and the hub cannot forward one it never held.
+        let back = serde_json::to_value(&read.payload).expect("serialises");
+        assert!(
+            !back
+                .as_object()
+                .expect("a frame is one flat object")
+                .contains_key("a_field_from_a_later_build"),
+            "a field this build never heard of was kept and written back out: {back}"
+        );
+    }
+
+    #[test]
+    fn a_declared_control_carrying_a_field_this_build_has_never_heard_of_is_admitted_and_the_field_reaches_nothing()
+     {
+        // The declaration is the one shape a CONTROLLER fills in, so this is the direction that
+        // matters most: a controller shipped after this hub must not be refused for saying more
+        // than this hub can read. The op it names that this build knows survives; the rest is
+        // dropped at the parse and never stored.
+        let from_a_newer_controller = r#"{"spec_id":"spec-worker","domain":"engineering","allowed":["scale"],"max":4,"a_bound_this_build_has_never_heard_of":{"nested":["anything"]}}"#;
+        let read: Control = serde_json::from_str(from_a_newer_controller)
+            .expect("a newer controller's declaration still parses");
+        assert_eq!(read.spec_id.as_str(), "spec-worker");
+        assert_eq!(read.allowed, vec!["scale".to_owned()]);
+        let back = serde_json::to_value(&read).expect("serialises");
+        assert!(
+            !back
+                .as_object()
+                .expect("a declaration is one object")
+                .contains_key("a_bound_this_build_has_never_heard_of"),
+            "a field this build never heard of was kept on a declaration: {back}"
+        );
+    }
+
+    /// The two directions, pinned apart, so that "closed" is never read back as "refused on
+    /// receipt". They are different promises and only one of them is a refusal:
+    ///
+    /// * **What the hub WRITES** is a closed set — the guard above, and the key-set assertions
+    ///   beside it, which run over a CONSTRUCTED frame and say nothing about parsing.
+    /// * **What any reader ACCEPTS** is open by design: an unknown field inside a known kind is
+    ///   ignored, which is what keeps a newer adapter alive against an older hub and the other way
+    ///   round.
+    ///
+    /// The surface in this project that genuinely REFUSES an unknown key is a different one — the
+    /// launcher's binding file (`docs/ATTACHING.md` §13.10), which is a local file with one writer
+    /// rather than a wire between two builds that ship apart.
+    #[test]
+    fn the_closed_field_set_is_a_promise_about_what_the_hub_writes_and_never_about_what_it_will_read()
+     {
+        // Written: exactly the keys the guard pins, and no more.
+        let written = serde_json::to_value(an_intent_with_every_field()).expect("serialises");
+        let written = written.as_object().expect("a frame is one flat object");
+        assert!(
+            !written.contains_key("something_nobody_declared"),
+            "the hub wrote a field nothing in its own type could have put there"
+        );
+        // Read: the same frame with one more key still becomes the same intent.
+        let mut with_one_more = written.clone();
+        with_one_more.insert(
+            "something_nobody_declared".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        with_one_more.insert("v".to_owned(), serde_json::Value::from(1));
+        with_one_more.insert("id".to_owned(), serde_json::Value::from("h44"));
+        let read: Envelope<HubFrame> =
+            serde_json::from_value(serde_json::Value::Object(with_one_more))
+                .expect("an unknown field inside a known kind is IGNORED, never refused");
+        assert!(matches!(read.payload, HubFrame::Intent { .. }));
+    }
+
     #[test]
     fn the_hub_carries_no_field_that_could_name_an_image_a_command_a_mount_a_secret_an_environment_variable_or_a_host_path()
      {
@@ -3121,7 +3282,7 @@ mod tests {
             spec_id: _,
             domain: Some(_),
             count: Some(_),
-            for_run: Some(_),
+            for_lease: Some(_),
             from: _,
             valid_for_ms: _,
         } = an_intent_with_every_field()
@@ -3191,7 +3352,7 @@ mod tests {
             [
                 "count",
                 "domain",
-                "for_run",
+                "for_lease",
                 "from",
                 "idempotency_key",
                 "intent_id",
@@ -3200,8 +3361,11 @@ mod tests {
                 "t",
                 "valid_for_ms",
             ],
-            "the field set of an intent is CLOSED. Adding one is a decision about what this hub \
-             is allowed to carry, and this list is where that decision is made."
+            "the field set of an intent is CLOSED — a promise about what this hub WRITES, and \
+             never about what a reader will accept (see \
+             `the_closed_field_set_is_a_promise_about_what_the_hub_writes_and_never_about_what_it_will_read`). \
+             Adding one is a decision about what this hub is allowed to carry, and this list is \
+             where that decision is made."
         );
         for (name, value) in intent {
             for word in forbidden {
@@ -3223,7 +3387,7 @@ mod tests {
                     "`op` carried something that is not one of this hub's own six verbs: {value}"
                 ),
                 // Numbers, bounded by their own types.
-                "count" | "for_run" | "valid_for_ms" => {
+                "count" | "for_lease" | "valid_for_ms" => {
                     assert!(value.is_number(), "`{name}` stopped being a number")
                 }
                 // The one nested object, and it is the type the hub already puts on every message:
@@ -3253,7 +3417,8 @@ mod tests {
         assert_eq!(
             declared,
             ["allowed", "domain", "max", "spec_id"],
-            "the field set of a control is CLOSED for the same reason an intent's is"
+            "the field set of a control is CLOSED for the same reason an intent's is — and, like \
+             that one, it says what this hub WRITES rather than what it will read"
         );
         for name in control.keys() {
             for word in forbidden {
@@ -3283,7 +3448,8 @@ mod tests {
         assert_eq!(
             answered,
             ["intent_id", "reason", "status", "t"],
-            "the field set of an outcome is CLOSED"
+            "the field set of an outcome is CLOSED — what this hub reads OUT of one, never what \
+             it refuses to parse"
         );
         for name in outcome.keys() {
             for word in forbidden {
@@ -3447,6 +3613,24 @@ mod tests {
         assert_eq!(
             json,
             r#"{"v":1,"id":"f1","t":"ack","ref":"f7","delivered":"no","why":"no-such-intent"}"#
+        );
+    }
+
+    #[test]
+    fn an_ack_about_a_word_that_contradicts_one_already_written_down_is_spelt_the_way_the_document_does()
+     {
+        // Its own word rather than a bare `no`: a controller replaying the outcome it already
+        // sent — which is what an at-least-once wire invites when an `ack` dies — is told `yes`,
+        // and only a controller that said something DIFFERENT gets this.
+        let json = serde_json::to_string(&env(HubFrame::Ack {
+            r#ref: FrameId::new("f7"),
+            delivered: Delivered::No,
+            why: Some(AckWhy::AlreadyAnswered),
+        }))
+        .expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"v":1,"id":"f1","t":"ack","ref":"f7","delivered":"no","why":"already-answered"}"#
         );
     }
 

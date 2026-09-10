@@ -77,6 +77,15 @@ use hub_proto::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 
+pub(crate) use self::intent::{
+    AlreadyCarried, Heard, INTENT_VALID_FOR, INTENTS_FILE, Intended, Intent, IntentLedger,
+    IntentRefusal, IntentState, Wanted, changes_a_running_thing, mint_idempotency_key,
+};
+// The two the hub itself no longer names: the bound belongs to the ledger and the phase is set
+// where the state is. The tests below read both, and an import a build without them would call
+// unused is an import that build refuses.
+#[cfg(test)]
+pub(crate) use self::intent::{INTENTS_KEPT, Phase};
 use crate::registry::Registry;
 use crate::transport::{Accepted, ConnectionIdentity, fence_is_alive};
 
@@ -1324,21 +1333,21 @@ impl HubAudit {
     /// can forge a second record. The user id is written for `HubAudit::stranger`'s reason: an id
     /// in this file is one the operator can copy.
     ///
-    /// The one absent field is `count` where there is none and `for_run` where there is none, and
+    /// The one absent field is `count` where there is none and `for_lease` where there is none, and
     /// both are written as `-` rather than left out — a field that is sometimes there is a field
     /// every search for it has to guess about.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     fn intent(&self, i: &Intent) -> std::io::Result<()> {
         self.line(&format!(
-            "intent\t{}\tdomain={}\top={}\tspec={}\tintent={}\tkey={}\tfor_run={}\tcount={}\tsender={}",
+            "intent\t{}\tdomain={}\top={}\tspec={}\tintent={}\tkey={}\tfor_lease={}\tcount={}\tsender={}",
             subject(&i.to),
             i.about.lane_field(),
             i.op.name(),
             i.spec,
             i.id,
             i.key,
-            i.for_run.map_or("-".to_owned(), |g| g.to_string()),
+            i.for_lease.map_or("-".to_owned(), |g| g.to_string()),
             i.count.map_or("-".to_owned(), |c| c.to_string()),
             name_the_sender(Some(i.user)),
         ))
@@ -1350,7 +1359,7 @@ impl HubAudit {
     /// lines beside it do: a search for one conversation's lifecycle work then finds the refusals
     /// with the intentions, which is the whole reason the field exists rather than being folded
     /// into the subject. `why` is a sentence this binary owns — never a word from anywhere else.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     fn intent_refused(
         &self,
@@ -1369,7 +1378,7 @@ impl HubAudit {
     /// A branch that carries nothing still writes a line, so silence in this file always means the
     /// process stopped rather than that the hub decided something quietly — and this is the one
     /// branch where nothing was carried and nothing was refused either.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     fn intent_again(&self, at: &Addr, id: &IntentId, key: &IdempotencyKey) -> std::io::Result<()> {
         self.line(&format!(
@@ -1383,7 +1392,7 @@ impl HubAudit {
     /// Its own word rather than `intent-again`, because the two are opposite events: that one says
     /// nothing went out, and this one says something did. The line names the record that was
     /// dropped, so a reader can join it to the `intent` line that follows.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     fn intent_again_carried(
         &self,
@@ -1707,7 +1716,7 @@ struct Claim {
     /// THIS operation rather than whether anything was declared at all.
     ///
     /// `None` for every bridge that is not a controller, which is every bridge shipped so far.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     controls: Option<Vec<Control>>,
     tx: mpsc::Sender<Envelope<HubFrame>>,
@@ -2133,7 +2142,7 @@ pub const MAX_SPEC: usize = 64;
 ///
 /// `Ord` puts `None` before `Some(_)`, so a project sorts immediately above its own lanes and the
 /// list the operator reads comes out grouped without anything sorting it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Addr {
     pub project: ProjectId,
     pub lane: Option<LaneId>,
@@ -2294,384 +2303,6 @@ fn admit_controls(declared: &Option<Vec<Control>>, addr: &Addr) -> Option<Vec<Co
     (!admitted.is_empty()).then_some(admitted)
 }
 
-// ───────────────────────────────────────────────────────────────────────────────────────────────
-// Carrying one intention to the controller that said it could do the thing.
-//
-// The whole of what the hub knows about this: a controller declared, in advance, on a connection
-// that had already proved a secret, that it can be asked to do a named thing to a named handle. The
-// operator picked one of those things. The hub carries the pick, fenced, idempotent and written
-// down — and carries nothing that could name an image, a command, a mount, a secret, an environment
-// variable or a host path, because the frame has no field for one.
-//
-// What the hub does NOT do here, and each is a line rather than an omission: it does not resolve a
-// spec (it holds no table and no way to get one), it does not schedule, it does not start or stop
-// anything, and it does not infer a workload's state from a connection's.
-//
-// # Why half of this carries `#[allow(dead_code)]`
-//
-// **The keyboard is a later slice.** Reading an outcome is wired into the shipped binary — a
-// controller can declare, be admitted, be echoed, and answer — but nothing in the binary CALLS
-// `Hub::intend` yet, because the only thing that ever should is a tap on buttons the hub drew, and
-// how those are drawn needs decisions nobody has made. So the outbound half is exercised by tests
-// and by nothing else, and it is marked rather than deleted or hidden behind `cfg(test)`: this is
-// the contract another org builds against, it has to ship, and an `allow` a reviewer can see is
-// more honest than code that quietly is not in the binary. Every one of these disappears on the
-// day one call site draws the keyboard.
-//
-// The marked items are exactly the outbound half — `Wanted`, `Intended`, `IntentRefusal`,
-// `Hub::intend` and what only they reach. Nothing on the INBOUND path is marked, and if a later
-// change makes something there unreachable, the gate says so rather than this note covering it.
-
-/// How many intentions the hub keeps a record of before the oldest is forgotten.
-///
-/// [`DOWN_KEPT`]'s sibling, and the same sentence: a controller that never answers must not turn a
-/// record nobody will read into a leak.
-///
-/// What is forgotten to make room is the oldest record that is FINISHED WITH — settled, or one
-/// whose connection ended — and never one still waiting for a word. Forgetting by age alone made
-/// the bound a way to carry one button twice: past it a repeat was carried afresh instead of
-/// answered from the record, and `start` and `inspect` carry no run, so the fence that bounds
-/// every other op does not bound those two at all. When every record is still waiting, an
-/// intention is refused rather than carried — a refusal is something the operator can read, and a
-/// second restart is not.
-///
-/// What the bound still costs: a very old outcome, about an intention two hundred and fifty-six
-/// finished ones ago, reads as one this hub never sent.
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-const INTENTS_KEPT: usize = 256;
-
-/// How long the hub is willing for an intention to be acted on, told to the controller as a
-/// DURATION rather than an instant — the two ends of this wire are two processes that have never
-/// agreed on a clock.
-///
-/// The hub does not enforce it and deliberately does not expire its own record at it. This is the
-/// controller's deadline to act; the record's job is to recognise a repeat, and a record dropped at
-/// the deadline would let a late duplicate be carried out a second time, which is the one thing the
-/// idempotency key exists to prevent.
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-pub const INTENT_VALID_FOR: Duration = Duration::from_secs(120);
-
-/// Where one intention has got to, as the hub OBSERVED it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IntentState {
-    /// Handed to the controller's connection, and nothing has been said about it.
-    // No shipped caller until the keyboard is drawn; see the section note above.
-    #[allow(dead_code)]
-    Sent,
-    /// The controller said the work had started, and owes exactly one terminal word.
-    Accepted,
-    /// The controller said what became of it. Nothing follows a terminal word.
-    Settled(IntentStatus),
-    /// The connection ended with the word still owed.
-    ///
-    /// **Not a failure, and deliberately not a word on the wire.** It says what became of the
-    /// CONVERSATION and nothing at all about the work: reading a disconnect as a failure is the
-    /// error `Delivered::Unseen` was written to prevent one wire over, and a controller that could
-    /// SAY this would have the hub repeat a rung it never observed. A controller answering late
-    /// from its own record still corrects it.
-    Unknown,
-}
-
-/// One intention the hub carried, and what it is waiting to hear about it.
-///
-/// Kept in memory and never on disk, which is the opposite of [`AskLedger`] and for a reason rather
-/// than an oversight. A question waits on a keyboard on his phone for hours and the record is the
-/// only thing that makes a tap resolvable across a restart. An intention needs nothing of the kind:
-/// across a restart every claim is gone and every address's generation has moved, so a repeat of a
-/// key minted before it is refused by the fence BEFORE the key is ever consulted. Persisting would
-/// buy nothing and would put who-asked-for-what on disk with a retention question attached.
-#[derive(Debug)]
-struct Intent {
-    id: IntentId,
-    /// What makes a repeat safe. Minted by the hub from what he was looking at when he tapped.
-    key: IdempotencyKey,
-    /// The claim it was handed to: the connection that DECLARED it, looked up when the intention
-    /// was built and never re-derived. An outcome arriving anywhere else is not about this.
-    to: Addr,
-    /// WHICH RUN of that address declared it — read in the same critical section as the
-    /// declaration and the fence, and carried through the hand-over.
-    ///
-    /// An address is not a run. Between the fence reading the claims map and the frame going out,
-    /// the wall can restart: without this the intention lands on whatever holds the address by
-    /// then, stamped with the successor's own lease so nothing downstream can tell — which is
-    /// verbatim the failure `for_run` exists to prevent, arriving one moment later than `for_run`
-    /// looks. It is also what says who may settle it while the conversation is still going.
-    run: u64,
-    /// What it is ABOUT: the address whose generation `for_run` named. The same as `to` when the
-    /// control named no domain. Never used for routing; routing reads `to`.
-    about: Addr,
-    op: Op,
-    spec: SpecId,
-    count: Option<u32>,
-    for_run: Option<u64>,
-    /// Who tapped, for the audit line. The allowlist decision was made long before this exists.
-    user: i64,
-    state: IntentState,
-    /// The controller's own sentence about it, when it sent one — clamped to what a topic can
-    /// carry, at the moment it is kept.
-    ///
-    /// Kept for the slice that draws this on his phone, and **never written to the audit**: that
-    /// file is one record per line and a sentence from another process can carry a newline, which
-    /// would be a second record of the sender's choosing. Clamped where it is kept rather than
-    /// where it is drawn, because this is the one string in the family whose length nobody on this
-    /// side chose and the surface must not be the first place that is noticed.
-    said: Option<String>,
-}
-
-/// One thing the operator picked off a keyboard the hub drew.
-///
-/// Every field is either something he SELECTED from what a controller declared, or something this
-/// hub minted. None of it is anything he could type: the op is a variant of a closed set, and the
-/// spec and the domain are strings a controller put on a connection that had already proved a
-/// secret. That is the oldest line in this repo — inbound content selects, it never names.
-#[derive(Clone, Debug)]
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-pub struct Wanted {
-    /// Whose conversation the keyboard was drawn in. Never from a frame.
-    pub project: ProjectId,
-    pub op: Op,
-    pub spec: SpecId,
-    /// Which conversation of the project it is about. Absence is the only spelling of "the
-    /// conversation itself"; `-` is not a domain and never reaches a claim.
-    pub domain: Option<LaneId>,
-    pub count: Option<u32>,
-    /// The run of the subject the keyboard was drawn against.
-    pub for_run: Option<u64>,
-    /// The message the keyboard is on, and the button he pressed. Two of the three things the
-    /// idempotency key is minted from.
-    pub offer: (i64, MsgId),
-    pub option_id: OptionId,
-    /// Who tapped, and where. The same type and spelling the hub already puts on every `message`.
-    pub from: hub_proto::From,
-}
-
-/// What became of an intention the hub was asked to carry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-pub enum Intended {
-    /// Handed to the controller that declared it, under this id.
-    Carried(IntentId),
-    /// This key has been carried before AND something is known about what became of it. What the
-    /// record says now, and **no second frame** — which is what makes at-least-once delivery
-    /// survivable without anybody claiming exactly-once.
-    ///
-    /// Never [`IntentState::Unknown`]: that state says the hub does not know, and answering a
-    /// fresh tap from it would be the hub claiming knowledge it has not got. Such a button is
-    /// offered again instead.
-    AlreadyAsked(IntentId, IntentState),
-}
-
-/// Why an intention was not carried. Every one of them is fail-closed: nothing was handed on.
-///
-/// There is deliberately no `say()` here yet. The keyboard these refusals belong under is a later
-/// slice and the sentences are its decision to make; what this slice owes the operator is the audit
-/// line and the journal, which is what [`IntentRefusal::written_down`] is for. A sentence invented
-/// now would be one written against a surface nobody has designed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-pub enum IntentRefusal {
-    /// The person named on the tap is on no list that covers that conversation.
-    ///
-    /// Asked at this door and not left to the caller, because a second caller is a second way
-    /// around the first — the sentence `resolve_tap` already has over its own allowlist check.
-    Stranger,
-    /// The spec or the domain is not a handle this hub will write down.
-    ///
-    /// The same shape check every admitted control passes, applied to what a caller in this
-    /// process built, because every refusal below writes a line before anything has compared the
-    /// handles against a declaration — and a handle carrying a newline writes a record of the
-    /// caller's own choosing into the one file an incident is read from.
-    HandleRefused,
-    /// Nothing at all is connected in that conversation, so there is nobody to ask.
-    NotConnected,
-    /// Something is connected and none of it said it could do this. Read from the claim, never
-    /// remembered anywhere else.
-    NotDeclared,
-    /// Two live connections of one project each said they could do it. Refused rather than
-    /// disambiguated: picking the newer would be the hub guessing which he meant.
-    MoreThanOneCouldDoIt,
-    /// The number he was shown is not the number that is running now.
-    TheWorldMoved,
-    /// The subject has no live run, so there is no number for `for_run` to have named. Its own
-    /// refusal, and never a comparison against the zero `highest_for` returns for an address that
-    /// was never claimed — a zero is read as "holds none" everywhere else on this wire.
-    NothingIsRunningThere,
-    /// The count is past the bound the controller set on itself, is on an op that has no number in
-    /// it, or is missing from the one that does.
-    CountRefused,
-    /// The hub refusing ITSELF: a `for_run` on an op that has no run to be about, or none on an op
-    /// that changes something already running. A number that means nothing is how a check becomes
-    /// decorative.
-    CouldNotBuildIt,
-    /// The controller's outbox would not take it. Nothing was carried, and the key is free again.
-    CouldNotHandItOn,
-    /// The connection that declared it ended between the fence and the hand-over.
-    ///
-    /// Its own refusal rather than a silent hand-over to whoever holds the address now: the
-    /// successor never declared this, and the run the operator's view was built against is gone.
-    TheControllerWentAway,
-    /// There are already as many intentions waiting for a word as this hub will keep.
-    ///
-    /// Fail closed: forgetting one nobody has answered for to make room is how one button gets
-    /// carried out twice. A refusal he can read is the honest end of a controller that has stopped
-    /// answering.
-    TooManyWaiting,
-}
-
-impl IntentRefusal {
-    /// What the journal and the audit say happened. **Never operator-facing** — the same rule
-    /// `Kick::sentence` holds to.
-    // No shipped caller until the keyboard is drawn; see the section note above.
-    #[allow(dead_code)]
-    fn written_down(self) -> &'static str {
-        match self {
-            Self::Stranger => "the person who tapped may not speak in that conversation",
-            Self::HandleRefused => "the spec or the domain is not one this hub will write down",
-            Self::NotConnected => "nothing was connected in that conversation",
-            Self::NotDeclared => "nothing connected there had said it could do that",
-            Self::MoreThanOneCouldDoIt => "more than one connection said it could do that",
-            Self::TheWorldMoved => "the run it was built against is not the run there now",
-            Self::NothingIsRunningThere => "nothing is running at the subject of that operation",
-            Self::CountRefused => "the count is not one the controller said it would take",
-            Self::CouldNotBuildIt => "the operation and the run it named do not go together",
-            Self::CouldNotHandItOn => "the controller was not keeping up and did not take it",
-            Self::TheControllerWentAway => {
-                "the connection that said it could do that ended before it was handed on"
-            }
-            Self::TooManyWaiting => "as many intentions are waiting for a word as this hub keeps",
-        }
-    }
-}
-
-/// Does this op change something that is already running?
-///
-/// The whole of the `for_run` rule, in one place so the frame builder and the refusal cannot come
-/// to disagree. `start` has nothing running to have a generation and `inspect` changes nothing, so
-/// a number on either would be a number that means nothing — and a check on a meaningless number is
-/// a check that gets deleted. The other four each change something that is running, and *which
-/// run* is the entire question.
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-fn changes_a_running_thing(op: Op) -> bool {
-    match op {
-        Op::Start | Op::Inspect => false,
-        Op::Scale | Op::Drain | Op::Stop | Op::Restart => true,
-    }
-}
-
-/// Which word may follow which, and the state it leaves behind.
-///
-/// `accepted` says the work has STARTED and owes exactly one terminal word; a terminal word may
-/// also arrive first, from a controller that never accepted. Nothing follows a terminal word: a
-/// controller that could keep re-answering could turn one intention into a stream of them, and the
-/// last one to arrive would silently be the truth.
-///
-/// `refused` after `accepted` is not a transition either, and the reason is the whole point of
-/// having four words: `refused` means NOTHING happened, and by then something had.
-///
-/// [`IntentState::Unknown`] takes any of them, because it is not a state of the WORK — it says the
-/// connection ended with the word still owed, and a controller answering late from its own record
-/// is exactly the thing that can correct it.
-fn may_follow(from: &IntentState, status: IntentStatus) -> Option<IntentState> {
-    match (from, status) {
-        (IntentState::Settled(_), _) => None,
-        (IntentState::Accepted, IntentStatus::Accepted | IntentStatus::Refused) => None,
-        (_, IntentStatus::Accepted) => Some(IntentState::Accepted),
-        (_, terminal) => Some(IntentState::Settled(terminal)),
-    }
-}
-
-/// May the connection now holding the address say what became of this intention?
-///
-/// Two cases, and they are not the same question. While the intention is still live, the answer is
-/// the RUN it was handed to and nothing else: the address it went to can be held by a successor
-/// within a second of the original leaving, and a successor speaking for its predecessor's work is
-/// the hub believing a run about work it never took.
-///
-/// Once the connection has ended, the hub has written `Unknown` — and a controller answering LATE,
-/// from its own record after its own restart, is the one thing that can correct that. So a late
-/// word is taken from any run that DECLARED the same thing, and from nothing else: an ordinary
-/// bridge holding the address declared nothing, and the id counter is one anybody on the wire can
-/// follow, so without this a plain connection could turn an honest "I do not know" into "Done" on
-/// the operator's phone.
-///
-/// `None` for the claim — nothing is connected at that address at all — is refused like everything
-/// else this file cannot prove.
-fn may_speak_about(record: &Intent, speaking: Option<&(u64, Option<Vec<Control>>)>) -> bool {
-    let Some((generation, controls)) = speaking else {
-        return false;
-    };
-    match record.state {
-        IntentState::Sent | IntentState::Accepted => *generation == record.run,
-        IntentState::Unknown | IntentState::Settled(_) => control_for(
-            controls,
-            &record.spec,
-            record.about.lane.as_ref(),
-            record.op,
-        )
-        .is_some(),
-    }
-}
-
-/// The key that makes a repeat safe, minted by the HUB from what he was looking at when he tapped.
-///
-/// Three things: the message the keyboard is on, the button he pressed, and the run it was drawn
-/// against. So two taps on one button are one key — the receipt was slow and he tapped *Restart*
-/// again — and the same button drawn again after the address rolled is a different one, because the
-/// second is a different operation on a different run and deduplicating it into the first would
-/// silently drop it.
-///
-/// The conversation goes in beside them, and it is belt against braces: one chat numbers its own
-/// messages, so two keyboards can already never share a message id. It is here so that the ledger's
-/// look-up — which is by key alone, over every conversation at once — cannot be made ambiguous by
-/// some later change to what a keyboard is drawn on. One conversation must never be able to answer
-/// for another's button.
-///
-/// Hashed rather than concatenated, and the hash is not decoration: this token is written into the
-/// audit, and a token of fixed length over a fixed alphabet needs no second argument about what a
-/// message id from Telegram could carry into that file. It is not a secret and nothing about it
-/// needs to be — a controller supplies no part of the input, so there is nothing here to collide
-/// with on purpose.
-// No shipped caller until the keyboard is drawn; see the section note above.
-#[allow(dead_code)]
-fn mint_idempotency_key(
-    project: &ProjectId,
-    chat_id: i64,
-    msg: &MsgId,
-    option: &OptionId,
-    for_run: Option<u64>,
-) -> IdempotencyKey {
-    // FNV-1a, spelled out rather than pulled in: the property wanted is a fixed shape over a fixed
-    // alphabet, and a dependency for that is a supply-chain decision for a log field.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut eat = |bytes: &[u8]| {
-        for b in bytes {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    };
-    eat(project.as_str().as_bytes());
-    eat(b"\x1f");
-    eat(&chat_id.to_be_bytes());
-    eat(b"\x1f");
-    eat(msg.as_str().as_bytes());
-    eat(b"\x1f");
-    eat(option.as_str().as_bytes());
-    eat(b"\x1f");
-    // Spelled apart from any number, so "no run" can never collide with a run that happens to be
-    // zero — which is the number this wire already reads as "holds none".
-    match for_run {
-        None => eat(b"-"),
-        Some(g) => eat(&g.to_be_bytes()),
-    }
-    IdempotencyKey::new(format!("k{h:016x}"))
-}
-
 /// What the registry file looks like from outside, for noticing that it changed.
 ///
 /// The inode is the load-bearing part: the registry is written by temp-and-rename, so every save is
@@ -2786,9 +2417,9 @@ pub struct Hub<S: Surface> {
     ///
     /// The idempotency ledger and the outcome ledger are ONE list, for `Down`'s reason: an outcome
     /// and a repeat are two questions about the same intention, and two lists keyed on one thing is
-    /// two places to look it up and one of them to win. In memory only — see [`Intent`] — and
-    /// bounded at [`INTENTS_KEPT`].
-    intents: Arc<Mutex<VecDeque<Intent>>>,
+    /// two places to look it up and one of them to win. Bounded at [`intent::INTENTS_KEPT`], and
+    /// written down — [`IntentLedger`] holds what survives a restart and what deliberately does not.
+    intents: Arc<Mutex<IntentLedger>>,
     /// The highest run number handed out for each address, and the file it survives a restart in.
     ///
     /// A `std::sync::Mutex` and not an async one, deliberately: it is taken INSIDE the claims lock
@@ -2935,7 +2566,9 @@ impl<S: Surface> Hub<S> {
             topic_refused: Arc::new(Mutex::new(BTreeMap::new())),
             gist: crate::summarize::Summarizer::from_env().map(Arc::new),
             down: Arc::new(Mutex::new(VecDeque::new())),
-            intents: Arc::new(Mutex::new(VecDeque::new())),
+            intents: Arc::new(Mutex::new(IntentLedger::load(
+                audit_path.with_file_name(INTENTS_FILE),
+            ))),
             generations: Arc::new(std::sync::Mutex::new(Generations::load(
                 audit_path.with_file_name(GENERATIONS_FILE),
             ))),
@@ -3340,7 +2973,9 @@ impl<S: Surface> Hub<S> {
         let generation;
         let highest_was;
         let who;
-        let evicted_a_run;
+        // The run that was evicted, for the sweep after the lock — which is scoped to THAT run
+        // and not to the address, because by then the address is the successor's.
+        let evicted_run: Option<u64>;
         // The address is moved into the claims map below, so the sweep after the lock keeps its
         // own copy rather than the map's.
         let for_the_sweep = addr.clone();
@@ -3404,7 +3039,7 @@ impl<S: Surface> Hub<S> {
                 .lock()
                 .expect("the generations are not held across an await")
                 .mint(&addr, arriving.unwrap_or(0));
-            evicted_a_run = evicted.is_some();
+            evicted_run = evicted.as_ref().map(|(_, _, was, _)| *was);
             if let Some((kick, dead, was, speaks)) = evicted {
                 tracing::info!(
                     project = %addr.project, lane = addr.lane_field(), dead,
@@ -3442,8 +3077,12 @@ impl<S: Surface> Hub<S> {
         // An evicted run owes a word about anything it was handed and will never say it — its own
         // `release_this_run` finds the address already taken and returns without touching this.
         // Unknown, and never failed: what ended is the conversation, not the work.
-        if evicted_a_run {
-            self.nothing_more_will_be_said_about(&for_the_sweep).await;
+        //
+        // Named by its own generation, because the successor already holds the address: the lock
+        // is let go above and this run's records are the only ones that are waiting on nobody.
+        if let Some(was) = evicted_run {
+            self.nothing_more_will_be_said_about(&for_the_sweep, was)
+                .await;
         }
         // WITH THE CLAIMS LOCK LET GO, and still before the number is handed to anybody. Deciding
         // the number needs the lock — two claims racing must not be given the same one, which is
@@ -3629,9 +3268,14 @@ impl<S: Surface> Hub<S> {
         }
         // Claims first, registry second, and never both at once — the same order every other
         // reader keeps. The kicks are cloned out and the guard dropped before anything is awaited.
-        let (kicked, who): (Vec<Addr>, WhoIsConnected) = {
+        let (kicked, forgotten, who): (Vec<Addr>, Vec<(Addr, u64)>, WhoIsConnected) = {
             let mut claims = self.claims.lock().await;
             let mut kicked = Vec::new();
+            // The runs this removes ITSELF, rather than through their own connection. Everything
+            // else that takes a claim out of this map sweeps what that run was owed a word about;
+            // this branch did not, so a record of one was left saying a live controller is working
+            // on it — unsettleable by anybody, and unforgettable by the ledger's own bound.
+            let mut forgotten = Vec::new();
             claims.retain(|addr, claim| {
                 if !off.contains(&addr.project) {
                     return true;
@@ -3657,12 +3301,18 @@ impl<S: Surface> Hub<S> {
                             project = %addr.project, lane = addr.lane_field(),
                             "a switched-off project's claim had nothing behind it to tell; forgotten"
                         );
+                        forgotten.push((addr.clone(), claim.generation));
                         false
                     }
                 }
             });
-            (kicked, self.note_who_is_connected(&claims))
+            (kicked, forgotten, self.note_who_is_connected(&claims))
         };
+        // With the claims lock let go, which is the one lock order in this file: the ledger, then
+        // the claims. Never failed — what ended is the conversation, not the work.
+        for (addr, run) in forgotten {
+            self.nothing_more_will_be_said_about(&addr, run).await;
+        }
         self.put_who_is_connected_on_disk(who).await;
         for addr in kicked {
             tracing::info!(
@@ -3789,7 +3439,9 @@ impl<S: Surface> Hub<S> {
             self.note_who_is_connected(&claims)
         };
         // The connection is gone and whatever it owed a word about is now unknown — never failed.
-        self.nothing_more_will_be_said_about(addr).await;
+        // This run's records and no others: a wall that restarts within a second can already hold
+        // the address by the time this line runs, and its intentions are not this one's to close.
+        self.nothing_more_will_be_said_about(addr, generation).await;
         // Outside the block, so the lock is gone before the disk is touched. A departure is the
         // half of this that MUST reach the file: a snapshot still naming a bridge that has left is
         // what sends the operator to a conversation nothing is listening to.
@@ -3801,15 +3453,21 @@ impl<S: Surface> Hub<S> {
     /// connection the hub really serves knows its own run number.
     #[cfg(test)]
     pub async fn release(&self, addr: &Addr, pid: u32) {
-        let who = {
+        // The run number is read under the same lock that removes the claim, because the sweep
+        // below is scoped to the run that left and this form's caller was never handed one.
+        let (who, generation) = {
             let mut claims = self.claims.lock().await;
-            if !claims.get(addr).is_some_and(|c| c.pid == pid) {
+            let Some(generation) = claims
+                .get(addr)
+                .filter(|c| c.pid == pid)
+                .map(|c| c.generation)
+            else {
                 return;
-            }
+            };
             claims.remove(addr);
-            self.note_who_is_connected(&claims)
+            (self.note_who_is_connected(&claims), generation)
         };
-        self.nothing_more_will_be_said_about(addr).await;
+        self.nothing_more_will_be_said_about(addr, generation).await;
         self.put_who_is_connected_on_disk(who).await;
     }
 
@@ -3893,7 +3551,7 @@ impl<S: Surface> Hub<S> {
     /// No `Down` record is kept for it. The controller's `ack` for the intent frame says the frame
     /// arrived and is bookkeeping the hub does not act on; what the hub waits for is the
     /// `intent_outcome`, correlated by `intent_id` and by nothing else.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     pub async fn intend(&self, wanted: Wanted) -> Result<Intended, IntentRefusal> {
         let Wanted {
@@ -3902,7 +3560,7 @@ impl<S: Surface> Hub<S> {
             spec,
             domain,
             count,
-            for_run,
+            for_lease,
             offer: (chat_id, ref msg_id),
             ref option_id,
             from,
@@ -3919,7 +3577,7 @@ impl<S: Surface> Hub<S> {
         }
 
         // What it is ABOUT, which is not where it is going. The one address whose run number
-        // `for_run` can mean anything about.
+        // `for_lease` can mean anything about.
         let about = match &domain {
             None => Addr::project_itself(project.clone()),
             Some(lane) => Addr::lane_of(project.clone(), lane.clone()),
@@ -3955,7 +3613,7 @@ impl<S: Surface> Hub<S> {
         // The hub refusing ITSELF: an operation and a run that do not go together is a request
         // this hub built wrong, and carrying it would put a number that means nothing in front of
         // a check.
-        if changes_a_running_thing(op) != for_run.is_some() {
+        if changes_a_running_thing(op) != for_lease.is_some() {
             return self.did_not_carry(&project, &domain, IntentRefusal::CouldNotBuildIt);
         }
         // The same for the count. `scale` is the one op with a number in it; a number on any other
@@ -4020,9 +3678,9 @@ impl<S: Surface> Hub<S> {
                         // answers `0` for an address that was never claimed, and a zero is read as
                         // "holds none" everywhere else on this wire — so a subject with no run is
                         // its own refusal rather than a comparison something could win.
-                        match (for_run, claims.get(&about).map(|c| c.generation)) {
+                        match (for_lease, claims.get(&about).map(|c| c.generation)) {
                             (None, _) => Ok((to, run)),
-                            (Some(_), None) => Err(IntentRefusal::NothingIsRunningThere),
+                            (Some(_), None) => Err(IntentRefusal::NothingIsConnectedThere),
                             (Some(named), Some(running)) if named != running => {
                                 Err(IntentRefusal::TheWorldMoved)
                             }
@@ -4037,8 +3695,12 @@ impl<S: Surface> Hub<S> {
             Err(why) => return self.did_not_carry(&project, &domain, why),
         };
 
-        let id = IntentId::new(format!("i{}", next_frame_seq()));
-        let key = mint_idempotency_key(&project, chat_id, msg_id, option_id, for_run);
+        // From the ledger's own counter, behind the ledger's own boot token — never the frame
+        // counter, which starts at one with the process. An id that recurred across a restart let
+        // an outcome a controller still owed for one intention settle a different one minted
+        // after it. See [`IntentLedger::boot`].
+        let id = self.intents.lock().await.mint_an_id();
+        let key = mint_idempotency_key(&project, chat_id, msg_id, option_id, for_lease);
 
         // Written down BEFORE the frame is on the wire, which is `resolve_tap`'s rule and its
         // reason: an unrecorded intention is one that can be carried again. The audit line goes
@@ -4053,10 +3715,11 @@ impl<S: Surface> Hub<S> {
             op,
             spec,
             count,
-            for_run,
+            for_lease,
             user: from.user_id,
             state: IntentState::Sent,
             said: None,
+            said_digest: None,
         };
         let frame = HubFrame::Intent {
             intent_id: id.clone(),
@@ -4065,7 +3728,7 @@ impl<S: Surface> Hub<S> {
             spec_id: record.spec.clone(),
             domain: domain.clone(),
             count,
-            for_run,
+            for_lease,
             from,
             valid_for_ms: INTENT_VALID_FOR.as_millis() as u64,
         };
@@ -4083,59 +3746,67 @@ impl<S: Surface> Hub<S> {
         // needs before it opens the ledger at all.
         {
             let mut intents = self.intents.lock().await;
-            if let Some(seen) = intents.iter().position(|i| i.key == record.key) {
-                if intents[seen].state == IntentState::Unknown {
-                    // Offered AGAIN rather than answered from, and this is the one state where
-                    // that is right: `Unknown` says the hub does not know what became of it, and
-                    // answering a fresh tap from it would be the hub claiming knowledge it has not
-                    // got — for ever, since the key of an op that carries no run never moves and
-                    // that button would be dead for the life of the process. At-least-once is what
-                    // this wire promises and the key rides on the frame, so a controller that did
-                    // act on it answers from its own record and does not act twice.
-                    let old = intents.remove(seen).expect("the position was just read");
+            // The record this one replaces, if any — given up below, and only once the frame that
+            // replaces it is on the wire.
+            let mut replacing = None;
+            match intents.already_carried(&record.key) {
+                // Offered AGAIN rather than answered from, and this is the one state where that is
+                // right: nothing was ever said about this one, so the hub does not know what
+                // became of it, and answering a fresh tap from that would be the hub claiming
+                // knowledge it has not got — for ever, since the key of an op that carries no
+                // lease never moves and that button would be dead for the life of the process.
+                // At-least-once is what this wire promises and the key rides on the frame, so a
+                // controller that did act on it answers from its own record and does not act
+                // twice.
+                //
+                // A record whose controller had ACCEPTED does not come here, deliberately: the hub
+                // was told that work began, and re-carrying it would ask for a second run of an
+                // operation known to have started — at a fresh controller with no record of the
+                // key, which is precisely where the key protects nobody. That one is answered from
+                // instead, and the honest answer is the state itself. It survives a restart for
+                // that reason: see [`IntentLedger`].
+                Some(AlreadyCarried::NothingWasEverSaidAboutIt(old)) => {
                     let _ = self.audit.intent_again_carried(&old.to, &old.id, &old.key);
-                } else {
-                    // Not a refusal: this button has been carried, and the honest answer is what
-                    // became of it. **No second frame** — at-least-once is what this wire
-                    // promises, and nothing here claims exactly-once.
-                    let seen = &intents[seen];
-                    let answered = Intended::AlreadyAsked(seen.id.clone(), seen.state.clone());
-                    let _ = self.audit.intent_again(&seen.to, &seen.id, &record.key);
-                    return Ok(answered);
+                    replacing = Some(old.id.clone());
                 }
+                // Not a refusal: this button has been carried, and the honest answer is what became
+                // of it. **No second frame** — at-least-once is what this wire promises, and
+                // nothing here claims exactly-once.
+                Some(AlreadyCarried::AnswerFromIt(id, state)) => {
+                    let _ = self.audit.intent_again(&record.to, &id, &record.key);
+                    return Ok(Intended::AlreadyAsked(id, state));
+                }
+                None => {}
             }
             // Room, and never at the cost of a record nobody has answered for. The bound is what
             // stops a controller that never answers turning a record nobody will read into a leak,
             // but forgetting the OLDEST regardless of its state made the bound a way to carry one
             // button twice: past it, a repeat was carried afresh instead of answered from the
-            // record. So what goes is the oldest record that is already finished with, and when
-            // there is none the intention is refused — which the operator can read, where a
-            // duplicate restart is something he cannot see.
-            if intents.len() >= INTENTS_KEPT {
-                match intents
-                    .iter()
-                    .position(|i| matches!(i.state, IntentState::Settled(_) | IntentState::Unknown))
-                {
-                    Some(finished) => {
-                        intents.remove(finished);
-                    }
-                    None => {
-                        return self.did_not_carry(
-                            &project,
-                            &domain,
-                            IntentRefusal::TooManyWaiting,
-                        );
-                    }
-                }
+            // record. So when there is none to forget the intention is refused — which the
+            // operator can read, where a duplicate restart is something he cannot see.
+            //
+            // A REPEAT IS NOT ONE MORE. The record it replaces is the room it needs, and that
+            // record is not given up until the hand-over below has succeeded — so asking the bound
+            // for a slot here would let it choose the predecessor itself, and a hand-over that
+            // then failed would take that away too. The ledger holds one over its bound for the
+            // rest of this critical section, which nothing outside it can see.
+            if replacing.is_none() && !intents.room_for_one_more() {
+                return self.did_not_carry(&project, &domain, IntentRefusal::TooManyWaiting);
             }
             let _ = self.audit.intent(&record);
-            intents.push_back(record);
+            intents.write_down(record);
             if let Err(why) = self.hand_to_the_run(&to, run, frame).await {
                 // Taken back, so the key is free to be used again: nothing was carried, and a
                 // record waiting for a word about a frame nothing received would answer a second
-                // tap from it. `deliver_tap` does exactly this, for exactly this reason.
-                intents.pop_back();
+                // tap from it. `deliver_tap` does exactly this, for exactly this reason. What is
+                // NOT taken back is the record this one was replacing: nothing replaced it, a
+                // controller may still be acting on it, and the audit line above points at it.
+                intents.take_the_last_one_back();
                 return self.did_not_carry(&project, &domain, why);
+            }
+            // On the wire, so the record it replaced can be given up.
+            if let Some(old) = replacing {
+                intents.forget(&old);
             }
         }
         Ok(Intended::Carried(id))
@@ -4148,7 +3819,7 @@ impl<S: Surface> Hub<S> {
     /// going out — a wall restarting is the ordinary case, not an exotic one — and a successor
     /// that never declared this capability would otherwise be handed the intention anyway,
     /// stamped with its own lease so that nothing downstream could tell.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     async fn hand_to_the_run(
         &self,
@@ -4198,18 +3869,6 @@ impl<S: Surface> Hub<S> {
         status: IntentStatus,
         reason: Option<String>,
     ) -> (Delivered, Option<AckWhy>) {
-        enum Heard {
-            /// No intention of this hub's has that id.
-            NeverSent,
-            /// One does, and it was carried to somebody else.
-            NotThisConversation,
-            /// One does, in this conversation, and this connection is not the one that may say.
-            NotItsToSettle,
-            /// It has already been answered for, and nothing follows a terminal word.
-            AlreadyAnswered,
-            /// Taken, and this is where the record now stands.
-            Took,
-        }
         // Read BEFORE the ledger is opened, never inside it: the one lock order in this file is
         // the ledger and then the claims, because `intend` holds the ledger while it hands a frame
         // to a claim. Taking them the other way round here would be a deadlock waiting for two
@@ -4218,34 +3877,22 @@ impl<S: Surface> Hub<S> {
             let claims = self.claims.lock().await;
             claims.get(addr).map(|c| (c.generation, c.controls.clone()))
         };
-        let heard = {
-            let mut intents = self.intents.lock().await;
-            match intents.iter_mut().find(|i| &i.id == id) {
-                None => Heard::NeverSent,
-                Some(record) if &record.to != addr => Heard::NotThisConversation,
-                Some(record) if !may_speak_about(record, speaking.as_ref()) => {
-                    Heard::NotItsToSettle
-                }
-                Some(record) => match may_follow(&record.state, status) {
-                    None => Heard::AlreadyAnswered,
-                    Some(next) => {
-                        record.state = next;
-                        // Kept for the slice that draws it on his phone, and never written to the
-                        // audit: a sentence from another process can carry a newline, which in a
-                        // file of one record per line is a second record of its choosing.
-                        //
-                        // Clamped where it is KEPT rather than where it is drawn, so a second
-                        // reader cannot get it wrong: this is the one string in the family whose
-                        // length nobody on this side chose, and the ledger holds `INTENTS_KEPT` of
-                        // them. `queue::fit` is the same clamp every other word from a bridge gets
-                        // before it reaches a topic.
-                        record.said =
-                            reason.map(|r| crate::queue::fit(&r, crate::queue::MAX_TEXT).0);
-                        Heard::Took
-                    }
-                },
-            }
-        };
+        // Clamped BEFORE anything is compared, because the clamp is where the sentence is kept:
+        // the record holds what `queue::fit` made of it and the text before that is never
+        // retained, so "the same word again" can only ever mean the same as the hub wrote it down.
+        // Comparing the two ends of the clamp would answer "you said something different" to a
+        // controller that said the same thing.
+        //
+        // Never written to the audit either way: a sentence from another process can carry a
+        // newline, which in a file of one record per line is a second record of its choosing.
+        // `queue::fit` is the same clamp every other word from a bridge gets before it reaches a
+        // topic.
+        let said = reason.map(|r| crate::queue::fit(&r, crate::queue::MAX_TEXT).0);
+        let heard =
+            self.intents
+                .lock()
+                .await
+                .a_word_about(id, addr, status, said, speaking.as_ref());
         match heard {
             Heard::NeverSent => {
                 tracing::warn!(
@@ -4279,16 +3926,36 @@ impl<S: Surface> Hub<S> {
                 );
                 (Delivered::No, Some(AckWhy::NoSuchIntent))
             }
-            Heard::AlreadyAnswered => {
+            Heard::SameObservationAgain => {
+                // One observation, arriving twice, and the controller's retry has SUCCEEDED: the
+                // hub holds exactly what it was told, so `yes` is the true answer and there is
+                // nothing to add to it. This wire is at-least-once in both directions and the
+                // late-correction rule invites a controller to replay from its own record, so a
+                // lost `ack` puts a correct controller here — and answering it the way a
+                // self-contradicting one is answered told it its frame had died, with no reason
+                // it could act on.
+                //
+                // No second audit line, deliberately: the file records what became of an
+                // intention, and a second line about one observation makes a reader counting
+                // outcomes count the network's retries instead.
+                (Delivered::Yes, None)
+            }
+            Heard::ContradictsWhatItAlreadySaid => {
                 // Not `no_such_intent`: the intention is real and is this connection's. What is
-                // wrong is the word, and the closed set has none for "you have already told me",
-                // so the controller is told the frame died and nothing more — which is what a peer
-                // is owed rather than a reason that would be a lie.
+                // wrong is the WORD — the controller said `completed` and now says `failed` — and
+                // the first word stands. It is told which kind of wrong this is, because a
+                // controller that cannot tell a contradiction from a lost frame cannot find its
+                // own defect.
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(),
+                    "a controller said something different about an intention it had already \
+                     answered for; the first word stands"
+                );
                 let _ = self.audit.refused(
                     addr,
                     "a second word about an intention that was already answered for",
                 );
-                (Delivered::No, None)
+                (Delivered::No, Some(AckWhy::AlreadyAnswered))
             }
             Heard::Took => {
                 let _ = self.audit.intent_outcome(addr, id, status);
@@ -4299,21 +3966,29 @@ impl<S: Surface> Hub<S> {
 
     /// A connection has ended with words still owed about intentions it was handed.
     ///
-    /// They become [`IntentState::Unknown`] and never `failed`. What the hub observed is that the
+    /// They become [`IntentState::Unknown`], keeping the phase they had reached, and never
+    /// `failed`. What the hub observed is that the
     /// CONVERSATION ended; it observed nothing whatever about the work, and a hub that read one as
     /// the other would tell the operator something changed when nothing may have — which is the
     /// worst thing this system can tell him, because his next action is chosen on it.
     ///
-    /// Every record of the address, and not only the run that has just left. The address is empty
-    /// by the time this runs — that is what a release and an eviction both mean — so anything of
-    /// its still waiting for a word is waiting on nobody, whichever run it was handed to.
-    async fn nothing_more_will_be_said_about(&self, addr: &Addr) {
-        let mut intents = self.intents.lock().await;
-        for i in intents.iter_mut() {
-            if &i.to == addr && matches!(i.state, IntentState::Sent | IntentState::Accepted) {
-                i.state = IntentState::Unknown;
-            }
-        }
+    /// **The RUN that left, never the address it left.** An address is not a run here either: on
+    /// the eviction path the successor's claim is already in the map when this lands, and on the
+    /// ordinary path a wall that restarts within a second — the ordinary case, not the exotic
+    /// one — can have claimed and been handed an intention before this gets the ledger. Sweeping
+    /// by address wrote off a live intention of the run that is still working on it: its record
+    /// then said the connection had ended, so a repeat of that button was carried a SECOND time
+    /// to a controller already doing the first, and who may settle it widened from that one run
+    /// to anything at the address.
+    ///
+    /// **Why it cannot simply be done under the claims lock**, so that a later reader does not
+    /// close the window by moving it in: `intend` holds the LEDGER and then reaches for the
+    /// claims, which is the one lock order in this file. Taking the claims and then the ledger
+    /// here is the other order, and two ordinary events — one connection leaving while another
+    /// is handed an intention — would deadlock the hub. The window stays; what changed is that
+    /// nothing in it belongs to the sweep.
+    async fn nothing_more_will_be_said_about(&self, addr: &Addr, run: u64) {
+        self.intents.lock().await.nothing_more_from(addr, run);
     }
 
     /// Where one intention has got to, as the hub observed it.
@@ -4322,12 +3997,7 @@ impl<S: Surface> Hub<S> {
     /// shipped reads it yet; what this slice owes him is the audit line and the journal.
     #[cfg(test)]
     pub async fn what_became_of(&self, id: &IntentId) -> Option<IntentState> {
-        self.intents
-            .lock()
-            .await
-            .iter()
-            .find(|i| &i.id == id)
-            .map(|i| i.state.clone())
+        self.intents.lock().await.state_of(id)
     }
 
     /// The controller's own sentence about one intention, as the hub kept it.
@@ -4336,19 +4006,14 @@ impl<S: Surface> Hub<S> {
     /// in front of the operator is a later slice.
     #[cfg(test)]
     pub async fn what_was_said_about(&self, id: &IntentId) -> Option<String> {
-        self.intents
-            .lock()
-            .await
-            .iter()
-            .find(|i| &i.id == id)
-            .and_then(|i| i.said.clone())
+        self.intents.lock().await.said_about(id)
     }
 
     /// One refusal, said once in the journal and once in the audit, and handed back.
     ///
     /// A branch that carries nothing still writes a line, so silence in that file always means the
     /// process stopped rather than that the hub decided something quietly.
-    // No shipped caller until the keyboard is drawn; see the section note above.
+    // No shipped caller until the keyboard is drawn; see the note at the head of `hub::intent`.
     #[allow(dead_code)]
     fn did_not_carry(
         &self,
@@ -8129,5 +7794,6 @@ fn next_frame_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+mod intent;
 #[cfg(test)]
 mod tests;

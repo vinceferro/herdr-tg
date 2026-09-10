@@ -834,14 +834,15 @@ names are first.
    nothing, because routing reads `Addr` from the record and the claim, exactly as `resolve_tap`
    already does (`crates/herdr-tg/src/hub.rs:2547-2556`).
 
-3. **`an_intent_with_a_stale_expected_generation_is_refused_before_delivery`**
+3. **`an_intent_naming_a_lease_that_is_not_the_one_held_there_now_is_refused_before_delivery`**
    The claim at the domain is at generation *g*. `Some(g-1)` → refused. `Some(g)` → delivered. The
    worker reconnects at *g′ > g*; `Some(g)` → refused. A domain never claimed → its own refusal, and
    **not** a comparison against the zero `highest_for` returns
    (`crates/herdr-tg/src/hub.rs:1839-1841`). `None` on `restart` → refused. `Some(g)` on `start` →
    refused. **Both spellings of the conversation itself are pinned** — omitted `domain`, and the
-   `domain` a caller might be tempted to spell `-` — so an expected generation can never be compared
-   against a different address's claim. **Proves** the fence points the right way in all six cases.
+   `domain` a caller might be tempted to spell `-` — so the lease an intent names can never be
+   compared against a different address's claim. **Proves** the fence points the right way in all
+   six cases.
 
 4. **`an_intent_repeated_with_the_same_key_is_answered_from_the_record_and_never_redelivered`**
    Two taps, one key. The second returns the first's status; no second frame reaches the connection.
@@ -1007,3 +1008,211 @@ These are genuinely undecided. None is a decision this document made quietly.
 * **Does the hub run `systemctl`?** No. `docs/HUB-AND-KICKOFF.md:150-160` (Q2).
 * **Does the hub validate a spec?** No. It cannot, and pretending otherwise would be the first step
   towards it holding one.
+
+---
+
+## 13. What was built, and what the first review corrected
+
+§1–§12 are the proposal as written on 8 September, when nothing was built. It **was** built, at
+`3824a2f`, and reviewed. This section is the difference. Where §1–§12 and this section disagree,
+this section is what the code does.
+
+### 13.1 The fence is the hub's own delivery lease, and it is named for it
+
+`expected_generation` in §7.2 shipped as `for_run`, and `for_run` was the wrong name for the number
+in it. **It is renamed `for_lease`.**
+
+The number the hub compares against is `Claim::generation` — the lease it mints for a CONNECTION in
+one conversation. It is not a number about the workload, and reading it as one had two failures,
+both ordinary:
+
+* **A false refusal.** A controller's socket drops and it redials while the work it manages never
+  stops. The lease moves. A button drawn against the workload he is still watching is refused,
+  about a run that never moved.
+* **A false pass.** The workload is replaced while the connection holding it never drops. The lease
+  does not move, the fence passes, and the tap lands on a run he never saw — which is verbatim the
+  failure §7.2 says the fence exists to prevent.
+
+**Four numbers fence a fleet, and this hub mints exactly one of them.**
+
+| axis | who mints it | where it lives | on this wire |
+|---|---|---|---|
+| the hub's delivery lease for a conversation | **this hub** | `Claim::generation`, `Generations` | the envelope's `generation`, and `intent.for_lease` |
+| the dispatcher's slot generation | whoever dispatches | kickoff's own state | **not carried.** Fence it yourself, or carry it inside the opaque handle |
+| the launcher's note revision | the launcher | the binding file, `--opencode-binding-generation` | **deliberately off the wire** — a fact about one machine |
+| the desired object's spec revision | whoever approved the spec | inside `spec_id`, opaque here | **not carried** as a field of its own |
+
+A controller that needs any of the last three fenced must fence them **itself, against its own
+numbers, before it acts**. The hub cannot: it holds no table for any of them, and a check on a
+number nobody mints is a check that gets deleted the first time it is wrong.
+
+**No `for_subject` field was invented in the correction**, and that is a decision rather than an
+omission: nothing on this wire produces such a number today, and a second fence on a meaningless
+number is how a check becomes decorative. It is handed back to whoever consumes this protocol as
+one open decision — either `Control` grows an opaque revision that the hub carries verbatim and
+never compares, or the controller fences on the idempotency key alone.
+
+`Control.domain` and `intent.domain` stay a `LaneId` and were **not** retyped. A domain is one
+conversation of one project, and the security argument rests on that typing: the project half comes
+from the secret and only the lane half comes from the wire.
+
+The refusals were renamed with the field. `NothingIsRunningThere` is `NothingIsConnectedThere`, and
+its sentence says *"nothing is connected at the conversation that operation is about"* — the hub
+holds no table that could say whether a workload is running, and a refusal that claimed to would be
+read as one by whoever acts on the audit.
+
+### 13.2 A disconnect forgets the word that was owed, never the phase the work had reached
+
+`IntentState::Unknown` carries a `Phase` — `Sent` or `Accepted`. Flattened, it was a way ROUND the
+state machine: `accepted`, then a dropped socket, then `refused` was a legal path, and `refused`
+means *nothing happened* about work the controller had said was under way.
+
+* From `Unknown { after: Accepted }`, neither `refused` nor `accepted` is a transition — the same
+  rule as from `Accepted`, for the same reasons. `completed` and `failed` still are: a controller
+  answering late from its own record is exactly what that state is for. A replayed `accepted` is
+  not a new word but the same one arriving twice, and §13.4 is where it is answered; §13.7 has what
+  taking it as a transition cost.
+* A repeat tap on `Unknown { after: Sent }` is **offered again**, because nothing was ever said
+  about it and answering from it would be the hub claiming knowledge it has not got.
+* A repeat tap on `Unknown { after: Accepted }` is **answered from**, and the honest answer is that
+  state: re-carrying it would ask for a second run of an operation known to have started.
+
+### 13.3 A departing run sweeps its own records and nobody else's
+
+`nothing_more_will_be_said_about` takes the RUN as well as the address. On the eviction path the
+successor's claim is already in the map when the sweep lands, and on the ordinary path a wall that
+restarts within a second can already have been handed an intention. Sweeping by address wrote off a
+live intention of the run still working on it: a repeat of that button was then carried a second
+time, and who may settle it widened from that one run to anything at the address.
+
+The sweep still runs **outside** the claims lock, and that is deliberate: `intend` holds the ledger
+and then reaches for the claims, which is the one lock order in the file, so sweeping under the
+claims lock would deadlock on two ordinary events. The window remains; nothing in it belongs to the
+sweep any more.
+
+**The obvious further tightening was refused.** Requiring a late correction to come from the same
+`instance` would break the only case that branch exists for: `docs/ATTACHING.md` §3b tells every
+adapter to mint an instance once per process and change it when it restarts, so a controller
+answering from its own record after its own restart is by definition a different instance.
+
+### 13.4 A repeat and a contradiction are different events
+
+A byte-identical repeat of a terminal word is one observation arriving twice, and this wire is
+at-least-once in both directions: an `ack` can die on a socket that ends before it lands. Such a
+repeat is now answered `delivered: yes` with no reason, no second audit line and no state change —
+the controller's retry has succeeded.
+
+A word that differs from the one already written down is a contradiction. It is refused
+`delivered: no, why: "already-answered"` — a new member of the closed `AckWhy` set, safe there for
+the reason `no-such-intent` is: only a peer that sent an outcome can ever be told it. One audit line
+is written and the first word stands.
+
+`accepted` is in this rule as well as the terminal words, and both sides of a disconnect: from
+`Accepted` and from `Unknown { after: Accepted }` a second `accepted` is the same observation, not a
+new one. A controller replaying its last word after it reconnects — which is the one thing §13.3's
+late-correction rule invites it to do — is the ordinary case, not the exotic one.
+
+Identity is decided on `(status, reason)` compared **after** the clamp, because the clamp is where
+the sentence is kept — the pre-clamp text is never retained, so "byte-identical" can only mean
+identical as the hub wrote it down. What is compared is a digest of the sentence rather than the
+sentence, so that the answer does not change across a restart: see §13.5.
+
+### 13.5 What survives a restart
+
+The ledger is written down, at `hub.intents.json` beside the audit, in the shape `AskLedger`
+already uses. §7.1's key is only safe if the record outlives the process:
+
+* `start` and `inspect` carry no fence at all, and every input their key is minted from — the
+  conversation, the chat, the message, the button — comes back identically after a restart. The
+  record was the only thing between a slow receipt and a second `start`.
+* An intention the controller had ACCEPTED must not be re-carried. Forgetting that across a restart
+  turns "he tapped again while it was running" into a second run of an operation known to have
+  started, at a controller with no record of the key — which is precisely where the key protects
+  nobody.
+
+**What a load makes of what it reads.** Anything still `Sent` or `Accepted` becomes `Unknown` of
+that phase: nothing is connected in the first moment of a hub's life, so every intention still
+waiting for a word is waiting on a connection that is gone.
+
+**One field never reaches the disk**: the controller's own sentence (`reason`). It is another
+process's prose with a retention question attached and nothing decides anything on it. What is
+written down instead is a **digest** of it, and that is what §13.4's comparison reads. Without it,
+the sentence a restart had thrown away was compared against the one arriving and every honest retry
+after a restart was classified as a controller contradicting itself — refused on the wire and
+written into the audit as one, which is manufacturing evidence against a correct controller in the
+one file an incident is read from. The retention answer is unchanged: a digest is not prose and
+nothing can be read back out of it.
+
+**An intent id can no longer recur.** It was `i{counter}` from a per-process counter that starts at
+one with the process, so `i7` named one intention before a restart and a different one after it, and
+a controller replaying the outcome it still owed for the first would settle the second. Ids are now
+minted `i{boot}-{n}` from a token drawn per boot.
+
+### 13.6 The closed field set is a promise about what the hub WRITES
+
+The guard tests run over a **constructed** frame and pin the exact key set that goes out. On the way
+IN the rule is the opposite one and is deliberate: an unknown field inside a known kind is **ignored**
+— serde's default, kept on purpose, because a reader that refused one would turn every additive
+change on the other side into a dead worker. It is also structural: the payload is `serde(flatten)`ed
+into the envelope, and a variant reached through a flatten cannot carry `deny_unknown_fields` at all.
+Nothing unknown is stored and nothing is forwarded, so no field can be smuggled through either.
+
+The surface in this project that genuinely refuses an unknown key is a different one — the launcher's
+binding file (`docs/ATTACHING.md` §13.10), which has one writer and is a local file rather than a
+wire between two builds that ship apart. The two must not be confused again.
+
+### 13.7 What the second review corrected
+
+The corrections in §13.1–§13.6 were attacked in turn. Five defects were confirmed with failing
+tests, four of them reachable by an ordinary sequence rather than a contrived one, and every one of
+them lives where two of the earlier corrections meet.
+
+**A word that revives a record moves who may answer for it.** `Unknown` says the connection the
+intention was waiting on has ended. A late word that puts the record back into a live state — a
+controller that reads its own record after a restart, starts the work and reports `accepted` — left
+the record stamped with the run that had gone. Nothing could then settle it (only that run may speak
+about a live intention), its own speaker's departure swept nothing (the sweep is scoped to the run
+it was handed to), and the bound could not forget it either — so on an unfenced op, whose key never
+moves, the button answered every later tap *"still running"* for the life of the process.
+`a_word_about` now re-homes the record to the run that spoke, which for a live record is the number
+it already held.
+
+**A replayed `accepted` is one observation, on both sides of a disconnect.** Taken as a transition
+it walked a record from `Unknown { after: Accepted }` straight into that dead end, wrote a second
+audit line about one observation, and answered the correct controller `no-such-intent` when it later
+said how the work had ended. It is now §13.4's answer: `yes`, nothing written, nothing moved.
+
+**The bound forgot the record persistence was added for.** `room_for_one_more` took the first record
+that was finished with, and `Unknown { after: Accepted }` qualified — so an operation the controller
+had said was under way was dropped in front of hundreds of settled ones, defeating §13.5's own
+guarantee with no restart involved. Eviction is now ordered: the oldest **answered for**, then the
+oldest the hub knows **nothing at all** about, and otherwise nothing is forgotten and the intention
+is refused. What that costs is named in the code: a ledger entirely of operations reported as
+started and never finished refuses new ones until one is answered for. A refusal is something the
+operator can read.
+
+**A repeat that nothing took destroyed the record it was replacing.** A repeat of an unfenced
+button removed its predecessor's record before the new frame was on the wire, and the failure path
+took back only the new one — so a controller that was not keeping up (which is why the receipt was
+slow, which is why he tapped again) lost both, leaving an `intent-again-carried` line in the audit
+pointing at an id nothing could answer for. The predecessor is now given up only after the
+hand-over succeeds, and a repeat asks the bound for no room at all: the record it replaces is the
+room it needs.
+
+**A claim the off switch could not talk to took no sweep with it.** Every other claim removal in
+the hub sweeps what that run was owed a word about; the one branch that forgets a claim with
+nothing behind its kick did not. It does now. (Not reachable through a real connection today — the
+connection task holds that receiver and releases on its way out — but it was the only asymmetry
+left, and it is five lines.)
+
+**Four properties that held were pinned rather than left implicit**: which run number the eviction
+path hands the sweep, that a successor at an address cannot settle an intention still live with the
+run it replaced, that the phase survives the FILE and not merely the disconnect, and that the
+sentence is part of the observation. Each was proved to be load-bearing by breaking the code under
+it and watching the new test fail.
+
+**Two things the review asked for were refused, with reasons.** The `instance` tightening in §13.3
+stays refused for the reason given there. And the id shape stays `i{boot}-{n}`: the objection was
+that it reads as a word at a glance, which is true and costs nothing that matters — an id is joined
+on, never read for meaning, and changing the shape of a token already in an audit file to improve
+how it scans is not a correction.

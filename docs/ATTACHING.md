@@ -1239,7 +1239,13 @@ three values:
   The operator sees a message ending in `… (clipped)`; you would otherwise go on referring to a part
   he never read.
 * `no` — it did not land, and it will not be retried. `why` is one of `too-fast`, `no-topic`,
-  `telegram-refused`.
+  `telegram-refused` and `stale-generation` (*The lease*, below: the connection is over, so stop
+  rather than re-send). Two more can only ever answer an `intent_outcome`, which is a frame no
+  adapter sends unless it has opted into the lifecycle family — `no-such-intent` and
+  `already-answered`; that family is specified in `docs/PROPOSAL-LIFECYCLE-INTENT.md` and is not
+  part of this contract yet. **Branch on the ones you can act on and render anything else as "it
+  did not land"**: this set grows with what a frame can be, and a word that can only answer a frame
+  you never send can never reach you.
 * `unseen` — it went out and could not be confirmed, and **it is never retried.** Telegram has no
   idempotency key, so re-sending a question would leave two live keyboards for it, both tappable
   forever. Folding `unseen` into success is a defect this project has already shipped and fixed;
