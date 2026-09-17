@@ -18,8 +18,9 @@
 //! * **A snapshot the hub writes**, whenever the map changes. Cheap, and the hub already keeps
 //!   three state files this way. Its one hazard is staleness: a hub killed with `SIGKILL` leaves a
 //!   file naming claims that died with it. So the snapshot carries the hub's pid, and a reader
-//!   believes it only when that pid is alive, is a `herdr-tg`, and is the pid the lock's holder
-//!   wrote — which the same process wrote at the same moment it took the lock.
+//!   believes it only when that pid is alive, is running under one of the hub's own command names,
+//!   and is the pid the lock's holder wrote — which the same process wrote at the same moment it
+//!   took the lock.
 //!
 //! When none of that holds the answer is **unknown**, never `false`: a reader that cannot prove
 //! nothing is connected must not say so. A hub that is not running has nothing connected to it,
@@ -148,8 +149,9 @@ impl Presence {
 /// The snapshot in `state_dir`, if — and only if — a running hub stands behind it.
 ///
 /// Three facts, all required, none a guess: the lock file names a holder; that holder is alive and
-/// is a `herdr-tg`; and the snapshot was written by that same pid. Anything less is `None`, which
-/// the caller must render as UNKNOWN rather than as nothing connected.
+/// is a hub of ours (see [`HUB_COMMAND_NAMES`]); and the snapshot was written by that same pid.
+/// Anything less is `None`, which the caller must render as UNKNOWN rather than as nothing
+/// connected.
 ///
 /// The lock file is read, never locked. Taking it, even non-blocking and for a microsecond, can
 /// refuse a hub that is starting in that microsecond.
@@ -166,14 +168,47 @@ pub fn vouched_for(state_dir: &Path) -> Option<Snapshot> {
     (snapshot.hub_pid == holder).then_some(snapshot)
 }
 
-/// Is this pid one of ours? `/proc/<pid>/comm` is the executable's name, and a hub's begins with
-/// `herdr` whether it is the installed binary or a test build. A pid recycled by some other
-/// program after a hub was killed fails this, which is the one case a live-pid check alone would
-/// get wrong.
+/// Every executable name a hub of ours is allowed to be running under.
+///
+/// Three spellings because the product was renamed and the old name still ships:
+///
+/// * `kickoff-channel` — the canonical installed binary, and the name a fresh adopter invokes.
+/// * `kickoff_channel` — the same crate built as a test binary; Cargo spells the target with an
+///   underscore (`deps/kickoff_channel-<hash>`).
+/// * `herdr-tg` and `herdr_tg` — the former name, kept as an alias for installs that predate the
+///   rename. The running hub on a box that has not been reinstalled is still this one, so dropping
+///   it here would make a live hub stop vouching for its own snapshot.
+///
+/// Both spellings of each name are listed because Cargo names a test target with an underscore
+/// (`deps/kickoff_channel-<hash>`) while the shipped command keeps its hyphen. The predicate this
+/// replaced matched the single prefix `herdr`, which covered both by accident; naming them is what
+/// makes the rename visible here at all.
+///
+/// **Matched by prefix, and the prefixes are exact on purpose.** A looser `kickoff` would vouch
+/// for any future sibling command that happens to share the stem — `kickoff-hub-attach` is
+/// already on this box — and the whole point of the check is to be narrower than "some process
+/// with this pid exists".
+const HUB_COMMAND_NAMES: [&str; 4] = ["kickoff-channel", "kickoff_channel", "herdr-tg", "herdr_tg"];
+
+/// Is this pid one of ours? `/proc/<pid>/comm` is the executable's name, and a hub runs under one
+/// of [`HUB_COMMAND_NAMES`] whether it is the installed binary or a test build. A pid recycled by
+/// some other program after a hub was killed fails this, which is the one case a live-pid check
+/// alone would get wrong.
+///
+/// **`comm` holds fifteen characters.** The kernel truncates to `TASK_COMM_LEN - 1`, and
+/// `kickoff-channel` is exactly fifteen — it survives whole, with nothing to spare. A future name
+/// one character longer would arrive here already cut, and this check would silently stop
+/// recognising the hub rather than fail loudly. `the_hub_is_recognised_under_every_name_it_ships_under`
+/// pins the current names against that.
 fn looks_like_a_hub(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|comm| comm.trim().starts_with("herdr"))
+        .map(|comm| comm_is_a_hub(comm.trim()))
         .unwrap_or(false)
+}
+
+/// The name rule on its own, so it can be tested without a process to point it at.
+fn comm_is_a_hub(comm: &str) -> bool {
+    HUB_COMMAND_NAMES.iter().any(|name| comm.starts_with(name))
 }
 
 #[cfg(test)]
@@ -182,6 +217,40 @@ mod tests {
 
     fn lane(p: &str, l: &str) -> Addr {
         Addr::lane_of(ProjectId::new(p), LaneId::new(l))
+    }
+
+    /// Every name the hub can legitimately be running under, and the near misses it must refuse.
+    ///
+    /// This exists because the rename to `kickoff-channel` silently broke the check it pins: the
+    /// predicate tested one hard-coded prefix, so the renamed binary — and every test build of it
+    /// — stopped being recognised as a hub, and `vouched_for` began answering UNKNOWN about a
+    /// perfectly live process. A name rule that is invisible when it is wrong needs a test that
+    /// names each accepted spelling out loud.
+    #[test]
+    fn the_hub_is_recognised_under_every_name_it_ships_under() {
+        // The installed binary a fresh adopter runs. Exactly 15 characters, which is all
+        // /proc/<pid>/comm holds, so it arrives whole and with nothing to spare.
+        assert!(comm_is_a_hub("kickoff-channel"));
+        assert_eq!("kickoff-channel".len(), 15);
+
+        // The same crate built as a test binary: Cargo spells the target with an underscore and
+        // appends a hash, which comm then truncates back to exactly the stem.
+        assert!(comm_is_a_hub("kickoff_channel"));
+
+        // The former name, still installed on every box that predates the rename — including the
+        // hub running right now. Dropping this arm would make a live hub disown its own snapshot.
+        assert!(comm_is_a_hub("herdr-tg"));
+        assert!(comm_is_a_hub("herdr_tg-b4a92115d4e3f"));
+
+        // A pid recycled by something else is the case the liveness check alone gets wrong, and
+        // the whole reason this predicate exists.
+        assert!(!comm_is_a_hub("systemd"));
+        assert!(!comm_is_a_hub("bash"));
+
+        // Narrower than the stem on purpose: a sibling command that merely shares it is not this
+        // hub. `kickoff` and `kickoff-hub-attach` are both already on this machine.
+        assert!(!comm_is_a_hub("kickoff"));
+        assert!(!comm_is_a_hub("kickoff-hub-att"));
     }
 
     #[test]
@@ -228,7 +297,7 @@ mod tests {
         assert!(vouched_for(d.path()).is_none(), "believed a dead hub");
 
         // The lock names a live process that is not a hub: a recycled pid, or a hand-written file.
-        // pid 1 is always alive and is never a herdr-tg.
+        // pid 1 is always alive and is never a hub of ours.
         fs::write(d.path().join("hub.lock"), "1").expect("lock");
         assert!(
             vouched_for(d.path()).is_none(),

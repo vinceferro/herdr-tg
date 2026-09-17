@@ -36,7 +36,7 @@
 //! another bot. So every positive id on the chat allowlist names exactly one person the operator
 //! already let talk to the bot in private — and that person may speak in the forum too. Nothing to
 //! set, nothing a stranger can be admitted by, and the startup log says which people it found.
-//! `HERDR_TG_ALLOWED_USER_IDS` / `allowed_user_ids` adds to that; it never replaces it.
+//! `KICKOFF_CHANNEL_ALLOWED_USER_IDS` / `allowed_user_ids` adds to that; it never replaces it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -45,19 +45,20 @@ use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 
 /// The environment variable carrying the bot token. Written by `scripts/setup-token.sh`.
-pub const TOKEN_ENV: &str = "HERDR_TG_TOKEN";
+pub const TOKEN_ENV: &str = "KICKOFF_CHANNEL_TOKEN";
 
 /// Optional environment override for the allowlist, as a comma-separated list of chat ids.
-pub const CHAT_IDS_ENV: &str = "HERDR_TG_ALLOWED_CHAT_IDS";
+pub const CHAT_IDS_ENV: &str = "KICKOFF_CHANNEL_ALLOWED_CHAT_IDS";
 
 /// Optional environment override for the people allowlist, as a comma-separated list of user ids.
 /// Added to the people the chat allowlist already names; see the module doc.
-pub const USER_IDS_ENV: &str = "HERDR_TG_ALLOWED_USER_IDS";
+pub const USER_IDS_ENV: &str = "KICKOFF_CHANNEL_ALLOWED_USER_IDS";
 
 /// Keys that must never appear in the TOML. Presence is a hard error, not a warning.
 const FORBIDDEN_TOML_KEYS: &[&str] = &["token", "bot_token", "api_token", "secret"];
 
-/// The `[bot]` section of `herdr-tg.toml`. Structure only — never a credential.
+/// The `[bot]` section of the config file. Structure only — never a credential. Existing
+/// `herdr-tg.toml` files remain valid during the source-only rename.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -89,7 +90,7 @@ pub struct Config {
     /// [`crate::bot::Gate`] — because two implementations of a fail-closed check are two places
     /// for it to drift open, and only one of them will have the test.
     pub allowed_chat_ids: BTreeSet<i64>,
-    /// The people LISTED as allowed to speak anywhere, by `HERDR_TG_ALLOWED_USER_IDS` or the
+    /// The people LISTED as allowed to speak anywhere, by `KICKOFF_CHANNEL_ALLOWED_USER_IDS` or the
     /// file. Not the whole answer: [`Config::people`] is, because the chat allowlist names people
     /// too. Kept apart so the startup line can say which of the two each person came from.
     pub allowed_user_ids: BTreeSet<i64>,
@@ -140,9 +141,10 @@ impl Config {
         };
         Self::assemble(
             file,
-            std::env::var(TOKEN_ENV).ok(),
-            std::env::var(CHAT_IDS_ENV).ok(),
-            std::env::var(USER_IDS_ENV).ok(),
+            crate::compat::environment("TOKEN")?,
+            crate::compat::environment("ALLOWED_CHAT_IDS")?,
+            crate::compat::environment("ALLOWED_USER_IDS")?,
+            crate::compat::environment("FORUM_CHAT_ID")?,
         )
     }
 
@@ -155,6 +157,7 @@ impl Config {
         token: Option<String>,
         chat_ids_env: Option<String>,
         user_ids_env: Option<String>,
+        forum_chat_id_env: Option<String>,
     ) -> anyhow::Result<Self> {
         let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
             bail!(
@@ -198,7 +201,7 @@ impl Config {
         }
 
         // `workspace`, `socket` and `submit_key` are still ACCEPTED in the file and ignored, so an
-        // existing herdr-tg.toml does not become a startup error on upgrade. They configured the
+        // existing config file does not become a startup error on upgrade. They configured the
         // path that watched panes and typed into them, and that path no longer exists.
         for (name, present) in [
             ("workspace", file.workspace.is_some()),
@@ -218,8 +221,7 @@ impl Config {
             token: token.trim().to_string(),
             allowed_chat_ids: allowed,
             allowed_user_ids: people,
-            forum_chat_id: std::env::var("HERDR_TG_FORUM_CHAT_ID")
-                .ok()
+            forum_chat_id: forum_chat_id_env
                 .and_then(|v| v.trim().parse().ok())
                 .or(file.forum_chat_id),
         })
@@ -395,6 +397,7 @@ mod tests {
             Some("t".into()),
             Some("9,-1009".into()),
             user_ids_env.map(str::to_owned),
+            None,
         )
         .expect("the live configuration loads")
     }
@@ -441,6 +444,7 @@ mod tests {
             Some("t".into()),
             None,
             Some("12,-1009".into()),
+            None,
         )
         .expect_err("a group on the people list loaded");
         let said = err.to_string();
@@ -452,7 +456,7 @@ mod tests {
 
         let file: FileConfig =
             toml::from_str("allowed_user_ids = [12, -1009]\n").expect("the file parses");
-        let err = Config::assemble(file, Some("t".into()), None, None)
+        let err = Config::assemble(file, Some("t".into()), None, None, None)
             .expect_err("a group in the file loaded");
         let said = err.to_string();
         assert!(
@@ -472,6 +476,7 @@ mod tests {
             Some("t".into()),
             Some("9,notanid".into()),
             None,
+            None,
         )
         .expect_err("a typo in the chat list loaded");
         let said = err.to_string();
@@ -485,6 +490,7 @@ mod tests {
             Some("t".into()),
             None,
             Some("12,twelve".into()),
+            None,
         )
         .expect_err("a typo in the people list loaded");
         let said = err.to_string();

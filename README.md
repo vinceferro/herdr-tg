@@ -1,4 +1,4 @@
-# herdr-tg
+# Kickoff Channel
 
 One Telegram bot, one forum, one topic per conversation. An agent connects to a Unix socket on the
 same machine and says what it is doing and what it is asking; the operator reads it on his phone and
@@ -186,7 +186,7 @@ Some tests are `#[ignore]`d because they need bun or a live child process. The b
 one that proves the plugin and the hub still agree on the wire:
 
 ```
-cargo test -p herdr-tg the_real_plugin -- --ignored
+cargo test -p kickoff-channel the_real_plugin -- --ignored
 ```
 
 `scripts/install-channel-plugin.sh` is the only supported way to put the bridge on a box. It runs

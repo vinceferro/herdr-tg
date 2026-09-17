@@ -32,10 +32,16 @@ const LOCK_FILE: &str = "hub.lock";
 
 /// `$XDG_STATE_HOME/herdr-tg`, else `~/.local/state/herdr-tg`.
 ///
-/// One derivation, used by the lock and by the heartbeat, so the two cannot come to disagree about
-/// which directory this hub lives in. `audit.rs` and `routing.rs` each still carry their own copy
-/// of this; they are older, they are load-bearing, and folding them in is a change to files this
-/// slice has no other reason to touch.
+/// **The one derivation in this crate**, and every consumer delegates to it, so no two of them can
+/// come to disagree about which directory this hub lives in. `audit.rs` and `routing.rs` used to
+/// carry copies of their own; both files were deleted with the screen-scraper, and this comment
+/// went on naming them long enough to send a reader looking for a divergence that no longer
+/// exists.
+///
+/// The leaf is still spelled `herdr-tg` after the rename, deliberately: it names a directory that
+/// exists on disk with a live hub's lock, heartbeat, registry and per-conversation secrets in it.
+/// `plugins/kickoff-channel/where.ts` derives the same path independently, so neither may move
+/// without the other — see the frozen-names section in the README.
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)

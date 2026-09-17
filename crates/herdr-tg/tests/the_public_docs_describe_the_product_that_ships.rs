@@ -10,7 +10,7 @@
 //! **A number in a public file is checked against the thing that produces it, never against a
 //! second copy of itself.** That is the whole failure this item exists to close: the tracker was a
 //! second copy of `CLAUDE.md`'s state and drifted within eleven hours of being written. So the
-//! command list is read out of `main.rs`, the rates are read out of `queue.rs`, and the README is
+//! command list is read out of `lib.rs`, the rates are read out of `queue.rs`, and the README is
 //! held against those — a sixteenth subcommand or a changed ceiling turns this red rather than
 //! quietly making the README wrong.
 //!
@@ -255,13 +255,13 @@ fn the_rates_the_readme_states_are_the_constants_the_binary_ships() {
 
 // ───────────────────────────── the commands, from clap's own list ─────────────────────────────
 
-/// Every subcommand the binary has, derived from `main.rs` rather than from a list kept beside it.
+/// Every subcommand the binary has, derived from `lib.rs` rather than from a list kept beside it.
 ///
 /// A hard-coded list here would be a second copy of the command set, which is exactly the failure
 /// this file is about: the drift it is meant to catch — a sixteenth subcommand nobody documented —
 /// is the one thing a hard-coded list can never see.
 fn subcommands() -> Vec<String> {
-    let names = subcommands_in(&source("crates/herdr-tg/src/main.rs"));
+    let names = subcommands_in(&source("crates/herdr-tg/src/lib.rs"));
     assert!(
         names.len() >= 10,
         "only found {names:?} in `enum Cmd`, which cannot be this binary's whole command set — \
@@ -276,7 +276,7 @@ fn subcommands() -> Vec<String> {
 fn subcommands_in(text: &str) -> Vec<String> {
     let at = text
         .find("enum Cmd {")
-        .expect("main.rs no longer declares `enum Cmd`; this guard cannot read the command set");
+        .expect("lib.rs no longer declares `enum Cmd`; this guard cannot read the command set");
     let body = &text[at..];
     let mut names = Vec::new();
     for line in body.lines().skip(1) {

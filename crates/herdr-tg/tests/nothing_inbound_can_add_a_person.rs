@@ -76,8 +76,13 @@ fn signatures(src: &str) -> Vec<String> {
 }
 
 /// The files that dispatch argv, and so may name the terminal verbs.
+///
+/// `src/lib.rs` is what `src/main.rs` became when the crate was renamed and grew two binaries: the
+/// clap dispatch moved there whole, and the shims under `src/bin/` are three lines that call into
+/// it. Those shims are deliberately NOT listed — they name no verb and reach into no `cmd::`, so
+/// exempting them would widen this door without anything asking to come through it.
 fn dispatches_argv(path: &str) -> bool {
-    path == "src/main.rs" || path.starts_with("src/cmd/")
+    path == "src/lib.rs" || path.starts_with("src/cmd/")
 }
 
 #[test]
@@ -152,7 +157,7 @@ fn no_message_tap_or_command_can_add_a_person_to_any_list() {
     // 1b. And the terminal verbs are reached only from argv. `cmd::enroll::let_speak` is the
     //     `pub(crate)` wrapper the verb calls, and a wrapper is a second name for the same door —
     //     so the file that reads Telegram must not name `cmd::` at all, whatever the wrapper is
-    //     called this week. `main.rs` dispatches argv and is the one file outside `cmd/` allowed.
+    //     called this week. `lib.rs` dispatches argv and is the one file outside `cmd/` allowed.
     let mut reached_into_cmd = Vec::new();
     for (path, src) in &sources {
         if path.ends_with("/tests.rs") || dispatches_argv(path) {

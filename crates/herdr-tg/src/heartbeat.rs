@@ -496,8 +496,11 @@ impl Heartbeat {
 
     /// `$XDG_STATE_HOME/herdr-tg/hub.heartbeat`, else `~/.local/state/…`.
     ///
-    /// The same derivation as the audit log and the routing state, and the same one the watchdog's
-    /// unit hard-codes. The unit names it explicitly rather than relying on `$XDG_STATE_HOME`,
+    /// [`crate::lock::state_dir`], which is the crate's only derivation of it, and the same path
+    /// the watchdog's unit hard-codes. (It used to say "the same derivation as the audit log and
+    /// the routing state"; both of those files are gone.)
+    ///
+    /// The unit names it explicitly rather than relying on `$XDG_STATE_HOME`,
     /// because a `--user` service does not inherit the login shell's environment and the two would
     /// otherwise resolve differently — the hub stamping one file while the watchdog watched
     /// another, each of them correct and the pair useless.

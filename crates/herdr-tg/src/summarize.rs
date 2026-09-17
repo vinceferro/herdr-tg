@@ -65,11 +65,17 @@
 //! so much as looked at: a 500, or a body that is not JSON, came off the same socket as a good
 //! answer would have.
 //!
-//! Two variables widen this, and they are the only two. `HERDR_TG_SUMMARIZER_LOCAL_MODELS` replaces
-//! the list of responder names that count as local — for the operator whose own gateway answers to
-//! a name this crate has never heard of. `HERDR_TG_SUMMARIZER_ALLOW_REMOTE=1` is the operator
-//! saying, in one exact word, that their pane text may leave this machine; it lifts the address
-//! check and the responder check together, because both are asking them the same question.
+//! Two variables widen this, and they are the only two.
+//! `KICKOFF_CHANNEL_SUMMARIZER_LOCAL_MODELS` replaces the list of responder names that count as
+//! local — for the operator whose own gateway answers to a name this crate has never heard of.
+//! `KICKOFF_CHANNEL_SUMMARIZER_ALLOW_REMOTE=1` is the operator saying, in one exact word, that
+//! their pane text may leave this machine; it lifts the address check and the responder check
+//! together, because both are asking them the same question.
+//!
+//! Every `KICKOFF_CHANNEL_SUMMARIZER_*` here is also read under its former
+//! `HERDR_TG_SUMMARIZER_*` spelling, so a box configured before the rename keeps working
+//! untouched; `compat` refuses the one case it must not guess at, which is both spellings set to
+//! different values.
 //!
 //! Refusing costs a summary. Guessing costs the operator's screen. So every one of these fails
 //! closed, and a push always goes out either way.
@@ -84,18 +90,15 @@ use std::time::Duration;
 /// The gateway on this machine, which is where this points unless the operator moves it.
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8090/v1/chat/completions";
 
-/// Where the operator says, in one exact word, that their terminal may leave this machine.
-const ALLOW_REMOTE_ENV: &str = "HERDR_TG_SUMMARIZER_ALLOW_REMOTE";
-
 /// Where the operator names the responders their own gateway answers to.
-const LOCAL_MODELS_ENV: &str = "HERDR_TG_SUMMARIZER_LOCAL_MODELS";
+const LOCAL_MODELS_ENV: &str = "KICKOFF_CHANNEL_SUMMARIZER_LOCAL_MODELS";
 
 /// The responder names this bridge treats as local without being told to.
 ///
 /// These are seeds measured on the machine this was built on, not a claim about the world. The
 /// check is the mechanism and this list is only data: when a gateway answers to some other name,
 /// the warning in the journal prints that name exactly as it came back, and the operator puts it in
-/// `HERDR_TG_SUMMARIZER_LOCAL_MODELS`. `bash scripts/eval-gist.sh` prints the same name as
+/// [`LOCAL_MODELS_ENV`]. `bash scripts/eval-gist.sh` prints the same name as
 /// "served by …", which is the way to find it out without waiting for the warning.
 ///
 /// `qwen2.5-coder-1.5b-q4` is measured rather than guessed: the model server behind the gateway on
@@ -408,63 +411,96 @@ impl Summarizer {
     /// The three startup gates, kept apart from [`Summarizer::from_env`] so the refusal sentence is
     /// a value that can be read back and tested rather than only a line in a log.
     fn configure() -> Setup {
-        let Ok(key) = std::env::var("HERDR_TG_SUMMARIZER_KEY") else {
-            return Setup::Off;
+        // Every one of these is read under both spellings of the product's name; see `compat`.
+        // `named` is what the operator actually typed, and it is what the refusals below quote —
+        // the gate is the one place a mis-set variable is caught, so the sentence has to name a
+        // variable they can go and find.
+        let read = |suffix: &str| crate::compat::setting(suffix);
+        let named = |suffix: &str, fallback: &str| -> String {
+            read(suffix)
+                .ok()
+                .flatten()
+                .map(|found| found.name)
+                .unwrap_or_else(|| format!("{}{fallback}", crate::compat::CANONICAL_PREFIX))
+        };
+
+        // A conflict between the two spellings is refused rather than guessed at, and it is
+        // refused HERE so the operator reads one sentence on his phone instead of the gate
+        // silently switching off.
+        let key = match read("SUMMARIZER_KEY") {
+            Err(why) => return Setup::Refused(why.to_string()),
+            Ok(None) => return Setup::Off,
+            Ok(Some(found)) => found.value,
         };
         if key.trim().is_empty() {
             return Setup::Off;
         }
 
+        let allow_remote_env = named("SUMMARIZER_ALLOW_REMOTE", "SUMMARIZER_ALLOW_REMOTE");
+        let local_models_env = named("SUMMARIZER_LOCAL_MODELS", "SUMMARIZER_LOCAL_MODELS");
+
         // One exact spelling. `true`, `yes` and `on` are deliberately NOT this: a near miss has to
         // fail closed, and one literal is greppable across a whole machine's environment.
-        let allow_remote = std::env::var(ALLOW_REMOTE_ENV)
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
+        let allow_remote = match read("SUMMARIZER_ALLOW_REMOTE") {
+            Err(why) => return Setup::Refused(why.to_string()),
+            Ok(found) => found.is_some_and(|found| found.value.trim() == "1"),
+        };
 
-        let endpoint =
-            std::env::var("HERDR_TG_SUMMARIZER_URL").unwrap_or_else(|_| DEFAULT_ENDPOINT.into());
+        let (endpoint, endpoint_env) = match read("SUMMARIZER_URL") {
+            Err(why) => return Setup::Refused(why.to_string()),
+            Ok(Some(found)) => (found.value, found.name),
+            Ok(None) => (
+                DEFAULT_ENDPOINT.to_string(),
+                format!("{}SUMMARIZER_URL", crate::compat::CANONICAL_PREFIX),
+            ),
+        };
         if !allow_remote && !is_local_endpoint(&endpoint) {
             return Setup::Refused(format!(
-                "HERDR_TG_SUMMARIZER_URL={} is not on this machine, and what gets sent \
+                "{endpoint_env}={} is not on this machine, and what gets sent \
                  there is a piece of the operator's screen. No summaries will be added. Point it \
-                 at 127.0.0.1 or localhost, or set {ALLOW_REMOTE_ENV}=1 if sending screen text off \
+                 at 127.0.0.1 or localhost, or set {allow_remote_env}=1 if sending screen text off \
                  this machine is what you meant.",
                 without_userinfo(&endpoint)
             ));
         }
 
-        let local_models: BTreeSet<String> = match std::env::var(LOCAL_MODELS_ENV) {
-            Ok(raw) if !raw.trim().is_empty() => raw
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect(),
-            // Replaces the seeds rather than adding to them, so there is exactly one place to read
-            // the list that is actually in force — and so the operator can narrow it as well.
-            _ => DEFAULT_LOCAL_MODELS.iter().map(|s| s.to_string()).collect(),
-        };
+        let local_models: BTreeSet<String> =
+            match read("SUMMARIZER_LOCAL_MODELS").map(|found| found.map(|found| found.value)) {
+                Err(why) => return Setup::Refused(why.to_string()),
+                Ok(Some(raw)) if !raw.trim().is_empty() => raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                // Replaces the seeds rather than adding to them, so there is exactly one place to read
+                // the list that is actually in force — and so the operator can narrow it as well.
+                _ => DEFAULT_LOCAL_MODELS.iter().map(|s| s.to_string()).collect(),
+            };
         if local_models.iter().any(|name| name.contains('*')) {
             return Setup::Refused(format!(
-                "{LOCAL_MODELS_ENV} is a list of exact names, not a pattern. A `*` matches nothing \
-                 here and would read as permission it does not grant. Set {ALLOW_REMOTE_ENV}=1 if \
+                "{local_models_env} is a list of exact names, not a pattern. A `*` matches nothing \
+                 here and would read as permission it does not grant. Set {allow_remote_env}=1 if \
                  you mean to accept whoever answers."
             ));
         }
 
-        let model = std::env::var("HERDR_TG_SUMMARIZER_MODEL")
-            .ok()
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
+        let model_env = named("SUMMARIZER_MODEL", "SUMMARIZER_MODEL");
+        let model = match read("SUMMARIZER_MODEL") {
+            Err(why) => return Setup::Refused(why.to_string()),
+            Ok(found) => found
+                .map(|found| found.value.trim().to_string())
+                .filter(|m| !m.is_empty()),
+        };
         if let Some(pinned) = &model {
             let listed = local_models.iter().any(|l| l.eq_ignore_ascii_case(pinned));
             if !allow_remote && !listed {
                 return Setup::Refused(format!(
-                    "HERDR_TG_SUMMARIZER_MODEL={pinned} names something that is not in \
-                     {LOCAL_MODELS_ENV}, which lists {}. Naming one skips the gateway's own \
+                    "{model_env}={pinned} names something that is not in \
+                     {local_models_env}, which lists {}. Naming one skips the gateway's own \
                      routing entirely, which is exactly how pieces of the operator's screen \
                      reached a hosted provider before. Unset it, add {pinned} to \
-                     {LOCAL_MODELS_ENV} if it runs on this machine, or set {ALLOW_REMOTE_ENV}=1.",
+                     {local_models_env} if it runs on this machine, or set {allow_remote_env}=1.",
                     as_prose(&local_models)
                 ));
             }
@@ -478,36 +514,41 @@ impl Summarizer {
         let key = key.trim().to_string();
         if reqwest::header::HeaderValue::try_from(format!("Bearer {key}")).is_err() {
             // The value is the gateway credential, so the sentence names the variable and stops.
-            return Setup::Refused(
-                "HERDR_TG_SUMMARIZER_KEY cannot be sent as an HTTP header, so every request to the \
+            let key_env = named("SUMMARIZER_KEY", "SUMMARIZER_KEY");
+            return Setup::Refused(format!(
+                "{key_env} cannot be sent as an HTTP header, so every request to the \
                  gateway would fail and no summaries would be added at all. It holds a character no \
                  header value may carry, most likely a line break picked up when it was pasted. The \
                  value is not printed here. Set it again on one line."
-                    .to_string(),
-            );
+            ));
         }
 
-        let task_class = std::env::var("HERDR_TG_SUMMARIZER_CLASS")
-            .ok()
-            .filter(|c| !c.trim().is_empty())
-            .or_else(|| Some("autocomplete".into()));
+        let class_env = named("SUMMARIZER_CLASS", "SUMMARIZER_CLASS");
+        let task_class = match read("SUMMARIZER_CLASS") {
+            Err(why) => return Setup::Refused(why.to_string()),
+            Ok(found) => found
+                .map(|found| found.value)
+                .filter(|c| !c.trim().is_empty())
+                .or_else(|| Some("autocomplete".into())),
+        };
         if let Some(class) = &task_class {
             if reqwest::header::HeaderValue::from_str(class).is_err() {
-                return Setup::Refused(
-                    "HERDR_TG_SUMMARIZER_CLASS cannot be sent as an HTTP header, so every request \
+                return Setup::Refused(format!(
+                    "{class_env} cannot be sent as an HTTP header, so every request \
                      to the gateway would fail and no summaries would be added at all. It holds a \
                      character no header value may carry, such as a line break. Set it to a plain \
                      word like autocomplete, or unset it."
-                        .to_string(),
-                );
+                ));
             }
         }
 
-        let timeout = std::env::var("HERDR_TG_SUMMARIZER_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(4000));
+        let timeout = match read("SUMMARIZER_TIMEOUT_MS") {
+            Err(why) => return Setup::Refused(why.to_string()),
+            Ok(found) => found
+                .and_then(|found| found.value.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or_else(|| Duration::from_millis(4000)),
+        };
 
         Setup::On(Self {
             endpoint,
@@ -983,18 +1024,29 @@ mod tests {
         let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Start from nothing set. A test that only sets what it cares about would otherwise
         // inherit whatever the previous one left behind, and read as passing for the wrong reason.
-        for var in [
-            "HERDR_TG_SUMMARIZER_KEY",
-            "HERDR_TG_SUMMARIZER_URL",
-            "HERDR_TG_SUMMARIZER_MODEL",
-            "HERDR_TG_SUMMARIZER_CLASS",
-            "HERDR_TG_SUMMARIZER_TIMEOUT_MS",
-            ALLOW_REMOTE_ENV,
-            LOCAL_MODELS_ENV,
+        //
+        // BOTH spellings, because `compat` reads both. Clearing only the old one would let a
+        // `KICKOFF_CHANNEL_SUMMARIZER_*` left in the ambient environment decide a test's outcome
+        // — and worse, a test that sets the old name while the new one is also present would hit
+        // compat's conflict refusal and fail for a reason that has nothing to do with what it is
+        // testing.
+        for suffix in [
+            "SUMMARIZER_KEY",
+            "SUMMARIZER_URL",
+            "SUMMARIZER_MODEL",
+            "SUMMARIZER_CLASS",
+            "SUMMARIZER_TIMEOUT_MS",
+            "SUMMARIZER_ALLOW_REMOTE",
+            "SUMMARIZER_LOCAL_MODELS",
         ] {
-            // SAFETY: every reader of these variables is `from_env`, and ENV_LOCK serialises the
-            // tests that touch them.
-            unsafe { std::env::remove_var(var) };
+            for prefix in [
+                crate::compat::CANONICAL_PREFIX,
+                crate::compat::LEGACY_PREFIX,
+            ] {
+                // SAFETY: every reader of these variables is `from_env`, and ENV_LOCK serialises
+                // the tests that touch them.
+                unsafe { std::env::remove_var(format!("{prefix}{suffix}")) };
+            }
         }
         guard
     }
@@ -1437,6 +1489,51 @@ mod tests {
         assert!(sent[0].contains("Overwrite config.yaml"));
     }
 
+    /// The summariser answers to the product's current name, and still to its former one.
+    ///
+    /// The rename shipped with `compat` wired into four of the hub's own settings and none of the
+    /// summariser's, so every `KICKOFF_CHANNEL_SUMMARIZER_*` a fresh adopter set was read by
+    /// nobody — and the failure was silence, because an unset key is indistinguishable from a
+    /// summariser deliberately left off. This is the test that would have caught that.
+    #[test]
+    fn the_summariser_answers_to_both_spellings_of_the_product_name() {
+        let _env = env_guard();
+
+        // The name a fresh adopter has never had to learn the old form of.
+        // SAFETY: `_env` holds ENV_LOCK; outside the tests these are read only by from_env.
+        unsafe {
+            std::env::set_var("KICKOFF_CHANNEL_SUMMARIZER_KEY", "k");
+            std::env::set_var("KICKOFF_CHANNEL_SUMMARIZER_URL", "http://127.0.0.1:1/v1");
+        }
+        assert!(
+            matches!(Summarizer::configure(), Setup::On(_)),
+            "the current name of the product must be enough to switch the summariser on"
+        );
+
+        // And the box that was configured before the rename, untouched.
+        unsafe {
+            std::env::remove_var("KICKOFF_CHANNEL_SUMMARIZER_KEY");
+            std::env::remove_var("KICKOFF_CHANNEL_SUMMARIZER_URL");
+            std::env::set_var("HERDR_TG_SUMMARIZER_KEY", "k");
+            std::env::set_var("HERDR_TG_SUMMARIZER_URL", "http://127.0.0.1:1/v1");
+        }
+        assert!(
+            matches!(Summarizer::configure(), Setup::On(_)),
+            "an install that predates the rename must keep working with nothing changed"
+        );
+
+        // Both set, and disagreeing, is the one case that must not be guessed at: one of these is
+        // the endpoint the operator inspected and the other is the one that would have been used.
+        unsafe {
+            std::env::set_var("KICKOFF_CHANNEL_SUMMARIZER_URL", "http://127.0.0.1:2/v1");
+        }
+        let Setup::Refused(why) = Summarizer::configure() else {
+            panic!("two different values under two spellings of one setting must be refused");
+        };
+        assert!(why.contains("KICKOFF_CHANNEL_SUMMARIZER_URL"), "{why}");
+        assert!(why.contains("HERDR_TG_SUMMARIZER_URL"), "{why}");
+    }
+
     /// The one destination that is not on this machine, in the exact shape the journal caught.
     #[test]
     fn an_endpoint_off_this_machine_is_refused_and_the_message_says_how_to_mean_it() {
@@ -1464,7 +1561,10 @@ mod tests {
             why.contains("HERDR_TG_SUMMARIZER_URL"),
             "which variable? {why}"
         );
-        assert!(why.contains(ALLOW_REMOTE_ENV), "and how to mean it? {why}");
+        assert!(
+            why.contains("SUMMARIZER_ALLOW_REMOTE"),
+            "and how to mean it? {why}"
+        );
     }
 
     /// Sending pane text off this machine is possible, but it takes one exact word. Anything that
@@ -1548,7 +1648,10 @@ mod tests {
             why.contains("HERDR_TG_SUMMARIZER_MODEL"),
             "which variable? {why}"
         );
-        assert!(why.contains(LOCAL_MODELS_ENV), "and where to add it? {why}");
+        assert!(
+            why.contains("SUMMARIZER_LOCAL_MODELS"),
+            "and where to add it? {why}"
+        );
 
         unsafe { std::env::set_var("HERDR_TG_SUMMARIZER_MODEL", "local-coder") };
         assert_eq!(

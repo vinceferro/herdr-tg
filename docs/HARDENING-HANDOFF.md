@@ -333,8 +333,8 @@ All run on this box on 8 September with
 | gate | result |
 | --- | --- |
 | `cargo test --workspace` | **695 passed, 0 failed, 12 ignored**, across 21 targets |
-| `cargo test -p herdr-tg the_real_plugin -- --ignored` | **10 passed, 0 failed** |
-| `cargo test -p herdr-tg a_bridge_from_before_this_change -- --ignored` | **1 passed** (18.1 s) |
+| `cargo test -p kickoff-channel the_real_plugin -- --ignored` | **10 passed, 0 failed** |
+| `cargo test -p kickoff-channel a_bridge_from_before_this_change -- --ignored` | **1 passed** (18.1 s) |
 | `bun run test` in `adapters/kickoff-hub-attach/` | **321 checks, exit 0** — 54 + 36 + 143 + 63 + 25 across the five suites |
 | `bun test-against-a-fake-hub.ts` in `plugins/kickoff-channel/` | **161 checks**, "all checks passed" |
 | `bash scripts/watchdog-selftest.sh` | **pass=80 fail=0** |

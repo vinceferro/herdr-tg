@@ -91,7 +91,7 @@ of the hub and the adapter, which installing a bridge can neither break nor fix,
 install on it told the operator his plugin was unsafe when his plugin was fine:
 
 ```
-cargo test -p herdr-tg the_real_plugin -- --ignored
+cargo test -p kickoff-channel the_real_plugin -- --ignored
 ```
 
 **If you touch `plugins/kickoff-channel/`, bump its version in the same commit** — in

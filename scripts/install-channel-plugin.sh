@@ -286,7 +286,7 @@ run "the bridge's own test" bash -c 'cd "$1" && bun test-against-a-fake-hub.ts' 
 say
 say "Proving the real bridge against the real hub…"
 if ! ( cd "$REPO" && env -u RUSTUP_TOOLCHAIN TMPDIR="$PROOF_TMPDIR" PATH="$HOME/.cargo/bin:$PATH" \
-         cargo test -q -p herdr-tg the_real_plugin -- --ignored > "$WORK/wire.log" 2>&1 ); then
+         cargo test -q -p kickoff-channel the_real_plugin -- --ignored > "$WORK/wire.log" 2>&1 ); then
   say
   say "It said:"
   show "$WORK/wire.log"
@@ -303,7 +303,7 @@ show "$WORK/wire.log"
 say
 say "Proving a bridge from before this change still works against this hub…"
 if ! ( cd "$REPO" && env -u RUSTUP_TOOLCHAIN TMPDIR="$PROOF_TMPDIR" PATH="$HOME/.cargo/bin:$PATH" \
-         cargo test -q -p herdr-tg -- --ignored --exact \
+         cargo test -q -p kickoff-channel -- --ignored --exact \
          hub::tests::a_bridge_from_before_this_change_still_works_against_the_new_hub \
          > "$WORK/older.log" 2>&1 ); then
   say

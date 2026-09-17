@@ -1721,7 +1721,7 @@ file and the `crates/hub-proto` docs and nothing else.
    not a suite: it covers the good-day path and none of §8. Our own suites are
    `bun test-against-a-fake-hub.ts` and, under `adapters/kickoff-hub-attach/`, `bun
    test-two-producers.ts`, `bun test-what-breaks-it.ts`, `bun test-against-fakes.ts`,
-   `bun test-check.ts`, `bun test-run.ts`, plus `cargo test -p herdr-tg the_real_plugin -- --ignored`
+   `bun test-check.ts`, `bun test-run.ts`, plus `cargo test -p kickoff-channel the_real_plugin -- --ignored`
    — the last is the real tool server against the real hub with only Telegram faked. A third-party
    adapter has no equivalent, and a fake written from your own reading of this document proves only
    that you agree with yourself.
@@ -2432,7 +2432,7 @@ the four things a wall has to know about that engine — which the unit does not
 ### 13.7 The tests
 
 **Survive unchanged, not a line.** `plugins/kickoff-channel/test-against-a-fake-hub.ts` and
-`cargo test -p herdr-tg the_real_plugin -- --ignored` — the Claude path, which this section does
+`cargo test -p kickoff-channel the_real_plugin -- --ignored` — the Claude path, which this section does
 not touch, and the proof that the two shared files it does touch (below) changed nothing that path
 uses. Everything under `crates/`. And `docs/examples/attach-from-the-document.ts`, the stranger,
 which is run twice: once as a producer at attach's door, where it is heard beside the tool server

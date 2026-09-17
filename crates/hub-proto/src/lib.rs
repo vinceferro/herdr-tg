@@ -1,4 +1,4 @@
-//! The frames and the framing spoken between the herdr-tg hub and a project's bridge.
+//! The frames and the framing spoken between the Kickoff Channel hub and a project's bridge.
 //!
 //! One bot holds the only Telegram connection and listens on one Unix socket. Each project runs a
 //! small bridge that talks to that socket instead of talking to Telegram. This crate is the

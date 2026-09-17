@@ -555,30 +555,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "herdr-tg"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures-core",
- "getrandom 0.4.3",
- "herdr-client",
- "hub-proto",
- "reqwest",
- "ring",
- "rustix",
- "serde",
- "serde_json",
- "subtle",
- "teloxide",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -902,6 +878,30 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kickoff-channel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-core",
+ "getrandom 0.4.3",
+ "herdr-client",
+ "hub-proto",
+ "reqwest",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "subtle",
+ "teloxide",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

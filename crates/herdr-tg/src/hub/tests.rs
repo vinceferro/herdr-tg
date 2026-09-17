@@ -2793,7 +2793,7 @@ async fn a_full_legal_backlog_said_before_the_pong_is_held_whole_and_delivered()
 /// Ignored by default: it needs bun and a `bun install`, which the Rust suite has no business
 /// requiring. Run it deliberately:
 ///
-///     cargo test -p herdr-tg the_real_plugin -- --ignored --nocapture
+///     cargo test -p kickoff-channel the_real_plugin -- --ignored --nocapture
 #[tokio::test]
 #[ignore = "needs bun and the plugin's dependencies; run it deliberately"]
 async fn the_real_plugin_and_the_real_hub_agree_on_the_wire() {

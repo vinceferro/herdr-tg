@@ -1,4 +1,4 @@
-//! `herdr-tg` — slice 1: a read-only CLI over the herdr session daemon.
+//! Kickoff Channel — the Telegram front door for Kickoff, plus a read-only CLI over herdr.
 //!
 //! # What this binary may and may not do
 //!
@@ -36,6 +36,7 @@
 
 mod bot;
 mod cmd;
+mod compat;
 mod config;
 mod conversations;
 mod heartbeat;
@@ -60,7 +61,7 @@ use herdr_client::{HerdrClient, HerdrError};
 
 /// Steer a herd of coding agents from the socket herdr already speaks.
 #[derive(Debug, Parser)]
-#[command(name = "herdr-tg", version, about, long_about = None)]
+#[command(name = "kickoff-channel", version, about, long_about = None)]
 struct Cli {
     /// Socket to dial. Overrides `$HERDR_SOCKET_PATH` and the `~/.config/herdr/herdr.sock`
     /// fallback.
@@ -316,7 +317,8 @@ enum Cmd {
     },
 }
 
-fn main() -> ExitCode {
+/// Run the command-line surface shared by the canonical binary and its legacy alias.
+pub fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing();
 
@@ -326,7 +328,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(err) => {
-            eprintln!("herdr-tg: could not start the async runtime: {err}");
+            eprintln!("kickoff-channel: could not start the async runtime: {err}");
             return ExitCode::from(1);
         }
     };
@@ -343,7 +345,7 @@ fn main() -> ExitCode {
             ExitCode::from(exit_code(&err) as u8)
         }
         (Ok(()), Err(err)) => {
-            eprintln!("herdr-tg: could not flush stdout: {err}");
+            eprintln!("kickoff-channel: could not flush stdout: {err}");
             ExitCode::from(1)
         }
         (Ok(()), Ok(())) => ExitCode::SUCCESS,
@@ -449,7 +451,7 @@ fn exit_code(err: &anyhow::Error) -> i32 {
 /// would print the cause twice — and gate 6 greps this line for `herdr unreachable`. The full
 /// chain goes to the debug log for anyone who has turned `RUST_LOG` up.
 fn report(err: &anyhow::Error) {
-    eprintln!("herdr-tg: {err}");
+    eprintln!("kickoff-channel: {err}");
     for cause in err.chain().skip(1) {
         tracing::debug!(cause = %cause, "caused by");
     }

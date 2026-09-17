@@ -1,9 +1,22 @@
 [package]
-name = "herdr-tg"
+name = "kickoff-channel"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+# Two commands, both discovered from `src/bin/`: `kickoff-channel` is the product, and `herdr-tg` is
+# compatibility for the units, scripts and humans that still invoke the former name. Both enter the
+# same `lib.rs`, so the alias cannot become a second product surface.
+#
+# Discovered rather than declared, deliberately. `nothing_inbound_can_start_a_process` refuses an
+# explicit binary-target section anywhere in a member manifest, because a declared `path` can point
+# a shipped program at a directory its scan never opens. Naming these two here would have bought
+# nothing — they sit in `src/bin/`, which that scan already walks — at the cost of standing a
+# security guard down. The file stem is the command name, so the names live beside the code.
+#
+# That guard matches the section name as plain text, so it fires on a mention as readily as on a
+# declaration: this comment cannot spell the section it is describing.
+default-run = "kickoff-channel"
 
 [dependencies]
 herdr-client = { path = "../herdr-client" }

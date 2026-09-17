@@ -80,12 +80,14 @@ fn the_pane_flag_is_gone_rather_than_merely_off() {
 fn the_modules_that_could_type_are_not_declared_again() {
     // A file restored on disk is caught by `no_live_write_call_site.rs` the moment it names a write
     // method. A module DECLARED but empty would not be, and would be the first step back.
-    let main = std::fs::read_to_string(repo().join("crates/herdr-tg/src/main.rs"))
-        .expect("main.rs is readable");
+    // The crate root is `lib.rs` since the rename gave the crate two binaries; it is where a `mod`
+    // declaration has to land to bring one of these back.
+    let root = std::fs::read_to_string(repo().join("crates/herdr-tg/src/lib.rs"))
+        .expect("lib.rs is readable");
     for gone in ["mod deliver;", "mod permission;", "mod mirror;"] {
         assert!(
-            !main.contains(gone),
-            "main.rs declares `{gone}` again. Those modules read rendered terminals and sent \
+            !root.contains(gone),
+            "lib.rs declares `{gone}` again. Those modules read rendered terminals and sent \
              keystrokes; they were deleted because five review rounds could not make that safe."
         );
     }

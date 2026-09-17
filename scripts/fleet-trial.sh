@@ -15,9 +15,15 @@
 #
 # It is a wrapper and deliberately a thin one. The trial itself is one `#[ignore]`d test inside the
 # hub's own test module, because that is the ONLY place a hub with a faked Telegram surface can be
-# built at all — `herdr-tg` ships no library, and `serve` hard-constructs the real Telegram surface.
-# A `serve --fake-telegram` would put a fake Telegram in the shipped binary, so there is not one and
-# there will not be one. What this script adds over `cargo test` is the environment (the variables
+# built at all — the hub is not constructible from outside its own module, and `serve`
+# hard-constructs the real Telegram surface. A `serve --fake-telegram` would put a fake Telegram in
+# the shipped binary, so there is not one and there will not be one.
+#
+# The trial runs against `--lib`, not `--bins`. It used to be the other way: the crate was a single
+# `main.rs` and its test module compiled into the binary target. Renaming the product to
+# `kickoff-channel` moved the implementation into `lib.rs` so two commands could enter it, which
+# moved every unit test with it — and `--bins` then matched nothing. What this script adds over
+# `cargo test` is the environment (the variables
 # an agent session gets wrong), a run of its own to work in, and the refusals below.
 #
 # HERMETIC, and it proves it rather than promising it:
@@ -93,7 +99,7 @@ SAID="$WORK/what-it-said"
 set +e
 ( cd "$REPO" && env -u RUSTUP_TOOLCHAIN TMPDIR="$WORK" XDG_STATE_HOME="$AMBIENT" \
     PATH="$HOME/.cargo/bin:$PATH" \
-    cargo test -q -p herdr-tg --bins -- --ignored --nocapture --exact "$THE_TRIAL" ) 2>&1 | tee "$SAID"
+    cargo test -q -p kickoff-channel --lib -- --ignored --nocapture --exact "$THE_TRIAL" ) 2>&1 | tee "$SAID"
 RC=${PIPESTATUS[0]}
 set -e
 
