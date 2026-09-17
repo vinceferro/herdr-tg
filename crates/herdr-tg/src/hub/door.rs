@@ -582,7 +582,8 @@ mod tests {
                 .append(true)
                 .open(dir.path().join(RING))
                 .expect("the ring");
-            f.write_all(br#"{"seq":3,"ts":1"#).expect("half a line, torn");
+            f.write_all(br#"{"seq":3,"ts":1"#)
+                .expect("half a line, torn");
         }
 
         // A restart. The torn tail was never an event — nobody read it, nothing answered for it —
@@ -595,7 +596,10 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).expect("every line of the healed ring is one event"))
             .collect();
-        let seqs: Vec<u64> = lines.iter().map(|l| l["seq"].as_u64().expect("a seq")).collect();
+        let seqs: Vec<u64> = lines
+            .iter()
+            .map(|l| l["seq"].as_u64().expect("a seq"))
+            .collect();
         assert_eq!(
             seqs,
             vec![1, 2, 3],
@@ -610,10 +614,7 @@ mod tests {
             3,
             "the fragment of the write that never finished is still in the ring:\n{raw}"
         );
-        assert!(
-            raw.ends_with('\n'),
-            "the healed ring ends mid-line:\n{raw}"
-        );
+        assert!(raw.ends_with('\n'), "the healed ring ends mid-line:\n{raw}");
     }
 
     #[test]
