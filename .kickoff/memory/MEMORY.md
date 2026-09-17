@@ -18,3 +18,4 @@
 - [A sleep per caller is not a queue](a-sleep-per-caller-is-not-a-queue.md) — N sleepers wake together; one wins and the rest fall through to the failure branch.
 - [An edit script that aborts writes nothing](an-edit-script-that-aborts-writes-nothing.md) — the earlier replacements are lost too, and the commit message still claims them.
 - [A max over a pool drifts as the pool grows](a-max-over-a-pool-drifts-as-the-pool-grows.md) — the retrieval cutoff loosens with corpus size and K; scoping fixes it, a big shared core does not.
+- [Telegram is a connector, and kickoff work will drive it](telegram-is-a-connector-kickoff-will-drive-it.md) — the 17 Sept ruling: the PWA is the work surface, the hub stays, the Telegram connector is later kickoff work.
