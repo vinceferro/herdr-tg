@@ -2,10 +2,11 @@
 //!
 //! The PWA is the operator's work surface now, and this hub is the conversation plane. The ring
 //! is the seam between them: the hub appends what he would have seen — an agent's `say`, its
-//! `ask`, its `done`, an `ask` stopping being open, and the hub's own retirement of a question a
-//! dead session left open — and a later increment serves those lines to the PWA over HTTP.
-//! Nothing consumes the ring yet; the hub writes it regardless, because the events it misses
-//! before a reader exists are the events no reader will ever see.
+//! `ask`, its `done`, an `ask` stopping being open, the hub's own retirement of a question a
+//! dead session left open, and HIS OWN words and taps on their way down to an agent — and a
+//! later increment serves those lines to the PWA over HTTP. Nothing consumes the ring yet; the
+//! hub writes it regardless, because the events it misses before a reader exists are the events
+//! no reader will ever see.
 //!
 //! # The egress law, which is the whole design
 //!
@@ -37,7 +38,7 @@
 //! settlement the write guard received: the shapes nobody produces are not worth the mangle that
 //! chasing them would put on ordinary words.
 //!
-//! # As spoken, not as delivered
+//! # As spoken, not as delivered — and the down half's one exception
 //!
 //! A line is stamped where the hub first handles the frame — before the gist rewrites a question
 //! and before the pacer decides a wait — and it carries no delivery field, no seen, no shed.
@@ -47,6 +48,13 @@
 //! exception that proves the shape: a retirement the hub itself performed
 //! ([`Ring::resolved_by_the_hub`]) is stamped where the edit was observed to land, because that
 //! edit is the event.
+//!
+//! The DOWN half ([`Ring::the_operator_said`], [`Ring::the_operator_chose`]) is stamped only
+//! where the frame was actually handed to a live connection, for the reason the up half's rule
+//! exists mirrored: the PWA's echo of his own words is a receipt, and a receipt for words that
+//! reached nobody is the one thing it must never say. A refusal is the door's result file's
+//! fact (or the phone's line), not the ring's — the ring records what happened, not what did
+//! not.
 //!
 //! # A ring failure is never an agent's failure
 //!
@@ -73,7 +81,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use hub_proto::{AskId, BridgeFrame, LaneId, ProjectId};
+use hub_proto::{AskId, BridgeFrame, LaneId, OptionId, ProjectId};
 
 use super::now_secs;
 
@@ -93,10 +101,14 @@ pub const ROTATE_AT: u64 = 1024 * 1024;
 /// What an absolute or home-relative path becomes in a recorded line.
 const A_PATH: &str = "[a path]";
 
-/// Which way the event was travelling when the hub saw it. Up is an agent's own words; the
-/// operator's echoes (down) are a later increment, and the field is here from the start so a
-/// reader never has to learn a second envelope shape.
+/// Which way the event was travelling when the hub saw it. Up is an agent's own words; down is
+/// the operator's — his typed lines and his taps, from whichever surface he said them on, so a
+/// reader holding one file sees both halves of one conversation.
 const UP: &str = "up";
+
+/// The operator's half. See the module docs for why a down line exists only where the frame was
+/// delivered.
+const DOWN: &str = "down";
 
 /// The ring itself: a path pair, the next sequence number, and whether this run may write.
 ///
@@ -188,7 +200,7 @@ impl Ring {
         let Some(frame) = the_operator_visible(frame) else {
             return;
         };
-        self.stamp(conversation, lane, frame);
+        self.stamp(conversation, lane, frame, UP);
     }
 
     /// A question the HUB itself put away, in the wire's own vocabulary.
@@ -221,11 +233,72 @@ impl Ring {
             "how": how,
         });
         nothing_of_this_machine(&mut frame);
-        self.stamp(conversation, lane, frame);
+        self.stamp(conversation, lane, frame, UP);
     }
 
-    /// One built frame onto the ring, wearing the next number.
-    fn stamp(&self, conversation: &ProjectId, lane: Option<&LaneId>, frame: serde_json::Value) {
+    /// His own words, on their way down to an agent — the down half of the ring.
+    ///
+    /// Recorded at the shared delivery seam where the hub hands a `message` frame to a live
+    /// connection, from EITHER surface he typed on, because the PWA's one history must show his
+    /// half of the conversation or it is a transcript of a monologue. The frame is the wire's
+    /// own vocabulary with the phone's plumbing left OUT: `msg_id` is a Telegram message id and
+    /// `from` is a chat-and-person pair, and both are exactly the identifiers this file's law
+    /// forbids — the event is his words, not the phone's.
+    ///
+    /// Called only where the frame was DELIVERED, never on a refusal: an echo is a receipt, and
+    /// the ring must not tell him his words reached an agent when they did not.
+    pub fn the_operator_said(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        text: &str,
+        in_reply_to_ask: Option<&AskId>,
+    ) {
+        if !the_shape_the_registry_mints(conversation) {
+            return;
+        }
+        let mut frame = serde_json::json!({ "t": "message", "text": text });
+        if let Some(ask) = in_reply_to_ask {
+            frame["in_reply_to_ask"] = serde_json::json!(ask.as_str());
+        }
+        nothing_of_this_machine(&mut frame);
+        self.stamp(conversation, lane, frame, DOWN);
+    }
+
+    /// A tap of his, on its way down to the agent that asked — the down half of the ring.
+    ///
+    /// The twin of [`Ring::the_operator_said`], at the seam a `choice` frame crosses, from
+    /// either surface. The frame names the question and the answer he chose and nothing else:
+    /// the `msg_id` the wire frame carries is a Telegram message id, which this file does not
+    /// take. The button's LABEL is deliberately absent too — it is the bridge's own words, and
+    /// the reader that wants it has it on the `ask` line already.
+    pub fn the_operator_chose(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        option_id: &OptionId,
+    ) {
+        if !the_shape_the_registry_mints(conversation) {
+            return;
+        }
+        let mut frame = serde_json::json!({
+            "t": "choice",
+            "ask_id": ask_id.as_str(),
+            "option_id": option_id.as_str(),
+        });
+        nothing_of_this_machine(&mut frame);
+        self.stamp(conversation, lane, frame, DOWN);
+    }
+
+    /// The one built frame onto the ring, wearing the next number.
+    fn stamp(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        frame: serde_json::Value,
+        dir: &'static str,
+    ) {
         let mut where_ = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if where_.closed {
             return;
@@ -233,7 +306,7 @@ impl Ring {
         let line = Line {
             seq: where_.next_seq,
             ts: now_secs(),
-            dir: UP,
+            dir,
             conversation: conversation.as_str(),
             lane: lane.map_or("-", LaneId::as_str),
             frame: &frame,

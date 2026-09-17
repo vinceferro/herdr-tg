@@ -17393,3 +17393,710 @@ async fn a_ring_that_cannot_be_written_costs_no_delivery() {
         "the healthy hub's ring is not the two events:\n{raw}"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The answers drop — the inbound half of the door. A file lands in `<state>/answers/`, the
+// sweep reads it as one operator action, and it is consumed either way: carried to the
+// conversation it names, or refused with one plain-word sentence its result file carries. The
+// laws of the door itself are in `answers.rs`; these prove the acts.
+
+/// The drop, where a gateway will write his taps and his typed words.
+fn the_drop(h: &Harness) -> PathBuf {
+    h.dir.path().join(crate::hub::answers::ANSWERS)
+}
+
+/// One operator action into the drop, the way a gateway writes it: one JSON object, one file.
+fn drop_an_answer(h: &Harness, name: &str, body: serde_json::Value) -> PathBuf {
+    let path = the_drop(h).join(name);
+    std::fs::write(
+        &path,
+        serde_json::to_string(&body).expect("the answer as one object"),
+    )
+    .expect("the answer lands in the drop");
+    path
+}
+
+/// A tap as the door reads it, stamped when the test says.
+fn a_tap_at(conversation: &str, ask: &str, option: &str, ts: u64) -> serde_json::Value {
+    serde_json::json!({
+        "t": "choice", "conversation": conversation,
+        "ask_id": ask, "option_id": option, "ts": ts,
+    })
+}
+
+/// Typed words as the door reads them, stamped when the test says.
+fn words_at(
+    conversation: &str,
+    text: &str,
+    in_reply_to_ask: Option<&str>,
+    ts: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "t": "message", "conversation": conversation, "text": text,
+        "in_reply_to_ask": in_reply_to_ask, "ts": ts,
+    })
+}
+
+/// The result a consumed answer left behind, parsed.
+fn the_result_of(h: &Harness, name: &str) -> serde_json::Value {
+    let path = the_drop(h).join(format!("{name}.result"));
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{name}'s result is not there to read: {e}"));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name}'s result is not one object: {e}"))
+}
+
+/// A live bridge with one open question on the phone, so a test can answer it from either
+/// surface. Hands back the message the question landed on.
+async fn a_live_session_with_one_open_question(
+    h: &Harness,
+    instance: &str,
+    ask: &str,
+) -> (FakeBridge, MsgId) {
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, instance, h.project.as_str()).await;
+    bridge.become_live().await;
+    // The greeting first, so the question's own `until` counts from a floor that already holds
+    // it — `one_open_question` waits on a send COUNT, and a greeting that lands inside its
+    // window makes the count the question can never reach.
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(h, &mut bridge, ask).await;
+    (bridge, msg)
+}
+
+#[tokio::test]
+async fn a_tap_at_the_door_cannot_answer_what_the_phone_already_answered() {
+    let h = harness().await;
+    let (mut bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // The phone answers first: resolved, written down, delivered. The retirement of the keyboard
+    // is separate bookkeeping and is not what the door waits on.
+    let (who, ask, chosen) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the phone's tap resolves");
+    h.hub
+        .deliver_tap(&who, ALLOWED_CHAT, &msg, ask, chosen, "Yes")
+        .await
+        .expect("the phone's answer went down");
+    let _ = bridge.next_choice().await;
+
+    // The door tries the same question afterwards — through a different surface, but the
+    // question is the same one and it has been answered.
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "n", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "tap-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("already been answered"),
+        "the refusal does not name the thing that beat it to the question: {why}"
+    );
+    // And no second, contradicting answer reached the agent.
+    let seen = bridge.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "a question the phone had answered was answered again from the door: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_phone_cannot_answer_what_the_door_answered() {
+    let h = harness().await;
+    // The keyboard edit is refused, so the record of the door's answer SURVIVES with the answer
+    // written on it — which is the live-menu case the `closed` mark exists for, and the only
+    // honest way to watch a phone tap land after a door tap answered the same question.
+    *h.fake.retire_fails.lock().await = true;
+    let (_bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "the door's own answer was refused"
+    );
+
+    // The same question, from the phone, afterwards: one winner, and the loser is told which
+    // half of the truth it is holding.
+    let refused = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("n"))
+        .await
+        .expect_err("a question the door answered was answered again from the phone");
+    assert_eq!(
+        refused,
+        TapRefusal::AlreadyAnswered,
+        "the phone's refusal does not name the answer that beat it"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_naming_an_option_that_was_never_written_down_is_refused() {
+    let h = harness().await;
+    let (mut bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "perhaps", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "tap-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("not one of the ones written down"),
+        "the refusal does not say the option was never written down: {why}"
+    );
+    let seen = bridge.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "an answer that was never written down reached the agent: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_for_a_session_that_has_restarted_is_refused() {
+    let h = harness().await;
+    // The run that asked arrives behind a pid that is provably gone — spawned and reaped,
+    // because a made-up pid could belong to something real — so the address can be taken from
+    // it deterministically, without a successor's arrival and the retirement that arrival would
+    // sweep. Over the in-memory duplex because the kernel would vouch for this process over a
+    // real socket, and this test needs a peer it can prove is gone.
+    let mut corpse = std::process::Command::new("/bin/true")
+        .spawn()
+        .expect("spawn");
+    let dead_pid = corpse.id();
+    corpse.wait().expect("reap");
+    let who = ConnectionIdentity::this_user_behind_a_dead_process(dead_pid);
+    let mut bridge = FakeBridge::over(&h.hub, who, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let _msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    // A successor takes the address — the eviction path, not an arrival, so nothing sweeps the
+    // old run's open questions out from under the test.
+    let (tx, _still_holding_it) = mpsc::channel::<Envelope<HubFrame>>(4);
+    h.hub
+        .claim_declaring(h.own(), std::process::id(), "i2".into(), tx, None)
+        .await
+        .expect("the successor takes the address");
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "tap-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("restarted"),
+        "the refusal does not say the session that asked is gone: {why}"
+    );
+    let seen = bridge.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "an answer for a dead run was delivered into the turn that replaced it: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_left_behind_for_a_minute_is_refused_unread() {
+    let h = harness().await;
+    let (_bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // Written more than a minute ago — a gateway that was parked, replaying yesterday's queue at
+    // a question that is live now.
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(
+            h.project.as_str(),
+            "a1",
+            "y",
+            now_secs() - crate::hub::answers::STALE_AFTER - 1,
+        ),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "tap-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("more than a minute"),
+        "the refusal does not say how old the answer was: {why}"
+    );
+    // REFUSED UNREAD: the question never learned the file existed, so the phone can still answer
+    // it — a stale file must not burn the operator's only way to answer.
+    h.hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("a stale answer moved the question's own state");
+
+    // And the door itself is not what refused it: the same question, answered fresh, is taken —
+    // so the refusal above was the file's age and nothing else.
+    h.hub
+        .ledger
+        .lock()
+        .await
+        .mark_unanswered(ALLOWED_CHAT, &msg)
+        .expect("put the question back the way the stale answer found it");
+    drop_an_answer(
+        &h,
+        "tap-2",
+        a_tap_at(h.project.as_str(), "a1", "n", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-2")["status"],
+        "accepted",
+        "a fresh answer was refused, so the stale one above was refused for the wrong reason"
+    );
+}
+
+#[tokio::test]
+async fn a_message_typed_at_the_door_reaches_the_session_that_asked() {
+    let h = harness().await;
+    let (mut bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // A reply that names the question: the one time a message says which session it is for, and
+    // the field must survive to the agent exactly as it does for a reply typed at the phone.
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(
+            h.project.as_str(),
+            "take the left branch",
+            Some("a1"),
+            now_secs(),
+        ),
+    );
+    // And a plain line, naming nothing.
+    drop_an_answer(
+        &h,
+        "words-2",
+        words_at(
+            h.project.as_str(),
+            "and keep the notes short",
+            None,
+            now_secs(),
+        ),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "words-1")["status"],
+        "accepted",
+        "a message the live session asked for was refused"
+    );
+    assert_eq!(
+        the_result_of(&h, "words-2")["status"],
+        "accepted",
+        "a plain message was refused"
+    );
+
+    let (text, under) = bridge
+        .wait_for(|f| match f {
+            HubFrame::Message {
+                text,
+                in_reply_to_ask: Some(ask),
+                ..
+            } if ask.as_str() == "a1" => Some((text.clone(), ask.clone())),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        text, "take the left branch",
+        "his words did not reach the session verbatim"
+    );
+    assert_eq!(under.as_str(), "a1");
+    // The plain line named no question: `in_reply_to_ask` reaches the agent only when the reply
+    // is under one, exactly as the phone's replies do.
+    let plain = bridge
+        .wait_for(|f| match f {
+            HubFrame::Message {
+                text,
+                in_reply_to_ask,
+                ..
+            } if text == "and keep the notes short" => Some(in_reply_to_ask.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(
+        plain.is_none(),
+        "a message that named no question reached the agent as a reply to one"
+    );
+
+    // The question stays open for the tap: a reply is not an answer, on this surface any more
+    // than at the phone.
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "n", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "a reply under the question closed it"
+    );
+    let _ = bridge.next_choice().await;
+    // And the phone's own record of that question is what answered it — one winner, still.
+    assert!(
+        h.hub
+            .ledger
+            .lock()
+            .await
+            .get(ALLOWED_CHAT, &msg)
+            .is_none_or(|r| r.answered.is_some())
+    );
+}
+
+#[tokio::test]
+async fn a_message_typed_at_the_door_with_nobody_to_take_it_is_refused() {
+    let h = harness().await;
+    // A conversation with a question asked but nothing connected now — the phone's equivalent
+    // sentence says so rather than queueing the words, and so must the door's.
+    let (bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(h.project.as_str(), "are you still there", None, now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "words-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("Nothing is connected"),
+        "the refusal does not say the words reached nobody: {why}"
+    );
+    assert!(
+        why.contains("will not be delivered later"),
+        "the refusal leaves room for a delivery the hub will never make: {why}"
+    );
+}
+
+#[tokio::test]
+async fn the_ring_carries_the_operator_s_own_words_and_taps_from_either_surface() {
+    let h = harness().await;
+    let home = h.dir.path().display().to_string();
+    let (mut bridge, first) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    one_open_question(&h, &mut bridge, "a2").await;
+
+    // ── the phone's half: typed words, then a tap ───────────────────────────────────────────
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &MsgId::new("m-from-the-phone"),
+                &format!("from the phone — see {home}/notes/secret-plan.txt"),
+                None,
+            )
+            .await,
+        "the phone's own words did not go down"
+    );
+    let (who, ask, chosen) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &first, &OptionId::new("y"))
+        .await
+        .expect("the phone's tap resolves");
+    h.hub
+        .deliver_tap(&who, ALLOWED_CHAT, &first, ask, chosen, "Yes")
+        .await
+        .expect("the phone's answer went down");
+    let _ = bridge.next_choice().await;
+
+    // ── the door's half: typed words, then a tap ────────────────────────────────────────────
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(
+            h.project.as_str(),
+            "from the door — /etc/hosts is the one to check",
+            None,
+            now_secs(),
+        ),
+    );
+    // The keyboard edit for the door's tap is refused so the record survives with the answer on
+    // it; the ring line does not depend on that, but the question's second keyboard must not be
+    // forgotten before the door's answer to it is read back below.
+    *h.fake.retire_fails.lock().await = true;
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a2", "n", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "words-1")["status"],
+        "accepted",
+        "the door's words were refused"
+    );
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "the door's tap was refused"
+    );
+
+    // ── what the PWA would read: both halves of one conversation, one sequence ──────────────
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING))
+        .expect("the ring holds both halves");
+    let lines = ring_so_far(h.dir.path());
+    let seqs: Vec<u64> = lines
+        .iter()
+        .map(|l| l["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert_eq!(
+        seqs,
+        (1..=6).collect::<Vec<_>>(),
+        "the ring's sequence is not contiguous across both halves:\n{raw}"
+    );
+    let by_dir_t = |i: usize| {
+        (
+            lines[i]["dir"].as_str().expect("a direction"),
+            lines[i]["frame"]["t"].as_str().expect("a kind"),
+        )
+    };
+    // The phone's half is strictly ordered — its lines are written inside the very calls that
+    // carried it. The door's two files may be consumed in one sweep or two, so their order
+    // among themselves is whichever the sweep found them in; what is promised is that both
+    // surfaces' words and taps ARE here, attributed to the one conversation, one sequence
+    // through all of it.
+    assert_eq!(
+        (0..4).map(by_dir_t).collect::<Vec<_>>(),
+        vec![
+            ("up", "ask"),
+            ("up", "ask"),
+            ("down", "message"),
+            ("down", "choice"),
+        ],
+        "the phone's half of the conversation is not on the ring, in order:\n{raw}"
+    );
+    let mut the_door_s = (4..6).map(by_dir_t).collect::<Vec<_>>();
+    the_door_s.sort();
+    assert_eq!(
+        the_door_s,
+        vec![("down", "choice"), ("down", "message")],
+        "the door's half of the conversation is not on the ring:\n{raw}"
+    );
+    for line in &lines {
+        assert_eq!(line["conversation"], *h.project.as_str(), "{raw}");
+        assert_eq!(line["lane"], "-", "{raw}");
+    }
+    // The down frames carry no identifier of the surface they came from: no chat, no person, no
+    // Telegram message id — the event is what he said, not the phone's plumbing. And the two
+    // taps are the two questions, answered by whichever surface got there first.
+    let mut choices = Vec::new();
+    for line in lines.iter().filter(|l| l["dir"] == "down") {
+        let frame = &line["frame"];
+        assert!(
+            frame.get("msg_id").is_none() && frame.get("from").is_none(),
+            "a down frame carries a fact of the surface it left from:\n{raw}"
+        );
+        if frame["t"] == "choice" {
+            choices.push((
+                frame["ask_id"].as_str().expect("an ask"),
+                frame["option_id"].as_str().expect("an option"),
+            ));
+        }
+    }
+    assert_eq!(
+        choices,
+        vec![("a1", "y"), ("a2", "n")],
+        "the two questions were not answered once each, from whichever surface:\n{raw}"
+    );
+    let down_said: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["dir"] == "down" && l["frame"]["t"] == "message")
+        .map(|l| l["frame"]["text"].as_str().expect("the words"))
+        .collect();
+    assert_eq!(
+        down_said.len(),
+        2,
+        "not both surfaces' words on the ring:\n{raw}"
+    );
+    for said in down_said {
+        assert!(
+            said.contains("[a path]"),
+            "his own words reached the ring unscrubbed: {said}"
+        );
+        assert!(
+            !said.contains(&home) && !said.contains("/etc/hosts"),
+            "a path of this machine reached the ring in his own words: {said}"
+        );
+    }
+    // The whole file, one more time, against the egress law the up half already holds to.
+    for line in &lines {
+        let mut values = Vec::new();
+        every_value(line, &mut values);
+        for v in &values {
+            if let Some(n) = v.as_i64() {
+                assert!(
+                    ![-1001_i64, 7, 4242, 999_001, 1001, 1002].contains(&n),
+                    "a chat, topic or person id reached the ring as the number {n}:\n{raw}"
+                );
+            }
+            if let Some(s) = v.as_str() {
+                assert!(
+                    !s.contains(&home) && !s.contains("/tmp/") && !s.contains("~/"),
+                    "a path of this machine reached the ring: {s}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_that_cannot_write_a_result_still_consumes_the_answer() {
+    let h = harness().await;
+    let (mut bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // A directory standing where the result file must be: every write on it fails, the way a
+    // full disk or a misowned state directory would — and unlike those it fails for the whole
+    // test, which is exactly the case the property is about. Made BEFORE the answer lands, so
+    // the loop's own sweep cannot consume it first and dodge the blocked write.
+    let blocked = the_drop(&h).join("tap-1.result");
+    std::fs::create_dir(&blocked).expect("block the result");
+    let blocked_too = the_drop(&h).join("tap-2.result");
+    std::fs::create_dir(&blocked_too).expect("block the second result");
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    drop_an_answer(&h, "tap-2", serde_json::json!("not an answer at all"));
+    h.hub.sweep_the_answers().await;
+
+    // Consumed both ways — the act happened, and the malformed file is gone too. The drop never
+    // wedges on its own bookkeeping.
+    assert!(
+        !the_drop(&h).join("tap-1").exists(),
+        "an answer whose result could not be written was left in the drop, wedging it"
+    );
+    assert!(
+        !the_drop(&h).join("tap-2").exists(),
+        "a malformed answer whose result could not be written was left in the drop"
+    );
+    let _ = bridge.next_choice().await;
+    assert!(
+        blocked.is_dir() && blocked_too.is_dir(),
+        "the sweep wrote through the very things blocking it"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_one_the_door_can_believe_is_refused_and_consumed() {
+    let h = harness().await;
+    let (_bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // Every shape the door refuses on its own reading of the file: not JSON at all, no clock
+    // reading, a conversation this hub never minted, no kind, no words, and a file too big to
+    // be one answer. Each is consumed, each gets its own honest sentence.
+    let cases: [(&str, serde_json::Value, &str); 6] = [
+        (
+            "bad-json",
+            serde_json::json!("just a string"),
+            "could not be read",
+        ),
+        (
+            "no-ts",
+            serde_json::json!({"t": "choice", "conversation": h.project.as_str()}),
+            "when it was written",
+        ),
+        (
+            "no-such-conversation",
+            serde_json::json!({"t": "choice", "conversation": "p-not-this-one", "ts": now_secs()}),
+            "does not know",
+        ),
+        (
+            "no-kind",
+            serde_json::json!({"conversation": h.project.as_str(), "ts": now_secs()}),
+            "answer or a message",
+        ),
+        (
+            "no-words",
+            words_at(h.project.as_str(), "   ", None, now_secs()),
+            "no words",
+        ),
+        (
+            "too-big",
+            serde_json::json!({"t": "message", "conversation": h.project.as_str(), "text": "x".repeat(crate::hub::answers::AT_MOST as usize + 1), "ts": now_secs()}),
+            "too large",
+        ),
+    ];
+    for (name, body, _) in &cases {
+        drop_an_answer(&h, name, body.clone());
+    }
+    h.hub.sweep_the_answers().await;
+
+    for (name, _, why_it_says) in &cases {
+        let result = the_result_of(&h, name);
+        assert_eq!(result["status"], "refused", "{name}: {result:?}");
+        let why = result["why"].as_str().expect("a plain-word sentence");
+        assert!(
+            why.contains(why_it_says),
+            "{name}'s refusal does not say why: {why}"
+        );
+        assert!(
+            !the_drop(&h).join(name).exists(),
+            "{name} was left in the drop to be swept again for ever"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_a_plain_file_is_refused_and_consumed() {
+    let h = harness().await;
+    let (_bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // A link in the drop: the one shape that would carry the sweep somewhere outside the state
+    // home if the door believed it. It is unlinked, never followed.
+    let elsewhere = h.dir.path().join("elsewhere.json");
+    std::fs::write(
+        &elsewhere,
+        serde_json::to_string(&a_tap_at(h.project.as_str(), "a1", "y", now_secs()))
+            .expect("a perfectly good answer"),
+    )
+    .expect("write it outside the drop");
+    std::os::unix::fs::symlink(&elsewhere, the_drop(&h).join("the-link")).expect("a link");
+
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "the-link");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    assert!(
+        result["why"]
+            .as_str()
+            .expect("a sentence")
+            .contains("not a plain file"),
+        "the refusal does not say what was wrong with the file"
+    );
+    assert!(
+        !the_drop(&h).join("the-link").exists(),
+        "a link was left in the drop"
+    );
+    assert!(
+        elsewhere.exists(),
+        "the sweep followed a link out of the drop"
+    );
+}

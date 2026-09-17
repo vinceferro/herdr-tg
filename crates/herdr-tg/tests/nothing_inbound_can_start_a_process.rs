@@ -177,12 +177,15 @@ const MAY_START_A_PROCESS: [MayStartAProcess; 4] = [
 /// thing that sends anything off this machine; `media.rs` and `heartbeat.rs` are reached from the
 /// serving path too. `hub/door.rs` is the ring of operator-visible events the hub appends for the
 /// gateway that will one day serve them off this machine — a file a frame's own words land in, so
-/// it is on this list exactly as the files around it are.
-const THE_INBOUND_PATH: [&str; 13] = [
+/// it is on this list exactly as the files around it are. `hub/answers.rs` is the other half of
+/// that door: the drop an operator's taps and typed words arrive IN as files, and the sweep that
+/// turns them into frames — inbound content in file form, pure routing, watched like the rest.
+const THE_INBOUND_PATH: [&str; 14] = [
     "crates/herdr-tg/src/bot.rs",
     "crates/herdr-tg/src/conversations.rs",
     "crates/herdr-tg/src/heartbeat.rs",
     "crates/herdr-tg/src/hub.rs",
+    "crates/herdr-tg/src/hub/answers.rs",
     "crates/herdr-tg/src/hub/door.rs",
     "crates/herdr-tg/src/media.rs",
     "crates/herdr-tg/src/presence.rs",
