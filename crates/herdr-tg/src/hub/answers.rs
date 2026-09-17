@@ -17,7 +17,14 @@
 //!   ([`crate::conversations::is_conversation_id`]); an ask or option id must be a shape the hub
 //!   already writes down — the button law from `handle`'s own check, since the same ids come BACK
 //!   from the door as went out on the buttons. A control character in an id would forge a line in
-//!   the audit or the ring, and a `|` in an option id is the separator a button cannot carry.
+//!   the audit or the ring, and a `|` in an option id is the separator a button cannot carry. A
+//!   `lane`, when a message names one, gets the same addressability law the wire applies at
+//!   `hello` — the door cannot be where a lane stops being a name the hub will address a
+//!   conversation by. And a KNOWN field a program wrote wrongly — a reply id, a lane — is
+//!   refused, never silently stripped: unknown FIELDS stay ignored so a newer gateway cannot
+//!   break the door, but a known one that fails its law is the file saying something the hub
+//!   cannot believe, and sending it as though it had said nothing would be the hub rewriting
+//!   what he wrote.
 //! * **One size bound.** A file past [`AT_MOST`] is refused unread. That bound is half a wire
 //!   frame, so the frame built from any answer a sweep accepts cannot exceed the frame bound the
 //!   codec enforces on everything else.
@@ -50,12 +57,42 @@
 //! it answers, and a result file is no place to learn the shape of the hub's state directory.
 //! Results are swept away once older than [`RESULTS_KEPT_FOR`]; the answers themselves are
 //! always consumed, so the directory drains itself.
+//!
+//! A result is a RECEIPT, write-once: it says what the hub did with the file, at the moment it
+//! consumed it. What the BRIDGE later said about a delivered act — a refusal, a silence past the
+//! confirm window — is history, not receipt, and history is the ring's job: the follow-up is
+//! appended there (`door.rs`'s ack lines), attributed to the conversation and the lane, and the
+//! result is never rewritten to match. Two files, two tenses, and neither may do the other's.
+//!
+//! # Recorded, not fixed: three shapes the door leaves open on purpose
+//!
+//! The operator's standing settlement for contrived shapes — the same ruling the write guard's
+//! file received — is to write them down rather than chase them:
+//!
+//! * **The sweep is unbounded inside the registry-watch tick.** Every answer in the drop is
+//!   consumed before the tick looks at the registry again, so a gateway (or anything else this
+//!   uid runs) that drops files faster than the hub refuses them delays the very next thing the
+//!   tick does — the kill-switch fingerprint for a project switched off at the terminal. Each
+//!   refused file is cheap, but "cheap, unboundedly often" is a delay with no floor. Unbounded
+//!   on purpose: the writer is already this user inside the state home, and the honest bound
+//!   would punish a healthy gateway's burst to stop a misbehaving one.
+//! * **A drop entry that cannot be removed churns.** An answer whose `remove` fails — an
+//!   immutable bit, a filesystem in a strange mood — is re-swept every tick, refused again, and
+//!   given a FRESH result each time, so the ten-minute result sweep never collects it: one warn
+//!   a second, for ever, and a file the gateway is told about once a second. Recorded because
+//!   only this uid can build it and no bound would mend the cause.
+//! * **Two same-uid TOCTOU windows.** Between the metadata read and the bytes, a plain file can
+//!   be swapped for a link (the door then reads through a link once); and the result write
+//!   follows a link pre-planted at `<name>.result`, writing result bytes wherever it points.
+//!   Both need a writer that is already this user, inside a 0700 directory — at which point the
+//!   writer owns the box and the ring is not the secret worth protecting. Same ruling, same
+//!   file: recorded, closed by nothing, reopened the day the drop moves outside the state home.
 
 use std::path::{Path, PathBuf};
 
-use hub_proto::{AskId, OptionId, ProjectId};
+use hub_proto::{AskId, LaneId, OptionId, ProjectId};
 
-use super::CALLBACK_DATA_MAX;
+use super::{CALLBACK_DATA_MAX, lane_is_addressable};
 
 /// The drop directory, beside the audit log and every other state file of this hub.
 pub const ANSWERS: &str = "answers";
@@ -86,7 +123,9 @@ pub const RESULTS_KEPT_FOR: u64 = 600;
 ///
 /// The conversation is a [`ProjectId`] because that is what a conversation IS on this wire; the
 /// hub resolves it to a live session, and the file's other names (ask, option) are the bridge's
-/// own opaque ids, resolved against what the hub wrote down when the question went out.
+/// own opaque ids, resolved against what the hub wrote down when the question went out. A
+/// message may also name a `lane` — one conversation OF the project, a worktree — which the
+/// same addressability law the wire applies is applied to here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
     Choice {
@@ -96,6 +135,10 @@ pub(crate) enum Answer {
     },
     Message {
         conversation: ProjectId,
+        /// One conversation of the project the words are for, when the file named one. `None`
+        /// is the project's own voice — and an answer naming no lane while the voice is dead
+        /// and a lane is live is refused with directions rather than guessed for him.
+        lane: Option<LaneId>,
         text: String,
         in_reply_to_ask: Option<AskId>,
     },
@@ -132,10 +175,18 @@ pub(crate) mod said {
     pub const BAD_OPTION: &str = "That answer names the button it chose in a shape this hub does not write down, so it \
          was not sent.";
     pub const NO_WORDS: &str = "That message had no words in it, so it was not sent.";
+    pub const BAD_REPLY: &str = "That reply names its question in a shape this hub does not write down, so it was not \
+         sent.";
+    pub const BAD_LANE: &str = "That message names one of the project's own conversations in a shape this hub does not \
+         address, so it was not sent.";
     pub const WRITTEN_DOWN_TWICE: &str = "That question is written down more than once here and the answer does not say which it \
          means, so it was not sent.";
+    pub const ASKED_BY_TWO: &str = "That reply names a question two conversations are asking at once, and it does not say \
+         which it means, so it was not sent.";
     pub const NOTHING_TO_TAKE_WORDS: &str = "Nothing is connected for that conversation right now, so nothing was sent. It will not \
          be delivered later.";
+    pub const ONLY_ITS_OWN_CONVERSATIONS: &str = "Nothing is connected for this conversation itself right now — one of its own \
+         conversations is. Name which one and it will be sent; nothing will be delivered later.";
 
     /// Why a tap the door judged refused did not become an answer, in the door's own words.
     ///
@@ -240,6 +291,10 @@ pub(crate) fn parse(bytes: &str, now: u64) -> Result<Answer, &'static str> {
         .filter(|c| crate::conversations::is_conversation_id(c))
         .ok_or(said::NO_SUCH_CONVERSATION)?;
     let conversation = ProjectId::new(conversation);
+    // A KNOWN field a program wrote wrongly is refused, never silently stripped. Unknown FIELDS
+    // stay ignored — additive-proof — but a `lane` or an `in_reply_to_ask` that is present and
+    // not a shape the hub will act on is the file SAYING something the hub cannot believe, and
+    // sending it as though it had said nothing would be the hub rewriting what he wrote.
     match fields.get("t").and_then(serde_json::Value::as_str) {
         Some("choice") => {
             let ask_id = fields
@@ -266,13 +321,30 @@ pub(crate) fn parse(bytes: &str, now: u64) -> Result<Answer, &'static str> {
                 .and_then(serde_json::Value::as_str)
                 .filter(|t| !t.trim().is_empty())
                 .ok_or(said::NO_WORDS)?;
-            let in_reply_to_ask = fields
-                .get("in_reply_to_ask")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| an_id_the_hub_writes_down(s))
-                .map(AskId::new);
+            let lane = match fields.get("lane") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let s = value.as_str().ok_or(said::BAD_LANE)?;
+                    let named = LaneId::new(s);
+                    if !lane_is_addressable(&named) {
+                        return Err(said::BAD_LANE);
+                    }
+                    Some(named)
+                }
+            };
+            let in_reply_to_ask = match fields.get("in_reply_to_ask") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let s = value.as_str().ok_or(said::BAD_REPLY)?;
+                    if !an_id_the_hub_writes_down(s) {
+                        return Err(said::BAD_REPLY);
+                    }
+                    Some(AskId::new(s))
+                }
+            };
             Ok(Answer::Message {
                 conversation,
+                lane,
                 text: text.to_owned(),
                 in_reply_to_ask,
             })

@@ -2048,11 +2048,28 @@ struct Down {
     frame: FrameId,
     addr: Addr,
     /// The chat he typed or tapped in, so the mark on his message can find it. A message id is
-    /// only half an address on Telegram: every chat numbers its own.
+    /// only half an address on Telegram: every chat numbers its own. Zero for an act that came
+    /// in at the answers door, where no chat exists.
     chat_id: i64,
-    /// His message: the line he typed, or the question whose button he pressed.
+    /// His message: the line he typed, or the question whose button he pressed. The question's
+    /// own message even at the door — the keyboard is on the phone whoever answered it.
     msg_id: MsgId,
     what: His,
+    /// Which surface the act arrived on. The ack path uses one record shape for both so an
+    /// answer for a frame finds its record whichever door the act came in by; what the origin
+    /// decides is where the CONSEQUENCE of that answer is said — the phone's half edits lines
+    /// on his phone, the door's half appends to the ring, and neither can do the other's job.
+    came_from: CameFrom,
+}
+
+/// One of the two surfaces an operator's act can arrive on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameFrom {
+    /// Telegram — a tap on a keyboard or a line typed in a topic, with a phone line to edit
+    /// when something later has to be said about it.
+    Phone,
+    /// The answers drop — a file a gateway wrote, with no line anywhere except the ring.
+    Door,
 }
 
 /// Which of his the record is about, and what has to be known to answer for it.
@@ -2072,13 +2089,21 @@ enum His {
 struct HisTap {
     /// What the button said, because every line the hub writes about it names what he chose.
     label: String,
+    /// The question and the answer, as ids — the correlation the RING's follow-up joins on. The
+    /// door's consequence has no phone line to edit, so the ring line must name what it is
+    /// about in the vocabulary its own down line already used. The phone's half ignores them:
+    /// its line carries the label.
+    ask: AskId,
+    option: OptionId,
     /// Which message his receipt — `Sent: <label>` — is, once the bot has sent it and been told
     /// which message Telegram made of it.
     ///
-    /// `None` for the moment in between, and that moment is real: the receipt is a Telegram round
-    /// trip that starts AFTER the answer is on the wire, and a tool server acks a choice within a
-    /// millisecond of reading it. So an answer can arrive before there is any line to change, which
-    /// is what `said` is for.
+    /// `None` for the moment in between, and that moment is real: the receipt is a Telegram
+    /// round trip that starts AFTER the answer is on the wire, and a tool server acks a choice
+    /// within a millisecond of reading it. So an answer can arrive before there is any line to
+    /// change, which is what `said` is for. At the DOOR this stays `None` for the record's
+    /// whole life: no line is ever coming, and the door's branches of the ack path and the
+    /// confirm window never wait on one.
     receipt: Option<MsgId>,
     /// What the bridge said became of it, when that arrived before the receipt did.
     said: Option<WhatBecameOfTheTap>,
@@ -4194,6 +4219,35 @@ impl<S: Surface> Hub<S> {
         option_id: OptionId,
         label: &str,
     ) -> Option<FrameId> {
+        self.deliver_his_tap(
+            addr,
+            chat_id,
+            msg_id,
+            ask_id,
+            option_id,
+            label,
+            CameFrom::Phone,
+        )
+        .await
+    }
+
+    /// The shared tail of a tap from either surface: the record the ack path will look for, the
+    /// frame, and the confirm window. What differs is where a later word about the answer is
+    /// SAID — the record carries its origin, and every reader of it (`what_became_of_it`, the
+    /// window) speaks to the surface the act came in by.
+    // Eight, like the taps it carries: the question, the button, the label he read, where the
+    // question is on the phone, and which door the act came in by.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_his_tap(
+        self: &Arc<Self>,
+        addr: &Addr,
+        chat_id: i64,
+        msg_id: &MsgId,
+        ask_id: AskId,
+        option_id: OptionId,
+        label: &str,
+        came_from: CameFrom,
+    ) -> Option<FrameId> {
         // Read from the claim rather than remembered anywhere else: the promise belongs to the
         // connection that made it, and a run that has since been replaced cannot have its
         // successor nagged for it.
@@ -4214,12 +4268,18 @@ impl<S: Surface> Hub<S> {
                 msg_id: msg_id.clone(),
                 what: His::Tap(HisTap {
                     label: label.to_owned(),
+                    ask: ask_id.clone(),
+                    option: option_id.clone(),
                     receipt: None,
                     said: None,
                     promised,
                     overdue: false,
-                    no_receipt_is_coming: false,
+                    // At the door no line is ever coming to be edited, and waiting for one is
+                    // waiting for ever; the door's branches of the ack path and the window
+                    // never read this, but the record tells the truth about itself all the same.
+                    no_receipt_is_coming: came_from == CameFrom::Door,
                 }),
+                came_from,
             });
             while down.len() > DOWN_KEPT {
                 down.pop_front();
@@ -4234,7 +4294,9 @@ impl<S: Surface> Hub<S> {
         }
         // The window, in a task of its own. It cannot be awaited here: this runs inside Telegram's
         // per-chat dispatcher, which handles one update at a time, so waiting out the window here
-        // would hold every later tap and every line he types behind it.
+        // would hold every later tap and every line he types behind it. At the door the sweep is
+        // the caller, and waiting would hold a whole tick of the watch loop — the same refusal
+        // by a different door.
         {
             let hub = Arc::clone(self);
             let frame = frame.clone();
@@ -4381,10 +4443,42 @@ impl<S: Surface> Hub<S> {
                 return;
             };
             let addr = down[at].addr.clone();
+            let came_from = down[at].came_from;
             let His::Tap(tap) = &mut down[at].what else {
                 return;
             };
             if tap.said.is_some() {
+                return;
+            }
+            if came_from == CameFrom::Door {
+                // The door's spelling of the same silence. There is no receipt line to edit and
+                // none is ever coming, so the ring says it — and the RECORD STAYS, exactly as
+                // the phone's does: a session that finally says it took the answer, a minute
+                // late, corrects the history rather than leaving it at a worry that was false.
+                if !tap.promised {
+                    // A bridge that never promised to confirm anything has not gone silent;
+                    // this is every bridge shipped so far, and a worry about nothing is worse
+                    // than nothing. The phone's rule, held at the door.
+                    tracing::debug!(
+                        project = %addr.project, lane = addr.lane_field(),
+                        "nothing said about a door tap no bridge promised to confirm"
+                    );
+                    return;
+                }
+                tap.overdue = true;
+                let (ask, option) = (tap.ask.clone(), tap.option.clone());
+                drop(down);
+                self.ring.his_answer_was_never_confirmed(
+                    &addr.project,
+                    addr.lane.as_ref(),
+                    &ask,
+                    &option,
+                );
+                tracing::warn!(
+                    project = %addr.project, lane = addr.lane_field(),
+                    "a promising bridge has not confirmed the door's answer inside the window; \
+                     said so in the ring"
+                );
                 return;
             }
             match (tap.receipt.clone(), tap.promised) {
@@ -4705,6 +4799,7 @@ impl<S: Surface> Hub<S> {
                 chat_id,
                 msg_id: msg_id.clone(),
                 what: His::Words { files_on_disk },
+                came_from: CameFrom::Phone,
             });
             while down.len() > DOWN_KEPT {
                 down.pop_front();
@@ -6860,6 +6955,85 @@ impl<S: Surface> Hub<S> {
                     AckStatus::Accepted => WhatBecameOfTheTap::Took,
                     AckStatus::Refused => WhatBecameOfTheTap::Refused(plain_reason(reason)),
                 };
+                // The first word is the one he reads, on either surface: a second answer for
+                // one tap finds the first already said and changes nothing.
+                if let His::Tap(already) = &down[at].what
+                    && already.said.is_some()
+                {
+                    return;
+                }
+                if down[at].came_from == CameFrom::Door {
+                    // A tap that came in as a file. There is no phone line to edit and none is
+                    // ever coming, so the consequence is the RING's — appended beside the receipt
+                    // the down line already is — and the phone's half is whatever it can still
+                    // do: a refusal takes the question's keyboard back off, exactly as the
+                    // phone's own refusal does. The record is TAKEN here, by value: nothing
+                    // below waits on a line that will never exist.
+                    let Some(Down {
+                        addr,
+                        chat_id,
+                        msg_id: question,
+                        what: His::Tap(tap),
+                        ..
+                    }) = down.remove(at)
+                    else {
+                        return;
+                    };
+                    drop(down);
+                    match said {
+                        WhatBecameOfTheTap::Took if !tap.overdue => {
+                            // An ordinary acceptance corrects nothing: the receipt line claimed
+                            // only that his answer was sent, and that stands. A line here would
+                            // be a receipt printer, the failure the phone's own silence on this
+                            // path exists to avoid.
+                            tracing::debug!(
+                                project = %addr.project, lane = addr.lane_field(),
+                                "the door's answer was taken; the receipt stands"
+                            );
+                        }
+                        WhatBecameOfTheTap::Took => {
+                            // The window already said nobody had confirmed it. The phone's late
+                            // answer corrects its line; the ring appends the correction.
+                            self.ring.his_answer_was_taken_after_all(
+                                &addr.project,
+                                addr.lane.as_ref(),
+                                &tap.ask,
+                                &tap.option,
+                            );
+                            tracing::info!(
+                                project = %addr.project, lane = addr.lane_field(),
+                                "a bridge confirmed the door's answer after the window had said \
+                                 it never did; the ring carries the correction"
+                            );
+                        }
+                        WhatBecameOfTheTap::Refused(why) => {
+                            self.ring.his_answer_was_refused(
+                                &addr.project,
+                                addr.lane.as_ref(),
+                                &tap.ask,
+                                &tap.option,
+                                &why,
+                            );
+                            let _ = self.audit.refused(
+                                &addr,
+                                &format!("his answer to question {question} was not taken: {why}"),
+                            );
+                            tracing::warn!(
+                                project = %addr.project, lane = addr.lane_field(), why = %why,
+                                "the door's answer was refused by the bridge; said so in the ring"
+                            );
+                            // The same act the phone performs for the same news: the keyboard
+                            // that would not come off at the tap comes off now, with the truth.
+                            self.take_the_question_back(
+                                chat_id,
+                                &question,
+                                "not taken — the agent could not act on your answer",
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
                 let Some(Down {
                     chat_id,
                     msg_id,
@@ -6869,13 +7043,6 @@ impl<S: Surface> Hub<S> {
                 else {
                     return;
                 };
-                if tap.said.is_some() {
-                    // A second answer for one tap. The first is the one he reads, exactly as it is
-                    // for a line he typed: there the record goes with the first answer so a second
-                    // finds nothing, and here the record has to stay until his receipt exists, so
-                    // the rule has to be said out loud instead.
-                    return;
-                }
                 let receipt = tap.receipt.clone();
                 if receipt.is_none() && !tap.no_receipt_is_coming {
                     // Nowhere to say it YET. Kept beside the tap, and said the moment `bot.rs`
@@ -6911,6 +7078,30 @@ impl<S: Surface> Hub<S> {
             down.remove(at)
         };
         let Some(his) = his else { return };
+        if his.came_from == CameFrom::Door {
+            // Words that came in as a file. There is no message of his to mark and no topic he
+            // typed them in; the place he typed them is the app whose only history is the ring,
+            // so the refusal is said there, appended beside the words' own receipt line. An
+            // acceptance says nothing — the receipt claimed only that they were sent, and that
+            // stands — and the door carries no files, so there is no count to compare.
+            if status == AckStatus::Refused {
+                let why = plain_reason(reason);
+                self.ring
+                    .his_words_were_refused(&his.addr.project, his.addr.lane.as_ref(), &why);
+                let _ = self.audit.refused(
+                    &his.addr,
+                    &format!(
+                        "what he typed (message {}) was not handed on: {why}",
+                        his.msg_id
+                    ),
+                );
+                tracing::warn!(
+                    project = %his.addr.project, lane = his.addr.lane_field(), why = %why,
+                    "the door's words were refused by the bridge; said so in the ring"
+                );
+            }
+            return;
+        }
         let His::Words { files_on_disk } = his.what else {
             return;
         };
@@ -7758,7 +7949,7 @@ impl<S: Surface> Hub<S> {
     /// consumed — carried to the conversation it names, or refused with a sentence — whatever
     /// happens on the way. A drop that wedged on one bad file would be a door the gateway waits
     /// on for ever, so nothing here may return early over one answer's troubles.
-    async fn sweep_the_answers(&self) {
+    async fn sweep_the_answers(self: &Arc<Self>) {
         // One sweep at a time. The watch loop and a restart's first tick are the same caller in
         // production, but nothing stops a second — and two sweeps racing on one file would read
         // it twice and act twice, which for a message is a duplicate no law downstream can take
@@ -7811,7 +8002,7 @@ impl<S: Surface> Hub<S> {
     /// A result that cannot be written is logged and swallowed: the act has already happened,
     /// and refusing to consume a file because its bookkeeping failed would wedge the drop on
     /// exactly the failure the bookkeeping was for.
-    async fn consume_one_answer(&self, path: &Path, now: u64) {
+    async fn consume_one_answer(self: &Arc<Self>, path: &Path, now: u64) {
         let became = self.read_one_answer(path, now).await;
         match &became {
             Ok(()) => tracing::info!(
@@ -7852,7 +8043,7 @@ impl<S: Surface> Hub<S> {
     /// Read through no link and past no bound: the metadata is the symlink's own, so a link in
     /// the drop is refused as what it is rather than followed, and the size is known before a
     /// byte is read so the bound is a fact and not a hope.
-    async fn read_one_answer(&self, path: &Path, now: u64) -> Result<(), &'static str> {
+    async fn read_one_answer(self: &Arc<Self>, path: &Path, now: u64) -> Result<(), &'static str> {
         let meta = fs::symlink_metadata(path).map_err(|_| answers::said::NOT_READABLE)?;
         if !meta.file_type().is_file() {
             return Err(answers::said::NOT_A_PLAIN_FILE);
@@ -7869,11 +8060,14 @@ impl<S: Surface> Hub<S> {
     ///
     /// A tap goes through [`Self::answer_the_ask`], the same core the phone's tap goes through,
     /// so one question can only ever be answered once from however many surfaces; a message is
-    /// delivered as his typed words are, to the conversation's live session. Every refusal is
-    /// the plain sentence the result file carries, written by `answers.rs` — the door's own
-    /// words, because the phone's sentences for the same judgements say "topic" and "button",
-    /// which are a phone's words.
-    async fn answer_from_the_door(&self, which: answers::Answer) -> Result<(), &'static str> {
+    /// delivered as his typed words are, to a live session of the conversation it names. Every
+    /// refusal is the plain sentence the result file carries, written by `answers.rs` — the
+    /// door's own words, because the phone's sentences for the same judgements say "topic" and
+    /// "button", which are a phone's words.
+    async fn answer_from_the_door(
+        self: &Arc<Self>,
+        which: answers::Answer,
+    ) -> Result<(), &'static str> {
         match which {
             answers::Answer::Choice {
                 conversation,
@@ -7932,11 +8126,13 @@ impl<S: Surface> Hub<S> {
                     .answer_the_ask(chat, &msg, record, &option_id)
                     .await
                     .map_err(|why| answers::said::why_a_tap_was_refused(&why))?;
-                let id = Self::mint_frame_id();
-                if !self
-                    .carry_his_choice(&addr, id, &msg, ask_id, option_id)
-                    .await
-                {
+                // Down through the same tail the phone's tap takes — the record the ack path
+                // will look for, the frame, the confirm window — so a word the bridge later
+                // says about this answer reaches the ring instead of vanishing.
+                let went = self
+                    .deliver_his_tap(&addr, chat, &msg, ask_id, option_id, &label, CameFrom::Door)
+                    .await;
+                if went.is_none() {
                     // Written down as answered, then nobody could be told — the phone's path
                     // takes the question back rather than burn it, and so does the door's.
                     let what = self.withdraw_undelivered(chat, &msg).await;
@@ -7951,49 +8147,106 @@ impl<S: Surface> Hub<S> {
             }
             answers::Answer::Message {
                 conversation,
+                lane,
                 text,
                 in_reply_to_ask,
             } => {
-                // The conversation's own voice, and nothing narrower: an answer names a
-                // conversation by its id, and a lane — a worktree, a room's sibling — is its own
-                // addressable thing that the file did not name. Choosing a live lane for him
-                // would be the hub guessing which agent he meant, which is the one thing every
-                // other door in this file refuses to do.
-                let addr = Addr::project_itself(conversation);
+                // WHERE the words go: the conversation of the project the file named, or —
+                // naming none — the conversation's own voice. The hub never picks a lane on his
+                // behalf: a lane is its own addressable thing, and a guess would put his words
+                // into the turn of an agent he did not mean.
+                let mut addr = match &lane {
+                    Some(named) => Addr::lane_of(conversation.clone(), named.clone()),
+                    None => Addr::project_itself(conversation.clone()),
+                };
+                // A reply that names a question routes to the session that asked it — the
+                // phone's own rule, lane or voice — and carries the question's name on the wire.
+                // A name that belongs to nothing open here degrades to a plain line, exactly as
+                // the phone treats a reply under a message nothing was written down beside; a
+                // name TWO conversations are asking at once is not the hub's to pick between.
+                let mut carries: Option<AskId> = None;
+                if let Some(ask) = &in_reply_to_ask {
+                    let open: Vec<AskRecord> = {
+                        let ledger = self.ledger.lock().await;
+                        ledger
+                            .matching(|r| {
+                                r.project == conversation
+                                    && r.ask_id == *ask
+                                    && r.refusal_if_closed().is_none()
+                            })
+                            .into_iter()
+                            .filter_map(|(chat, msg)| ledger.get(chat, &msg).cloned())
+                            .collect()
+                    };
+                    match open.as_slice() {
+                        [] => {}
+                        [one] => {
+                            if lane.is_none() {
+                                // No conversation of the project was named, so the question
+                                // itself says whose turn the words belong in.
+                                addr = one.addr();
+                            }
+                            // Where a lane WAS named, the words go where the file said and the
+                            // reply must be a question asked there — a reply under another
+                            // conversation's question names nothing the recipient asked.
+                            if one.addr_is(&addr) {
+                                carries = Some(ask.clone());
+                            }
+                        }
+                        _ => return Err(answers::said::ASKED_BY_TWO),
+                    }
+                }
                 let instance = {
                     let claims = self.claims.lock().await;
                     claims.get(&addr).map(|c| c.instance.clone())
                 };
                 let Some(instance) = instance else {
+                    // The voice dead while a lane of the project is live is not "nothing is
+                    // connected" — it is directions he can follow from where he sits, and a
+                    // lie he can see with the lane's topic open beside him is worse than none.
+                    if lane.is_none() {
+                        let a_lane_is_live = {
+                            let claims = self.claims.lock().await;
+                            claims
+                                .keys()
+                                .any(|a| a.project == conversation && a.lane.is_some())
+                        };
+                        if a_lane_is_live {
+                            let _ = self.audit.refused(
+                                &addr,
+                                "words at the door with only a lane of the conversation \
+                                 connected to take them",
+                            );
+                            return Err(answers::said::ONLY_ITS_OWN_CONVERSATIONS);
+                        }
+                    }
                     let _ = self.audit.refused(
                         &addr,
                         "words at the door with nothing connected to take them",
                     );
                     return Err(answers::said::NOTHING_TO_TAKE_WORDS);
                 };
-                // The one time a message says which question it is under: when the ask it names
-                // is a live ask of THIS conversation, asked by the run that is connected now —
-                // the phone's own rule (`ask_replied_to`), read at the door. A name that fails
-                // any of that is not an error; his words go down as the plain line they are,
-                // exactly as a reply under another conversation's question does at the phone.
-                let in_reply_to_ask = match in_reply_to_ask {
-                    Some(ask)
-                        if {
-                            let ledger = self.ledger.lock().await;
-                            !ledger
-                                .matching(|r| {
-                                    r.addr_is(&addr)
-                                        && r.ask_id == ask
-                                        && r.instance == instance
-                                        && r.refusal_if_closed().is_none()
-                                })
-                                .is_empty()
-                        } =>
-                    {
-                        Some(ask)
+                // The phone's second check, held at the door: the question must have been asked
+                // by the RUN that is connected now, or a reply names a question the session it
+                // reaches never asked — and goes down as the plain line the phone's own
+                // degradation makes it.
+                if let Some(ask) = &carries {
+                    let still_theirs = {
+                        let ledger = self.ledger.lock().await;
+                        !ledger
+                            .matching(|r| {
+                                r.addr_is(&addr)
+                                    && r.ask_id == *ask
+                                    && r.instance == instance
+                                    && r.refusal_if_closed().is_none()
+                            })
+                            .is_empty()
+                    };
+                    if !still_theirs {
+                        carries = None;
                     }
-                    _ => None,
-                };
+                }
+                let in_reply_to_ask = carries;
                 // A message id the hub minted, in a namespace of its own: the wire requires one
                 // and the door has no phone message to name, and "d…" beside the phone's "m…"
                 // lets a reader of an adapter's logs tell which surface the words came from.
@@ -8001,11 +8254,30 @@ impl<S: Surface> Hub<S> {
                 // established "no person" — the door has no Telegram user, and inventing one
                 // would be a fact about nobody.
                 let msg_id = MsgId::new(format!("d{}", next_frame_seq()));
+                let frame = Self::mint_frame_id();
+                // The record BEFORE the wire, for the reason the phone's words and taps both
+                // have one: a bridge can answer about this frame the moment it is on the wire,
+                // and an answer that finds no record vanishes — which is what a refusal of his
+                // words did at this door until the record existed.
+                {
+                    let mut down = self.down.lock().await;
+                    down.push_back(Down {
+                        frame: frame.clone(),
+                        addr: addr.clone(),
+                        chat_id: 0,
+                        msg_id: msg_id.clone(),
+                        what: His::Words { files_on_disk: 0 },
+                        came_from: CameFrom::Door,
+                    });
+                    while down.len() > DOWN_KEPT {
+                        down.pop_front();
+                    }
+                }
                 let went = self
                     .carry_his_words(
                         &addr,
-                        Self::mint_frame_id(),
-                        msg_id,
+                        frame,
+                        msg_id.clone(),
                         hub_proto::From {
                             chat_id: 0,
                             user_id: 0,
@@ -8020,6 +8292,10 @@ impl<S: Surface> Hub<S> {
                     // ordinary case, not the exotic one. Dropped visibly, never queued: a
                     // message held for a session that may never return is one he believes was
                     // sent.
+                    self.down
+                        .lock()
+                        .await
+                        .retain(|d| d.msg_id != msg_id || d.came_from != CameFrom::Door);
                     let _ = self
                         .audit
                         .refused(&addr, "words at the door reached nobody connected");

@@ -18100,3 +18100,597 @@ async fn an_answer_that_is_not_a_plain_file_is_refused_and_consumed() {
         "the sweep followed a link out of the drop"
     );
 }
+
+/// Typed words as the door reads them, naming a conversation of the project to go to.
+///
+/// The lane field is optional and the door's own addition to the answer's shape: a conversation
+/// is a project or one worktree of it, and the words may name which.
+fn words_in(
+    conversation: &str,
+    lane: Option<&str>,
+    text: &str,
+    in_reply_to_ask: Option<&str>,
+    ts: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "t": "message", "conversation": conversation, "lane": lane, "text": text,
+        "in_reply_to_ask": in_reply_to_ask, "ts": ts,
+    })
+}
+
+/// One lane of the project, live: its own topic, its own claim, its own session — the shape a
+/// fleet of worktrees is. Hands back the bridge so its frames can be read.
+///
+/// Waited for in the CLAIMS map rather than in a send count: a test with no voice connected has
+/// only the lane's own sends to count, and a count that assumes another speaker passes before
+/// the lane has said anything.
+async fn a_live_lane(h: &Harness, lane: &str, instance: &str) -> FakeBridge {
+    let mut bridge =
+        FakeBridge::connect_as(&h.sock, &h.secret, instance, h.project.as_str(), Some(lane)).await;
+    bridge.become_live().await;
+    let addr = h.lane(lane);
+    until(async || h.hub.is_claimed(&addr).await).await;
+    bridge
+}
+
+/// One open question asked by the LANE itself, waited for where it matters: in the ledger, not
+/// in the send count. A lane's greeting lands whenever its settling window finishes, which
+/// straddles any count taken before it — and a question not yet written down is a question the
+/// door cannot see.
+async fn a_lane_s_open_question(h: &Harness, bridge: &mut FakeBridge, lane: &str, ask: &str) {
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new(ask),
+            text: "Overwrite it?".into(),
+            options: Some(vec![
+                AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                },
+                AskOption {
+                    option_id: OptionId::new("n"),
+                    label: "No".into(),
+                },
+            ]),
+        })
+        .await;
+    let addr = h.lane(lane);
+    until(async || {
+        !h.hub
+            .ledger
+            .lock()
+            .await
+            .matching(|r| r.addr_is(&addr) && r.ask_id.as_str() == ask)
+            .is_empty()
+    })
+    .await;
+}
+
+/// Every follow-up line the ring holds — the `t:"ack"` family, what became of his acts at the
+/// door once the bridge had its say.
+fn the_ring_s_follow_ups(h: &Harness) -> Vec<serde_json::Value> {
+    ring_so_far(h.dir.path())
+        .into_iter()
+        .filter(|l| l["frame"]["t"] == "ack")
+        .collect()
+}
+
+#[tokio::test]
+async fn a_refusal_of_the_door_s_answer_reaches_the_ring_instead_of_vanishing() {
+    let h = harness().await;
+    let (mut bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    // The keyboard edit at the moment of the answer is refused, so the record — and its
+    // keyboard — are still there when the agent says no: the one shape where what the phone
+    // does next is observable, and the door must do the same.
+    *h.fake.retire_fails.lock().await = true;
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "the door's own answer was refused"
+    );
+    let (frame, _option) = bridge.next_choice().await;
+
+    // The agent says it could not act on the answer. At the phone this rewrites his receipt
+    // line; at the door the receipt is a ring line, and the ring is where the correction must
+    // land — appended, never mutating the receipt that is already history. The keyboard edit is
+    // allowed to work from here: the one that failed at the tap is the one this must retry.
+    *h.fake.retire_fails.lock().await = false;
+    let said = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the session is busy".to_owned()),
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &said => Some(()),
+            _ => None,
+        })
+        .await;
+
+    let follow_ups = the_ring_s_follow_ups(&h);
+    let raw = serde_json::to_string(&follow_ups).expect("readable");
+    let [refused] = follow_ups.as_slice() else {
+        panic!("the refusal of his answer did not reach the ring: {raw}");
+    };
+    assert_eq!(refused["conversation"], *h.project.as_str(), "{raw}");
+    assert_eq!(refused["lane"], "-", "{raw}");
+    assert_eq!(refused["frame"]["of"], "choice", "{raw}");
+    assert_eq!(refused["frame"]["ask_id"], "a1", "{raw}");
+    assert_eq!(refused["frame"]["option_id"], "y", "{raw}");
+    assert_eq!(refused["frame"]["status"], "refused", "{raw}");
+    assert!(
+        refused["frame"]["reason"]
+            .as_str()
+            .expect("the agent's words")
+            .contains("the session is busy"),
+        "the follow-up does not carry the agent's own why:\n{raw}"
+    );
+
+    // And the phone's half of the same event: the keyboard that would not come off comes off
+    // now, with the truth — the answer reached somebody and was refused.
+    until(async || {
+        h.fake
+            .retired
+            .lock()
+            .await
+            .iter()
+            .any(|(_, m, note)| m == &msg && note.contains("not taken"))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_door_tap_the_bridge_never_confirms_is_said_so_in_the_ring() {
+    let h = harness().await;
+    // Only a bridge that PROMISED to say what became of every choice can be said to have gone
+    // silent — the phone's rule, held at the door too.
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let _msg = one_open_question(&h, &mut bridge, "a1").await;
+    h.hub.confirm_taps_within(Duration::from_millis(200));
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "the door's own answer was refused"
+    );
+    let (frame, _option) = bridge.next_choice().await;
+
+    // The window runs out with no word from the bridge. The phone's line says "the session has
+    // not confirmed it took your answer"; the door's receipt is the ring, so the ring says so —
+    // with no status, because nothing was answered, and the absent status is exactly that.
+    until(async || {
+        the_ring_s_follow_ups(&h).iter().any(|l| {
+            l["frame"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("has not confirmed"))
+        })
+    })
+    .await;
+    let never = the_ring_s_follow_ups(&h)
+        .into_iter()
+        .find(|l| {
+            l["frame"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("has not confirmed"))
+        })
+        .expect("the never-confirmed line, just watched for");
+    assert_eq!(never["conversation"], *h.project.as_str());
+    assert_eq!(never["frame"]["of"], "choice");
+    assert_eq!(never["frame"]["ask_id"], "a1");
+    assert_eq!(never["frame"]["option_id"], "y");
+    assert!(
+        never["frame"].get("status").is_none(),
+        "a timeout was recorded as though something had been answered"
+    );
+
+    // And a word that arrives late CORRECTS the history rather than leaving it at a worry — the
+    // phone's late answer corrects its line; the ring appends the correction after it.
+    let said = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Accepted,
+            reason: None,
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &said => Some(()),
+            _ => None,
+        })
+        .await;
+    until(async || {
+        the_ring_s_follow_ups(&h)
+            .iter()
+            .any(|l| l["frame"]["status"] == "accepted")
+    })
+    .await;
+    let taken = the_ring_s_follow_ups(&h)
+        .into_iter()
+        .find(|l| l["frame"]["status"] == "accepted")
+        .expect("the correction, just watched for");
+    assert_eq!(taken["frame"]["ask_id"], "a1");
+    // One line per event: the refusal family says its piece once, and no line was minted for
+    // the ordinary acceptance of a tap nobody had worried about.
+    assert_eq!(
+        the_ring_s_follow_ups(&h).len(),
+        2,
+        "{:?}",
+        the_ring_s_follow_ups(&h)
+    );
+}
+
+/// The envelope id his door words went down under, read off the wire the way a bridge does —
+/// the id its `ack` for them will name.
+async fn the_door_s_words_reach(bridge: &mut FakeBridge, text: &str) -> FrameId {
+    for _ in 0..20 {
+        let Some(env) = bridge.next().await else {
+            break;
+        };
+        match env.payload {
+            HubFrame::Message { text: what, .. } if what == text => return env.id,
+            HubFrame::Ping => {
+                let r = env.id.clone();
+                bridge.send(BridgeFrame::Pong { r#ref: r }).await;
+            }
+            _ => {}
+        }
+    }
+    panic!("the door's words never reached the bridge");
+}
+
+#[tokio::test]
+async fn a_refusal_of_the_door_s_words_reaches_the_ring_instead_of_vanishing() {
+    let h = harness().await;
+    let home = h.dir.path().display().to_string();
+    let (mut bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(
+            h.project.as_str(),
+            "try it with --dry-run",
+            None,
+            now_secs(),
+        ),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "words-1")["status"],
+        "accepted",
+        "the door's words were refused"
+    );
+    let frame = the_door_s_words_reach(&mut bridge, "try it with --dry-run").await;
+
+    // The adapter refuses his words — no session open to take them, say, naming where it
+    // looked. The phone is told in the topic it typed in; the door is told in the only history
+    // it has — and the follow-up passes the same egress law every other line of the ring holds:
+    // the adapter's own words may carry a path, and the ring may not.
+    let said = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some(format!(
+                "nothing is attached at {home}/worker to take typed words"
+            )),
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &said => Some(()),
+            _ => None,
+        })
+        .await;
+
+    until(async || {
+        the_ring_s_follow_ups(&h)
+            .iter()
+            .any(|l| l["frame"]["of"] == "message")
+    })
+    .await;
+    let refused = the_ring_s_follow_ups(&h)
+        .into_iter()
+        .find(|l| l["frame"]["of"] == "message")
+        .expect("the refusal of his words, just watched for");
+    assert_eq!(refused["conversation"], *h.project.as_str());
+    assert_eq!(refused["frame"]["status"], "refused");
+    let why = refused["frame"]["reason"]
+        .as_str()
+        .expect("the adapter's words");
+    assert!(
+        why.contains("nothing is attached") && why.contains("[a path]") && !why.contains(&home),
+        "the follow-up does not carry the adapter's own why, scrubbed:\n{why}"
+    );
+    assert!(
+        refused["frame"].get("ask_id").is_none(),
+        "a follow-up about his words names a question they never named"
+    );
+}
+
+#[tokio::test]
+async fn a_message_naming_a_lane_reaches_that_lane_s_session() {
+    let h = harness().await;
+    let (mut voice, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    let mut lane = a_live_lane(&h, "fix-17", "i2").await;
+
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_in(
+            h.project.as_str(),
+            Some("fix-17"),
+            "check the worktree's own build",
+            None,
+            now_secs(),
+        ),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "words-1")["status"],
+        "accepted",
+        "words naming a live lane were refused"
+    );
+
+    let got = lane
+        .wait_for(|f| match f {
+            HubFrame::Message { text, .. } if text == "check the worktree's own build" => {
+                Some(text.to_owned())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(got, "check the worktree's own build");
+    // And ONLY the lane: the project's own voice got nothing, because the words were not for it.
+    let seen = voice.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Message { .. })),
+        "words naming a lane reached the project's own voice: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_message_with_no_lane_named_is_refused_honestly_when_only_a_lane_is_live() {
+    let h = harness().await;
+    // The conversation's own voice has nothing connected; one of its worktrees does. "Nothing is
+    // connected" would be a lie he can see with the lane's topic open beside him.
+    let mut lane = a_live_lane(&h, "fix-17", "i2").await;
+
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(
+            h.project.as_str(),
+            "is anyone still in this conversation",
+            None,
+            now_secs(),
+        ),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "words-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("one of its own conversations"),
+        "the refusal does not say a lane of this conversation is live: {why}"
+    );
+    assert!(
+        why.contains("Name which one"),
+        "the refusal leaves him nothing he can do about it: {why}"
+    );
+    let seen = lane.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Message { .. })),
+        "words that named no lane were delivered to a lane anyway: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_typed_under_a_lane_s_ask_reaches_the_session_that_asked() {
+    let h = harness().await;
+    // The project's own voice is live TOO — so if the reply went wherever was merely connected,
+    // it would reach the wrong session. It must reach the one that asked.
+    let mut voice = FakeBridge::connect(&h.sock, &h.secret, "voice", h.project.as_str()).await;
+    voice.become_live().await;
+    let mut lane = a_live_lane(&h, "fix-17", "i2").await;
+    a_lane_s_open_question(&h, &mut lane, "fix-17", "a1").await;
+
+    // No lane named: the ask itself says which session the words are for, and that is the one
+    // that asked it — the phone's own rule for a reply, held at the door.
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(
+            h.project.as_str(),
+            "take the left branch",
+            Some("a1"),
+            now_secs(),
+        ),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "words-1")["status"],
+        "accepted",
+        "a reply under the lane's own question was refused"
+    );
+
+    let (text, under) = lane
+        .wait_for(|f| match f {
+            HubFrame::Message {
+                text,
+                in_reply_to_ask: Some(ask),
+                ..
+            } if ask.as_str() == "a1" => Some((text.clone(), ask.clone())),
+            _ => None,
+        })
+        .await;
+    assert_eq!(text, "take the left branch");
+    assert_eq!(under.as_str(), "a1");
+    let seen = voice.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Message { .. })),
+        "a reply under a lane's question reached the project's own voice: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_whose_known_fields_are_wrong_is_refused_not_silently_changed() {
+    let h = harness().await;
+    let (_bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // A reply field that fails the shape law: the file SAYS it is a reply to a question, and
+    // sending it as a plain line would be the hub quietly rewriting what he wrote. Refused.
+    drop_an_answer(
+        &h,
+        "words-1",
+        words_at(h.project.as_str(), "go on then", Some("a|1"), now_secs()),
+    );
+    // A lane field that fails the hub's addressing law, as a string and as a number alike: a
+    // KNOWN field a program wrote wrongly is surfaced, never stripped.
+    drop_an_answer(
+        &h,
+        "words-2",
+        words_in(
+            h.project.as_str(),
+            Some("../elsewhere"),
+            "go on then",
+            None,
+            now_secs(),
+        ),
+    );
+    drop_an_answer(
+        &h,
+        "words-3",
+        serde_json::json!({
+            "t": "message", "conversation": h.project.as_str(),
+            "lane": 7, "text": "go on then", "ts": now_secs(),
+        }),
+    );
+    h.hub.sweep_the_answers().await;
+
+    for (name, must_say) in [
+        ("words-1", "shape this hub does not write down"),
+        ("words-2", "shape this hub does not address"),
+        ("words-3", "shape this hub does not address"),
+    ] {
+        let result = the_result_of(&h, name);
+        assert_eq!(result["status"], "refused", "{name}: {result:?}");
+        let why = result["why"].as_str().expect("a plain-word sentence");
+        assert!(
+            why.contains(must_say),
+            "{name}'s refusal does not say what was wrong with the field: {why}"
+        );
+        assert!(
+            !the_drop(&h).join(name).exists(),
+            "{name} was left in the drop to be swept again for ever"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_open_asks_under_one_name_are_refused_rather_than_guessed() {
+    let h = harness().await;
+    // A lane and the project's own voice, each minting their first ask id from a counter that
+    // starts over — the same name, two live questions, and a file that does not say which.
+    let (mut voice, voice_s) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    let mut lane = a_live_lane(&h, "fix-17", "i2").await;
+    a_lane_s_open_question(&h, &mut lane, "fix-17", "a1").await;
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "tap-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    assert!(
+        result["why"]
+            .as_str()
+            .expect("a sentence")
+            .contains("more than once"),
+        "the refusal does not say the question is written down twice: {:?}",
+        result
+    );
+    let neither =
+        |frames: Vec<HubFrame>| !frames.iter().any(|f| matches!(f, HubFrame::Choice { .. }));
+    assert!(
+        neither(voice.drain_for(Duration::from_millis(150)).await),
+        "the hub guessed a lane's question on his behalf"
+    );
+    assert!(
+        neither(lane.drain_for(Duration::from_millis(150)).await),
+        "the hub guessed a lane's question on his behalf"
+    );
+    // And neither question was burned: the phone can still answer the one it can see.
+    h.hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &voice_s, &OptionId::new("y"))
+        .await
+        .expect("an ambiguous answer moved a question's own state");
+}
+
+#[tokio::test]
+async fn an_answer_cannot_reach_into_another_conversation_s_ask() {
+    let h = harness().await;
+    // A second enrolled project, so the ask id under attack belongs to a DIFFERENT conversation
+    // and a matcher that ignored the conversation would find the first project's open question.
+    let repo2 = h.dir.path().join("the-other-project");
+    std::fs::create_dir_all(&repo2).expect("a second repo");
+    let mut registry = Registry::load(h.dir.path().join("projects.json"));
+    let (second, _secret2) = registry.enrol(&repo2).expect("enrol the second project");
+    assert_ne!(
+        second.id, h.project,
+        "the enrolment minted the same conversation for two repos"
+    );
+
+    let (mut bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(second.id.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+
+    let result = the_result_of(&h, "tap-1");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    assert!(
+        result["why"]
+            .as_str()
+            .expect("a sentence")
+            .contains("no question written down under that name"),
+        "the refusal does not say the other conversation holds no such question: {:?}",
+        result
+    );
+    let seen = bridge.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "an answer naming one conversation was delivered into another's session: {seen:?}"
+    );
+    h.hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the first conversation's own question was moved by an answer for another");
+}

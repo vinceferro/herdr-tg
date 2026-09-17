@@ -54,7 +54,10 @@
 //! exists mirrored: the PWA's echo of his own words is a receipt, and a receipt for words that
 //! reached nobody is the one thing it must never say. A refusal is the door's result file's
 //! fact (or the phone's line), not the ring's — the ring records what happened, not what did
-//! not.
+//! not. What the bridge said about a delivered act LATER is the follow-up half
+//! ([`Ring::his_words_were_refused`] and its kin): appended as an `ack` line beside the receipt
+//! it answers, because the ring is append-only history and a receipt already written is a fact
+//! already sent.
 //!
 //! # A ring failure is never an agent's failure
 //!
@@ -289,6 +292,112 @@ impl Ring {
         });
         nothing_of_this_machine(&mut frame);
         self.stamp(conversation, lane, frame, DOWN);
+    }
+
+    /// What a bridge said became of one of his acts at the door — the follow-up half of the
+    /// door's receipt.
+    ///
+    /// His words and taps leave a `dir:"down"` line the moment they are handed to a live
+    /// session, and that line is history the moment it is written: what the bridge says LATER —
+    /// a refusal, a silence, a late acceptance — is APPENDED beside it, never folded back into
+    /// it, exactly as the phone edits a receipt line forward in time and never backwards. The
+    /// frame is the wire's own ack vocabulary (`t:"ack"`, `status`, `reason`) because that is
+    /// what the event IS on the wire; the wire's `ref` — a frame id this hub minted — is
+    /// replaced by what a reader of THIS file can join on: `of` names which of his acts it is
+    /// about, and a choice carries the `ask_id` and `option_id` its down line already carries.
+    ///
+    /// `status` is present only when somebody answered. A confirm window that ran out is not an
+    /// answer, and recording it as `refused` would put a refusal in his history no bridge ever
+    /// sent: the timeout line carries its sentence in `reason` and NO status, and the absent
+    /// status is exactly "nobody said".
+    fn the_door_was_answered(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        frame: serde_json::Value,
+    ) {
+        if !the_shape_the_registry_mints(conversation) {
+            return;
+        }
+        let mut frame = frame;
+        nothing_of_this_machine(&mut frame);
+        // Spoken upward, like every consequence the operator reads: the hub's own retirements
+        // travel the same way.
+        self.stamp(conversation, lane, frame, UP);
+    }
+
+    /// A bridge refused his typed words, and said why.
+    pub fn his_words_were_refused(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        why: &str,
+    ) {
+        self.the_door_was_answered(
+            conversation,
+            lane,
+            serde_json::json!({ "t": "ack", "of": "message", "status": "refused", "reason": why }),
+        );
+    }
+
+    /// A bridge refused his answer to a question, and said why.
+    pub fn his_answer_was_refused(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        option_id: &OptionId,
+        why: &str,
+    ) {
+        self.the_door_was_answered(
+            conversation,
+            lane,
+            serde_json::json!({
+                "t": "ack", "of": "choice", "ask_id": ask_id.as_str(),
+                "option_id": option_id.as_str(), "status": "refused", "reason": why,
+            }),
+        );
+    }
+
+    /// The bridge that promised to confirm a choice has said nothing in the window — the door's
+    /// spelling of the phone's "the session has not confirmed it took your answer".
+    pub fn his_answer_was_never_confirmed(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        option_id: &OptionId,
+    ) {
+        self.the_door_was_answered(
+            conversation,
+            lane,
+            serde_json::json!({
+                "t": "ack", "of": "choice", "ask_id": ask_id.as_str(),
+                "option_id": option_id.as_str(),
+                "reason": "the session has not confirmed it took your answer",
+            }),
+        );
+    }
+
+    /// A bridge that had gone silent confirmed his answer after all, late. The correction of an
+    /// earlier never-confirmed line, and the ONLY accepted ack this file ever writes: an
+    /// ordinary acceptance corrects nothing (the receipt line claimed nothing was confirmed),
+    /// so it gets no line and no words of its own — the order of the lines is the explanation.
+    pub fn his_answer_was_taken_after_all(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        option_id: &OptionId,
+    ) {
+        self.the_door_was_answered(
+            conversation,
+            lane,
+            serde_json::json!({
+                "t": "ack", "of": "choice", "ask_id": ask_id.as_str(),
+                "option_id": option_id.as_str(), "status": "accepted",
+            }),
+        );
     }
 
     /// The one built frame onto the ring, wearing the next number.
