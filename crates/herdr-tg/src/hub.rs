@@ -2347,7 +2347,7 @@ pub struct Hub<S: Surface> {
     /// `ask_resolved` the hub handles — the seam a later gateway reads this conversation plane
     /// from. Written and swallowed: a ring failure may never delay or fail a delivery. See
     /// `door.rs` for the egress law every line obeys.
-    ring: crate::door::Ring,
+    ring: door::Ring,
     /// One live connection per ADDRESS, not per project. Two worktrees of one repo are two agents
     /// that can each block on a question of their own, and the second used to be turned away.
     claims: Arc<Mutex<BTreeMap<Addr, Claim>>>,
@@ -2555,7 +2555,7 @@ impl<S: Surface> Hub<S> {
         let conversations =
             crate::conversations::ChannelHome::at(audit.path().parent().unwrap_or(Path::new(".")));
         // The ring beside them, resuming its sequence from whatever the last run left.
-        let ring = crate::door::Ring::in_dir(audit_path.parent().unwrap_or(Path::new(".")));
+        let ring = door::Ring::in_dir(audit_path.parent().unwrap_or(Path::new(".")));
         Self {
             surface,
             registry: Arc::new(Mutex::new(registry)),
@@ -3411,6 +3411,7 @@ impl<S: Surface> Hub<S> {
                 addr,
                 mine,
                 "the session that asked this restarted, so it is not waiting for an answer any more",
+                true,
             )
             .await;
         }
@@ -3422,6 +3423,7 @@ impl<S: Surface> Hub<S> {
                 addr,
                 orphaned,
                 "the session that asked this has ended, so it is not waiting for an answer any more",
+                true,
             )
             .await;
         }
@@ -7526,35 +7528,52 @@ impl<S: Surface> Hub<S> {
                 );
             }
         }
-        self.retire_each(addr, targets, &note).await;
+        // Not the hub's own word: the agent's `ask_resolved` frame was recorded as the frame
+        // that carried it, and a second line here would be the same event twice.
+        self.retire_each(addr, targets, &note, false).await;
     }
 
     /// Take the keyboard off each of these messages and leave the note in its place.
-    async fn retire_each(&self, addr: &Addr, targets: Vec<(i64, MsgId)>, note: &str) {
+    ///
+    /// `the_hub_s_own_word` is true only for the retirements no frame announced — the sweep that
+    /// clears a dead session's questions. The agent's own `ask_resolved` was recorded as the
+    /// frame that carried it, and recording it here as well would be two lines for one event; the
+    /// sweep's retirement exists nowhere else, so it is the one that owes the ring a line.
+    async fn retire_each(
+        &self,
+        addr: &Addr,
+        targets: Vec<(i64, MsgId)>,
+        note: &str,
+        the_hub_s_own_word: bool,
+    ) {
         for (chat, msg) in targets {
             // The record carries both the topic and the question's own words, so the retirement
             // does not have to go back to the registry for one and cannot leave the other out.
             let record = { self.ledger.lock().await.get(chat, &msg).cloned() };
-            let retired = match &record {
-                Some(record) => {
-                    // What HE did outranks everything, then the record's own note, then the
-                    // caller's. Both marks can sit on one record — he tapped, and the agent then
-                    // said the question was over — and only one of them is a thing he did; writing
-                    // "answered at the terminal" over a button he pressed is the two-truths defect
-                    // from the other side. Below that, the record's note beats the caller's,
-                    // because this retirement may be a sweep that only knows the question is not
-                    // open — and its sentence, "the session that asked this restarted", is true of
-                    // an abandoned question and false of one that was answered and then would not
-                    // let go of its keyboard.
-                    let note = record
+            // What HE did outranks everything, then the record's own note, then the caller's.
+            // Both marks can sit on one record — he tapped, and the agent then said the question
+            // was over — and only one of them is a thing he did; writing "answered at the
+            // terminal" over a button he pressed is the two-truths defect from the other side.
+            // Below that, the record's note beats the caller's, because this retirement may be a
+            // sweep that only knows the question is not open — and its sentence, "the session
+            // that asked this restarted", is true of an abandoned question and false of one that
+            // was answered and then would not let go of its keyboard.
+            let shown = record
+                .as_ref()
+                .map(|record| {
+                    record
                         .answered
                         .as_ref()
                         .and_then(|chosen| record.options.iter().find(|o| &o.option_id == chosen))
                         .map(|o| format!("answered from your phone — {}", o.label))
                         .or_else(|| record.closed.as_ref().map(|c| c.note.clone()))
-                        .unwrap_or_else(|| note.to_owned());
+                        .unwrap_or_else(|| note.to_owned())
+                })
+                .unwrap_or_else(|| note.to_owned());
+            let retired = match &record {
+                Some(record) => {
                     self.surface
-                        .retire_buttons(record.topic_id, &msg, &record.text, &note)
+                        .retire_buttons(record.topic_id, &msg, &record.text, &shown)
                         .await
                 }
                 None => Ok(()),
@@ -7564,6 +7583,19 @@ impl<S: Surface> Hub<S> {
             match retired {
                 Ok(()) => {
                     let _ = self.ledger.lock().await.forget(chat, &msg);
+                    // The ring's copy of a retirement the hub itself performed — written only
+                    // once the phone has actually taken the keyboard, and in the phone's own
+                    // words, so the PWA's history and what he read cannot disagree. Named for
+                    // the conversation the RECORD belongs to, not the one that triggered the
+                    // sweep, exactly as the failure log below is.
+                    if the_hub_s_own_word && let Some(record) = record.as_ref() {
+                        self.ring.resolved_by_the_hub(
+                            &record.project,
+                            record.lane.as_ref(),
+                            &record.ask_id,
+                            &shown,
+                        );
+                    }
                 }
                 // Named for the conversation the RECORD belongs to, not the one that triggered the
                 // sweep: a bridge arriving now clears what other worktrees of its project left, and
@@ -7807,6 +7839,10 @@ fn next_frame_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The ring of operator-visible events — see `door.rs`. A module of the hub rather than a file
+/// beside it, so the socket guard's walk over `src/hub/` covers it like everything else that
+/// decides what a frame means.
+mod door;
 mod intent;
 #[cfg(test)]
 mod tests;

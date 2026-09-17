@@ -175,15 +175,15 @@ const MAY_START_A_PROCESS: [MayStartAProcess; 4] = [
 /// into what a phone shows; `queue.rs` is the pacer that spends the send budget; `registry.rs`,
 /// `conversations.rs` and `presence.rs` are identity and what is live; `summarize.rs` is the only
 /// thing that sends anything off this machine; `media.rs` and `heartbeat.rs` are reached from the
-/// serving path too. `door.rs` is the ring of operator-visible events the hub appends for the
+/// serving path too. `hub/door.rs` is the ring of operator-visible events the hub appends for the
 /// gateway that will one day serve them off this machine — a file a frame's own words land in, so
 /// it is on this list exactly as the files around it are.
 const THE_INBOUND_PATH: [&str; 13] = [
     "crates/herdr-tg/src/bot.rs",
     "crates/herdr-tg/src/conversations.rs",
-    "crates/herdr-tg/src/door.rs",
     "crates/herdr-tg/src/heartbeat.rs",
     "crates/herdr-tg/src/hub.rs",
+    "crates/herdr-tg/src/hub/door.rs",
     "crates/herdr-tg/src/media.rs",
     "crates/herdr-tg/src/presence.rs",
     "crates/herdr-tg/src/queue.rs",

@@ -2,9 +2,10 @@
 //!
 //! The PWA is the operator's work surface now, and this hub is the conversation plane. The ring
 //! is the seam between them: the hub appends what he would have seen — an agent's `say`, its
-//! `ask`, its `done`, an `ask` stopping being open — and a later increment serves those lines to
-//! the PWA over HTTP. Nothing consumes the ring yet; the hub writes it regardless, because the
-//! events it misses before a reader exists are the events no reader will ever see.
+//! `ask`, its `done`, an `ask` stopping being open, and the hub's own retirement of a question a
+//! dead session left open — and a later increment serves those lines to the PWA over HTTP.
+//! Nothing consumes the ring yet; the hub writes it regardless, because the events it misses
+//! before a reader exists are the events no reader will ever see.
 //!
 //! # The egress law, which is the whole design
 //!
@@ -29,6 +30,24 @@
 //! from any other word to a scanner that does not know it, and goes where the words go. The same
 //! words already reached his phone; the ring is not a new disclosure, it is a new reader.
 //!
+//! And what the scrubber ACCEPTS, by ruling rather than by proof: relative paths with no leading
+//! slash (`src/hub.rs`), backslash forms (`C:\Users\…`, `..\x`), a bare `~` with no slash after
+//! it, and any scheme that is not exactly lower-case `http://` or `https://`. Each is contrived —
+//! this box's agents quote POSIX paths and lower-case URLs — and the ruling is the same
+//! settlement the write guard received: the shapes nobody produces are not worth the mangle that
+//! chasing them would put on ordinary words.
+//!
+//! # As spoken, not as delivered
+//!
+//! A line is stamped where the hub first handles the frame — before the gist rewrites a question
+//! and before the pacer decides a wait — and it carries no delivery field, no seen, no shed.
+//! Whether the phone took a message, clipped it, or refused it for the ceiling is the phone
+//! ledger's fact (the audit beside this file, and the marks he reads), and a second copy of it
+//! here would be two files that can disagree about one thing. The one hub-minted line is the
+//! exception that proves the shape: a retirement the hub itself performed
+//! ([`Ring::resolved_by_the_hub`]) is stamped where the edit was observed to land, because that
+//! edit is the event.
+//!
 //! # A ring failure is never an agent's failure
 //!
 //! The ring is written at the seam the audit is, from the hub's frame handling, and it is the
@@ -44,7 +63,9 @@
 //! reader orders them `.1.` first. Around a megabyte the active file is rotated: renamed onto
 //! the old one — whose previous contents are spent, which is what "bounded" means — and started
 //! again. `seq` never resets, across a rotation or across a hub restart, so a reader holding a
-//! cursor can always ask for "after this one" and be answered.
+//! cursor can always ask for "after this one" and be answered. Each line is written whole in one
+//! write, and a restart heals the tail of a write that never finished rather than building on it
+//! — see [`the_floor`].
 
 use std::fs;
 use std::io::Write as _;
@@ -52,7 +73,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use hub_proto::{BridgeFrame, LaneId, ProjectId};
+use hub_proto::{AskId, BridgeFrame, LaneId, ProjectId};
+
+use super::now_secs;
 
 /// The active ring file, beside the audit log and every other state file of this hub.
 pub const RING: &str = "hub.ring.ndjson";
@@ -159,28 +182,57 @@ impl Ring {
     /// the gist rewrites a question, before the pacer decides a wait — so what the ring holds is
     /// what the agent said, not what this hub did with it.
     pub fn append(&self, conversation: &ProjectId, lane: Option<&LaneId>, frame: &BridgeFrame) {
-        // The conversation becomes half of what a reader addresses an event by, so it must be the
-        // shape the registry mints and nothing else: an id of another shape could be any string
-        // the wire chose, and the ring's whole promise is that it names nothing of this machine.
-        if !crate::conversations::is_conversation_id(conversation.as_str()) {
-            tracing::warn!(
-                conversation = %conversation,
-                "a frame arrived for a conversation whose id is not a shape this hub minted; the \
-                 ring records nothing about it"
-            );
+        if !the_shape_the_registry_mints(conversation) {
             return;
         }
         let Some(frame) = the_operator_visible(frame) else {
             return;
         };
+        self.stamp(conversation, lane, frame);
+    }
 
+    /// A question the HUB itself put away, in the wire's own vocabulary.
+    ///
+    /// The one operator-visible event minted hub-side: a session that dies holding a question has
+    /// its keyboard taken off by the sweep, and that edit never passes the hub's frame handling —
+    /// so without this line the PWA's only history would show the question open for ever. The
+    /// frame reuses `ask_resolved`, the wire's own word for "this question stopped being open",
+    /// with the hub's sentence in `how` — the same words the phone reads — rather than a frame
+    /// kind nobody on the wire has ever spoken. No new kind, no change to hub-proto.
+    ///
+    /// Called only where the retirement was OBSERVED to land (`retire_each`'s success arm), so
+    /// the ring never says a keyboard came off one Telegram refused to take.
+    pub fn resolved_by_the_hub(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        how: &str,
+    ) {
+        if !the_shape_the_registry_mints(conversation) {
+            return;
+        }
+        // The sentence can carry a button's label — the phone's own "answered from your phone —
+        // …", an agent's words — so it goes through the same single rule every string in a frame
+        // does, rather than being trusted for being the hub's.
+        let mut frame = serde_json::json!({
+            "t": "ask_resolved",
+            "ask_id": ask_id.as_str(),
+            "how": how,
+        });
+        nothing_of_this_machine(&mut frame);
+        self.stamp(conversation, lane, frame);
+    }
+
+    /// One built frame onto the ring, wearing the next number.
+    fn stamp(&self, conversation: &ProjectId, lane: Option<&LaneId>, frame: serde_json::Value) {
         let mut where_ = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if where_.closed {
             return;
         }
         let line = Line {
             seq: where_.next_seq,
-            ts: crate::hub::now_secs(),
+            ts: now_secs(),
             dir: UP,
             conversation: conversation.as_str(),
             lane: lane.map_or("-", LaneId::as_str),
@@ -239,9 +291,15 @@ impl Where {
         // Re-asserted: `.mode()` applies only at creation, and a file that was once world-readable
         // stays that way through every append.
         let _ = fs::set_permissions(&self.active, fs::Permissions::from_mode(0o600));
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
-        self.bytes += line.len() as u64 + 1;
+        // ONE write, line and newline together. Two writes leave a window between them where
+        // death or a full disk has put the line's bytes down without its terminator — and the
+        // next event glues onto it, making both unparseable for ever. A partial single write is
+        // the torn tail `the_floor` heals at the next start.
+        let mut whole = Vec::with_capacity(line.len() + 1);
+        whole.extend_from_slice(line.as_bytes());
+        whole.push(b'\n');
+        f.write_all(&whole)?;
+        self.bytes += whole.len() as u64;
         Ok(())
     }
 
@@ -259,6 +317,21 @@ impl Where {
         self.bytes = 0;
         Ok(())
     }
+}
+
+/// The conversation becomes half of what a reader addresses an event by, so it must be the shape
+/// the registry mints and nothing else: an id of another shape could be any string the wire chose,
+/// and the ring's whole promise is that it names nothing of this machine.
+fn the_shape_the_registry_mints(conversation: &ProjectId) -> bool {
+    let shaped = crate::conversations::is_conversation_id(conversation.as_str());
+    if !shaped {
+        tracing::warn!(
+            conversation = %conversation,
+            "an event arrived for a conversation whose id is not a shape this hub minted; the \
+             ring records nothing about it"
+        );
+    }
+    shaped
 }
 
 /// The wire frame as the ring records it, or nothing — and nothing is every other kind.
@@ -297,66 +370,109 @@ fn nothing_of_this_machine(value: &mut serde_json::Value) {
     }
 }
 
-/// A byte that can sit inside a path or a word that might hold one. Everything else — a space, a
-/// comma, a bracket — is an edge a path cannot cross.
+/// A byte that can sit inside a path, a URL, or a word that might hold either.
+///
+/// The path bytes proper, plus the punctuation a URL carries (`: ? & = # % @ +`) — a token is a
+/// run of these, and everything else (a space, a comma, a bracket) is an edge a path or a URL
+/// cannot cross. The edges are what keep `/etc/x` inside `see(/etc/x)` scrubbed while the
+/// sentence around it stands, and what keep a trailing comma out of a spared URL's span.
+fn is_token_byte(b: u8) -> bool {
+    is_path_byte(b) || matches!(b, b':' | b'?' | b'&' | b'=' | b'#' | b'%' | b'@' | b'+')
+}
+
+/// The bytes a path is built from, on this machine. A `:` or a `?` breaks a path's run even
+/// though a token may carry on past it.
 fn is_path_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~' | b'/')
 }
 
-/// Every absolute and home-relative path in the words, replaced by `[a path]`.
+/// Every absolute and home-relative path in the words, replaced by `[a path]` — with `http://`
+/// and `https://` URLs spared whole.
 ///
-/// The shapes are the ones that name a place on THIS machine — `/`-rooted and `~`-rooted words,
-/// taken out WHOLE — and not the relative paths of a repository (`src/hub.rs`), which name a
-/// place in a conversation's own work and carry nothing of the operator's filesystem. A URL is
-/// not a filesystem path either and is spared whole, because an agent citing documentation is not
-/// an agent citing a disk. A word is a run of bytes a path can hold; everything else — a space, a
-/// comma, a bracket — is an edge a path cannot cross, which is what keeps `/etc/x` inside
-/// `see(/etc/x)` scrubbed while the sentence around it stands. Non-ASCII bytes are edges too:
-/// this box's paths are ASCII, and a scanner that guessed further would be a scanner guessing.
+/// The shapes that name a place on THIS machine — `/`-rooted and `~`-rooted paths, taken out
+/// whole — are not the same as a URL, and coding agents cite URLs constantly: the ring is the
+/// PWA's only history, and mangling every link an agent pasted would quietly gut it. A token
+/// that CONTAINS `http://` or `https://` is a citation — something may be glued to its front
+/// (`src=https://…`), and the glued thing is not a path — so the whole token is spared. Every
+/// other scheme is a path wearing a costume: `file:///home/…` scrubs exactly where the `/home/…`
+/// inside it would. Lower case only, because that is the spelling the law names and a
+/// capitalised scheme is nobody's citation.
+///
+/// Repository-relative paths (`src/hub.rs`) are kept: they name a place in a conversation's own
+/// work and carry nothing of the operator's filesystem. Non-token bytes are edges too — this
+/// box's paths are ASCII — and a scanner that guessed further would be a scanner guessing.
 fn no_paths(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(text.len());
     let mut at = 0;
 
     while at < bytes.len() {
-        // Whitespace and everything a candidate cannot start at pass through untouched, byte for
-        // byte — the string is only ever rebuilt where a path is taken out of it.
-        if !is_path_byte(bytes[at]) {
+        // An edge passes through untouched, byte for byte — the string is only ever rebuilt
+        // where a path is taken out of it.
+        if !is_token_byte(bytes[at]) {
             out.push(bytes[at]);
             at += 1;
             continue;
         }
-        // A word begins here. Find where it ends, and treat the whole word at once: the URL
-        // sparing is a fact about the word, not about any one slash in it.
-        let word_from = at;
-        let mut word_to = at;
-        while word_to < bytes.len() && is_path_byte(bytes[word_to]) {
-            word_to += 1;
+        // A token begins here. Find where it ends, and treat the whole token at once: whether it
+        // is a URL citation is a fact about the token, not about any one slash in it.
+        let token_from = at;
+        let mut token_to = at;
+        while token_to < bytes.len() && is_token_byte(bytes[token_to]) {
+            token_to += 1;
         }
-        let word = &text[word_from..word_to];
-        if word.contains("://") {
-            out.extend_from_slice(word.as_bytes());
-        } else if is_a_machine_path(word) {
-            out.extend_from_slice(A_PATH.as_bytes());
+        let token = &text[token_from..token_to];
+        if token.contains("http://") || token.contains("https://") {
+            out.extend_from_slice(token.as_bytes());
         } else {
-            out.extend_from_slice(word.as_bytes());
+            out.extend_from_slice(paths_out_of_a_token(token).as_bytes());
         }
-        at = word_to;
+        at = token_to;
     }
     // Nothing was invented here: every byte is either one the input already held or one of the
     // ASCII marker's, and spans only ever end at byte positions a valid string can be cut at.
     String::from_utf8(out).expect("taking paths out of a valid string cannot make an invalid one")
 }
 
-/// Does this word name a place on this machine — and so may not leave it?
+/// The paths out of one token that is not a URL citation.
 ///
-/// A word that BEGINS with `/` is an absolute path, whatever follows. A word that begins with `~`
-/// and holds a slash is a home-relative one. Nothing else is: `src/hub.rs` names a place in a
-/// repository rather than on a disk, `and/or` is prose, and a word that merely CONTAINS a slash
-/// after other characters — `read/write` — cannot be told from either of those by shape, so it is
-/// kept, which fails towards recording more of the agent's own words rather than less.
-fn is_a_machine_path(word: &str) -> bool {
-    word.starts_with('/') || (word.starts_with('~') && word.contains('/'))
+/// A path begins at a `/`, or at a `~` with a `/` later in the same run of path bytes — and only
+/// where the byte before it is the token's start or a non-path token byte (`file:`, `?q=`),
+/// because mid-run a slash is a join: `and/or` and `read/write` are prose, and `src/hub.rs` is
+/// relative.
+fn paths_out_of_a_token(token: &str) -> String {
+    let b = token.as_bytes();
+    let mut out = String::with_capacity(token.len());
+    let mut at = 0;
+    while at < b.len() {
+        // A path starts at a `/`, or at a `~` with a `/` later in the same run of path bytes.
+        // The forward scan runs only for a `~` at a run's start, so a long token costs one pass.
+        let at_a_path_start = at == 0 || !is_path_byte(b[at - 1]);
+        let is_a_path = at_a_path_start
+            && match b[at] {
+                b'/' => true,
+                b'~' => {
+                    let mut end = at;
+                    while end < b.len() && is_path_byte(b[end]) && b[end] != b'/' {
+                        end += 1;
+                    }
+                    b.get(end) == Some(&b'/')
+                }
+                _ => false,
+            };
+        if is_a_path {
+            let mut end = at;
+            while end < b.len() && is_path_byte(b[end]) {
+                end += 1;
+            }
+            out.push_str(A_PATH);
+            at = end;
+        } else {
+            out.push(b[at] as char);
+            at += 1;
+        }
+    }
+    out
 }
 
 /// One line of the ring. The field order is the envelope a reader parses, and it does not change:
@@ -372,15 +488,21 @@ struct Line<'a> {
 }
 
 /// The last sequence number a ring file holds, or why it does not answer.
+///
+/// Reads only COMPLETE lines — everything before the file's last newline — because a line is
+/// written whole or not at all, and what follows the last newline is a write the process did not
+/// finish. That torn tail is healed here: truncated away, so the next event lands on a line of
+/// its own instead of gluing onto a fragment and making both unreadable for ever. A tail that
+/// cannot be cut is a file this run cannot safely append to, and reads as [`Floor::Unreadable`].
 enum Floor {
     At(u64),
     /// No such file. Not an error: that is every ring's first run.
     Gone,
     /// There, but holding no event. An empty active file falls back to the old one, which is the
-    /// crash-between-rename-and-append shape.
+    /// crash-between-rename-and-append shape — and so does a file holding nothing but a torn
+    /// first line, which healing has just emptied.
     Empty,
-    /// There, and refusing to say. The tail of a file whose process died mid-write is handled —
-    /// the last line that PARSES is the floor — so this is a file that is not a ring at all.
+    /// There, and refusing to say: not a ring at all, or one whose torn tail could not be cut.
     Unreadable(std::io::Error),
 }
 
@@ -390,13 +512,25 @@ fn the_floor(path: &Path) -> Floor {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Floor::Gone,
         Err(e) => return Floor::Unreadable(e),
     };
-    if raw.trim().is_empty() {
+    // The tail after the last newline is a write that never finished. It was never an event —
+    // nobody read it, nothing answered for it — so it goes, and the file it leaves behind is one
+    // a reader can take line by line and an append can build on.
+    let whole = match raw.rfind('\n') {
+        Some(last_newline) => &raw[..=last_newline],
+        None => "",
+    };
+    if whole.len() < raw.len()
+        && let Err(e) = cut_the_file_down_to(path, whole.len() as u64)
+    {
+        return Floor::Unreadable(e);
+    }
+    if whole.trim().is_empty() {
         return Floor::Empty;
     }
-    // Last line that parses, not the last line: the one way a ring file legitimately ends
-    // half-written is the one way this reader must tolerate.
+    // Last line that parses, not the last line: a complete line that is not an event is skipped
+    // rather than trusted, and no floor is better than a wrong one.
     let mut floor = None;
-    for line in raw.lines() {
+    for line in whole.lines() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
             && let Some(seq) = v.get("seq").and_then(serde_json::Value::as_u64)
         {
@@ -405,18 +539,156 @@ fn the_floor(path: &Path) -> Floor {
     }
     match floor {
         Some(seq) => Floor::At(seq),
-        // Bytes are there and none of them is an event. Not a torn tail — a torn tail leaves the
-        // whole lines above it intact — so this file was never a ring, and nothing may be
-        // assumed about what its numbers were.
+        // Bytes are there and none of them is an event. Not a torn tail — that was healed above —
+        // so this file was never a ring, and nothing may be assumed about what its numbers were.
         None => Floor::Unreadable(std::io::Error::other(
             "the file holds no line this ring ever wrote",
         )),
     }
 }
 
+/// Take the file down to its last complete line. The caller has already decided the bytes past
+/// that point never happened; this is the act, not the decision.
+fn cut_the_file_down_to(path: &Path, to: u64) -> std::io::Result<()> {
+    let f = fs::OpenOptions::new().write(true).open(path)?;
+    f.set_len(to)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn say(what: &str) -> BridgeFrame {
+        BridgeFrame::Say {
+            text: what.to_owned(),
+            hint: None,
+            file: None,
+        }
+    }
+
+    #[test]
+    fn a_torn_last_line_is_healed_not_inherited() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let conversation = ProjectId::new("p-0123456789ab");
+        let ring = Ring::in_dir(dir.path());
+        ring.append(&conversation, None, &say("one"));
+        ring.append(&conversation, None, &say("two"));
+
+        // Death between the line and its newline: half a line on the disk, ending nowhere. The
+        // next event would glue onto it and BOTH would be lost to every reader for ever.
+        {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(RING))
+                .expect("the ring");
+            f.write_all(br#"{"seq":3,"ts":1"#).expect("half a line, torn");
+        }
+
+        // A restart. The torn tail was never an event — nobody read it, nothing answered for it —
+        // so the ring must come back whole: healed, and the next event on a fresh line of its own.
+        let ring = Ring::in_dir(dir.path());
+        ring.append(&conversation, None, &say("three"));
+
+        let raw = fs::read_to_string(dir.path().join(RING)).expect("the healed ring");
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line of the healed ring is one event"))
+            .collect();
+        let seqs: Vec<u64> = lines.iter().map(|l| l["seq"].as_u64().expect("a seq")).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "the torn tail was inherited rather than healed:\n{raw}"
+        );
+        assert_eq!(
+            lines[2]["frame"]["text"], "three",
+            "the event after a torn tail was not the one that was asked for:\n{raw}"
+        );
+        assert_eq!(
+            lines.len(),
+            3,
+            "the fragment of the write that never finished is still in the ring:\n{raw}"
+        );
+        assert!(
+            raw.ends_with('\n'),
+            "the healed ring ends mid-line:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn a_restarted_hub_resumes_a_rotated_ring_from_the_active_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let conversation = ProjectId::new("p-0123456789ab");
+        let ring = Ring::in_dir(dir.path());
+        // Big enough to cross the rotation bound, so a restart meets TWO files and must take its
+        // floor from the one holding the newest events.
+        let words = "w".repeat(crate::queue::MAX_TEXT * 3);
+        let events = 400;
+        for n in 1..=events {
+            ring.append(&conversation, None, &say(&format!("{n} {words}")));
+        }
+        assert!(
+            dir.path().join(RING_OLD).is_file(),
+            "the run never crossed a rotation, so this test is not about a rotated ring"
+        );
+        let old_before = fs::read(dir.path().join(RING_OLD)).expect("the old file");
+
+        let ring = Ring::in_dir(dir.path());
+        ring.append(&conversation, None, &say("after the restart"));
+
+        let old_after = fs::read(dir.path().join(RING_OLD)).expect("the old file, still there");
+        assert_eq!(
+            old_before, old_after,
+            "a restart touched the file it was not resuming from"
+        );
+        let active = fs::read_to_string(dir.path().join(RING)).expect("the active file");
+        let lines: Vec<serde_json::Value> = active
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("one line, one event"))
+            .collect();
+        assert_eq!(
+            lines.last().and_then(|l| l["frame"]["text"].as_str()),
+            Some("after the restart"),
+            "the post-restart event is not the last thing in the active file:\n{active}"
+        );
+        let first_seq = lines[0]["seq"].as_u64().expect("a seq");
+        let last_seq = lines.last().unwrap()["seq"].as_u64().expect("a seq");
+        assert_eq!(
+            last_seq,
+            events + 1,
+            "the restarted ring did not resume at the top"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| l["seq"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            (first_seq..=events + 1).collect::<Vec<_>>(),
+            "the active file's own sequence is not contiguous across the restart"
+        );
+    }
+
+    #[test]
+    fn a_ring_whose_history_cannot_be_read_stays_closed_rather_than_renumbering() {
+        let dir = tempfile::tempdir().expect("tmp");
+        // Bytes that are not a ring and never were: complete lines, none of them an event.
+        let poison = "not a ring\nnot one either\n";
+        fs::write(dir.path().join(RING), poison).expect("poison the history");
+
+        let conversation = ProjectId::new("p-0123456789ab");
+        let ring = Ring::in_dir(dir.path());
+        ring.append(&conversation, None, &say("must not be written"));
+        ring.append(&conversation, None, &say("nor this"));
+
+        let after = fs::read_to_string(dir.path().join(RING)).expect("still readable");
+        assert_eq!(
+            after, poison,
+            "a hub that could not read its ring's history wrote to it anyway — and a reader that \
+             had joined before would now see two different events under one number, with nothing \
+             able to tell them apart"
+        );
+    }
 
     #[test]
     fn the_door_speaks_strictly_contiguous_seq_past_any_cursor_a_reader_can_hold() {
@@ -430,15 +702,7 @@ mod tests {
         const EVENTS: u64 = 700;
 
         for n in 1..=EVENTS {
-            ring.append(
-                &conversation,
-                None,
-                &BridgeFrame::Say {
-                    text: format!("{n} {words}"),
-                    hint: None,
-                    file: None,
-                },
-            );
+            ring.append(&conversation, None, &say(&format!("{n} {words}")));
         }
 
         // A reader takes the old file first, then the active one — that ordering is the contract

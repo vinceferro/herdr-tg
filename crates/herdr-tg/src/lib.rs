@@ -39,7 +39,6 @@ mod cmd;
 mod compat;
 mod config;
 mod conversations;
-mod door;
 mod heartbeat;
 mod hub;
 mod lock;

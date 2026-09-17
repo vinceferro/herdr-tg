@@ -17003,7 +17003,7 @@ fn every_value<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value
 
 /// The hub's ring so far, parsed — one event per line, or nothing yet.
 fn ring_so_far(dir: &std::path::Path) -> Vec<serde_json::Value> {
-    std::fs::read_to_string(dir.join(crate::door::RING))
+    std::fs::read_to_string(dir.join(crate::hub::door::RING))
         .map(|raw| {
             raw.lines()
                 .map(|l| serde_json::from_str(l).expect("one line of the ring is one event"))
@@ -17026,9 +17026,18 @@ async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
     // Words whose payloads would naturally carry this machine's identifiers: an agent quotes the
     // path it edited, names a file by where it saved it, asks about overwriting one, and reports
     // a log so long it must be clipped. If any of that survives to the ring, the law is broken.
+    // The same sentence cites URLs, because coding agents cite them constantly and the ring will
+    // be the PWA's only history: http and https are spared whole, every other scheme is a path
+    // wearing a costume and dies with the paths.
     bridge
         .send(BridgeFrame::Say {
-            text: format!("edited {home}/src/hub.rs and/or {home}/docs/ATTACHING.md by hand"),
+            text: format!(
+                "edited {home}/src/hub.rs and/or {home}/docs/ATTACHING.md by hand — the guide is \
+                 https://docs.example.com/guide, the tool is \
+                 http://tools.example.org/a?b=c&d=e, the tilde one is \
+                 https://example.com/~someone/page, and the key at file://{home}/.ssh/id_ed25519 is \
+                 not a citation"
+            ),
             hint: Some(SayHint::Output),
             file: None,
         })
@@ -17085,7 +17094,7 @@ async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
     .await;
     until(async || ring_so_far(h.dir.path()).len() == 5).await;
 
-    let raw = std::fs::read_to_string(h.dir.path().join(crate::door::RING)).expect("the ring");
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING)).expect("the ring");
     let lines = ring_so_far(h.dir.path());
     assert_eq!(
         lines.len(),
@@ -17161,6 +17170,26 @@ async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
     assert!(
         text.contains("and/or"),
         "ordinary prose was mangled by the path scrub: {text}"
+    );
+    assert!(
+        text.contains("https://docs.example.com/guide"),
+        "an https URL an agent cited was not spared whole: {text}"
+    );
+    assert!(
+        text.contains("http://tools.example.org/a?b=c&d=e"),
+        "an http URL with a query was not spared whole: {text}"
+    );
+    assert!(
+        text.contains("https://example.com/~someone/page"),
+        "a URL with a home-directory component was not spared whole: {text}"
+    );
+    assert!(
+        !text.contains(".ssh"),
+        "a file:// URL is a path wearing a costume, and it reached the ring: {text}"
+    );
+    assert!(
+        text.contains("file:[a path]"),
+        "the file:// costume was not stripped where the path was: {text}"
     );
 
     let with_file = &lines[1];
@@ -17245,7 +17274,7 @@ async fn a_hub_that_restarts_resumes_the_ring_where_it_left_off() {
         .await;
     until(async || !fake.sends.lock().await.is_empty()).await;
 
-    let raw = std::fs::read_to_string(h.dir.path().join(crate::door::RING))
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING))
         .expect("the ring outlived the hub that wrote it");
     let lines = ring_so_far(h.dir.path());
     let seqs: Vec<u64> = lines
@@ -17262,12 +17291,58 @@ async fn a_hub_that_restarts_resumes_the_ring_where_it_left_off() {
 }
 
 #[tokio::test]
+async fn a_session_that_dies_holding_a_question_writes_its_retirement_to_the_ring() {
+    // The one operator-visible event that is minted hub-side: a session that dies holding a
+    // question has its keyboard taken off by the hub itself, and that edit never passes `handle`.
+    // Without this, the PWA's only history would show the question open for ever.
+    let h = harness().await;
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    first.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    one_open_question(&h, &mut first, "a1").await;
+    drop(first);
+
+    // The next session of this conversation arriving is what sweeps the dead one's questions off
+    // the phone — and what must also write the retirement to the ring.
+    let mut next = FakeBridge::connect(&h.sock, &h.secret, "i2", "p-somebody-else").await;
+    next.become_live().await;
+    until(async || ring_so_far(h.dir.path()).len() == 2).await;
+
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING))
+        .expect("the ring holds both halves");
+    let lines = ring_so_far(h.dir.path());
+    let seqs: Vec<u64> = lines
+        .iter()
+        .map(|l| l["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![1, 2],
+        "the retirement was not written beside the ask:\n{raw}"
+    );
+    assert_eq!(lines[0]["frame"]["t"], "ask", "{raw}");
+    assert_eq!(lines[0]["frame"]["ask_id"], "a1", "{raw}");
+    assert_eq!(lines[1]["frame"]["t"], "ask_resolved", "{raw}");
+    assert_eq!(lines[1]["frame"]["ask_id"], "a1", "{raw}");
+    assert_eq!(
+        lines[1]["frame"]["how"],
+        "the session that asked this restarted, so it is not waiting for an answer any more",
+        "the retirement's how must be the same words the phone reads:\n{raw}"
+    );
+    // Attributed to the conversation that asked — the record's, not the sweeper's — and spoken
+    // upward like everything else in the ring.
+    assert_eq!(lines[1]["conversation"], *h.project.as_str(), "{raw}");
+    assert_eq!(lines[1]["lane"], "-", "{raw}");
+    assert_eq!(lines[1]["dir"], "up", "{raw}");
+}
+
+#[tokio::test]
 async fn a_ring_that_cannot_be_written_costs_no_delivery() {
     let blocked = harness().await;
     // A directory standing where the ring's file must be: every append on it fails, the way a
     // full disk or a misowned state directory would — and unlike those it fails for the whole
     // test, which is exactly the case the property is about.
-    std::fs::create_dir(blocked.dir.path().join(crate::door::RING)).expect("block the ring");
+    std::fs::create_dir(blocked.dir.path().join(crate::hub::door::RING)).expect("block the ring");
     let fine = harness().await;
 
     for h in [&blocked, &fine] {
@@ -17307,10 +17382,10 @@ async fn a_ring_that_cannot_be_written_costs_no_delivery() {
     // The failure is nowhere but the logs: the blocked hub's ring is still the blocking
     // directory, and the healthy hub's ring holds exactly the two events.
     assert!(
-        blocked.dir.path().join(crate::door::RING).is_dir(),
+        blocked.dir.path().join(crate::hub::door::RING).is_dir(),
         "the blocked hub wrote through the very thing blocking it"
     );
-    let raw = std::fs::read_to_string(fine.dir.path().join(crate::door::RING))
+    let raw = std::fs::read_to_string(fine.dir.path().join(crate::hub::door::RING))
         .expect("the healthy hub's ring");
     assert_eq!(
         raw.lines().count(),
