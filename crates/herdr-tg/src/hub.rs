@@ -2343,6 +2343,11 @@ pub struct Hub<S: Surface> {
     titles: std::sync::Mutex<BTreeMap<ProjectId, Option<String>>>,
     pub ledger: Arc<Mutex<AskLedger>>,
     pub audit: Arc<HubAudit>,
+    /// The ring of operator-visible events, one NDJSON line per `say`, `ask`, `done` and
+    /// `ask_resolved` the hub handles — the seam a later gateway reads this conversation plane
+    /// from. Written and swallowed: a ring failure may never delay or fail a delivery. See
+    /// `door.rs` for the egress law every line obeys.
+    ring: crate::door::Ring,
     /// One live connection per ADDRESS, not per project. Two worktrees of one repo are two agents
     /// that can each block on a question of their own, and the second used to be turned away.
     claims: Arc<Mutex<BTreeMap<Addr, Claim>>>,
@@ -2549,6 +2554,8 @@ impl<S: Surface> Hub<S> {
         // conversation's title is.
         let conversations =
             crate::conversations::ChannelHome::at(audit.path().parent().unwrap_or(Path::new(".")));
+        // The ring beside them, resuming its sequence from whatever the last run left.
+        let ring = crate::door::Ring::in_dir(audit_path.parent().unwrap_or(Path::new(".")));
         Self {
             surface,
             registry: Arc::new(Mutex::new(registry)),
@@ -2556,6 +2563,7 @@ impl<S: Surface> Hub<S> {
             titles: std::sync::Mutex::new(BTreeMap::new()),
             ledger: Arc::new(Mutex::new(ledger)),
             audit: Arc::new(audit),
+            ring,
             claims: Arc::new(Mutex::new(BTreeMap::new())),
             presence,
             presence_order: AtomicU64::new(0),
@@ -6468,6 +6476,11 @@ impl<S: Surface> Hub<S> {
         instance: &str,
         frame: BridgeFrame,
     ) -> (Delivered, Option<hub_proto::AckWhy>) {
+        // The ring, stamped as the frame reaches the hub's handling — before the gist rewrites a
+        // question and before the pacer decides a wait, so what it holds is what the agent said.
+        // The door decides which kinds are operator-visible and swallows its own failures; it
+        // neither awaits nor errors, so it can cost a delivery nothing.
+        self.ring.append(&addr.project, addr.lane.as_ref(), &frame);
         match frame {
             BridgeFrame::Say {
                 text,

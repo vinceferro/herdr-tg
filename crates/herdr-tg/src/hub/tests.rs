@@ -14,8 +14,8 @@ use std::time::Duration;
 use hub_proto::frame::{Control, IntentStatus, Op};
 use hub_proto::ids::{IntentId, SpecId};
 use hub_proto::{
-    AckStatus, AskEnd, AskOption, BridgeFrame, Delivered, Envelope, FrameId, FrameReader, HubFrame,
-    MsgId, OptionId, write_frame,
+    AckStatus, AskEnd, AskOption, BeatState, BridgeFrame, Delivered, Envelope, FileAs, FrameId,
+    FrameReader, HubFrame, MsgId, OptionId, SayFile, SayHint, write_frame,
 };
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
@@ -16982,5 +16982,339 @@ fn a_ledger_file_longer_than_the_bound_keeps_the_newest_records_and_forgets_the_
         None,
         "the bound was not applied on the way in, so a file that grew makes this hub's memory \
          unbounded"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The ring of operator-visible events — the file a later gateway serves to the PWA. The egress
+// law these tests enforce is stated in `door.rs`: a file that will one day leave this machine
+// carries no chat, no topic, no person, no Telegram message id, no path and no secret.
+
+/// Every value in a JSON tree, depth first — the egress law is about values, wherever they sit,
+/// so the assertion walks the whole line rather than the fields it can name.
+fn every_value<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+    out.push(v);
+    match v {
+        serde_json::Value::Array(a) => a.iter().for_each(|x| every_value(x, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| every_value(x, out)),
+        _ => {}
+    }
+}
+
+/// The hub's ring so far, parsed — one event per line, or nothing yet.
+fn ring_so_far(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join(crate::door::RING))
+        .map(|raw| {
+            raw.lines()
+                .map(|l| serde_json::from_str(l).expect("one line of the ring is one event"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
+    let h = harness().await;
+    let home = h.dir.path().display().to_string();
+
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    let _ = bridge.next().await.expect("a welcome");
+    let ping = bridge.next().await.expect("a ping");
+    bridge.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // Words whose payloads would naturally carry this machine's identifiers: an agent quotes the
+    // path it edited, names a file by where it saved it, asks about overwriting one, and reports
+    // a log so long it must be clipped. If any of that survives to the ring, the law is broken.
+    bridge
+        .send(BridgeFrame::Say {
+            text: format!("edited {home}/src/hub.rs and/or {home}/docs/ATTACHING.md by hand"),
+            hint: Some(SayHint::Output),
+            file: None,
+        })
+        .await;
+    bridge
+        .send(BridgeFrame::Say {
+            text: "the screen, as it stood".to_owned(),
+            hint: None,
+            file: Some(SayFile {
+                name: "screen.png".to_owned(),
+                mime: Some("image/png".to_owned()),
+                filename: Some(format!("{home}/shot at the terminal.png")),
+                r#as: Some(FileAs::Photo),
+            }),
+        })
+        .await;
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: format!("Overwrite {home}/deploy/prod.yaml?"),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "yes, stage it under /tmp/first".to_owned(),
+            }]),
+        })
+        .await;
+    let long = "l".repeat(crate::queue::MAX_TEXT * 2);
+    bridge
+        .send(BridgeFrame::Done {
+            text: format!("{home}/logs/everything.txt {long}"),
+            file: None,
+        })
+        .await;
+    // Liveness reaches no phone, so it must reach no ring.
+    bridge
+        .send(BridgeFrame::Beat {
+            state: BeatState::Working,
+            note: Some(format!("watching {home}")),
+        })
+        .await;
+    until(async || ring_so_far(h.dir.path()).len() == 4).await;
+
+    // One lane speaking, so its address is the lane on the ring rather than a dash.
+    let mut lane =
+        FakeBridge::connect_as(&h.sock, &h.secret, "i1", "p-whatever", Some("fix-ring")).await;
+    let _ = lane.next().await.expect("a welcome");
+    let ping = lane.next().await.expect("a ping");
+    lane.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+    lane.send(BridgeFrame::Say {
+        text: "the worktree's own words".to_owned(),
+        hint: None,
+        file: None,
+    })
+    .await;
+    until(async || ring_so_far(h.dir.path()).len() == 5).await;
+
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::door::RING)).expect("the ring");
+    let lines = ring_so_far(h.dir.path());
+    assert_eq!(
+        lines.len(),
+        5,
+        "the ring recorded something beyond the four operator-visible kinds:\n{raw}"
+    );
+
+    let mut seqs = Vec::new();
+    for line in &lines {
+        assert_eq!(
+            line["dir"], "up",
+            "an agent's own words are the up direction"
+        );
+        assert_eq!(
+            line["conversation"],
+            *h.project.as_str(),
+            "the conversation must be its id, not a path or a title"
+        );
+        let lane = line["lane"]
+            .as_str()
+            .expect("a lane, or the wire's own dash");
+        assert!(
+            lane == "-" || lane == "fix-ring",
+            "the lane field names something beyond an address: {lane}"
+        );
+        seqs.push(line["seq"].as_u64().expect("a sequence number"));
+        assert!(line["ts"].as_u64().is_some(), "a unix-second stamp");
+        assert!(
+            line["frame"]["t"].is_string(),
+            "the frame carries the wire's own kind tag"
+        );
+
+        let mut values = Vec::new();
+        every_value(line, &mut values);
+        for v in &values {
+            if let Some(n) = v.as_i64() {
+                assert!(
+                    ![-1001_i64, 7, 4242, 999_001, 1001, 1002, 1003].contains(&n),
+                    "a chat, topic or person id reached the ring as the number {n}:\n{raw}"
+                );
+            }
+            if let Some(s) = v.as_str() {
+                assert!(
+                    !s.contains(&home),
+                    "an absolute path of this machine reached the ring: {s}"
+                );
+                assert!(
+                    !s.contains("/tmp/"),
+                    "an absolute path reached the ring: {s}"
+                );
+                assert!(
+                    !s.contains("~/"),
+                    "a home-relative path reached the ring: {s}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        seqs,
+        (1..=5).collect::<Vec<_>>(),
+        "the sequence is not contiguous from 1"
+    );
+
+    // What IS there: the words, the buttons, the ids the agent minted — clipped, never enriched.
+    let say = &lines[0];
+    assert_eq!(say["frame"]["t"], "say");
+    assert_eq!(say["frame"]["hint"], "output");
+    let text = say["frame"]["text"].as_str().expect("the words");
+    assert!(
+        text.contains("[a path]"),
+        "the path was not withheld: {text}"
+    );
+    assert!(
+        text.contains("and/or"),
+        "ordinary prose was mangled by the path scrub: {text}"
+    );
+
+    let with_file = &lines[1];
+    let filename = with_file["frame"]["file"]["filename"]
+        .as_str()
+        .expect("a name");
+    assert!(
+        filename.contains("[a path]"),
+        "a path reached the ring inside a file's name: {filename}"
+    );
+
+    let ask = &lines[2];
+    assert_eq!(ask["frame"]["t"], "ask");
+    assert_eq!(ask["frame"]["ask_id"], "a1");
+    let label = ask["frame"]["options"][0]["label"]
+        .as_str()
+        .expect("the button");
+    assert!(
+        label.contains("[a path]"),
+        "a path reached the ring on a button: {label}"
+    );
+
+    let done = &lines[3];
+    assert_eq!(done["frame"]["t"], "done");
+    let long_text = done["frame"]["text"].as_str().expect("the words");
+    assert!(
+        long_text.contains("(clipped)"),
+        "long words were not said to be clipped"
+    );
+    assert!(long_text.chars().count() <= crate::queue::MAX_TEXT);
+    assert!(
+        !long_text.contains(&home),
+        "clipping did not withhold the path"
+    );
+
+    assert_eq!(
+        lines[4]["lane"], "fix-ring",
+        "the lane's address is its own"
+    );
+
+    // The secret travelled on the hello, which is not an operator-visible event. Nothing of it,
+    // and nothing of the chat, is in the file the ring wrote.
+    assert!(
+        !raw.contains(&h.secret),
+        "the enrollment secret reached the ring"
+    );
+    assert!(!raw.contains("-1001"), "the chat id reached the ring");
+}
+
+#[tokio::test]
+async fn a_hub_that_restarts_resumes_the_ring_where_it_left_off() {
+    let h = harness().await;
+    let mut first = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    let _ = first.next().await.expect("a welcome");
+    let ping = first.next().await.expect("a ping");
+    first.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    first
+        .send(BridgeFrame::Say {
+            text: "before the restart".to_owned(),
+            hint: None,
+            file: None,
+        })
+        .await;
+    until(async || h.fake.sends.lock().await.len() == 2).await;
+    drop(first);
+
+    // The same state, a hub that has never seen it: what a restart of the service really is.
+    let (_hub, fake, sock) = restarted(&h).await;
+    let mut again = FakeBridge::connect(&sock, &h.secret, "i1", "p-somebody-else").await;
+    let _ = again.next().await.expect("a welcome");
+    let ping = again.next().await.expect("a ping");
+    again.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+    // No greeting to wait for: the topic already exists, and a topic that exists is not greeted
+    // again. The words are the observation.
+    again
+        .send(BridgeFrame::Say {
+            text: "after the restart".to_owned(),
+            hint: None,
+            file: None,
+        })
+        .await;
+    until(async || !fake.sends.lock().await.is_empty()).await;
+
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::door::RING))
+        .expect("the ring outlived the hub that wrote it");
+    let lines = ring_so_far(h.dir.path());
+    let seqs: Vec<u64> = lines
+        .iter()
+        .map(|l| l["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![1, 2],
+        "a restart did not resume the ring at the last event it held:\n{raw}"
+    );
+    assert_eq!(lines[0]["frame"]["text"], "before the restart", "{raw}");
+    assert_eq!(lines[1]["frame"]["text"], "after the restart", "{raw}");
+}
+
+#[tokio::test]
+async fn a_ring_that_cannot_be_written_costs_no_delivery() {
+    let blocked = harness().await;
+    // A directory standing where the ring's file must be: every append on it fails, the way a
+    // full disk or a misowned state directory would — and unlike those it fails for the whole
+    // test, which is exactly the case the property is about.
+    std::fs::create_dir(blocked.dir.path().join(crate::door::RING)).expect("block the ring");
+    let fine = harness().await;
+
+    for h in [&blocked, &fine] {
+        let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+        let _ = bridge.next().await.expect("a welcome");
+        let ping = bridge.next().await.expect("a ping");
+        bridge.send(BridgeFrame::Pong { r#ref: ping.id }).await;
+        until(async || !h.fake.sends.lock().await.is_empty()).await;
+        bridge
+            .send(BridgeFrame::Say {
+                text: "the words, whatever the ring is doing".to_owned(),
+                hint: None,
+                file: None,
+            })
+            .await;
+        bridge
+            .send(BridgeFrame::Ask {
+                ask_id: AskId::new("a1"),
+                text: "the question, same conditions".to_owned(),
+                options: Some(vec![AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "yes".to_owned(),
+                }]),
+            })
+            .await;
+        until(async || h.fake.sends.lock().await.len() == 3).await;
+    }
+
+    let blocked_says = blocked.fake.sends.lock().await.clone();
+    let fine_says = fine.fake.sends.lock().await.clone();
+    assert_eq!(
+        blocked_says[1..],
+        fine_says[1..],
+        "an unwritable ring changed what the operator received"
+    );
+
+    // The failure is nowhere but the logs: the blocked hub's ring is still the blocking
+    // directory, and the healthy hub's ring holds exactly the two events.
+    assert!(
+        blocked.dir.path().join(crate::door::RING).is_dir(),
+        "the blocked hub wrote through the very thing blocking it"
+    );
+    let raw = std::fs::read_to_string(fine.dir.path().join(crate::door::RING))
+        .expect("the healthy hub's ring");
+    assert_eq!(
+        raw.lines().count(),
+        2,
+        "the healthy hub's ring is not the two events:\n{raw}"
     );
 }
