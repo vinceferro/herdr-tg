@@ -2230,7 +2230,7 @@ impl std::fmt::Display for Addr {
 ///   variable were not set", so nothing going through the namespace can ask for one — but `hello`
 ///   carries the lane itself, and §14 invites a stranger to write an adapter from §6 alone, which
 ///   touches no variable. The shape rule is what makes the collision unreachable from the wire.
-fn lane_is_addressable(lane: &LaneId) -> bool {
+pub(crate) fn lane_is_addressable(lane: &LaneId) -> bool {
     let s = lane.as_str();
     !s.is_empty()
         && s.len() <= MAX_LANE
@@ -8084,8 +8084,10 @@ impl<S: Surface> Hub<S> {
                 // which is the one way out of two live questions minted under one name: the
                 // refusal's sentence tells him to name the conversation, so naming one must
                 // answer, not refuse twice.
-                let the_one_he_meant =
-                    |r: &AskRecord| lane.as_ref().is_none_or(|named| r.lane.as_ref() == Some(named));
+                let the_one_he_meant = |r: &AskRecord| {
+                    lane.as_ref()
+                        .is_none_or(|named| r.lane.as_ref() == Some(named))
+                };
                 let (chat, msg, record) = {
                     let ledger = self.ledger.lock().await;
                     let open = ledger.matching(|r| {
@@ -8559,8 +8561,14 @@ fn next_frame_seq() -> u64 {
 /// The ring of operator-visible events — see `door.rs`. A module of the hub rather than a file
 /// beside it, so the socket guard's walk over `src/hub/` covers it like everything else that
 /// decides what a frame means.
-mod answers;
-mod door;
+///
+/// `answers` and `door` are `pub(crate)` because the gateway (`src/gateway.rs`) is the reader the
+/// ring was written for and the writer the drop was made for: it shares the FILE NAMES and the
+/// lane's addressability law with the hub rather than growing copies of either. It shares nothing
+/// else — no type of the hub's reaches it, and no frame does, which is the whole difference
+/// between a second consumer of two files and a second hub.
+pub(crate) mod answers;
+pub(crate) mod door;
 mod intent;
 #[cfg(test)]
 mod tests;

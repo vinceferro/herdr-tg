@@ -39,6 +39,7 @@ mod cmd;
 mod compat;
 mod config;
 mod conversations;
+pub mod gateway;
 mod heartbeat;
 mod hub;
 mod lock;
@@ -315,6 +316,21 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+
+    /// Mint the token the PWA's door takes — the one credential its write side accepts.
+    ///
+    /// Terminal-only, like every credential decision in this product: the gateway reads the
+    /// token from `<state>/door/token` on every request and never mints one itself, so a token
+    /// exists exactly when somebody at a keyboard decided it should. Refuses to overwrite
+    /// silently; rotation names the first characters of the token it replaces, so rotating over
+    /// a token that is not the one the operator believed he had is refused rather than done
+    /// blind.
+    DoorToken {
+        /// The first characters of the token being replaced. Required to rotate; a token that
+        /// does not start with them is left exactly as it was.
+        #[arg(long, value_name = "OLD_PREFIX")]
+        rotate: Option<String>,
+    },
 }
 
 /// Run the command-line surface shared by the canonical binary and its legacy alias.
@@ -395,9 +411,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let hub_lock = lock::HubLock::acquire(lock::state_dir())?;
             tracing::debug!(lock = %hub_lock.path().display(), "this process holds the hub lock");
             let cfg = config::Config::load(config.as_deref())?;
-            // `serve` takes no herdr client. It used to: the bot watched panes and could type into
-            // them. That whole path is deleted, so the bot's only inputs are Telegram and its own
-            // socket, and there is nothing for a herdr connection to do here.
+            // `serve` takes no herdr client. It used to: the bot watched panes and could type
+            // into them. That whole path is deleted, so the bot's only inputs are Telegram and its
+            // own socket, and there is nothing for a herdr connection to do here.
             let outcome = bot::serve(cfg).await;
             // Explicit, and not merely stylistic: the lock lives as long as this binding. Letting
             // it drop before `serve` returns would release it while the bot was still polling,
@@ -405,6 +421,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             drop(hub_lock);
             outcome
         }
+        Cmd::DoorToken { rotate } => gateway::mint_a_token(&lock::state_dir(), rotate.as_deref()),
     }
 }
 

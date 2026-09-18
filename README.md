@@ -127,8 +127,10 @@ Three crates in one Cargo workspace, plus the adapters that attach to them.
 
 * `crates/hub-proto` — the wire contract. NDJSON, nine frames up, six down. It knows nothing about
   herdr, kickoff, Claude or any engine, and must not learn.
-* `crates/herdr-tg` — the bot and the hub. **It binds nothing**: no listening port, and a Unix
-  socket is not one.
+* `crates/herdr-tg` — the bot and the hub. **The hub binds nothing**: no listening port, and a
+  Unix socket is not one. The one binary here that listens is `kickoff-door`, a separate program
+  that binds loopback only and serves the ring and the answers drop over HTTP to the PWA's bridge;
+  nothing reachable from a message, a tap or a frame names a port outside it.
 * `crates/herdr-client` — a typed client for herdr protocol 20, in maintenance. It serves the four
   read-only subcommands and nothing else; the bot does not talk to herdr at all.
 * `plugins/kickoff-channel/` — the MCP tool server both engines start. It holds no token, no
@@ -144,7 +146,7 @@ is run against the real door by the suite.
 
 ## The commands
 
-Fifteen, and every one of them is run at a keyboard. Nothing in Telegram can reach any of them.
+Sixteen, and every one of them is run at a keyboard. Nothing in Telegram can reach any of them.
 
 The phone has two commands of its own and the set is closed: `/projects`, which says which projects
 are enrolled, which are connected and which are switched off, and `/help`. Neither can change
@@ -168,6 +170,7 @@ appears, whatever it is called.
 | `read` | print what one of herdr's screens is showing, as text, byte for byte. Read-only |
 | `doctor` | is this bridge's view of herdr still valid, and is the control plane being watched |
 | `watch` | decode herdr's event stream. Read-only |
+| `door-token` | mint the token the PWA's gateway takes on its write door. Refuses to overwrite; rotation names the old token's first characters |
 
 ## Build and test
 

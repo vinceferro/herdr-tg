@@ -175,7 +175,8 @@ choose. The hub admits one live claim per address and refuses the second with `a
 **The joining belongs to the adapter, and the hub does not change at all.** One process per
 addressable thing holds the connection and opens a door; the producers talk to it over a local socket
 that speaks hub-proto unchanged. The hub sees one `hello`, one pid, one claim — so this is not a
-seventh capability, and the closed list below is still six. That process is
+capability, and it did not move the closed list below. (The list is seven today; the seventh is the
+door gateway, decided 18 September — see below.) That process is
 `adapters/kickoff-hub-attach/` (the door was `adapters/fanin/`; both it and the opencode event
 bridge folded into the one command — see `docs/ATTACHING.md` §13).
 
@@ -264,7 +265,9 @@ What that buys:
 
 ## Capabilities of this project — the closed list
 
-The hub does exactly these things, and adding a seventh is a decision, not a refactor.
+The hub does exactly these things, and adding another is a decision, not a refactor. This file said
+"six" for a month, and the seventh below is written as that decision: what it offers, what it
+requires, what it refuses, and the date it was decided.
 
 1. **Identity** — resolve a secret to a project; one live claim per addressable thing; a dead pid is
    evicted, a live one is refused.
@@ -278,6 +281,19 @@ The hub does exactly these things, and adding a seventh is a decision, not a ref
 5. **Retirement** — buttons come off a question that has closed, whoever closed it.
 6. **Alarm** — the watchdog, which shares no code, no process and no runtime with the hub, because
    an alarm that dies with the thing it watches is not one.
+7. **The door — a reader that is not Telegram. DECIDED, 18 September.** A separate binary,
+   `kickoff-door`, that speaks HTTP on **127.0.0.1 only** — the one thing in this workspace that
+   listens, ever — over the two files the hub already writes for a reader it will never meet: the
+   ring of operator-visible events, served as `/v1/stream` (SSE) and `/v1/events` (poll), and the
+   answers drop, written through `/v1/commands`. It is NOT a second transport: no hub-proto frame
+   crosses it, no claim is held through it, and OPEN 4 (a peer elsewhere) is unchanged by it. What
+   it offers is the PWA's contract, transcribed from that org's own pinned stub rather than
+   designed here — the shapes are theirs, byte-compat is the adoption's whole cost advantage. What
+   it requires is a token minted at the terminal (`herdr-tg door-token`), read per request,
+   constant-time compared, never minted by the gateway itself. What it refuses: any address but
+   loopback (no flag exists for one); any answer it was not given by the hub's own result file —
+   never an optimistic ok; and anything new through the egress law the ring already holds to,
+   which the HTTP edge adds nothing to and is tested as not adding to.
 
 ## Explicitly NOT capabilities of the hub
 

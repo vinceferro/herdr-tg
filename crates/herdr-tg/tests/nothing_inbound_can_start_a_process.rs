@@ -180,9 +180,14 @@ const MAY_START_A_PROCESS: [MayStartAProcess; 4] = [
 /// it is on this list exactly as the files around it are. `hub/answers.rs` is the other half of
 /// that door: the drop an operator's taps and typed words arrive IN as files, and the sweep that
 /// turns them into frames — inbound content in file form, pure routing, watched like the rest.
-const THE_INBOUND_PATH: [&str; 14] = [
+/// `gateway.rs` is that door's HTTP edge: an inbound body becomes an answer file there, so it is
+/// the first file on this list inbound content crosses before the drop — and it holds no way to
+/// start a process, which is what keeps the door a reader and a writer of two files and nothing
+/// else.
+const THE_INBOUND_PATH: [&str; 15] = [
     "crates/herdr-tg/src/bot.rs",
     "crates/herdr-tg/src/conversations.rs",
+    "crates/herdr-tg/src/gateway.rs",
     "crates/herdr-tg/src/heartbeat.rs",
     "crates/herdr-tg/src/hub.rs",
     "crates/herdr-tg/src/hub/answers.rs",
