@@ -20,10 +20,10 @@
 //!   the audit or the ring, and a `|` in an option id is the separator a button cannot carry. A
 //!   `lane`, when a message or a choice names one, gets the same addressability law the wire
 //!   applies at `hello` — the door cannot be where a lane stops being a name the hub will address a
-//!   conversation by. And a KNOWN field a program wrote wrongly — a reply id, a lane — is
-//!   refused, never silently stripped: unknown FIELDS stay ignored so a newer gateway cannot
-//!   break the door, but a known one that fails its law is the file saying something the hub
-//!   cannot believe, and sending it as though it had said nothing would be the hub rewriting
+//!   conversation by. And a KNOWN field a program wrote wrongly — a reply id, a lane, a receipt
+//!   name — is refused, never silently stripped: unknown FIELDS stay ignored so a newer gateway
+//!   cannot break the door, but a known one that fails its law is the file saying something the
+//!   hub cannot believe, and sending it as though it had said nothing would be the hub rewriting
 //!   what he wrote.
 //! * **One size bound.** A file past [`AT_MOST`] is refused unread. That bound is half a wire
 //!   frame, so the frame built from any answer a sweep accepts cannot exceed the frame bound the
@@ -146,6 +146,13 @@ pub(crate) enum Answer {
         lane: Option<LaneId>,
         text: String,
         in_reply_to_ask: Option<AskId>,
+        /// The receipt name the SENDER minted for its own words — an opaque `w…` that names
+        /// nothing on this box, carried so the reader that sent the line can recognise its
+        /// echo instead of drawing the line twice. The hub passes it through: it rides the
+        /// wire frame's `msg_id` and the ring's receipt line, and it is never one the hub would
+        /// have minted itself. A KNOWN optional field, held to the one shape law the door's
+        /// other opaque handles keep.
+        receipt: Option<String>,
     },
 }
 
@@ -182,6 +189,8 @@ pub(crate) mod said {
     pub const NO_WORDS: &str = "That message had no words in it, so it was not sent.";
     pub const BAD_REPLY: &str = "That reply names its question in a shape this hub does not write down, so it was not \
          sent.";
+    pub const BAD_RECEIPT: &str = "That message names the receipt its words should come back under in a shape this hub \
+         does not write down, so it was not sent.";
     pub const BAD_LANE: &str = "That message names one of the project's own conversations in a shape this hub does not \
          address, so it was not sent.";
     pub const BAD_LANE_ON_AN_ANSWER: &str = "That answer names one of the project's own conversations in a shape this hub does not \
@@ -365,11 +374,25 @@ pub(crate) fn parse(bytes: &str, now: u64) -> Result<Answer, &'static str> {
                     Some(AskId::new(s))
                 }
             };
+            // The sender's own receipt name, when it minted one. The same shape law as every
+            // other opaque handle a file can carry: present-and-wrong is refused rather than
+            // stripped, because the reader is waiting on exactly the name it wrote.
+            let receipt = match fields.get("ref") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let s = value.as_str().ok_or(said::BAD_RECEIPT)?;
+                    if !an_id_the_hub_writes_down(s) {
+                        return Err(said::BAD_RECEIPT);
+                    }
+                    Some(s.to_owned())
+                }
+            };
             Ok(Answer::Message {
                 conversation,
                 lane,
                 text: text.to_owned(),
                 in_reply_to_ask,
+                receipt,
             })
         }
         _ => Err(said::NO_KIND),

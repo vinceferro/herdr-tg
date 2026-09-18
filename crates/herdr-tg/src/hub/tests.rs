@@ -17826,15 +17826,17 @@ async fn the_ring_carries_the_operator_s_own_words_and_taps_from_either_surface(
     let _ = bridge.next_choice().await;
 
     // ── the door's half: typed words, then a tap ────────────────────────────────────────────
+    // The door's words carry a receipt nonce — the sender-minted `w…` the ring's down line now
+    // echoes, which is the one identifier a down line may hold and the whole point of the case
+    // this fixture exists for.
     drop_an_answer(
         &h,
         "words-1",
-        words_at(
-            h.project.as_str(),
-            "from the door — /etc/hosts is the one to check",
-            None,
-            now_secs(),
-        ),
+        serde_json::json!({
+            "t": "message", "conversation": h.project.as_str(),
+            "text": "from the door — /etc/hosts is the one to check",
+            "ref": "wTEST-egress-half", "ts": now_secs(),
+        }),
     );
     // The keyboard edit for the door's tap is refused so the record survives with the answer on
     // it; the ring line does not depend on that, but the question's second keyboard must not be
@@ -17903,15 +17905,25 @@ async fn the_ring_carries_the_operator_s_own_words_and_taps_from_either_surface(
         assert_eq!(line["lane"], "-", "{raw}");
     }
     // The down frames carry no identifier of the surface they came from: no chat, no person, no
-    // Telegram message id — the event is what he said, not the phone's plumbing. And the two
-    // taps are the two questions, answered by whichever surface got there first.
+    // Telegram message id — the event is what he said, not the phone's plumbing. The ONE id a
+    // down line may hold is the door's own receipt nonce, the sender-minted `w…` the ring
+    // echoes so a sent line can be its own receipt — never a Telegram-shaped `m…`, and never on
+    // the phone's lines at all. And the two taps are the two questions, answered by whichever
+    // surface got there first.
     let mut choices = Vec::new();
     for line in lines.iter().filter(|l| l["dir"] == "down") {
         let frame = &line["frame"];
         assert!(
-            frame.get("msg_id").is_none() && frame.get("from").is_none(),
+            frame.get("from").is_none(),
             "a down frame carries a fact of the surface it left from:\n{raw}"
         );
+        if let Some(msg_id) = frame.get("msg_id") {
+            let msg_id = msg_id.as_str().expect("the nonce, as words");
+            assert!(
+                msg_id.starts_with("wTEST-"),
+                "a down frame's msg_id is not the door's own nonce:\n{raw}"
+            );
+        }
         if frame["t"] == "choice" {
             choices.push((
                 frame["ask_id"].as_str().expect("an ask"),
@@ -17919,6 +17931,21 @@ async fn the_ring_carries_the_operator_s_own_words_and_taps_from_either_surface(
             ));
         }
     }
+    // And the nonce IS there, on the door's own words — the narrowing is to something, not to
+    // nothing, or the seam this echo exists to close would still be open.
+    let the_door_s_line = lines
+        .iter()
+        .find(|l| {
+            l["dir"] == "down"
+                && l["frame"]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("from the door"))
+        })
+        .expect("the door's words on the ring");
+    assert_eq!(
+        the_door_s_line["frame"]["msg_id"], "wTEST-egress-half",
+        "the ring did not echo the door's receipt nonce:\n{raw}"
+    );
     assert_eq!(
         choices,
         vec![("a1", "y"), ("a2", "n")],
@@ -18470,6 +18497,94 @@ async fn a_message_naming_a_lane_reaches_that_lane_s_session() {
 }
 
 #[tokio::test]
+async fn the_ring_echoes_the_door_s_own_nonce_so_a_sent_line_is_its_own_receipt() {
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // His words, sent from the door with the receipt the DOOR minted for them. The nonce names
+    // nothing on this box — it exists to be recognised — and the reader that sent the line holds
+    // it already, from the answer its own POST got. Echoing it back on the ring's receipt line is
+    // what lets that reader match its sent line to its echo instead of drawing it twice.
+    drop_an_answer(
+        &h,
+        "words-1",
+        serde_json::json!({
+            "t": "message", "conversation": h.project.as_str(),
+            "text": "the nonce comes back on the receipt",
+            "ref": "wTEST-the-nonce", "ts": now_secs(),
+        }),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "words-1")["status"],
+        "accepted",
+        "words carrying a receipt name were refused"
+    );
+
+    // The wire frame carries the nonce as its msg_id — that is the one channel down to the
+    // session, and the bridge's own logs can correlate the line with the receipt.
+    let on_the_wire = bridge
+        .wait_for(|f| match f {
+            HubFrame::Message { msg_id, text, .. }
+                if text == "the nonce comes back on the receipt" =>
+            {
+                Some(msg_id.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        on_the_wire.as_str(),
+        "wTEST-the-nonce",
+        "the door's nonce did not ride the wire frame's msg_id"
+    );
+
+    // And the ring's down line — the receipt a reader joins on — carries the SAME nonce. It is
+    // the door's own opaque `w…`, not a Telegram message id, and the egress law is narrowed to
+    // exactly that: the phone's ids still never ride this file.
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING))
+        .expect("the ring holds the receipt");
+    let said = raw
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("one event per line"))
+        .find(|l| l["dir"] == "down" && l["frame"]["t"] == "message")
+        .expect("the door's words left no down line on the ring");
+    assert_eq!(
+        said["frame"]["msg_id"], "wTEST-the-nonce",
+        "the ring's receipt line does not echo the door's nonce:\n{said}"
+    );
+
+    // The phone's half keeps its old shape: a line relayed from Telegram carries NO msg_id on
+    // the ring, because its msg_id is Telegram's — an identifier of the phone, which this file
+    // has never taken and still does not.
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &MsgId::new("m9999"),
+                "from the phone, meanwhile",
+                None,
+            )
+            .await,
+        "the phone's own words did not go down"
+    );
+    let _ = the_door_s_words_reach(&mut bridge, "from the phone, meanwhile").await;
+    let lines = ring_so_far(h.dir.path());
+    let phone_s = lines
+        .iter()
+        .find(|l| l["dir"] == "down" && l["frame"]["text"] == "from the phone, meanwhile")
+        .expect("the phone's words left no down line");
+    assert!(
+        phone_s["frame"].get("msg_id").is_none(),
+        "a Telegram message id reached the ring on the phone's own receipt line:\n{phone_s}"
+    );
+}
+
+#[tokio::test]
 async fn a_message_with_no_lane_named_is_refused_honestly_when_only_a_lane_is_live() {
     let h = harness().await;
     // The conversation's own voice has nothing connected; one of its worktrees does. "Nothing is
@@ -18587,12 +18702,32 @@ async fn an_answer_whose_known_fields_are_wrong_is_refused_not_silently_changed(
             "lane": 7, "text": "go on then", "ts": now_secs(),
         }),
     );
+    // A receipt name that fails the shape law, as a number and as a broken string alike: the
+    // reader is waiting on exactly the name it wrote, so stripping it is not the hub's to do.
+    drop_an_answer(
+        &h,
+        "words-4",
+        serde_json::json!({
+            "t": "message", "conversation": h.project.as_str(),
+            "text": "go on then", "ref": 42, "ts": now_secs(),
+        }),
+    );
+    drop_an_answer(
+        &h,
+        "words-5",
+        serde_json::json!({
+            "t": "message", "conversation": h.project.as_str(),
+            "text": "go on then", "ref": "w|broken", "ts": now_secs(),
+        }),
+    );
     h.hub.sweep_the_answers().await;
 
     for (name, must_say) in [
         ("words-1", "shape this hub does not write down"),
         ("words-2", "shape this hub does not address"),
         ("words-3", "shape this hub does not address"),
+        ("words-4", "names the receipt"),
+        ("words-5", "names the receipt"),
     ] {
         let result = the_result_of(&h, name);
         assert_eq!(result["status"], "refused", "{name}: {result:?}");
@@ -19138,23 +19273,37 @@ async fn the_pwa_s_door_round_trip_reaches_the_hub_and_back_through_the_real_gat
         .await;
     let (status, body) = the_reply(&raw);
     assert_eq!(status, 200, "{raw:?}");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(body).expect("one object")["ok"],
-        serde_json::Value::Bool(true)
-    );
+    let ok: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(ok["ok"], serde_json::Value::Bool(true));
+    let the_nonce = ok["msg_id"].as_str().expect("a nonce").to_owned();
     let got = lane
         .wait_for(|f| match f {
-            HubFrame::Message { text, .. } if text == "check the worktree's own build" => {
-                Some(text.to_owned())
+            HubFrame::Message { text, msg_id, .. } if text == "check the worktree's own build" => {
+                Some(msg_id.as_str().to_owned())
             }
             _ => None,
         })
         .await;
-    assert_eq!(got, "check the worktree's own build");
     assert!(
         nobody_else(voice1.drain_for(Duration::from_millis(150)).await),
         "words naming a lane reached the project's own voice"
     );
+
+    // The receipt loop, closed through the real binary: the nonce the POST answered with is the
+    // one the wire frame carried AND the one the ring's down line echoes — so their client's
+    // `r.msg === f.msg_id` matching turns this sent line into its own receipt, which is the
+    // whole point of the nonce. Waited for in the ring because the down line is written inside
+    // the delivery the bridge just confirmed.
+    assert_eq!(
+        got, the_nonce,
+        "the wire frame's msg_id is not the nonce the POST answered with"
+    );
+    until(async || {
+        ring_so_far(h.dir.path()).iter().any(|l| {
+            l["dir"] == "down" && l["frame"]["t"] == "message" && l["frame"]["msg_id"] == *the_nonce
+        })
+    })
+    .await;
 
     // ── the second conversation's answers reach it and nobody else — the door does not cross ──
     let raw = door

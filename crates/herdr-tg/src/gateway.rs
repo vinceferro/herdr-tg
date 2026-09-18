@@ -65,6 +65,48 @@
 //! file, and the 503 for a missing token says the operator has not minted one rather than where
 //! it would be. What the law cannot cover is the same as the ring's: an agent's own words are the
 //! event, and they go where they already went.
+//!
+//! # The receipt nonce, and the seam it closes
+//!
+//! A POSTed line needed an id the sender could recognise its own echo by, and the ring's law
+//! forbade `msg_id` on a down line — rightly, because the phone's `msg_id` is Telegram's and
+//! that is an identifier of a surface. The ruling that closed the seam narrowed the law to what
+//! it always meant: a door-minted nonce names nothing on this box. So this door mints one
+//! `w…` per message, carries it on the answer file as `ref`, and answers it in the POST's
+//! ok-shape as `msg_id`; the hub rides it onto the wire frame's `msg_id` and the ring's down
+//! `message` line, and their client's `r.msg === f.msg_id` matching turns the sent line into
+//! its own receipt. One field name to note: their pinned client reads `msg_id` on the ring
+//! frame (`app/index.src.html`, `hubFrame`'s down-`message` arm), so that is the name the ring
+//! echo wears — a `ref`-named ring field would have left their matcher reading `undefined`.
+//! Choices echo no nonce: their client joins a tap to its question by `ask_id`, and the down
+//! `choice` line already names that.
+//!
+//! # Recorded, not fixed: shapes left open on purpose
+//!
+//! The operator's standing settlement for contrived shapes — write them down rather than chase
+//! them, as the write guard's and the drop's own files received before this one:
+//!
+//! * **The in-call rotation race.** More than two rotations landing inside one 250 ms poll gap
+//!   lose the middle old file entirely — the second rotation removes the first before any
+//!   reader has finished it — and the served sequence gains a gap nothing here can fill.
+//!   Contrived by ruling: a rotation is a megabyte of operator-visible events, human cadence
+//!   cannot spend three megabytes inside 250 ms, and the client that meets the gap resyncs from
+//!   the hub's own cursor echo by design — which is the honest mend for a gap nobody caused.
+//! * **No read timeouts on the door's own sockets.** A request head, a body, and every
+//!   `write_all` on a stream wait for the peer for ever, because nothing on this box can say
+//!   how long a loopback peer may take. Contrived by ruling: the door binds loopback only, the
+//!   one client is the PWA's own bridge, and that bridge already bounds every upstream call it
+//!   makes (10 s on the poll, 30 s on the stream) — so a wedged door task is bounded by the
+//!   deployment's own timeouts, and no SSE write buffering exists today for a slow reader to
+//!   grow against. The day the door faces a peer that is not that bridge is the day this
+//!   becomes a decision rather than a settlement.
+//! * **The unbounded poll drain.** One `/v1/events` drains to quiescence — passes until a poll
+//!   adds nothing — and a writer of this same uid appending steadily can keep a drain going for
+//!   as long as it likes, holding one connection and one task open past any bound this module
+//!   would set. Contrived by ruling: it is the same trust settlement the answers drop already
+//!   records — the writer is already this user, inside the state home, and a bound here would
+//!   punish a healthy hub's burst to spite a misbehaving writer the drop's own file has
+//!   already accepted.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::IsTerminal as _;
@@ -624,6 +666,22 @@ impl Door {
             .await;
             return;
         }
+        // The reply field, held to the same law as every other known field: refused when present
+        // and not words, never stripped. The routing ladder below READS it, and a reader that
+        // swallows the wrong shape is how a reply becomes a plain line while the POST says ok —
+        // the door quietly rewriting what he wrote.
+        if let Err(field) = the_string(fields, "in_reply_to_ask") {
+            let _ = say_json(
+                stream,
+                400,
+                "Bad Request",
+                &the_shape_of_a_refusal(&format!(
+                    "that named the {field} as something other than words"
+                )),
+            )
+            .await;
+            return;
+        }
 
         // The routing ladder: what the body names, then the conversation this door was started
         // for, then — for a command that answers a question — the question itself, which is the
@@ -665,13 +723,21 @@ impl Door {
                 file.insert("in_reply_to_ask".into(), serde_json::json!(ask));
             }
         }
+        // The receipt, under the name the sender will see again: the file's minted name rides
+        // the file as `ref`, the hub carries it onto the wire frame and the ring's down line,
+        // and the POST's ok-shape answers the SAME name — one nonce, three places, so a reader
+        // that sent the line can match its own echo. Choices carry none: their client joins a
+        // tap to its question by ask, and the ring's down `choice` line already names that.
+        let name = a_new_name();
+        if t == "message" {
+            file.insert("ref".into(), serde_json::json!(name));
+        }
         file.insert("ts".into(), serde_json::json!(crate::hub::now_secs()));
         let body = serde_json::Value::Object(file).to_string();
 
-        // Minted, staged beside the drop, renamed in — never written in place: the hub's sweep
+        // Staged beside the drop, renamed in — never written in place: the hub's sweep
         // lists the directory and reads what it finds, and a half-written file would be read as
         // a malformed answer and CONSUMED, which is the one way this door could eat his words.
-        let name = a_new_name();
         let staged = self.door_dir.join(format!("{name}.staging"));
         let in_the_drop = self.drop_dir.join(&name);
         let written = std::fs::OpenOptions::new()
@@ -699,16 +765,24 @@ impl Door {
         }
 
         // Then the wait: the hub sweeps about once a second, judges, and writes the result. What
-        // the POST answers is that and nothing else.
+        // the POST answers is that and nothing else — and "that" means a result that PARSES and
+        // SAYS a verdict. The hub writes its results open-truncate-then-write, and this door
+        // polls every 50 ms, so a read can land inside the write: half a JSON object on the
+        // disk is a receipt nobody has finished, and answering it — with a refusal, an error,
+        // anything terminal — would be a receipt that lies, because behind the torn bytes the
+        // answer was accepted and delivered. So a result that is not yet a verdict is not yet
+        // arrived: the door waits, and the window's close says only what it always said.
         let deadline = tokio::time::Instant::now() + WAIT_FOR_THE_RESULT;
         loop {
             if let Ok(raw) = std::fs::read_to_string(self.drop_dir.join(format!("{name}.result"))) {
                 match serde_json::from_str::<serde_json::Value>(&raw) {
                     Ok(result) if result["status"] == "accepted" => {
                         // The ok-shape their client expects: `ok`, the kind it sent, an id for
-                        // the act, and the lane it went to. The id is this door's own — see the
-                        // module docs for the echo seam their client's msg_id matching leaves
-                        // open, and why this cannot be the hub's `d…` id.
+                        // the act, and the lane it went to. The id is the same nonce the answer
+                        // file carried as `ref` and the ring's down line echoes as `msg_id` —
+                        // one name in three places, so their client's `r.msg === f.msg_id`
+                        // matching turns a sent line into its own receipt instead of a second
+                        // bubble.
                         let ok = serde_json::json!({
                             "ok": true,
                             "t": t,
@@ -716,27 +790,20 @@ impl Door {
                             "lane": lane,
                         });
                         let _ = say_json(stream, 200, "OK", &ok.to_string()).await;
+                        return;
                     }
-                    Ok(result) => {
+                    Ok(result) if result["status"] == "refused" => {
                         let why = result["why"]
                             .as_str()
                             .unwrap_or("the hub refused it, and did not say why");
                         let _ = say_json(stream, 400, "Bad Request", &the_shape_of_a_refusal(why))
                             .await;
+                        return;
                     }
-                    Err(_) => {
-                        let _ = say_json(
-                            stream,
-                            503,
-                            "Service Unavailable",
-                            &the_shape_of_a_refusal(
-                                "the hub answered with something this door could not read",
-                            ),
-                        )
-                        .await;
-                    }
+                    // Not yet a verdict — torn, empty, or a shape this door has not been told
+                    // about. Waited out below, exactly as though the file were not there.
+                    _ => {}
                 }
-                return;
             }
             if tokio::time::Instant::now() >= deadline {
                 // Not a refusal and never an ok: the hub may still take it, and the words say
@@ -1466,6 +1533,209 @@ mod tests {
         raw.lines().map(str::to_owned).collect()
     }
 
+    /// The hub writing one result in TWO writes, the way the real one can be read mid-write: the
+    /// first half lands, a gap follows, then the file is completed. The gap is long enough that
+    /// the door's 50 ms result poll is certain to look at least once — the deterministic stand-in
+    /// for the ~1-in-10⁴ window the defect was found in.
+    fn the_hub_decides_slowly(
+        drop: PathBuf,
+        torn: &'static str,
+        completed: &'static str,
+        gap: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for _ in 0..1_000 {
+                if let Ok(entries) = std::fs::read_dir(&drop) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if name.ends_with(".result") {
+                            continue;
+                        }
+                        let beside = drop.join(format!("{name}.result"));
+                        if !beside.exists() {
+                            std::fs::write(&beside, torn).expect("half a result, on disk");
+                            tokio::time::sleep(gap).await;
+                            std::fs::write(&beside, completed).expect("the whole result");
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the faked hub never saw an answer to judge");
+        })
+    }
+
+    #[tokio::test]
+    async fn a_result_read_mid_write_is_waited_out_not_answered_with_a_lie() {
+        let state = a_state();
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        // The hub's result is open-truncate-then-write, and this door polls every 50 ms — so a
+        // read that succeeds with half a JSON object on the disk is a read of a receipt the hub
+        // has not finished writing. Answering that with anything terminal is a receipt that
+        // lies, because behind the torn bytes the answer was accepted and delivered.
+        the_hub_decides_slowly(
+            state.the_drop(),
+            r#"{"t": "result", "status": "acce"#,
+            r#"{"t":"result","status":"accepted"}"#,
+            Duration::from_millis(400),
+        );
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"steer left"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(
+            status,
+            200,
+            "a receipt read mid-write was not waited out:\n{}",
+            String::from_utf8_lossy(&raw)
+        );
+        let ok: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert_eq!(ok["ok"], serde_json::Value::Bool(true), "{ok:?}");
+
+        // And the same patience at the REFUSED end: a torn refusal is waited out too, and the
+        // POST answers from the completed sentence — never a 503, never a guess.
+        the_hub_decides_slowly(
+            state.the_drop(),
+            r#"{"t": "result", "status": "refused", "why": "Noth"#,
+            r#"{"t":"result","status":"refused","why":"Nothing is connected for that conversation right now, so nothing was sent. It will not be delivered later."}"#,
+            Duration::from_millis(400),
+        );
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"anyone?"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(
+            status,
+            400,
+            "a torn refusal was not waited out:\n{}",
+            String::from_utf8_lossy(&raw)
+        );
+        let refused: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert!(
+            refused["why"]
+                .as_str()
+                .expect("the hub's sentence")
+                .contains("Nothing is connected"),
+            "the refusal did not come from the completed result: {refused}"
+        );
+
+        // And a result that NEVER completes — torn and then nothing — is the timeout's business,
+        // not a 503's: the words still claim nothing beyond nobody having answered.
+        the_hub_decides_slowly(
+            state.the_drop(),
+            r#"{"t": "result", "status": "acce"#,
+            r#"{"t": "result", "status": "acce"#,
+            WAIT_FOR_THE_RESULT + Duration::from_secs(1),
+        );
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"still there?"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(
+            status,
+            504,
+            "a result that never completed was answered as something other than the honest \
+             timeout:\n{}",
+            String::from_utf8_lossy(&raw)
+        );
+        let timeout: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert!(
+            timeout["why"]
+                .as_str()
+                .expect("a sentence")
+                .contains("has not said what became of it"),
+            "the timeout's words changed: {timeout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_field_that_is_not_a_string_is_refused_at_the_door_not_stripped() {
+        let state = a_state();
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        // The door's own law: a KNOWN field a program wrote wrongly is refused, never silently
+        // stripped — sending it on as though it had said nothing would be the door rewriting
+        // what he wrote. `in_reply_to_ask` as a number is exactly that shape, and the routing
+        // ladder used to swallow it: the file went out as a plain line and the POST said ok.
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"go on then","in_reply_to_ask":42}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(
+            status,
+            400,
+            "a non-string reply field was not refused at the door:\n{}",
+            String::from_utf8_lossy(&raw)
+        );
+        let refused: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert_eq!(refused["ok"], serde_json::Value::Bool(false), "{refused:?}");
+        assert!(
+            refused["why"]
+                .as_str()
+                .expect("a sentence")
+                .contains("in_reply_to_ask"),
+            "the refusal does not name the field it refused: {refused}"
+        );
+        // And nothing was written: a refused command leaves no file for the hub to judge.
+        let left = std::fs::read_dir(state.the_drop())
+            .expect("the drop")
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().ends_with(".result"))
+            .count();
+        assert_eq!(left, 0, "a refused command left a file in the drop");
+
+        // The same field as a STRING is still taken, and rides the file the hub judges.
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"go on then","in_reply_to_ask":"a1"}"#,
+            ),
+        )
+        .await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(
+            status,
+            200,
+            "a well-formed reply field was refused:\n{}",
+            String::from_utf8_lossy(&raw)
+        );
+    }
+
     #[tokio::test]
     async fn the_shapes_their_client_pins_are_the_shapes_this_door_speaks() {
         let state = a_state();
@@ -1533,6 +1803,17 @@ mod tests {
         assert!(
             file["ts"].as_u64().is_some(),
             "no clock on the answer: {file}"
+        );
+        // One nonce, two of its three places: the file's `ref` IS the ok-shape's `msg_id`, so
+        // the ring's echo (the third place, held by the hub's own tests) sends back the name
+        // this POST answered. A mismatch here is a sent line that can never meet its receipt.
+        assert_eq!(
+            file["ref"], ok["msg_id"],
+            "the receipt on the file is not the id the POST answered with:\n{file}\n{ok}"
+        );
+        assert!(
+            file["ref"].as_str().is_some_and(|r| r.starts_with('w')),
+            "the receipt nonce is not from this door's own namespace: {file}"
         );
 
         // A refusal carries the hub's own sentence, as a named 400 — the pattern their bridge

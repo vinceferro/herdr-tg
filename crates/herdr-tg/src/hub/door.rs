@@ -57,7 +57,9 @@
 //! not. What the bridge said about a delivered act LATER is the follow-up half
 //! ([`Ring::his_words_were_refused`] and its kin): appended as an `ack` line beside the receipt
 //! it answers, because the ring is append-only history and a receipt already written is a fact
-//! already sent.
+//! already sent. And a down `message` line may carry one identifier: the door's own receipt
+//! nonce, the sender-minted `w…` [`Ring::the_operator_said`]'s docs narrow the law to — the one
+//! way a reader that sent a line can tell its echo from a second line.
 //!
 //! # A ring failure is never an agent's failure
 //!
@@ -244,9 +246,14 @@ impl Ring {
     /// Recorded at the shared delivery seam where the hub hands a `message` frame to a live
     /// connection, from EITHER surface he typed on, because the PWA's one history must show his
     /// half of the conversation or it is a transcript of a monologue. The frame is the wire's
-    /// own vocabulary with the phone's plumbing left OUT: `msg_id` is a Telegram message id and
-    /// `from` is a chat-and-person pair, and both are exactly the identifiers this file's law
-    /// forbids — the event is his words, not the phone's.
+    /// own vocabulary with the phone's plumbing left OUT: `from` is a chat-and-person pair, and
+    /// it is exactly the kind of identifier of a surface this file's law forbids — the event is
+    /// his words, not the phone's. The one exception is `the_receipt`: when the words came from
+    /// the door carrying a nonce the SENDER minted, that nonce rides the receipt line as
+    /// `msg_id`, because it names nothing on this box — it exists to be recognised by the reader
+    /// that made it, and without it a sent line and its echo are two lines. A Telegram message
+    /// id still never rides this file; the narrowing is to a door-minted `w…` and to nothing
+    /// else.
     ///
     /// Called only where the frame was DELIVERED, never on a refusal: an echo is a receipt, and
     /// the ring must not tell him his words reached an agent when they did not.
@@ -256,11 +263,15 @@ impl Ring {
         lane: Option<&LaneId>,
         text: &str,
         in_reply_to_ask: Option<&AskId>,
+        the_receipt: Option<&hub_proto::MsgId>,
     ) {
         if !the_shape_the_registry_mints(conversation) {
             return;
         }
         let mut frame = serde_json::json!({ "t": "message", "text": text });
+        if let Some(receipt) = the_receipt {
+            frame["msg_id"] = serde_json::json!(receipt.as_str());
+        }
         if let Some(ask) = in_reply_to_ask {
             frame["in_reply_to_ask"] = serde_json::json!(ask.as_str());
         }

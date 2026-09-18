@@ -3002,9 +3002,12 @@ impl<S: Surface> Hub<S> {
     /// a connection, so the ring's down half is written exactly once whichever surface the words
     /// arrived on. `msg_id` and `from` are the caller's facts — his Telegram message from the
     /// phone, a hub-minted id and no person from the door — because they ride the WIRE, whose
-    /// shape is not this method's to change; neither rides the RING, whose law forbids them.
-    // Eight, like `relay_with` beside it: a message frame carries eight facts, and splitting
-    // the seam to shorten the list is the drift this method exists to prevent.
+    /// shape is not this method's to change. `from` never rides the RING, whose law forbids it;
+    /// `msg_id` rides it only as `the_receipt`: the door-minted nonce the sender asked to see
+    /// again, which names nothing on this box. The phone passes `None`, always — its msg_id is
+    /// Telegram's, and that is an identifier of the phone the ring has never taken.
+    // Nine, one more than `relay_with` beside it: the receipt is the door's own ask, and
+    // splitting the seam to shorten the list is the drift this method exists to prevent.
     #[allow(clippy::too_many_arguments)]
     async fn carry_his_words(
         &self,
@@ -3014,6 +3017,7 @@ impl<S: Surface> Hub<S> {
         from: hub_proto::From,
         text: &str,
         in_reply_to_ask: Option<AskId>,
+        the_receipt: Option<&MsgId>,
         files: Option<Vec<hub_proto::MessageFile>>,
     ) -> bool {
         let went = self
@@ -3035,6 +3039,7 @@ impl<S: Surface> Hub<S> {
                 addr.lane.as_ref(),
                 text,
                 in_reply_to_ask.as_ref(),
+                the_receipt,
             );
         }
         went
@@ -4818,6 +4823,9 @@ impl<S: Surface> Hub<S> {
                 hub_proto::From { chat_id, user_id },
                 text,
                 in_reply_to_ask,
+                // The phone's receipt echo is nobody's to ask for: its msg_id is Telegram's own,
+                // and the ring has never taken an identifier of the phone. See the method.
+                None,
                 (!carried.is_empty()).then(|| carried.iter().map(|f| f.file.clone()).collect()),
             )
             .await;
@@ -8178,6 +8186,7 @@ impl<S: Surface> Hub<S> {
                 lane,
                 text,
                 in_reply_to_ask,
+                receipt,
             } => {
                 // WHERE the words go: the conversation of the project the file named, or —
                 // naming none — the conversation's own voice. The hub never picks a lane on his
@@ -8275,13 +8284,18 @@ impl<S: Surface> Hub<S> {
                     }
                 }
                 let in_reply_to_ask = carries;
-                // A message id the hub minted, in a namespace of its own: the wire requires one
-                // and the door has no phone message to name, and "d…" beside the phone's "m…"
-                // lets a reader of an adapter's logs tell which surface the words came from.
-                // `from` is the wire's own shape for a person, and zero is this codebase's
-                // established "no person" — the door has no Telegram user, and inventing one
-                // would be a fact about nobody.
-                let msg_id = MsgId::new(format!("d{}", next_frame_seq()));
+                // A message id the hub minted, in a namespace of its own — UNLESS the sender
+                // minted one first: the door's receipt name rides the wire frame's `msg_id` as
+                // it is, so the reader that sent the line and holds the name can recognise its
+                // own echo. The hub's "d…" beside the phone's "m…" still tells a reader of an
+                // adapter's logs which surface the words came from; the door's "w…" names the
+                // sender's own line, and names nothing on this box. `from` is the wire's own
+                // shape for a person, and zero is this codebase's established "no person" — the
+                // door has no Telegram user, and inventing one would be a fact about nobody.
+                let echo = receipt.as_deref().map(MsgId::new);
+                let msg_id = echo
+                    .clone()
+                    .unwrap_or_else(|| MsgId::new(format!("d{}", next_frame_seq())));
                 let frame = Self::mint_frame_id();
                 // The record BEFORE the wire, for the reason the phone's words and taps both
                 // have one: a bridge can answer about this frame the moment it is on the wire,
@@ -8312,6 +8326,7 @@ impl<S: Surface> Hub<S> {
                         },
                         &text,
                         in_reply_to_ask,
+                        echo.as_ref(),
                         None,
                     )
                     .await;
