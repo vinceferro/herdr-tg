@@ -1,4 +1,6 @@
-<!-- CONTRACT, 18 September 2026. Written against HEAD 9fb27ed. Every route, body, status code
+<!-- CONTRACT, 18 September 2026. Written against HEAD 9fb27ed and corrected by the final fix
+     round that followed it (see git log for the HEAD that carries this file). Every route, body,
+     status code
      and sentence below was read in the code that serves it — crates/herdr-tg/src/gateway.rs (the
      door), crates/herdr-tg/src/hub/door.rs (the ring), crates/herdr-tg/src/hub/answers.rs (the
      drop), crates/herdr-tg/src/hub/tests.rs (the trial) — and every behaviour named "yours" was
@@ -59,7 +61,8 @@ serves; your cursor discipline (§3) is built on that.
 | `dir` | `"up"` is the agent's half — its `say`, `ask`, `done`, a question stopping being open, and the hub's own follow-ups about your acts (below). `"down"` is the operator's half — his typed words and his taps, stamped **only where the frame was handed to a live session**. A down line is a receipt: it never appears for words that reached nobody. What became of a delivered act *later* is an up-line follow-up, never an edit of the receipt. |
 | `conversation` | The id of the conversation this event belongs to: `p-` or `c-` then twelve lower-case hex characters, exactly fourteen characters. Not a path, not a name — the shape is refused at every door here, and the id is the only project-identifying thing the ring ever carries (§5). |
 | `lane` | Which conversation *of that project* said it: the lane's own address (a bare name — see the lane law in §4), or the single character `-`, which is the spelling for **the project's own voice**. Your `hubLaneKey` already strips a `lane/` prefix and treats the empty key as the fleet's own row; `-` plays that role here. |
-| `frame` | The event itself, in the wire's own vocabulary. Up frames: `{"t":"say","text":…}`, `{"t":"ask","ask_id":…,"text":…,"options":[{"option_id":…,"label":…}]}` (options absent means free-text), `{"t":"done","text":…}`, `{"t":"ask_resolved","ask_id":…,"how":…}` — `how` is `"answered"`, `"withdrawn"` or `"timeout"` when a bridge said it, or a plain sentence when the hub itself put a dead session's question away. Down frames: `{"t":"message","text":…}` and `{"t":"choice","ask_id":…,"option_id":…}`. Nothing else is recorded — the `hello` that carries the token never reaches this file, nor any `ack`/`bye`/`beat` bookkeeping except the follow-up lines below. |
+| `frame` | The event itself, in the wire's own vocabulary. Up frames: `{"t":"say","text":…}`, `{"t":"ask","ask_id":…,"text":…,"options":[{"option_id":…,"label":…}]}` (options absent means free-text), `{"t":"done","text":…}`, `{"t":"ask_resolved","ask_id":…,"how":…}` — `how` is `"answered"`, `"withdrawn"` or `"timeout"` when a bridge said it, or a plain sentence when the hub itself put a dead session's question away — and when the question had been answered, that sentence names the surface the answer came from: `answered from your phone — …` or `answered from the app — …`, never the wrong one. The hub's own record of a tap says where the tap was made; a retirement that had to guess has credited the phone for the app's answer, on the phone and in this history at once. Down frames: `{"t":"message","text":…,"msg_id":…}` — **every** message line he says carries a
+`msg_id`, see the names below — and `{"t":"choice","ask_id":…,"option_id":…}`. Nothing else is recorded — the `hello` that carries the token never reaches this file, nor any `ack`/`bye`/`beat` bookkeeping except the follow-up lines below. |
 
 **The egress law, which is the whole design.** This file is built to leave the machine. It
 carries no chat id, no topic id, no user id, no Telegram message id, no filesystem path and
@@ -69,8 +72,9 @@ same ceiling your own composer enforces (`HUB_MAX_TEXT`), so a line is bounded b
 number you already bound the writer with. `http://` and `https://` URLs are spared whole —
 including something glued to their front (`src=https://…`) — because the ring is your only
 history and mangling every link an agent pasted would quietly gut it. Every other scheme
-scrubs where the path inside it would. The one identifier a down `message` line may carry is
-the receipt nonce, below, which names nothing on this box.
+scrubs where the path inside it would. The only identifier a down `message` line ever carries is
+its own name — the receipt nonce when the door sent the line, the hub's own `p…` mint when the
+phone did — and names of that kind name nothing on this box.
 
 ### The follow-up lines — `t:"ack"`
 
@@ -95,16 +99,26 @@ line forward in time and never backwards:
   ordinary acceptance gets no line, because the receipt line already claimed nothing was
   confirmed and nothing needs correcting.
 
-### The receipt nonce
+### The names every line he says carries
 
-A down `message` line may carry one extra field: `msg_id`, a `w…` string. That is **the
-door's own nonce for your POST** — minted by the door at write time, returned to you in the
-POST's ok-shape as `msg_id`, carried on the answer file as `ref`, and echoed here by the hub.
-One nonce, three places, and your client's `r.msg === f.msg_id` matching (index.src.html's
-down-`message` arm) turns the line you sent into its own receipt instead of a second bubble.
-It names nothing on this box; a Telegram message id still never rides this file. Down
-`choice` lines carry no nonce — your client joins a tap to its question by `ask_id`, and the
-line already names that.
+Every down `message` line carries a `msg_id`, with no exceptions:
+
+* **yours, when you sent the line** — a `w…` string, **the door's own nonce for your POST**:
+  minted by the door at write time, returned to you in the POST's ok-shape as `msg_id`,
+  carried on the answer file as `ref`, and echoed here by the hub. One nonce, three places,
+  and your client's `r.msg === f.msg_id` matching (index.src.html's down-`message` arm) turns
+  the line you sent into its own receipt instead of a second bubble.
+* **the hub's, when the phone sent the line** — a `p…` string the ring mints for any message
+  line that arrives with no nonce. Your matcher is the reason: `find(r => r.msg ===
+  f.msg_id)` over a nameless line matches any row whose `msg` is not yet set — an optimistic
+  row mid-POST — so the second phone-typed line your client ever read would have been marked
+  as a line it never sent. The `p…` names the line's own `seq` and nothing on this box.
+
+Either way the name joins a line to a row and nothing else; a Telegram message id never rides
+this file. Down `choice` lines carry no name of this kind — your client joins a tap to its
+question by `ask_id`, and the line already names that. (A choice's **ok-shape** still carries
+a `msg_id` like every ok-shape — the answer file's minted name, the same opaque string a
+message's carries. Nothing of your client's reads it and it joins nothing.)
 
 ---
 
@@ -143,8 +157,12 @@ data: {"seq":41,…}
   the browser actually reached and the query is where the URL was cut, possibly minutes of
   events ago. A malformed cursor (either spelling) is a `400` in the refusal shape below.
 * **Past the rotation window:** the ring keeps the active file and one old file, about a
-  megabyte each — a few hundred events at the clip ceiling, comfortably more than a minute
-  away. Ask from a cursor older than what the two files hold and there is a gap nothing here
+  megabyte each — roughly six hundred events between them at the 3500-character clip
+  ceiling, which at the hub's own send ceiling (eighteen messages a minute for the whole
+  chat) is on the order of half an hour of flat-out talking, and far longer at any human
+  cadence. That is arithmetic from the constants, not a measurement — no test here pins how
+  long your fleet takes to spend a megabyte. Ask from a cursor older than what the two files
+  hold and there is a gap nothing here
   can fill; the door serves what it holds without renumbering, your client's coherence check
   trips, and it resyncs from the hub's own cursor echo — which is the designed mend, and the
   reason the poll's echo is always the ring's true head (below). Your `hubResync` already
@@ -365,7 +383,10 @@ end — keep it, as your tests already insist.
    `conversation`; we send nothing that names a project — no path, no repo name, ever. Your
    push watcher's law ("attribution may not be guessed", a lane nothing pins is skipped)
    stands; the map from our ids to your project display is yours to keep, the way your
-   lane→project pinning already is. The ids are stable for a conversation's life.
+   lane→project pinning already is. The ids are stable for as long as the enrolment lives —
+minted at enrolment and never rewritten while the row stands. What a re-enrolment does to
+them is not pinned by any test here, so treat re-enrolling as the moment an old id may stop
+resolving and re-read `projects --json` rather than caching forever.
 6. **Hold your own `test_hub.py` expectations against the door** — the shapes that suite
    pins are the shapes this door serves, so its assertions are the checklist: the
    byte-identical 401, the 404 body, the poll envelope with strict next-seq and a truthful
@@ -416,10 +437,12 @@ Shapes recorded rather than fixed, each with its reason:
   finished, and behind the torn bytes the answer was accepted); the mend on the hub side —
   stage and rename, exactly as the door already stages its own answer files — is a named
   follow-up, not done.
-* **One door per state home.** Nothing enforces it and nothing coordinates two: each door's
-  routing memory (§4 rung 3) is its own, learned from the lines it has served. Two doors on
-  one state home means a tap can be refused "did not say which conversation" by the door
-  that never served the ask its sibling did. Run one.
+* **One door per state home.** An operational recommendation, nothing more — the code neither
+  enforces it nor coordinates two doors that run: each door's routing memory (§4 rung 3) is
+  its own, learned from the lines it has served, so two doors on one state home means a tap
+  can be refused "did not say which conversation" by the door that never served the ask its
+  sibling did. Run one; if you ever must run two, make every write name its `conversation`
+  (§4 rung 1) so neither door's memory is load-bearing.
 * **Nothing of yours has talked to this binary yet.** The hermetic trial proves the seam
   with a scripted client, not your browser, your EventSource's reconnect behaviour, or your
   bridge's forwarding — your `test_hub.py` holds your half against a stub standing where

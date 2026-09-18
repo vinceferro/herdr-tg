@@ -57,9 +57,11 @@
 //! not. What the bridge said about a delivered act LATER is the follow-up half
 //! ([`Ring::his_words_were_refused`] and its kin): appended as an `ack` line beside the receipt
 //! it answers, because the ring is append-only history and a receipt already written is a fact
-//! already sent. And a down `message` line may carry one identifier: the door's own receipt
-//! nonce, the sender-minted `w…` [`Ring::the_operator_said`]'s docs narrow the law to — the one
-//! way a reader that sent a line can tell its echo from a second line.
+//! already sent. And every down `message` line carries its own name in `msg_id`: the door's
+//! receipt nonce — the sender-minted `w…` [`Ring::the_operator_said`]'s docs narrow the law to —
+//! or, for a line typed at the phone, the hub's own `p…` mint, which names the line itself and
+//! nothing on this box. A Telegram message id still never rides this file; the names exist so a
+//! reader can tell its own echo from a second line, not to carry a fact of the phone.
 //!
 //! # A ring failure is never an agent's failure
 //!
@@ -256,7 +258,10 @@ impl Ring {
     /// else.
     ///
     /// Called only where the frame was DELIVERED, never on a refusal: an echo is a receipt, and
-    /// the ring must not tell him his words reached an agent when they did not.
+    /// the ring must not tell him his words reached an agent when they did not. When
+    /// `the_receipt` is `None` — a line typed at the phone, or a door that minted no nonce — the
+    /// ring itself names the line with its own `p…` mint, so every down `message` line carries a
+    /// name and no reader's matcher can confuse one line for a row it never sent.
     pub fn the_operator_said(
         &self,
         conversation: &ProjectId,
@@ -416,12 +421,24 @@ impl Ring {
         &self,
         conversation: &ProjectId,
         lane: Option<&LaneId>,
-        frame: serde_json::Value,
+        mut frame: serde_json::Value,
         dir: &'static str,
     ) {
         let mut where_ = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if where_.closed {
             return;
+        }
+        // Every line he says carries its OWN name, minted here when the caller brought none. The
+        // reader's matcher joins a down `message` line to its own sent row by `msg_id`, and a
+        // line with no name matches any row whose `msg` is not yet set — an optimistic row
+        // mid-POST — so the second phone line he ever reads would be marked as a line the reader
+        // never sent. The mint is the line's own seq in disguise (`p…` beside the door's `w…`),
+        // minted under this lock so no two lines that land can share it, spent only when the
+        // write lands like the seq itself, and naming nothing on this box. Choice lines are named
+        // by their question (`ask_id`) and follow-ups by their subject (`of`); this is the
+        // `message` shape's own join, and the only one the reader's client matches by msg_id.
+        if dir == DOWN && frame["t"] == "message" && frame.get("msg_id").is_none() {
+            frame["msg_id"] = serde_json::json!(format!("p{}", where_.next_seq));
         }
         let line = Line {
             seq: where_.next_seq,

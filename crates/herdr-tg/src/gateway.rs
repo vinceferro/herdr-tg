@@ -66,7 +66,7 @@
 //! it would be. What the law cannot cover is the same as the ring's: an agent's own words are the
 //! event, and they go where they already went.
 //!
-//! # The receipt nonce, and the seam it closes
+//! # The receipt nonce, and the names every line he says carries
 //!
 //! A POSTed line needed an id the sender could recognise its own echo by, and the ring's law
 //! forbade `msg_id` on a down line — rightly, because the phone's `msg_id` is Telegram's and
@@ -78,8 +78,20 @@
 //! its own receipt. One field name to note: their pinned client reads `msg_id` on the ring
 //! frame (`app/index.src.html`, `hubFrame`'s down-`message` arm), so that is the name the ring
 //! echo wears — a `ref`-named ring field would have left their matcher reading `undefined`.
-//! Choices echo no nonce: their client joins a tap to its question by `ask_id`, and the down
-//! `choice` line already names that.
+//!
+//! A line the door did NOT carry in — typed at the phone — is named by the hub itself: the
+//! ring mints a `p…` for every down `message` line that arrives with no nonce, so no line he
+//! says is ever nameless. The reason is their matcher again: `find(r => r.msg === f.msg_id)`
+//! over a nameless line matches any row whose `msg` is not yet set — an optimistic row
+//! mid-POST — and the second phone line their client ever read was marked as a line it never
+//! sent. The `p…` names the line's own seq and nothing on this box; Telegram's `m…` ids still
+//! never ride the ring.
+//!
+//! Choices, on the ring, are joined to their question by `ask_id` — their client's choice
+//! matching reads the ask, not any msg id — and the down `choice` line names that and nothing
+//! else. A choice ok-shape still carries a `msg_id` like every ok-shape (the answer file's
+//! minted name, the same opaque string a message's carries); nothing of their client's reads
+//! it, and it joins nothing.
 //!
 //! # Recorded, not fixed: shapes left open on purpose
 //!

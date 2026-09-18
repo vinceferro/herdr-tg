@@ -575,6 +575,17 @@ pub struct AskRecord {
     /// So authorisation is this field, and the record's presence is only retirement bookkeeping.
     #[serde(default)]
     pub answered: Option<OptionId>,
+    /// Which surface the answer came from, when the record says `answered`. The retirement that
+    /// retries a keyboard edit words itself by this — "answered from your phone" and "answered
+    /// from the app" are both true sentences, and only the record knows which one is his. A
+    /// sweep that guessed credited the phone for the app's answer, on the phone itself and in
+    /// the reader's history at once.
+    ///
+    /// `#[serde(default)]` because the ledger on the operator's box holds records written before
+    /// this existed — and every one of those was answered from the phone or not at all, which is
+    /// exactly what a missing value reads as.
+    #[serde(default)]
+    pub answered_from: Option<CameFrom>,
     /// That the question has stopped being asked, and the note its keyboard is retired with.
     ///
     /// The other half of `answered`. A question can stop being asked from two sides — a tap on
@@ -973,15 +984,19 @@ impl AskLedger {
 
     /// Write down that a question has been answered, so it cannot be answered again.
     ///
-    /// The record stays — the keyboard may still need retiring — but it stops authorising anything.
+    /// The record stays — the keyboard may still need retiring — but it stops authorising
+    /// anything. The surface is written down beside the answer, because whoever retries the
+    /// keyboard edit later has to say where the answer came from and cannot guess.
     pub fn mark_answered(
         &mut self,
         chat_id: i64,
         msg_id: &MsgId,
         option_id: &OptionId,
+        from: CameFrom,
     ) -> std::io::Result<()> {
         if let Some(r) = self.records.get_mut(&ledger_key(chat_id, msg_id)) {
             r.answered = Some(option_id.clone());
+            r.answered_from = Some(from);
         }
         self.save()
     }
@@ -997,6 +1012,9 @@ impl AskLedger {
             // fact about the agent, not about this tap, and taking it back would reopen a question
             // nobody is asking.
             r.answered = None;
+            // The surface came off with the answer: an answer that did not happen has no "from",
+            // and a later sweep must not word a retried tap by a surface whose tap was taken back.
+            r.answered_from = None;
         }
         self.save()
     }
@@ -2063,8 +2081,8 @@ struct Down {
 }
 
 /// One of the two surfaces an operator's act can arrive on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CameFrom {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CameFrom {
     /// Telegram — a tap on a keyboard or a line typed in a topic, with a phone line to edit
     /// when something later has to be said about it.
     Phone,
@@ -2832,7 +2850,7 @@ impl<S: Surface> Hub<S> {
         let Some(record) = record else {
             return Err(TapRefusal::NoRecord);
         };
-        self.answer_the_ask(chat_id, msg_id, record, option_id)
+        self.answer_the_ask(chat_id, msg_id, record, option_id, CameFrom::Phone)
             .await
     }
 
@@ -2842,13 +2860,16 @@ impl<S: Surface> Hub<S> {
     /// can go through it without a chat or a person to name. Everything that could refuse is
     /// asked BEFORE anything is written down, the answer exists before the frame is on the wire,
     /// and the record is marked under the ledger lock it was judged under — which is what makes
-    /// a second answer, from either surface, arrive after the mark and be refused by it.
+    /// a second answer, from either surface, arrive after the mark and be refused by it. The
+    /// surface is written down WITH the answer, because the retirement that may retry the
+    /// keyboard edit later has to name where the answer came from, and only this moment knows.
     async fn answer_the_ask(
         &self,
         chat_id: i64,
         msg_id: &MsgId,
         record: AskRecord,
         option_id: &OptionId,
+        came_from: CameFrom,
     ) -> Result<(Addr, AskId, OptionId), TapRefusal> {
         if !record.options.iter().any(|o| &o.option_id == option_id) {
             return Err(TapRefusal::NotAnOption);
@@ -2899,7 +2920,7 @@ impl<S: Surface> Hub<S> {
                     }
                 }
             }
-            if let Err(e) = ledger.mark_answered(chat_id, msg_id, option_id) {
+            if let Err(e) = ledger.mark_answered(chat_id, msg_id, option_id, came_from) {
                 // Fail closed: if the answer cannot be written down, it must not be sent. An
                 // unrecorded answer is one that can be given again.
                 tracing::error!(error = %e, "could not write down that a question was answered");
@@ -6838,6 +6859,8 @@ impl<S: Surface> Hub<S> {
                                 // have already been made.
                                 text: crate::queue::fit(&text, crate::queue::MAX_TEXT).0,
                                 answered: None,
+
+                                answered_from: None,
                                 closed: None,
                             };
                             if let Err(e) =
@@ -7676,11 +7699,12 @@ impl<S: Surface> Hub<S> {
     /// Take the keyboard off a question some surface has answered, with the note saying how.
     ///
     /// The body of a retirement, shared by the two surfaces an answer can come from: a tap at
-    /// the phone retires with "answered from your phone", a tap at the door with "answered" —
-    /// the words differ because where he answered is a thing the phone reading them can see, and
-    /// the LAWS do not. Both say what he chose, both forget the record only once the buttons are
-    /// gone, and both leave it written down — closed, with his choice on it — when Telegram
-    /// refused the edit, so the next thing that can take it off still knows what it must say.
+    /// the phone retires with "answered from your phone", a tap at the door with "answered from
+    /// the app" — the words differ because where he answered is a thing the phone reading them
+    /// can see, and the LAWS do not. Both say what he chose, both forget the record only once
+    /// the buttons are gone, and both leave it written down — closed, with his choice on it —
+    /// when Telegram refused the edit, so the next thing that can take it off still knows what
+    /// it must say.
     async fn retire_an_answered_keyboard(&self, chat_id: i64, msg_id: &MsgId, note: &str) {
         let record = { self.ledger.lock().await.get(chat_id, msg_id).cloned() };
         let Some(record) = record else {
@@ -7888,10 +7912,13 @@ impl<S: Surface> Hub<S> {
             // Both marks can sit on one record — he tapped, and the agent then said the question
             // was over — and only one of them is a thing he did; writing "answered at the
             // terminal" over a button he pressed is the two-truths defect from the other side.
-            // Below that, the record's note beats the caller's, because this retirement may be a
-            // sweep that only knows the question is not open — and its sentence, "the session
-            // that asked this restarted", is true of an abandoned question and false of one that
-            // was answered and then would not let go of its keyboard.
+            // His act is worded by the surface the record says he used, never guessed: the sweep
+            // that retries a failed edit is the one place "where" could have been invented, and
+            // inventing it credited the phone for the app's answer. Below that, the record's
+            // note beats the caller's, because this retirement may be a sweep that only knows
+            // the question is not open — and its sentence, "the session that asked this
+            // restarted", is true of an abandoned question and false of one that was answered
+            // and then would not let go of its keyboard.
             let shown = record
                 .as_ref()
                 .map(|record| {
@@ -7899,7 +7926,16 @@ impl<S: Surface> Hub<S> {
                         .answered
                         .as_ref()
                         .and_then(|chosen| record.options.iter().find(|o| &o.option_id == chosen))
-                        .map(|o| format!("answered from your phone — {}", o.label))
+                        // Where he answered is the record's own fact, not the sweep's guess: a
+                        // door tap whose keyboard edit failed is still an answer that came from
+                        // the app, and crediting the phone for it — on the phone, and in the
+                        // reader's history at once — is a sentence about the wrong surface. A
+                        // record with no surface is one written before the field existed, and
+                        // those were answered from the phone or not at all.
+                        .map(|o| match record.answered_from {
+                            Some(CameFrom::Door) => format!("answered from the app — {}", o.label),
+                            _ => format!("answered from your phone — {}", o.label),
+                        })
                         .or_else(|| record.closed.as_ref().map(|c| c.note.clone()))
                         .unwrap_or_else(|| note.to_owned())
                 })
@@ -8159,7 +8195,7 @@ impl<S: Surface> Hub<S> {
                     .map(|o| o.label.clone())
                     .unwrap_or_default();
                 let (addr, ask_id, option_id) = self
-                    .answer_the_ask(chat, &msg, record, &option_id)
+                    .answer_the_ask(chat, &msg, record, &option_id, CameFrom::Door)
                     .await
                     .map_err(|why| answers::said::why_a_tap_was_refused(&why))?;
                 // Down through the same tail the phone's tap takes — the record the ack path
@@ -8176,9 +8212,16 @@ impl<S: Surface> Hub<S> {
                 }
                 // The question's keyboard is on the phone whoever answered it, so it comes off
                 // for whoever answered it — with where he answered it in the note, which is the
-                // one thing the phone cannot otherwise tell him.
-                self.retire_an_answered_keyboard(chat, &msg, &format!("answered — {label}"))
-                    .await;
+                // one thing the phone cannot otherwise tell him. The words name the surface for
+                // the same reason the sweep's do below: a note that guesses has credited the
+                // phone for the app's answer, and this note is what a failed edit leaves on the
+                // record for every later retry to say.
+                self.retire_an_answered_keyboard(
+                    chat,
+                    &msg,
+                    &format!("answered from the app — {label}"),
+                )
+                .await;
                 Ok(())
             }
             answers::Answer::Message {

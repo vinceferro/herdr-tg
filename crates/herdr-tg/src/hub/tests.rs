@@ -5441,6 +5441,8 @@ async fn a_question_too_old_for_its_keyboard_ever_to_come_off_is_not_kept_for_ev
                         pid: None,
                         at,
                         answered: None,
+
+                        answered_from: None,
                         closed: None,
                     },
                 )
@@ -5533,6 +5535,8 @@ async fn a_stuck_keyboard_is_swept_when_the_agent_that_asked_is_gone_and_an_unfi
         pid: Some(dead),
         at: now_secs(),
         answered: Some(OptionId::new("y")),
+
+        answered_from: None,
         closed,
     };
 
@@ -5890,6 +5894,8 @@ async fn a_retirement_still_goes_out_when_every_send_token_is_spent() {
                 pid: None,
                 at: now_secs(),
                 answered: None,
+
+                answered_from: None,
                 closed: None,
             },
         )
@@ -17905,11 +17911,12 @@ async fn the_ring_carries_the_operator_s_own_words_and_taps_from_either_surface(
         assert_eq!(line["lane"], "-", "{raw}");
     }
     // The down frames carry no identifier of the surface they came from: no chat, no person, no
-    // Telegram message id — the event is what he said, not the phone's plumbing. The ONE id a
-    // down line may hold is the door's own receipt nonce, the sender-minted `w…` the ring
-    // echoes so a sent line can be its own receipt — never a Telegram-shaped `m…`, and never on
-    // the phone's lines at all. And the two taps are the two questions, answered by whichever
-    // surface got there first.
+    // Telegram message id — the event is what he said, not the phone's plumbing. And EVERY
+    // `message` line he says carries its own name: the door's `wTEST-…` receipt nonce when the
+    // sender minted one, else the hub's own `p…` mint, which names the line itself — never a
+    // Telegram-shaped `m…`, never a `from`. A line with no name would match any row in their
+    // client's send-queue whose `msg` is not yet set. And the two taps are the two questions,
+    // answered by whichever surface got there first.
     let mut choices = Vec::new();
     for line in lines.iter().filter(|l| l["dir"] == "down") {
         let frame = &line["frame"];
@@ -17917,11 +17924,13 @@ async fn the_ring_carries_the_operator_s_own_words_and_taps_from_either_surface(
             frame.get("from").is_none(),
             "a down frame carries a fact of the surface it left from:\n{raw}"
         );
-        if let Some(msg_id) = frame.get("msg_id") {
-            let msg_id = msg_id.as_str().expect("the nonce, as words");
+        if frame["t"] == "message" {
+            let name = frame["msg_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a line he said has no name of its own:\n{line}"));
             assert!(
-                msg_id.starts_with("wTEST-"),
-                "a down frame's msg_id is not the door's own nonce:\n{raw}"
+                name.starts_with("wTEST-") || name.starts_with('p'),
+                "a down frame's msg_id is neither the door's nonce nor the hub's mint:\n{line}"
             );
         }
         if frame["t"] == "choice" {
@@ -18578,9 +18587,232 @@ async fn the_ring_echoes_the_door_s_own_nonce_so_a_sent_line_is_its_own_receipt(
         .iter()
         .find(|l| l["dir"] == "down" && l["frame"]["text"] == "from the phone, meanwhile")
         .expect("the phone's words left no down line");
+    // The phone's line carries a name of its own — the hub's `p…` mint, never Telegram's `m…`:
+    // the name exists so a reader can tell lines apart, not to carry a fact of the phone.
+    let the_name = phone_s["frame"]["msg_id"]
+        .as_str()
+        .expect("the phone's own line reached the ring with no name of its own");
     assert!(
-        phone_s["frame"].get("msg_id").is_none(),
+        the_name.starts_with('p'),
         "a Telegram message id reached the ring on the phone's own receipt line:\n{phone_s}"
+    );
+}
+
+#[tokio::test]
+async fn every_line_the_operator_says_gets_its_own_name_so_no_two_can_be_confused() {
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    // Two lines typed at the phone — Telegram's own ids ride the WIRE frames (m50, m51) and must
+    // never ride the ring — and one line from the door, carrying the sender's receipt nonce.
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &MsgId::new("m50"),
+                "first from the phone",
+                None,
+            )
+            .await,
+        "the first phone line did not go down"
+    );
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &MsgId::new("m51"),
+                "second from the phone",
+                None,
+            )
+            .await,
+        "the second phone line did not go down"
+    );
+    drop_an_answer(
+        &h,
+        "words-1",
+        serde_json::json!({
+            "t": "message", "conversation": h.project.as_str(),
+            "text": "from the door", "ref": "wTEST-named", "ts": now_secs(),
+        }),
+    );
+    h.hub.sweep_the_answers().await;
+    let _ = the_door_s_words_reach(&mut bridge, "first from the phone").await;
+    let _ = the_door_s_words_reach(&mut bridge, "second from the phone").await;
+    let _ = the_door_s_words_reach(&mut bridge, "from the door").await;
+
+    let lines = ring_so_far(h.dir.path());
+    let said: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["dir"] == "down" && l["frame"]["t"] == "message")
+        .collect();
+    assert_eq!(said.len(), 3, "the three lines are not all on the ring");
+
+    // Every line he says carries its OWN name — a door line the sender's `w…` nonce, a phone
+    // line a hub mint that names the line itself and nothing on this box — and never a
+    // Telegram-shaped id, never a `from`.
+    let mut names: Vec<&str> = Vec::new();
+    for line in &said {
+        let frame = &line["frame"];
+        assert!(
+            frame.get("from").is_none(),
+            "a down frame carries a fact of the surface it left from:\n{line}"
+        );
+        let name = frame["msg_id"].as_str().unwrap_or_else(|| {
+            panic!("a line he said reached the ring with no name of its own:\n{line}")
+        });
+        assert!(
+            !name.starts_with('m'),
+            "a Telegram message id reached the ring:\n{line}"
+        );
+        names.push(name);
+    }
+    let door_s = said
+        .iter()
+        .find(|l| l["frame"]["text"] == "from the door")
+        .expect("the door's line");
+    assert_eq!(
+        door_s["frame"]["msg_id"], "wTEST-named",
+        "the door's line did not keep the sender's own nonce:\n{door_s}"
+    );
+    let phone_names: Vec<&str> = said
+        .iter()
+        .filter(|l| l["frame"]["text"] != "from the door")
+        .map(|l| l["frame"]["msg_id"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(phone_names.len(), 2);
+    assert!(
+        phone_names.iter().all(|n| n.starts_with('p')),
+        "the phone's lines are not named by the hub's own mint: {phone_names:?}"
+    );
+    assert_ne!(
+        phone_names[0], phone_names[1],
+        "two of his lines share one name"
+    );
+
+    // And the reason all three need names, played by their client's own matcher: `me.find(r =>
+    // r.msg === f.msg_id)`. The rows are the client's send-queue — one optimistic row mid-POST
+    // whose `msg` is not yet set, one holding the door's nonce — and the QUESTION is which row a
+    // down line matches. A phone line with no name of its own would match the optimistic row
+    // (undefined === undefined) and the client would mark a line it never sent as sent; with
+    // names, a phone line matches nothing, and the door's line matches its own row alone.
+    let me_rows: Vec<Option<&str>> = vec![None, Some("wTEST-named")];
+    let their_matcher = |f_msg_id: Option<&str>| -> Option<Option<&str>> {
+        me_rows.iter().find(|r| **r == f_msg_id).copied()
+    };
+    for name in &phone_names {
+        assert!(
+            their_matcher(Some(name)).is_none(),
+            "a phone line matched one of the client's own rows: {name}"
+        );
+    }
+    assert_eq!(
+        their_matcher(Some("wTEST-named")),
+        Some(Some("wTEST-named")),
+        "the door's own line no longer matches its own row"
+    );
+    // The old shape, for contrast: an unnamed phone line matches the optimistic row — this is
+    // the confusion the names exist to end, and the assert that would have caught it.
+    assert_eq!(
+        their_matcher(None),
+        Some(None),
+        "the rig no longer models the matcher it exists to test"
+    );
+}
+
+#[tokio::test]
+async fn a_question_answered_at_the_door_is_never_said_to_have_been_answered_from_the_phone() {
+    let h = harness().await;
+    let (mut bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // The door answers, and the keyboard edit that would follow the answer is refused by
+    // Telegram — a 429, a message past its window — so the record stays behind, answered and
+    // closed, waiting for whatever can take the menu off next.
+    *h.fake.retire_fails.lock().await = true;
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "the door's answer was refused"
+    );
+    let _ = bridge.next_choice().await;
+
+    // A later session of the conversation arrives, and its sweep takes the keyboard off at
+    // last. What it must NOT do is credit the phone for a tap the phone never saw.
+    *h.fake.retire_fails.lock().await = false;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut next = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    next.become_live().await;
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(retired[0].1, msg, "{retired:?}");
+    assert!(
+        retired[0].2.contains("answered from the app"),
+        "the sweep credited the phone for the app's answer: {retired:?}"
+    );
+    assert!(
+        !retired[0].2.contains("your phone"),
+        "the sweep credited the phone for the app's answer: {retired:?}"
+    );
+    // And the ring's copy of the same retirement — the reader's history — names the surface too,
+    // in the same words the phone reads.
+    let lines = ring_so_far(h.dir.path());
+    let signed_off = lines
+        .iter()
+        .find(|l| l["frame"]["t"] == "ask_resolved" && l["frame"]["ask_id"] == "a1")
+        .expect("the hub's own retirement on the ring");
+    let how = signed_off["frame"]["how"].as_str().expect("the sentence");
+    assert!(
+        how.contains("answered from the app"),
+        "the ring credited the phone for the app's answer: {signed_off}"
+    );
+    assert!(
+        !how.contains("your phone"),
+        "the ring credited the phone for the app's answer: {signed_off}"
+    );
+
+    // The twin, from the phone: the same chain — answer, refused edit, later sweep — keeps
+    // today's exact words, because today's words are true of a phone tap.
+    let h = harness().await;
+    let (mut bridge, msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    *h.fake.retire_fails.lock().await = true;
+    let (who, ask, chosen) = h
+        .hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &msg, &OptionId::new("y"))
+        .await
+        .expect("the phone's tap resolves");
+    h.hub
+        .deliver_tap(&who, ALLOWED_CHAT, &msg, ask, chosen, "Yes")
+        .await
+        .expect("the phone's answer went down");
+    let _ = bridge.next_choice().await;
+    // The phone's own retirement is attempted and refused, exactly as the door's was — that is
+    // what leaves the record behind for the later sweep, and the note it must keep to.
+    h.hub.answered_from_phone(ALLOWED_CHAT, &msg, "Yes").await;
+    *h.fake.retire_fails.lock().await = false;
+    drop(bridge);
+    until(async || !h.hub.is_claimed(&h.own()).await).await;
+    let mut next = FakeBridge::connect(&h.sock, &h.secret, "i2", h.project.as_str()).await;
+    next.become_live().await;
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+    let retired = h.fake.retired.lock().await.clone();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert!(
+        retired[0].2.contains("answered from your phone — Yes"),
+        "the phone's own words changed on us: {retired:?}"
     );
 }
 

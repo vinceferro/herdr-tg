@@ -3284,6 +3284,8 @@ mod tests {
                     pid: Some(std::process::id()),
                     at: crate::hub::now_secs(),
                     answered: None,
+
+                    answered_from: None,
                     closed: None,
                 },
             )
