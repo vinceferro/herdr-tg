@@ -18,8 +18,8 @@
 //!   already writes down — the button law from `handle`'s own check, since the same ids come BACK
 //!   from the door as went out on the buttons. A control character in an id would forge a line in
 //!   the audit or the ring, and a `|` in an option id is the separator a button cannot carry. A
-//!   `lane`, when a message names one, gets the same addressability law the wire applies at
-//!   `hello` — the door cannot be where a lane stops being a name the hub will address a
+//!   `lane`, when a message or a choice names one, gets the same addressability law the wire
+//!   applies at `hello` — the door cannot be where a lane stops being a name the hub will address a
 //!   conversation by. And a KNOWN field a program wrote wrongly — a reply id, a lane — is
 //!   refused, never silently stripped: unknown FIELDS stay ignored so a newer gateway cannot
 //!   break the door, but a known one that fails its law is the file saying something the hub
@@ -123,13 +123,18 @@ pub const RESULTS_KEPT_FOR: u64 = 600;
 ///
 /// The conversation is a [`ProjectId`] because that is what a conversation IS on this wire; the
 /// hub resolves it to a live session, and the file's other names (ask, option) are the bridge's
-/// own opaque ids, resolved against what the hub wrote down when the question went out. A
-/// message may also name a `lane` — one conversation OF the project, a worktree — which the
-/// same addressability law the wire applies is applied to here.
+/// own opaque ids, resolved against what the hub wrote down when the question went out. Either
+/// kind may also name a `lane` — one conversation OF the project, a worktree — which the same
+/// addressability law the wire applies is applied to here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Answer {
     Choice {
         conversation: ProjectId,
+        /// Which conversation of the project the answer is for, when the file named one — the
+        /// one way out of two live questions minted under one name, which is what the ambiguous
+        /// refusal's sentence tells the operator to name. `None` is every question under the
+        /// name, and two of those are still refused rather than guessed between.
+        lane: Option<LaneId>,
         ask_id: AskId,
         option_id: OptionId,
     },
@@ -179,8 +184,12 @@ pub(crate) mod said {
          sent.";
     pub const BAD_LANE: &str = "That message names one of the project's own conversations in a shape this hub does not \
          address, so it was not sent.";
+    pub const BAD_LANE_ON_AN_ANSWER: &str = "That answer names one of the project's own conversations in a shape this hub does not \
+         address, so it was not sent.";
     pub const WRITTEN_DOWN_TWICE: &str = "That question is written down more than once here and the answer does not say which it \
          means, so it was not sent.";
+    pub const NO_SUCH_QUESTION_IN_THAT_LANE: &str = "That answer names one of the project's own conversations, and no question open \
+         under that name is being asked there, so it was not sent.";
     pub const ASKED_BY_TWO: &str = "That reply names a question two conversations are asking at once, and it does not say \
          which it means, so it was not sent.";
     pub const NOTHING_TO_TAKE_WORDS: &str = "Nothing is connected for that conversation right now, so nothing was sent. It will not \
@@ -263,6 +272,28 @@ fn an_id_the_hub_writes_down(s: &str) -> bool {
         && !s.chars().any(char::is_control)
 }
 
+/// The lane a file names, when it names one — one law, whichever kind of answer named it.
+///
+/// The caller hands in the refusal sentence, because the only difference between a message naming
+/// a lane badly and an answer naming one badly is the word the reader is looking at when the
+/// sentence reaches them.
+fn the_lane(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    refused: &'static str,
+) -> Result<Option<LaneId>, &'static str> {
+    match fields.get("lane") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let s = value.as_str().ok_or(refused)?;
+            let named = LaneId::new(s);
+            if !lane_is_addressable(&named) {
+                return Err(refused);
+            }
+            Ok(Some(named))
+        }
+    }
+}
+
 /// One file's bytes, made into an answer — or the sentence its result carries instead.
 ///
 /// Staleness is judged FIRST, before any name in the file is believed, because "refused unread"
@@ -307,8 +338,10 @@ pub(crate) fn parse(bytes: &str, now: u64) -> Result<Answer, &'static str> {
                 .and_then(serde_json::Value::as_str)
                 .filter(|s| an_id_the_hub_writes_down(s))
                 .ok_or(said::BAD_OPTION)?;
+            let lane = the_lane(fields, said::BAD_LANE_ON_AN_ANSWER)?;
             Ok(Answer::Choice {
                 conversation,
+                lane,
                 ask_id: AskId::new(ask_id),
                 option_id: OptionId::new(option_id),
             })
@@ -321,17 +354,7 @@ pub(crate) fn parse(bytes: &str, now: u64) -> Result<Answer, &'static str> {
                 .and_then(serde_json::Value::as_str)
                 .filter(|t| !t.trim().is_empty())
                 .ok_or(said::NO_WORDS)?;
-            let lane = match fields.get("lane") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(value) => {
-                    let s = value.as_str().ok_or(said::BAD_LANE)?;
-                    let named = LaneId::new(s);
-                    if !lane_is_addressable(&named) {
-                        return Err(said::BAD_LANE);
-                    }
-                    Some(named)
-                }
-            };
+            let lane = the_lane(fields, said::BAD_LANE)?;
             let in_reply_to_ask = match fields.get("in_reply_to_ask") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(value) => {

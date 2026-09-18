@@ -18651,6 +18651,91 @@ async fn two_open_asks_under_one_name_are_refused_rather_than_guessed() {
         .expect("an ambiguous answer moved a question's own state");
 }
 
+/// A tap as the door reads it, naming a conversation of the project the answer is for.
+///
+/// The twin of [`words_in`]: a choice may name the lane whose question it means, which is the one
+/// way out of two live questions minted under one name — and the door's own answer to the sentence
+/// that refusal carries, which tells him to name one.
+fn a_tap_in(
+    conversation: &str,
+    lane: Option<&str>,
+    ask: &str,
+    option: &str,
+    ts: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "t": "choice", "conversation": conversation, "lane": lane,
+        "ask_id": ask, "option_id": option, "ts": ts,
+    })
+}
+
+#[tokio::test]
+async fn a_tap_naming_a_lane_disambiguates_two_asks_under_one_name() {
+    let h = harness().await;
+    // The same shape the ambiguous refusal is proved on — a lane and the project's own voice, each
+    // minting their first ask id from a counter that starts over.
+    let (mut voice, voice_s) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    let mut lane = a_live_lane(&h, "fix-17", "i2").await;
+    a_lane_s_open_question(&h, &mut lane, "fix-17", "a1").await;
+
+    // A lane that names nothing is refused, and without guessing: the name is open in this
+    // project, but nothing asking under it lives in the conversation the file named — and the
+    // honest answer is the sentence that says so, not an answer delivered on a guess. Proved
+    // FIRST, while both questions are still open, so nothing above can have burned either.
+    drop_an_answer(
+        &h,
+        "tap-nowhere",
+        a_tap_in(h.project.as_str(), Some("fix-404"), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    let result = the_result_of(&h, "tap-nowhere");
+    assert_eq!(result["status"], "refused", "{result:?}");
+    let why = result["why"].as_str().expect("a plain-word sentence");
+    assert!(
+        why.contains("no question open under that name"),
+        "the refusal does not say the named conversation holds no such question: {why}"
+    );
+    let neither =
+        |frames: Vec<HubFrame>| !frames.iter().any(|f| matches!(f, HubFrame::Choice { .. }));
+    assert!(
+        neither(voice.drain_for(Duration::from_millis(150)).await),
+        "the hub delivered an answer for a lane that names nothing"
+    );
+    assert!(
+        neither(lane.drain_for(Duration::from_millis(150)).await),
+        "the hub delivered an answer for a lane that names nothing"
+    );
+
+    // The lane naming the one that IS asking is the way out of the ambiguity — which is what
+    // that family of refusals tells him to do, so it must answer, not refuse twice.
+    drop_an_answer(
+        &h,
+        "tap-1",
+        a_tap_in(h.project.as_str(), Some("fix-17"), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_of(&h, "tap-1")["status"],
+        "accepted",
+        "a tap that named the lane asking was refused anyway"
+    );
+
+    // It reached the session whose question it answered, and no other.
+    let (_frame, chosen) = lane.next_choice().await;
+    assert_eq!(chosen.as_str(), "y", "the lane got somebody else's answer");
+    let seen = voice.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "an answer naming one conversation reached the project's own voice: {seen:?}"
+    );
+    // And neither question was burned by any of it: the one not answered is still answerable
+    // from the phone, and the refusal above moved nothing.
+    h.hub
+        .resolve_tap(ALLOWED_CHAT, Some(OPERATOR), &voice_s, &OptionId::new("y"))
+        .await
+        .expect("a refused answer moved a question's own state");
+}
+
 #[tokio::test]
 async fn an_answer_cannot_reach_into_another_conversation_s_ask() {
     let h = harness().await;

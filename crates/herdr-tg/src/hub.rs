@@ -8071,6 +8071,7 @@ impl<S: Surface> Hub<S> {
         match which {
             answers::Answer::Choice {
                 conversation,
+                lane,
                 ask_id,
                 option_id,
             } => {
@@ -8079,17 +8080,40 @@ impl<S: Surface> Hub<S> {
                 // door's names are resolved against that record exactly as a button's are.
                 // Located by conversation and ask id, with no test of liveness — the core owns
                 // every judgement from here on, and guessing at liveness here would only
-                // duplicate one of its refusals worse.
+                // duplicate one of its refusals worse. A lane the file named narrows it first,
+                // which is the one way out of two live questions minted under one name: the
+                // refusal's sentence tells him to name the conversation, so naming one must
+                // answer, not refuse twice.
+                let the_one_he_meant =
+                    |r: &AskRecord| lane.as_ref().is_none_or(|named| r.lane.as_ref() == Some(named));
                 let (chat, msg, record) = {
                     let ledger = self.ledger.lock().await;
                     let open = ledger.matching(|r| {
                         r.project == conversation
                             && r.ask_id == ask_id
                             && r.refusal_if_closed().is_none()
+                            && the_one_he_meant(r)
                     });
                     match open.len() {
                         1 => {}
                         0 => {
+                            // A lane that names nothing is its own refusal, and a plainer one
+                            // than "no record": questions under that name ARE open here, in
+                            // other conversations of this project, and the honest sentence says
+                            // where the answer went wrong rather than that nothing was ever
+                            // asked. Only when the name is open nowhere — here or in any
+                            // conversation of the project — does the record's own story take
+                            // over, which is the ended-question-or-never-asked branch below.
+                            if lane.is_some() {
+                                let open_somewhere_in_the_project = ledger.matching(|r| {
+                                    r.project == conversation
+                                        && r.ask_id == ask_id
+                                        && r.refusal_if_closed().is_none()
+                                });
+                                if !open_somewhere_in_the_project.is_empty() {
+                                    return Err(answers::said::NO_SUCH_QUESTION_IN_THAT_LANE);
+                                }
+                            }
                             // Nothing open under that name: either the question ended while the
                             // answer sat in the drop — and the record still says how, which is
                             // the honest sentence — or nothing by that name was ever written
@@ -8102,9 +8126,11 @@ impl<S: Surface> Hub<S> {
                                 .unwrap_or(TapRefusal::NoRecord);
                             return Err(answers::said::why_a_tap_was_refused(&why));
                         }
-                        // Two live questions under one name — two lanes of a project each minting
-                        // their ids from a counter that starts over, or one ask that reached him
-                        // twice. Either way the file does not say which he means, and neither
+                        // Two live questions under one name — with no lane named, two
+                        // conversations of a project each minting their ids from a counter that
+                        // starts over, or one ask that reached him twice; with a lane named, two
+                        // records in the SAME conversation, which a lane cannot tell apart
+                        // either. Either way the file does not say which he means, and neither
                         // does the hub: fail closed rather than answer for him.
                         _ => return Err(answers::said::WRITTEN_DOWN_TWICE),
                     }
