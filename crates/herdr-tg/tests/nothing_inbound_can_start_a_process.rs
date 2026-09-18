@@ -155,12 +155,15 @@ const MAY_START_A_PROCESS: [MayStartAProcess; 4] = [
             declared_in: "crates/herdr-tg/src/hub.rs",
             declaration: "#[cfg(test)] mod tests;",
         },
-        programs: &["/bin/true", "bun", "git", "mkfifo", "sh"],
+        programs: &["/bin/true", "bun", "git", "kickoff-door", "mkfifo", "sh"],
         why: "The hub's own test module, and the one file under the hub that is excused from this \
               rule — the same exemption `the_hub_does_not_know_what_a_socket_is.rs` makes for the \
               same file and the same reason: it drives the real thing on purpose. It starts the \
               real bun bridge, builds real git repos, makes a fifo the read loop can block on, and \
-              reaps a child to get a dead pid. None of it is in the shipped binary.",
+              reaps a child to get a dead pid. `kickoff-door` is the PWA-door trial: its whole \
+              point is the REAL gateway binary on a real loopback port, so the test starts it BY \
+              NAME through `PATH` — a fixed program no inbound string chooses, put there by \
+              `scripts/pwa-door-trial.sh` after building it. None of it is in the shipped binary.",
     },
 ];
 
@@ -1162,7 +1165,7 @@ fn a_tree_that_starts_only_what_it_should() -> tempfile::TempDir {
     }
 
     // The hub declares its test module behind the gate, and that module is where the bun bridge,
-    // the git repos, the fifo and the dead pid come from.
+    // the git repos, the fifo, the dead pid and the real gateway binary come from.
     write_at(
         root,
         "crates/herdr-tg/src/hub.rs",
@@ -1174,6 +1177,7 @@ fn a_tree_that_starts_only_what_it_should() -> tempfile::TempDir {
         "fn f() {\n    std::process::Command::new(\"/bin/true\");\n    \
          tokio::process::Command::new(\"bun\");\n    \
          std::process::Command::new(\"git\");\n    \
+         std::process::Command::new(\"kickoff-door\");\n    \
          std::process::Command::new(\"mkfifo\");\n    \
          std::process::Command::new(\"sh\");\n    let _ = std::process::Stdio::null();\n}\n",
     );

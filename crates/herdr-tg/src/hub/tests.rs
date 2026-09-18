@@ -18779,3 +18779,540 @@ async fn an_answer_cannot_reach_into_another_conversation_s_ask() {
         .await
         .expect("the first conversation's own question was moved by an answer for another");
 }
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The hermetic PWA-door trial: one real hub, one real gateway binary, a scripted client shaped
+// like the PWA's, and nothing whatever reaching Telegram or this box's real state.
+//
+// It exists for the same reason the fleet trial does: the adoption's other org (and this one)
+// need to run the WHOLE door against the real thing before anything is installed — without a bot
+// token, without the PWA's bridge, and without spending a send. What is real here: the hub, over
+// the production listener, on a real Unix socket; the registry, the ledger, the ring and the
+// answers drop on disk; and `kickoff-door` as a REAL PROCESS, spawned on a loopback port — the
+// one binary in this workspace that listens, and this trial is where that is exercised rather
+// than asserted. What is faked: `FakeTelegram`, which counts instead of sending, and the client,
+// which is raw TCP shaped exactly as the PWA's `hubAnchor`/`hubStream`/`hubSend`/`hubAsk` shape
+// their requests — because the trial's client is the stand-in for their code, not for a browser.
+//
+// The token is written the way the verb would leave it rather than by running the verb: the verb
+// mints into the real state home the trial must not touch, and the door's behaviour under a
+// minted token is the property, not the minting (that is unit-held, in `gateway.rs`).
+//
+// **What no hermetic run can prove**, said where the next reader will meet it:
+//   * their bridge's own half — the session gate, the Origin pin, the proxy's unbuffered
+//     forwarding. `bridge/test_hub.py` holds those, in their repo, against a stub standing where
+//     this binary stands;
+//   * the browser's EventSource, whose reconnect behaviour is why `Last-Event-ID` wins over a
+//     stale `?cursor=` — the rule is implemented and unit-held, but only a real browser
+//     reconnects like one;
+//   * a real interface's idea of loopback. The bind call names 127.0.0.1 and nothing else, and
+//     no flag exists for another address; what this trial proves is the door works ON loopback,
+//     not that it cannot be heard off it — that property is the code's, and the closed list's.
+//
+// Run it with `scripts/pwa-door-trial.sh`, which builds the binary, puts it on PATH for the run,
+// and refuses to run pointed anywhere near the real state home.
+
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+
+/// The real `kickoff-door` binary as a child process, on a port of its own choosing.
+///
+/// Spawned by NAME and found through `PATH`, because a path built from a value is the shape the
+/// spawn guard refuses even in the files it trusts — and the script that runs this trial is what
+/// puts the built binary on `PATH`, so the program this test starts is the one this repo builds.
+struct TheRealDoor {
+    child: tokio::process::Child,
+    port: u16,
+}
+
+impl TheRealDoor {
+    async fn start(state: &std::path::Path) -> Self {
+        let mut child = tokio::process::Command::new("kickoff-door")
+            .arg("--state")
+            .arg(state)
+            .arg("--port")
+            .arg("0")
+            .arg("--ping-every-ms")
+            .arg("200")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "kickoff-door could not be started ({e}). It is built and put on PATH by \
+                     scripts/pwa-door-trial.sh — run the trial through the script"
+                )
+            });
+        let stdout = child.stdout.take().expect("piped");
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let said = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+            .await
+            .expect("the door says where it came up")
+            .expect("a line")
+            .expect("the door printed nothing");
+        // The one diagnostic line the door prints, whose shape is load-bearing here: the port is
+        // in it, and the address in it is the loopback one.
+        assert!(
+            said.starts_with("kickoff-door: listening on http://127.0.0.1:"),
+            "the door's one line does not name a loopback address: {said:?}"
+        );
+        let port: u16 = said
+            .rsplit(':')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("a port in the door's line");
+        Self { child, port }
+    }
+
+    /// One request, answered to the end. Raw bytes both ways, because half of what this trial
+    /// proves is what the wire carries: the shapes their client pins, and nothing of this machine.
+    async fn ask(&self, request: String) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .expect("the door is there");
+        stream.write_all(request.as_bytes()).await.expect("asked");
+        stream.shutdown().await.expect("half-closed");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("answered");
+        raw
+    }
+
+    /// The stream, read until the predicate is satisfied or the door goes quiet. Raw, for the
+    /// same reason — an SSE block is bytes before it is anything.
+    async fn stream_until(&self, cursor: u64, enough: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .expect("the door is there");
+        stream
+            .write_all(
+                format!("GET /v1/stream?cursor={cursor} HTTP/1.1\r\nHost: the-door\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("opened");
+        let mut raw = Vec::new();
+        let mut bit = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match tokio::time::timeout_at(deadline, stream.read(&mut bit)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    raw.extend_from_slice(&bit[..n]);
+                    if enough(&raw) {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => panic!("the stream broke: {e}"),
+            }
+        }
+        stream.shutdown().await.ok();
+        raw
+    }
+
+    async fn stop(mut self) {
+        let _ = self.child.kill().await;
+    }
+}
+
+/// The status line and body out of one raw HTTP reply.
+fn the_reply(raw: &[u8]) -> (u16, &[u8]) {
+    let text = String::from_utf8_lossy(raw);
+    let status = text
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status");
+    let body = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| &raw[at + 4..])
+        .expect("a body");
+    (status, body)
+}
+
+/// One POST the way their client sends it: content-type, length, and — for the writes that get
+/// through — the bearer their bridge adds server-side, played here by the trial itself.
+fn a_pwa_post(path: &str, token: Option<&str>, body: &str) -> String {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: the-door\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n",
+        body.len()
+    );
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    request
+}
+
+#[tokio::test]
+#[ignore = "the hermetic PWA-door trial: spawns the real kickoff-door binary, which must be \
+            built and on PATH; run it with scripts/pwa-door-trial.sh"]
+async fn the_pwa_s_door_round_trip_reaches_the_hub_and_back_through_the_real_gateway() {
+    let h = harness().await;
+    let home = h.dir.path().display().to_string();
+
+    // A second conversation, enrolled the way a terminal would, reachable by its own secret.
+    let repo2 = h.dir.path().join("the-other-project");
+    std::fs::create_dir_all(&repo2).expect("a second repo");
+    let mut registry = Registry::load(h.dir.path().join("projects.json"));
+    let (second, secret2) = registry.enrol(&repo2).expect("enrol the second project");
+    assert_ne!(second.id, h.project, "two repos minted one conversation");
+
+    // Three speakers: the first conversation's own voice, one of its lanes — both asking under
+    // the SAME name, which is the ambiguity a lane at the door must resolve — and the second
+    // conversation's voice, asking under that name too.
+    let (mut voice1, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+    let mut lane = a_live_lane(&h, "fix-17", "i2").await;
+    a_lane_s_open_question(&h, &mut lane, "fix-17", "a1").await;
+    let mut voice2 = FakeBridge::connect(&h.sock, &secret2, "i3", second.id.as_str()).await;
+    voice2.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let _ = one_open_question(&h, &mut voice2, "a1").await;
+
+    // The token, minted as the verb leaves it: 0600, trimmed, in the door's own directory.
+    let door_dir = h.dir.path().join("door");
+    std::fs::create_dir_all(&door_dir).expect("the door's directory");
+    std::fs::write(door_dir.join("token"), "the-trial-s-token\n").expect("a minted token");
+    let door = TheRealDoor::start(h.dir.path()).await;
+
+    // ── the anchor: one poll names the ring's head, and the events are strictly contiguous ────
+    let raw = door
+        .ask("GET /v1/events?cursor=0 HTTP/1.1\r\nHost: the-door\r\n\r\n".into())
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{raw:?}");
+    let poll: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(poll["ok"], serde_json::Value::Bool(true), "{poll:?}");
+    let events = poll["events"].as_array().expect("a list");
+    let head = poll["cursor"].as_u64().expect("a head");
+    assert!(!events.is_empty(), "the anchor found nothing to name");
+    let seqs: Vec<u64> = events
+        .iter()
+        .map(|e| e["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert_eq!(
+        seqs,
+        (1..=head).collect::<Vec<_>>(),
+        "the served events are not strictly the next seq past the cursor asked with"
+    );
+    let asked_here: Vec<&str> = events
+        .iter()
+        .filter(|e| e["frame"]["t"] == "ask")
+        .map(|e| e["conversation"].as_str().expect("a conversation"))
+        .collect();
+    assert_eq!(
+        asked_here.len(),
+        3,
+        "the three questions are not all on the ring: {poll:?}"
+    );
+
+    // ── the stream: the ask envelopes arrive as they were written, conversation and lane stamped ──
+    let raw = door
+        .stream_until(0, |raw| {
+            let text = String::from_utf8_lossy(raw);
+            text.matches("data: ").count() >= events.len()
+        })
+        .await;
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.starts_with(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\r\n\
+             retry: 3000\n: connected\n\n"
+        ),
+        "the stream does not open the way their client expects:\n{text}"
+    );
+    let lane_s_ask: serde_json::Value = {
+        let block = text
+            .split("\n\n")
+            .find(|block| {
+                block
+                    .strip_prefix("id: ")
+                    .and_then(|rest| rest.split_once("\ndata: "))
+                    .is_some_and(|(_, data)| {
+                        serde_json::from_str::<serde_json::Value>(data)
+                            .is_ok_and(|v| v["lane"] == "fix-17" && v["frame"]["t"] == "ask")
+                    })
+            })
+            .unwrap_or_else(|| panic!("the lane's ask never arrived on the stream:\n{text}"));
+        serde_json::from_str(block.split_once("\ndata: ").expect("a framed block").1)
+            .expect("one event")
+    };
+    assert_eq!(
+        lane_s_ask["conversation"],
+        *h.project.as_str(),
+        "{lane_s_ask:?}"
+    );
+    assert_eq!(lane_s_ask["lane"], "fix-17", "{lane_s_ask:?}");
+    assert_eq!(lane_s_ask["frame"]["ask_id"], "a1", "{lane_s_ask:?}");
+    let the_others: Vec<&str> = text
+        .split("\n\n")
+        .filter_map(|block| block.strip_prefix("id: "))
+        .collect();
+    assert!(
+        the_others.len() >= 3,
+        "the stream did not carry every event the poll did:\n{text}"
+    );
+
+    // ── the write: a tap naming the lane reaches the session that asked, and only it ──────────
+    let raw = door
+        .ask(a_pwa_post(
+            "/v1/commands",
+            Some("the-trial-s-token"),
+            r#"{"t":"choice","conversation":"h.project","lane":"fix-17","ask_id":"a1","option_id":"y"}"#
+                .replace("h.project", h.project.as_str())
+                .as_str(),
+        ))
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{raw:?}");
+    let ok: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(ok["ok"], serde_json::Value::Bool(true), "{ok:?}");
+    assert_eq!(ok["t"], "choice");
+    let (refused_frame, chosen) = lane.next_choice().await;
+    assert_eq!(
+        chosen.as_str(),
+        "y",
+        "the lane's session got another answer"
+    );
+    let nobody_else =
+        |frames: Vec<HubFrame>| !frames.iter().any(|f| matches!(f, HubFrame::Choice { .. }));
+    assert!(
+        nobody_else(voice1.drain_for(Duration::from_millis(150)).await),
+        "an answer naming one conversation reached the project's own voice"
+    );
+    assert!(
+        nobody_else(voice2.drain_for(Duration::from_millis(150)).await),
+        "an answer naming one conversation reached ANOTHER conversation's session"
+    );
+
+    // ── the receipt's other half: a refusing bridge's word lands on the ring, not in silence ──
+    let raw = door
+        .ask(a_pwa_post(
+            "/v1/commands",
+            Some("the-trial-s-token"),
+            r#"{"t":"choice","conversation":"h.project","ask_id":"a1","option_id":"n"}"#
+                .replace("h.project", h.project.as_str())
+                .as_str(),
+        ))
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{raw:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).expect("one object")["ok"],
+        serde_json::Value::Bool(true),
+        "a delivered answer the bridge later refuses is not the door's refusal"
+    );
+    let (frame, _chosen) = voice1.next_choice().await;
+    let said = voice1
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the session is busy".to_owned()),
+            files: None,
+        })
+        .await;
+    voice1
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &said => Some(()),
+            _ => None,
+        })
+        .await;
+    until(async || {
+        the_ring_s_follow_ups(&h).iter().any(|l| {
+            l["frame"]["status"] == "refused" && l["frame"]["reason"] == "the session is busy"
+        })
+    })
+    .await;
+
+    // ── typed words naming a lane reach that lane's session ───────────────────────────────────
+    let raw = door
+        .ask(a_pwa_post(
+            "/v1/commands",
+            Some("the-trial-s-token"),
+            r#"{"t":"message","conversation":"h.project","lane":"fix-17","text":"check the worktree's own build"}"#
+                .replace("h.project", h.project.as_str())
+                .as_str(),
+        ))
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{raw:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).expect("one object")["ok"],
+        serde_json::Value::Bool(true)
+    );
+    let got = lane
+        .wait_for(|f| match f {
+            HubFrame::Message { text, .. } if text == "check the worktree's own build" => {
+                Some(text.to_owned())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(got, "check the worktree's own build");
+    assert!(
+        nobody_else(voice1.drain_for(Duration::from_millis(150)).await),
+        "words naming a lane reached the project's own voice"
+    );
+
+    // ── the second conversation's answers reach it and nobody else — the door does not cross ──
+    let raw = door
+        .ask(a_pwa_post(
+            "/v1/commands",
+            Some("the-trial-s-token"),
+            r#"{"t":"choice","conversation":"second","ask_id":"a1","option_id":"y"}"#
+                .replace("second", second.id.as_str())
+                .as_str(),
+        ))
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{raw:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(body).expect("one object")["ok"],
+        serde_json::Value::Bool(true),
+        "the second conversation's own answer was refused at the first's door"
+    );
+    let (_f2, c2) = voice2.next_choice().await;
+    assert_eq!(
+        c2.as_str(),
+        "y",
+        "the second conversation got another answer"
+    );
+    assert!(
+        nobody_else(voice1.drain_for(Duration::from_millis(150)).await),
+        "the second conversation's answer reached the first's voice"
+    );
+    assert!(
+        nobody_else(lane.drain_for(Duration::from_millis(150)).await),
+        "the second conversation's answer reached the first's lane"
+    );
+
+    // ── the ring holds the whole story: asks, his taps, the follow-up ─────────────────────────
+    let lines = ring_so_far(h.dir.path());
+    let by_dir_t = |i: usize| {
+        (
+            lines[i]["dir"].as_str().unwrap_or(""),
+            lines[i]["frame"]["t"].as_str().unwrap_or(""),
+        )
+    };
+    let asks = lines
+        .iter()
+        .filter(|l| l["frame"]["t"] == "ask" && l["dir"] == "up")
+        .count();
+    let downs = lines
+        .iter()
+        .filter(|l| l["dir"] == "down" && l["frame"]["t"] == "choice")
+        .count();
+    let follow = the_ring_s_follow_ups(&h);
+    assert_eq!(
+        asks, 3,
+        "the three questions are not all recorded:\n{lines:?}"
+    );
+    assert_eq!(
+        downs, 3,
+        "the three taps are not all recorded as receipts:\n{lines:?}"
+    );
+    assert_eq!(
+        follow.len(),
+        1,
+        "the refusing bridge's word is not exactly once:\n{follow:?}"
+    );
+    assert_eq!(follow[0]["conversation"], *h.project.as_str());
+    assert_eq!(follow[0]["frame"]["of"], "choice");
+    let _ = by_dir_t; // every line's shape already asserted, above and below
+    // Nothing left in the drop: everything the door wrote was consumed either way. The RESULTS
+    // stay by design — a receipt's shelf life is the hub's business — so it is the answers
+    // themselves that are counted, not the directory.
+    let left = std::fs::read_dir(h.dir.path().join(crate::hub::answers::ANSWERS))
+        .expect("the drop")
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().ends_with(".result"))
+        .count();
+    assert_eq!(left, 0, "an answer was left unconsumed in the drop");
+
+    // ── the 401, byte for byte, as their bridge passes it through ─────────────────────────────
+    let raw = door
+        .ask(a_pwa_post(
+            "/v1/commands",
+            Some("not-the-token"),
+            r#"{"t":"message","text":"no"}"#,
+        ))
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 401, "{raw:?}");
+    assert_eq!(body, b"{\"error\": \"unauthorized\"}");
+
+    // ── replay from an old cursor is exact: the next seq past it, and the ring's own line ─────
+    let first_ask_seq = lines
+        .iter()
+        .find(|l| l["frame"]["t"] == "ask")
+        .and_then(|l| l["seq"].as_u64())
+        .expect("an ask on the ring");
+    let raw = door
+        .ask(format!(
+            "GET /v1/events?cursor={} HTTP/1.1\r\nHost: the-door\r\n\r\n",
+            first_ask_seq - 1
+        ))
+        .await;
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{raw:?}");
+    let replay: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    let events = replay["events"].as_array().expect("a list");
+    assert_eq!(
+        events[0]["seq"].as_u64().expect("a seq"),
+        first_ask_seq,
+        "replay did not continue the cursor exactly"
+    );
+    assert_eq!(
+        events[0],
+        lines
+            .iter()
+            .find(|l| l["seq"] == events[0]["seq"])
+            .cloned()
+            .expect("the ring's own line"),
+        "a served event is not the ring's own line"
+    );
+
+    // ── and nothing on the wire named this machine: not the state home, not a chat, not a topic,
+    //    not a secret — asserted on the raw bytes, both directions, whole trial through. The
+    //    requests below carry what the client sent; the replies carry what the door said.
+    let mut wire = Vec::new();
+    for cursor in [0u64, first_ask_seq - 1] {
+        wire.extend_from_slice(
+            &door
+                .ask(format!(
+                    "GET /v1/events?cursor={cursor} HTTP/1.1\r\nHost: the-door\r\n\r\n"
+                ))
+                .await,
+        );
+    }
+    wire.extend_from_slice(&door.stream_until(head, |raw| raw.len() > 200).await);
+    wire.extend_from_slice(
+        &door
+            .ask(a_pwa_post(
+                "/v1/commands",
+                Some("not-the-token"),
+                r#"{"t":"message","text":"x"}"#,
+            ))
+            .await,
+    );
+    let wire = String::from_utf8_lossy(&wire);
+    let not_on_the_wire = [
+        home.clone(),
+        "/tmp/".to_owned(),
+        format!("-{ALLOWED_CHAT}"),
+        h.secret.clone(),
+        secret2.clone(),
+        "the-trial-s-token".to_owned(),
+    ];
+    for not_on_the_wire in &not_on_the_wire {
+        assert!(
+            !wire.contains(not_on_the_wire),
+            "the identifier {not_on_the_wire:?} reached the HTTP wire:\n{wire}"
+        );
+    }
+
+    let _ = refused_frame;
+    door.stop().await;
+}
