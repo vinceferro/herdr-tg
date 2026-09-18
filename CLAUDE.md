@@ -21,8 +21,12 @@ Three crates in one Cargo workspace.
   carries it: that is `transport.rs`, the one file in the bot that knows what a socket and a peer
   uid are, and `tests/the_hub_does_not_know_what_a_socket_is.rs` fails if the hub learns either.
 - `crates/herdr-tg` — the bot. A `clap` binary: `enroll`, `projects`, `serve`, plus four read-only
-  herdr subcommands (`status`, `read`, `doctor`, `watch`). **It binds nothing** — no listening port,
-  and the Unix socket is not one.
+  herdr subcommands (`status`, `read`, `doctor`, `watch`). **The hub binds nothing** — no listening
+  port, and the Unix socket is not one. The one program in this workspace that listens is
+  `kickoff-door` (`src/bin/kickoff-door.rs` + `src/gateway.rs`), a separate binary that binds
+  **127.0.0.1 only** and serves the ring and the answers drop over HTTP to the kickoff PWA's
+  bridge; its write door takes a bearer token minted at the terminal by `herdr-tg door-token`, and
+  nothing reachable from a message, a tap or a frame names a port outside it.
 - `crates/herdr-client` — the typed client for herdr protocol 20. Used ONLY by the read-only
   subcommands now; the bot does not talk to herdr at all.
 
