@@ -57,7 +57,9 @@
 //! not. What the bridge said about a delivered act LATER is the follow-up half
 //! ([`Ring::his_words_were_refused`] and its kin): appended as an `ack` line beside the receipt
 //! it answers, because the ring is append-only history and a receipt already written is a fact
-//! already sent. And every down `message` line carries its own name in `msg_id`: the door's
+//! already sent. Beside is not the same as attached, so a follow-up NAMES what it answers — a
+//! tap's by the question and the button, a line of words by the `msg_id` its own receipt line
+//! was named with. And every down `message` line carries its own name in `msg_id`: the door's
 //! receipt nonce — the sender-minted `w…` [`Ring::the_operator_said`]'s docs narrow the law to —
 //! or, for a line typed at the phone, the hub's own `p…` mint, which names the line itself and
 //! nothing on this box. A Telegram message id still never rides this file; the names exist so a
@@ -320,7 +322,8 @@ impl Ring {
     /// frame is the wire's own ack vocabulary (`t:"ack"`, `status`, `reason`) because that is
     /// what the event IS on the wire; the wire's `ref` — a frame id this hub minted — is
     /// replaced by what a reader of THIS file can join on: `of` names which of his acts it is
-    /// about, and a choice carries the `ask_id` and `option_id` its down line already carries.
+    /// about, a choice carries the `ask_id` and `option_id` its down line already carries, and a
+    /// message carries the `msg_id` ITS down line was named with.
     ///
     /// `status` is present only when somebody answered. A confirm window that ran out is not an
     /// answer, and recording it as `refused` would put a refusal in his history no bridge ever
@@ -342,18 +345,35 @@ impl Ring {
         self.stamp(conversation, lane, frame, UP);
     }
 
-    /// A bridge refused his typed words, and said why.
+    /// A bridge refused his typed words, and said why — under the name the refused line carries.
+    ///
+    /// `named` is the down `message` line's own `msg_id`, so a reader can put this refusal under
+    /// the line it refuses instead of under the last line it happens to have drawn. Without it a
+    /// reader with two of his lines in flight could only guess, and the one client there is got
+    /// away with guessing only because it keeps a single send in flight — which is a property of
+    /// that client, not of this history. A refusal of a CHOICE needs no such name: it already
+    /// carries the `ask_id` and `option_id` its own down line carries, and that pair names the
+    /// row exactly.
+    ///
+    /// `None` where no name can be given, which is the door's own "this line reached the ring
+    /// under a name the hub minted for it and nobody else has ever seen": a nameless refusal is
+    /// honest about being unplaceable, where a made-up name would join to nothing while looking
+    /// like it joined to something. A name of the PHONE's is never passed — the caller's arm is
+    /// the whole of that rule, and this file's law is why.
     pub fn his_words_were_refused(
         &self,
         conversation: &ProjectId,
         lane: Option<&LaneId>,
+        named: Option<&hub_proto::MsgId>,
         why: &str,
     ) {
-        self.the_door_was_answered(
-            conversation,
-            lane,
-            serde_json::json!({ "t": "ack", "of": "message", "status": "refused", "reason": why }),
+        let mut frame = serde_json::json!(
+            { "t": "ack", "of": "message", "status": "refused", "reason": why }
         );
+        if let Some(name) = named {
+            frame["msg_id"] = serde_json::json!(name.as_str());
+        }
+        self.the_door_was_answered(conversation, lane, frame);
     }
 
     /// A bridge refused his answer to a question, and said why.

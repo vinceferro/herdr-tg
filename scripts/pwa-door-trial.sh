@@ -147,5 +147,5 @@ say
 say "Nothing was kept outside the run's own directory, nothing was spent, nothing was sent, and"
 say "the real state directory holds what it held. What this did NOT prove is written at the top of"
 say "the test, in crates/herdr-tg/src/hub/tests.rs — search for the trial's name."
-say "The shapes the door speaks are pinned by the PWA org's own bridge/test_hub.py; this trial is"
-say "the real-binary half of that agreement."
+say "The shapes the door speaks are pinned by the PWA org's own stub suite, in their repo; this"
+say "trial is the real-binary half of that agreement."

@@ -21,8 +21,11 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
 
 ## Conventions that override the pulled charter
 
-- **Report in chat, not to the tracker.** `.kickoff/bin/mc` is dead here — the pinned core dropped
-  mission-control from the public line.
+- **Report in chat AND write the tracker.** `.kickoff/bin/mc` works here again; the line saying it
+  was dead outlived the ten-hour outage by two weeks, and while it stood nobody wrote the file. The
+  founder's surface renders `.kickoff/state/mission-control/mission-state.json` as this project's
+  lanes and plate, so a tracker nobody writes is worse than none — it presents Slice 3 to him as
+  current work. The chat still carries the decision; the tracker carries what is true now.
 - **Answer where the question came from.** A message that arrives as a `<channel …>` block was typed
   on a phone, and the operator is not reading this transcript. Reply to it through the channel's
   `reply` or `ask`, not only in the terminal — printing an answer he cannot see is the same failure
@@ -55,6 +58,17 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
 
 - **Never start the service.** It is stopped by decision, after a review found four ways it could
   type the wrong thing into a real terminal. Restarting it is the operator's call, and only his.
+- **The Telegram surface is retired; the hub is demoted, not dead (17 September 2026).** The
+  operator revoked the bot token himself (~12:38 CEST) and the same hour `herdr-tg.service`,
+  `herdr-tg-watchdog.timer` and `kickoff-hub-attach@oc-dogfood.service` were stopped and disabled,
+  so a dead credential would not be polled, refused and nagged about forever. This matches his
+  ruling the same day (`.kickoff/memory/telegram-is-a-connector-kickoff-will-drive-it.md`): the
+  work surface is the PWA and the herdr TUI; the hub stays the conversation plane for the PWA to
+  be proven on, with the Telegram connector arriving later as kickoff work. Ordering, his words:
+  PWA chat proven first, then any dismissal. His live comms path meanwhile is agent-mail
+  (claude-kickoff's `kickoff-hub.service` — a different system, never touched from here). A
+  session's channel tools failing to reach the hub are the expected state, not an outage to fix;
+  reviving any unit or minting a token is his call, in that order.
 - **Never add a call site to `send_text`, `send_keys` or `send_input`.** One audited path exists.
   The guard that enforces it has been walked past six times; do not become the seventh.
 - **Never route around a gate.** If `cargo test` is red, it is red. The one exception is the TMPDIR

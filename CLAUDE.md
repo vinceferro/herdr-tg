@@ -86,9 +86,23 @@ overrides `rust-toolchain.toml`. `TMPDIR` because an agent session inherits it a
 The same applies to `git commit`: the pre-commit hook runs six gates in your environment, so prefix
 the commit too, or it is refused with seven red tests you did not break.
 
-Thirteen tests are `#[ignore]`d — eleven need bun (one runs the plugin from before conversations
+**One test in this suite is flaky, and it weakens every green run — follow-up, not yet fixed.**
+`summarize::tests::an_ambient_proxy_must_not_be_able_to_reroute_the_gist` (`summarize.rs`) fails
+about one run in three with `run the child: Os { code: 2, kind: NotFound }`: it spawns
+`current_exe()` and the spawn comes back ENOENT. Re-running it passes, so it has been re-run, and
+that is the whole problem. **A green gate is the evidence every contract this repo publishes rests
+on** — `docs/PWA-DOOR.md` opens by telling another organisation that every sentence in it was read
+in code that passes this suite — and one green run of a suite with a one-in-three flake is one run
+of a coin. It also trains the reflex the gate exists to prevent: a red test you have learned to
+re-run is a red test you have learned not to read. Nobody has found the cause; the spawn is of this
+binary's own path, which is the part that makes it worth an hour rather than a `#[ignore]`. Until
+somebody does: hitting it is not a red gate, and it is not licence to re-run anything else.
+
+Fourteen tests are `#[ignore]`d — eleven need bun (one runs the plugin from before conversations
 existed against the new hub, one dispatches three rooms with the real adapter, one is the fleet
-trial below), one is a proxy-driven child, one runs the pre-change bridge against the new hub.
+trial below), one is a proxy-driven child, one runs the pre-change bridge against the new hub, and
+one is the hermetic PWA-door trial (`scripts/pwa-door-trial.sh`). The count is held to the tree by
+nothing, so it has been wrong before: when you add one, move the number in the same commit.
 `scripts/install-channel-plugin.sh` runs the bun ones and refuses to install a bridge that
 disagrees with the hub. It does NOT run the fleet trial: four conversations crossing is a property
 of the hub and the adapter, which installing a bridge can neither break nor fix, so failing an
@@ -215,6 +229,32 @@ until the number moves, which is the point.
   program built from a value refused even there, the test-only sites proved gated. Six evasions
   planted and killed, including a module mounted from outside the walk and a renamed file. Four
   documents that overstated it now say what the guard proves.
+- **The PWA has a door, and it is the product's new front** (17–18 September). `kickoff-door` is a
+  separate binary on loopback serving the hub's own ring of operator-visible events and taking the
+  operator's writes; `docs/PWA-DOOR.md` is the contract, written to be implemented by a stranger,
+  and `bash scripts/pwa-door-trial.sh` is the hermetic proof — one real hub over a real socket, the
+  real gateway binary on a real port, Telegram counted instead of called. The surface org read the
+  contract and called it near drop-in. Five mends followed their verdict: the hub's receipts are
+  written by stage-and-rename rather than emptied where the door is already reading them; a refusal
+  of his words names the line it refuses, and only on the arm where the words came through the door,
+  because a phone line's name is a Telegram id the ring may never carry; the write door's answers
+  name the conversation they resolved to, and a timed-out MESSAGE names the nonce its echo will
+  carry (a tap gets none — no file and no ring line will ever say it); the ladder's first rung fills
+  a missing lane from the question, scoped to the conversation the body named; and the door's own
+  refusals say what a person can act on instead of naming wire fields back at him.
+  **The defect worth remembering was in none of that.** The door remembered every question twice —
+  once from the ring it reads at start, once from the line it served — and read one question as two
+  conversations asking under one name, so it refused the tap. A client can only learn an ask id by
+  reading the ring, so every client that could tap was a client that had made the door remember
+  twice: the routing rung was broken for every real client, and no test saw it because no test had
+  polled before it tapped.
+- **What this repo publishes about another organisation is scrubbed** (18 September). The contract
+  named their files, their line numbers, their helpers and once a verbatim line out of their test
+  suite — checkable for their engineer, and published to everyone, because THIS REMOTE IS PUBLIC.
+  The findings all stand; they are written as behaviour now, which their engineer can still find in
+  one search of his own tree. Letters addressed to them left the repo (`.gitignore` covers
+  `.kickoff/mail-drafts/`) and travel by agent-mail instead. Nothing had been pushed when this was
+  caught, so nothing was ever published; `pwa-door-proposal.md` remains in history at `7d85dc9`.
 - **A fleet trial runs hermetically: `bash scripts/fleet-trial.sh`** (9 September). Four
   conversations of one repo, live at once, each bound to its own engine session — a real hub over a
   real socket, four real adapters, fake Telegram and fake engines, nothing spent and nothing sent.
@@ -282,7 +322,13 @@ until the number moves, which is the point.
   at `@` before it looks for a slash, so an `@mention`, an email or an ssh remote read as another
   bot's command and were dropped in silence; `what_he_typed` guards on the slash first.
 - `fix/r5-parser` is **dead**: it improved the screen parser, and there is no screen parser.
-- The tracker shim `.kickoff/bin/mc` is **dead** in this repo. Report status in chat.
+- **The tracker shim `.kickoff/bin/mc` works again**, and the founder's PWA renders what it writes
+  (`.kickoff/state/mission-control/mission-state.json`) as this project's lanes and plate. It was
+  dead for about ten hours on 31 August, the note saying so outlived the outage by two weeks, and
+  in the meantime nobody wrote the tracker: on 18 September its headline still announced Slice 3
+  and its blocked list still said "3 commits unpushed" against an actual 79. A tracker nobody
+  writes is worse than none, because his surface presents it as current. Write it, and read the
+  exit code of what you ran.
 
 ## The quality bar
 

@@ -18041,6 +18041,137 @@ async fn a_sweep_that_cannot_write_a_result_still_consumes_the_answer() {
 }
 
 #[tokio::test]
+async fn a_result_is_put_in_place_whole_rather_than_emptied_where_a_reader_is_looking() {
+    let h = harness().await;
+    let (mut bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // A whole older receipt already at the name, and a reader holding it open before the new one
+    // is earned. That reader is the ordinary case, not a contrived one: the door polls this exact
+    // path several times a second while it waits.
+    //
+    // Honest about what this proves: the DISCIPLINE, not the race. A receipt's body goes down in
+    // one write, so the window a concurrent observer could actually catch is the empty file
+    // between the truncate and that write — and a test that watched for it would pass by luck on
+    // a slow box and fail by luck on a fast one. A test that can pass by luck proves nothing. So
+    // the reader here is a held descriptor, which turns the question into one with no timing in
+    // it at all: emptying the name in place empties the very thing the reader holds, while
+    // putting a new file at the name leaves the reader its whole old one. Two whole receipts
+    // either side, never a torn one.
+    let name = "tap-1";
+    let at_the_name = the_drop(&h).join(format!("{name}.result"));
+    let older = r#"{"t":"result","status":"refused","why":"an older receipt, whole"}"#;
+    std::fs::write(&at_the_name, older).expect("an older receipt at the name");
+    let mut held = std::fs::File::open(&at_the_name).expect("a reader looking at it");
+
+    drop_an_answer(
+        &h,
+        name,
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    let _ = bridge.next_choice().await;
+
+    let now = the_result_of(&h, name);
+    assert_eq!(
+        now["status"], "accepted",
+        "the new verdict never reached the name the door reads: {now}"
+    );
+    let mut what_the_reader_has = String::new();
+    std::io::Read::read_to_string(&mut held, &mut what_the_reader_has)
+        .expect("read back what the reader was holding");
+    assert_eq!(
+        what_the_reader_has, older,
+        "the receipt a reader was already holding was emptied under it instead of replaced beside it"
+    );
+}
+
+#[tokio::test]
+async fn a_result_is_never_written_through_a_link_somebody_planted_at_its_name() {
+    let h = harness().await;
+    let (mut bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // A link standing where the receipt's name is, aimed out of the drop. Opening a name follows
+    // a link and writes the receipt's bytes wherever it points; putting a file at the name by
+    // rename replaces the link instead. Only this user can plant it, inside a 0700 directory —
+    // but closing it costs nothing, so it is closed rather than written down.
+    let elsewhere = h.dir.path().join("elsewhere.json");
+    let untouched = "not a receipt, and never was";
+    std::fs::write(&elsewhere, untouched).expect("a file for the link to aim at");
+    let name = "tap-1";
+    let at_the_name = the_drop(&h).join(format!("{name}.result"));
+    std::os::unix::fs::symlink(&elsewhere, &at_the_name).expect("a link at the receipt's name");
+
+    drop_an_answer(
+        &h,
+        name,
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    let _ = bridge.next_choice().await;
+
+    assert_eq!(
+        std::fs::read_to_string(&elsewhere).expect("it is still there to read"),
+        untouched,
+        "the receipt's bytes were written through a link, into a file outside the drop"
+    );
+    let landed =
+        std::fs::symlink_metadata(&at_the_name).expect("something is at the receipt's name");
+    assert!(
+        landed.file_type().is_file(),
+        "the link is still standing where the receipt itself should be"
+    );
+    // The receipt is put down under one name and moved onto this one, and a file carries its
+    // width across that move: the hop is where a receipt could quietly start arriving wider than
+    // every other file this hub writes.
+    assert_eq!(
+        landed.permissions().mode() & 0o777,
+        0o600,
+        "the receipt arrived at its name readable by more than this hub"
+    );
+    assert_eq!(
+        the_result_of(&h, name)["status"],
+        "accepted",
+        "the answer was carried but its receipt is not at the name the door reads"
+    );
+}
+
+#[tokio::test]
+async fn a_result_being_staged_is_never_read_as_one_of_his_answers() {
+    let h = harness().await;
+    // A GUARD, and it passes on both sides of the change that motivates it — that is the point.
+    // What it pins is the NAME. The sweep sorts this directory by one test: a file whose name
+    // ends the way a receipt's does is a receipt, and everything else is one of his acts. A
+    // receipt halfway to its name spelled any other way would be swept as an answer, refused as
+    // garbage, consumed, and given a receipt of its own — the hub eating a file nobody wrote. So
+    // a later edit at either end, the name or the sorting, turns this red.
+    //
+    // Which is why the name is ASKED FOR here rather than spelled out. A copy of it written into
+    // this file goes on passing after the minting has changed underneath it — the one shape of
+    // blindness a name guard can have, and the one this guard had: it wrote the name by hand and
+    // never called the minting at all, so the minting could stop wearing the suffix entirely and
+    // nothing here noticed. Taking the name from the minting is what holds the two ends together.
+    h.hub.sweep_the_answers().await;
+    let one_of_his = the_drop(&h).join("tap-1");
+    let halfway = crate::hub::answers::where_a_result_is_staged(
+        &crate::hub::answers::the_result_of(&one_of_his),
+    );
+    std::fs::write(&halfway, r#"{"t":"result","status":"accepted"}"#)
+        .expect("a receipt halfway to its name");
+
+    h.hub.sweep_the_answers().await;
+
+    assert!(
+        halfway.exists(),
+        "a receipt halfway to its name was consumed as though he had written it: {}",
+        halfway.display()
+    );
+    assert!(
+        !crate::hub::answers::the_result_of(&halfway).exists(),
+        "the hub minted a receipt for a file nobody wrote"
+    );
+}
+
+#[tokio::test]
 async fn an_answer_that_is_not_one_the_door_can_believe_is_refused_and_consumed() {
     let h = harness().await;
     let (_bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
@@ -18465,6 +18596,179 @@ async fn a_refusal_of_the_door_s_words_reaches_the_ring_instead_of_vanishing() {
 }
 
 #[tokio::test]
+async fn a_refusal_of_words_that_came_through_the_door_names_the_line_it_refuses() {
+    // A follow-up about a TAP names the question and the button it is about, so a reader can put
+    // it under the right row. A follow-up about his WORDS named nothing at all, and a reader
+    // holding two lines he had sent could only guess which of them the refusal was about. It got
+    // away with it because the one client reading this file keeps a single send in flight — a
+    // property of that client, which no wire should be resting on.
+    let h = harness().await;
+    let (mut bridge, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // Two lines, each under the name its own sender minted. With one line in flight any name
+    // looks right, so the second is what gives a wrong name somewhere to land.
+    for (file, text, name) in [
+        ("words-1", "run the whole suite", "wTEST-the-first-line"),
+        ("words-2", "and then push it", "wTEST-the-second-line"),
+    ] {
+        drop_an_answer(
+            &h,
+            file,
+            serde_json::json!({
+                "t": "message", "conversation": h.project.as_str(),
+                "text": text, "ref": name, "ts": now_secs(),
+            }),
+        );
+        h.hub.sweep_the_answers().await;
+        assert_eq!(
+            the_result_of(&h, file)["status"],
+            "accepted",
+            "words carrying a receipt name were refused at the door"
+        );
+    }
+    let _first = the_door_s_words_reach(&mut bridge, "run the whole suite").await;
+    let second = the_door_s_words_reach(&mut bridge, "and then push it").await;
+
+    // The agent turns down the SECOND line only.
+    let said = bridge
+        .send(BridgeFrame::Ack {
+            r#ref: second,
+            status: AckStatus::Refused,
+            reason: Some("the session that asked has ended".into()),
+            files: None,
+        })
+        .await;
+    bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack { r#ref, .. } if r#ref == &said => Some(()),
+            _ => None,
+        })
+        .await;
+
+    until(async || {
+        the_ring_s_follow_ups(&h)
+            .iter()
+            .any(|l| l["frame"]["of"] == "message")
+    })
+    .await;
+    let refused = the_ring_s_follow_ups(&h)
+        .into_iter()
+        .find(|l| l["frame"]["of"] == "message")
+        .expect("the refusal of his words, just watched for");
+    assert_eq!(
+        refused["frame"]["msg_id"], "wTEST-the-second-line",
+        "the refusal does not say which of his two lines it is about:\n{refused}"
+    );
+
+    // And the name it carries is the name the words' OWN receipt line carries, which is what
+    // makes it a join rather than a second opaque string a reader has to guess about.
+    let receipt = ring_so_far(h.dir.path())
+        .into_iter()
+        .find(|l| l["dir"] == "down" && l["frame"]["text"] == "and then push it")
+        .expect("the refused words left no receipt line to join to");
+    assert_eq!(
+        refused["frame"]["msg_id"], receipt["frame"]["msg_id"],
+        "the refusal names something no line of his history is called:\n{refused}\n{receipt}"
+    );
+    // The line it does NOT refuse keeps its own name, so the join is to one row and not to both.
+    let untouched = ring_so_far(h.dir.path())
+        .into_iter()
+        .find(|l| l["dir"] == "down" && l["frame"]["text"] == "run the whole suite")
+        .expect("the first line left no receipt line");
+    assert_ne!(
+        refused["frame"]["msg_id"], untouched["frame"]["msg_id"],
+        "the refusal names the line it did not refuse:\n{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_of_words_typed_on_the_phone_names_nothing_the_ring_may_not_carry() {
+    // The name a door line's refusal carries is the sender's own nonce, which names nothing on
+    // this box. One arm over, the very same field holds a TELEGRAM message id — and this file
+    // takes none of those, ever. So the carry belongs to the door's arm alone, and this is the
+    // test that goes red the day it moves.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let before = h.fake.sends.lock().await.len();
+
+    // A message id no other string in this test could be mistaken for, so its presence anywhere
+    // in the ring is the leak and nothing else.
+    let typed_on_the_phone = MsgId::new("m770077");
+    assert!(
+        h.hub
+            .relay(
+                &h.own(),
+                ALLOWED_CHAT,
+                Some(OPERATOR),
+                &typed_on_the_phone,
+                "from the phone, and turned down",
+                None,
+            )
+            .await,
+        "the phone's words did not go down"
+    );
+    let frame = the_door_s_words_reach(&mut bridge, "from the phone, and turned down").await;
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the worker has no session open to take them".into()),
+            files: None,
+        })
+        .await;
+    // He is told in the topic he typed in — the phone's own half of this news, and what proves
+    // the refusal was handled at all rather than dropped before it could say anything.
+    until(async || h.fake.sends.lock().await.len() > before).await;
+
+    let raw =
+        std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING)).unwrap_or_default();
+    // Swept whole rather than field by field, the way the four up kinds are swept: the field
+    // added today is not the field somebody adds next, and a guard that names one field only
+    // guards that one.
+    for line in ring_so_far(h.dir.path()) {
+        let mut values = Vec::new();
+        every_value(&line, &mut values);
+        for v in &values {
+            if let Some(n) = v.as_i64() {
+                assert!(
+                    ![ALLOWED_CHAT, OPERATOR].contains(&n),
+                    "a chat or a person reached the ring as the number {n}:\n{raw}"
+                );
+            }
+            if let Some(s) = v.as_str() {
+                assert!(
+                    !s.contains("770077"),
+                    "a Telegram message id reached the ring: {s}\n{raw}"
+                );
+            }
+        }
+    }
+    // And the whole of the rule, said as the count it really is: a refusal of words he typed on
+    // the phone puts NO follow-up on the ring at all. Not "one without a name" — none. The only
+    // name such a line could carry is the Telegram message id of the line he typed in, and this
+    // file takes none of those ever, so there is no name left for it to be written under; the
+    // phone's own half of this news is the cross on his message and the sentence under it, and
+    // that news is already where he is reading.
+    //
+    // Counted rather than sifted field by field, because a sift only ever fires on a line that
+    // both exists AND carries the forbidden field. The edit a maintainer actually makes is the
+    // first half alone — hoisting the ring call out of the arm it belongs to, receipt and all, so
+    // both arms say it — and against that a sift is silent: the hoisted line is nameless, because
+    // a phone record carries no receipt to name it with. So the count is what catches the move,
+    // and the sweep above is what catches the name.
+    let follow_ups = the_ring_s_follow_ups(&h);
+    assert!(
+        follow_ups.is_empty(),
+        "a refusal of words typed on the phone put {} follow-up line(s) on the ring, which \
+         belongs to the door's arm alone: {}",
+        follow_ups.len(),
+        serde_json::to_string(&follow_ups).expect("readable")
+    );
+}
+
+#[tokio::test]
 async fn a_message_naming_a_lane_reaches_that_lane_s_session() {
     let h = harness().await;
     let (mut voice, _msg) = a_live_session_with_one_open_question(&h, "i1", "a1").await;
@@ -18695,15 +18999,17 @@ async fn every_line_the_operator_says_gets_its_own_name_so_no_two_can_be_confuse
         "two of his lines share one name"
     );
 
-    // And the reason all three need names, played by their client's own matcher: `me.find(r =>
-    // r.msg === f.msg_id)`. The rows are the client's send-queue — one optimistic row mid-POST
-    // whose `msg` is not yet set, one holding the door's nonce — and the QUESTION is which row a
-    // down line matches. A phone line with no name of its own would match the optimistic row
-    // (undefined === undefined) and the client would mark a line it never sent as sent; with
-    // names, a phone line matches nothing, and the door's line matches its own row alone.
-    let me_rows: Vec<Option<&str>> = vec![None, Some("wTEST-named")];
+    // And the reason all three need names, played by their client's own matcher — restated as
+    // the behaviour it is, because their source is theirs and this remote is public: it takes
+    // the first row of its send-queue whose held name equals the down line's. The rows below are
+    // that send-queue — one optimistic row mid-POST holding no name yet, one holding the door's
+    // nonce — and the QUESTION is which row a down line matches. A phone line with no name of
+    // its own would match the optimistic row, nothing equalling nothing, and the client would
+    // mark a line it never sent as sent; with names, a phone line matches nothing, and the
+    // door's line matches its own row alone.
+    let their_rows: Vec<Option<&str>> = vec![None, Some("wTEST-named")];
     let their_matcher = |f_msg_id: Option<&str>| -> Option<Option<&str>> {
-        me_rows.iter().find(|r| **r == f_msg_id).copied()
+        their_rows.iter().find(|r| **r == f_msg_id).copied()
     };
     for name in &phone_names {
         assert!(
@@ -19158,8 +19464,12 @@ async fn an_answer_cannot_reach_into_another_conversation_s_ask() {
 // answers drop on disk; and `kickoff-door` as a REAL PROCESS, spawned on a loopback port — the
 // one binary in this workspace that listens, and this trial is where that is exercised rather
 // than asserted. What is faked: `FakeTelegram`, which counts instead of sending, and the client,
-// which is raw TCP shaped exactly as the PWA's `hubAnchor`/`hubStream`/`hubSend`/`hubAsk` shape
-// their requests — because the trial's client is the stand-in for their code, not for a browser.
+// which is raw TCP shaped exactly as their client's own three calls shape their requests: the
+// poll it anchors on, the stream it opens from that anchor's cursor, and the write that carries
+// a typed line or a tap — because the trial's client is the stand-in for their code, not for a
+// browser. It is shaped like theirs and names nothing of theirs: their source is theirs, this
+// remote is public, and the precise citations travel by the letter the two organisations
+// exchange.
 //
 // The token is written the way the verb would leave it rather than by running the verb: the verb
 // mints into the real state home the trial must not touch, and the door's behaviour under a
@@ -19167,8 +19477,8 @@ async fn an_answer_cannot_reach_into_another_conversation_s_ask() {
 //
 // **What no hermetic run can prove**, said where the next reader will meet it:
 //   * their bridge's own half — the session gate, the Origin pin, the proxy's unbuffered
-//     forwarding. `bridge/test_hub.py` holds those, in their repo, against a stub standing where
-//     this binary stands;
+//     forwarding. Their own pinned suite holds those, in their repo, against a stub standing
+//     where this binary stands;
 //   * the browser's EventSource, whose reconnect behaviour is why `Last-Event-ID` wins over a
 //     stale `?cursor=` — the rule is implemented and unit-held, but only a real browser
 //     reconnects like one;
@@ -19522,10 +19832,10 @@ async fn the_pwa_s_door_round_trip_reaches_the_hub_and_back_through_the_real_gat
     );
 
     // The receipt loop, closed through the real binary: the nonce the POST answered with is the
-    // one the wire frame carried AND the one the ring's down line echoes — so their client's
-    // `r.msg === f.msg_id` matching turns this sent line into its own receipt, which is the
-    // whole point of the nonce. Waited for in the ring because the down line is written inside
-    // the delivery the bridge just confirmed.
+    // one the wire frame carried AND the one the ring's down line echoes — so their client,
+    // matching a down line against the name its own row holds, turns this sent line into its own
+    // receipt, which is the whole point of the nonce. Waited for in the ring because the down
+    // line is written inside the delivery the bridge just confirmed.
     assert_eq!(
         got, the_nonce,
         "the wire frame's msg_id is not the nonce the POST answered with"

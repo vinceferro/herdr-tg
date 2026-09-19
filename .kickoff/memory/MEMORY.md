@@ -7,7 +7,7 @@
 - [The write guard was walked past six times](the-write-guard-was-walked-past-six-times.md) — all six were the same shape: a lookup that came up empty and carried on.
 - [Write guard stays a scanner](write-guard-stays-a-scanner.md) — the operator's call: fix accident-reachable evasions, write contrived ones down.
 - [Build a two-sided corpus before tuning a classifier](build-a-two-sided-corpus-before-tuning-a-classifier.md) — one real capture and seventeen imagined ones is how four rounds traded one error for the other.
-- [Mission Control left the public core](mission-control-left-the-public-core.md) — the mc shim is dead here and its error message sends you the wrong way.
+- [Mission Control left the public core](mission-control-left-the-public-core.md) — RESOLVED: the shim works; what outlived the outage was the note saying it did not.
 - [The opencode crew set is inert](the-opencode-crew-set-is-inert.md) — five charters a hop delivered, unreconciled, and one of them mandates the dead tracker.
 - [opencode has a public server API](opencode-has-a-public-server-api.md) — serve + /doc + /event, so the bridge needs no plugin and no patch there.
 - [A proof staged in /tmp proves nothing under PrivateTmp](a-proof-staged-in-tmp-proves-nothing-under-privatetmp.md) — the unit sees an empty dir, does the right thing, and the pass means nothing.
@@ -19,3 +19,5 @@
 - [An edit script that aborts writes nothing](an-edit-script-that-aborts-writes-nothing.md) — the earlier replacements are lost too, and the commit message still claims them.
 - [A max over a pool drifts as the pool grows](a-max-over-a-pool-drifts-as-the-pool-grows.md) — the retrieval cutoff loosens with corpus size and K; scoping fixes it, a big shared core does not.
 - [Telegram is a connector, and kickoff work will drive it](telegram-is-a-connector-kickoff-will-drive-it.md) — the 17 Sept ruling: the PWA is the work surface, the hub stays, the Telegram connector is later kickoff work.
+- [A guard that fires only on the whole leak](a-guard-that-fires-only-on-the-whole-leak.md) — three guards passed while what they named was broken; break each half separately or the comment is lying.
+- [The wire already carried files](the-wire-already-carried-files.md) — hub-proto has had the file vocabulary since 6 September; read frame.rs before proposing a wire change.

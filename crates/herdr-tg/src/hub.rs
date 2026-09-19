@@ -2072,6 +2072,16 @@ struct Down {
     /// His message: the line he typed, or the question whose button he pressed. The question's
     /// own message even at the door — the keyboard is on the phone whoever answered it.
     msg_id: MsgId,
+    /// The name the SENDER minted for these words, when they arrived at the door wearing one —
+    /// the very string the ring's receipt line for them carries as its own name.
+    ///
+    /// Kept so that what the bridge says about them LATER can be put against the line it is
+    /// about. `msg_id` beside it cannot do that job on either surface: from the phone it is
+    /// Telegram's own id, which the ring has never carried and must not start carrying, and at
+    /// the door a sender that minted no name gets a hub-minted one the receipt line never saw —
+    /// so naming it would be a name that joins to nothing. `None` on both counts, and a
+    /// follow-up about a line nobody can name carries no name at all.
+    the_receipt: Option<MsgId>,
     what: His,
     /// Which surface the act arrived on. The ack path uses one record shape for both so an
     /// answer for a frame finds its record whichever door the act came in by; what the origin
@@ -4292,6 +4302,9 @@ impl<S: Surface> Hub<S> {
                 addr: addr.clone(),
                 chat_id,
                 msg_id: msg_id.clone(),
+                // A tap's follow-up names the question and the button it answers, which is a
+                // join a reader already has; there is nothing here a receipt name would add.
+                the_receipt: None,
                 what: His::Tap(HisTap {
                     label: label.to_owned(),
                     ask: ask_id.clone(),
@@ -4824,6 +4837,10 @@ impl<S: Surface> Hub<S> {
                 addr: addr.clone(),
                 chat_id,
                 msg_id: msg_id.clone(),
+                // Nothing the ring may carry. His message id here is Telegram's, and the phone's
+                // half of this news is an edit to the line itself — which needs no name, because
+                // it IS the line.
+                the_receipt: None,
                 what: His::Words { files_on_disk },
                 came_from: CameFrom::Phone,
             });
@@ -7117,8 +7134,12 @@ impl<S: Surface> Hub<S> {
             // stands — and the door carries no files, so there is no count to compare.
             if status == AckStatus::Refused {
                 let why = plain_reason(reason);
-                self.ring
-                    .his_words_were_refused(&his.addr.project, his.addr.lane.as_ref(), &why);
+                self.ring.his_words_were_refused(
+                    &his.addr.project,
+                    his.addr.lane.as_ref(),
+                    his.the_receipt.as_ref(),
+                    &why,
+                );
                 let _ = self.audit.refused(
                     &his.addr,
                     &format!(
@@ -8045,7 +8066,9 @@ impl<S: Surface> Hub<S> {
     ///
     /// A result that cannot be written is logged and swallowed: the act has already happened,
     /// and refusing to consume a file because its bookkeeping failed would wedge the drop on
-    /// exactly the failure the bookkeeping was for.
+    /// exactly the failure the bookkeeping was for. The half-written file such a failure leaves
+    /// under the staging name goes with it, so nothing the gateway could mistake for a receipt
+    /// is left behind in the one directory it reads.
     async fn consume_one_answer(self: &Arc<Self>, path: &Path, now: u64) {
         let became = self.read_one_answer(path, now).await;
         match &became {
@@ -8059,15 +8082,43 @@ impl<S: Surface> Hub<S> {
             ),
         }
         let result = answers::the_result_of(path);
+        let staged = answers::where_a_result_is_staged(&result);
         let body = answers::the_result(&became);
+        // Put down under another name and moved onto this one, never emptied where it lies. The
+        // gateway polls this exact name several times a second while it waits, so "a reader is
+        // looking" is the ordinary case: truncating in place shows that reader an empty file
+        // where a receipt was, and moving a finished one onto the name shows it one whole
+        // receipt or the other. The move also REPLACES whatever name is standing there, where
+        // opening the name would follow a link somebody had planted at it and put the receipt's
+        // bytes wherever it pointed.
+        //
+        // Nothing is flushed to the disk, and that it is not — where the door's own write of an
+        // answer is — is the whole point rather than an oversight. The reader is a program on
+        // this box reading the same cache the hub just wrote into, and the move is ordered after
+        // the bytes for such a reader, so a short receipt is not a thing it can see. What a
+        // power cut can leave is a receipt that is missing or empty, which the door already
+        // reads as "nothing decided yet" and answers by waiting and then saying so. The two
+        // files are not worth the same: an ANSWER is an act that has NOT happened yet — lose it
+        // and his words never happen at all — while a receipt is for an act that ALREADY
+        // happened, and losing one costs the door one honest wait.
         let written = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&result)
-            .and_then(|mut f| f.write_all(body.as_bytes()).map(|_| f));
+            .open(&staged)
+            .and_then(|mut f| f.write_all(body.as_bytes()))
+            // Re-asserted rather than trusted to `.mode()`, which applies only where the file is
+            // created: a staged file an earlier failure left behind is opened again at whatever
+            // width it already had.
+            .and_then(|()| fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)))
+            .and_then(|()| fs::rename(&staged, &result));
         if let Err(e) = written {
+            // Whatever got as far as the staged name goes with the failure. It wears the receipt
+            // suffix, so the ten-minute sweep would take it away in the end — but until then it
+            // is a name in the one directory the gateway reads, standing for an answer nobody
+            // will ever be told about.
+            let _ = fs::remove_file(&staged);
             tracing::warn!(
                 error = %e, path = %result.display(),
                 "an answer's result could not be written; the answer is consumed anyway"
@@ -8351,6 +8402,10 @@ impl<S: Surface> Hub<S> {
                         addr: addr.clone(),
                         chat_id: 0,
                         msg_id: msg_id.clone(),
+                        // The sender's own nonce and not the id above it: where the sender minted
+                        // none, `msg_id` is the hub's `d…`, which the ring's receipt line for
+                        // these words never carried.
+                        the_receipt: echo.clone(),
                         what: His::Words { files_on_disk: 0 },
                         came_from: CameFrom::Door,
                     });

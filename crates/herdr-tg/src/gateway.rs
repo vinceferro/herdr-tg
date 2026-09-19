@@ -9,17 +9,19 @@
 //! # Who the client is, and why the shapes are transcribed rather than designed
 //!
 //! The kickoff PWA — a different product, in a different repo — already speaks a `/v1` seam
-//! through its own bridge (`bridge/serve.py`, which proxies these three routes and holds the
-//! token so the browser never does). Its contract is pinned by that repo's own tests
-//! (`bridge/test_hub.py`, a StubHub standing where this program stands), and byte-compat with
-//! those pinned shapes is the whole cost advantage of the adoption: a client written against the
-//! stub works against the real thing. Where this file and a shape their tests pin could disagree,
-//! THEIRS wins, and the transcription here says so at each site:
+//! through its own server-side bridge, which proxies these three routes and holds the token so
+//! the browser never does. Its contract is pinned by that repo's own suite, which stands a stub
+//! hub where this program stands, and byte-compat with those pinned shapes is the whole cost
+//! advantage of the adoption: a client written against the stub works against the real thing.
+//! Where this file and a shape their tests pin could disagree, THEIRS wins, and the transcription
+//! here says so at each site — as the BEHAVIOUR it is, never as a citation: their source is
+//! theirs and this remote is public, so nothing below names a file, a line or an identifier of
+//! theirs, and the precise citations travel by the letter the two organisations exchange.
 //!
 //! * **`401` is byte-identical.** `{"error": "unauthorized"}` — with the space after the colon,
-//!   because their test compares raw bytes (`test_hub.py`: "a wrong token is the hub's identical
-//!   401, passed through untouched") and Python's `json.dumps` puts one there. Not a formatting
-//!   choice of ours; a fact about theirs.
+//!   because their suite compares the raw bytes of the refusal a wrong token earns against the
+//!   bytes their bridge hands back untouched, and the serialiser their stub writes its bodies
+//!   with puts a space after every colon. Not a formatting choice of ours; a fact about theirs.
 //! * **`404` is their stub's body**, `{"error": "not found"}`, for the same reason.
 //! * **The poll's envelope** is `{"ok":true,"at":…,"cursor":…,"events":[…]}` with each event the
 //!   ring line verbatim; their client demands the events it is handed continue its cursor
@@ -74,15 +76,16 @@
 //! it always meant: a door-minted nonce names nothing on this box. So this door mints one
 //! `w…` per message, carries it on the answer file as `ref`, and answers it in the POST's
 //! ok-shape as `msg_id`; the hub rides it onto the wire frame's `msg_id` and the ring's down
-//! `message` line, and their client's `r.msg === f.msg_id` matching turns the sent line into
-//! its own receipt. One field name to note: their pinned client reads `msg_id` on the ring
-//! frame (`app/index.src.html`, `hubFrame`'s down-`message` arm), so that is the name the ring
-//! echo wears — a `ref`-named ring field would have left their matcher reading `undefined`.
+//! `message` line, and their client — which matches a down line against its own send-queue by
+//! the name the row holds for the line it sent — turns the sent line into its own receipt. One
+//! field name to note: where their board handles a down `message` it takes that name off
+//! `msg_id`, so that is the name the ring echo wears — a `ref`-named ring field would have left
+//! their matcher comparing against a name that was never there.
 //!
 //! A line the door did NOT carry in — typed at the phone — is named by the hub itself: the
 //! ring mints a `p…` for every down `message` line that arrives with no nonce, so no line he
-//! says is ever nameless. The reason is their matcher again: `find(r => r.msg === f.msg_id)`
-//! over a nameless line matches any row whose `msg` is not yet set — an optimistic row
+//! says is ever nameless. The reason is their matcher again: it takes the first row whose held
+//! name equals the line's, so a nameless line matches any row not yet named — an optimistic row
 //! mid-POST — and the second phone line their client ever read was marked as a line it never
 //! sent. The `p…` names the line's own seq and nothing on this box; Telegram's `m…` ids still
 //! never ride the ring.
@@ -92,6 +95,11 @@
 //! else. A choice ok-shape still carries a `msg_id` like every ok-shape (the answer file's
 //! minted name, the same opaque string a message's carries); nothing of their client's reads
 //! it, and it joins nothing.
+//!
+//! The `504` is the one place that rule matters rather than merely being tidy, so it does not
+//! follow the ok-shape: it names a message and never a tap. The name is there to be held until
+//! the echo arrives, and a tap's echo carries no name for it to match — so a named timeout on a
+//! tap is a client waiting on a string this box will never say.
 //!
 //! # Recorded, not fixed: shapes left open on purpose
 //!
@@ -167,13 +175,24 @@ const AT_MOST_HEAD: usize = 16 * 1024;
 /// with room for the `ts` and the envelope this program wraps the body's fields in.
 const AT_MOST_BODY: u64 = answers::AT_MOST - 512;
 
-/// The body their test pins byte-for-byte for a wrong or missing token. The space after the colon
-/// is theirs (Python's `json.dumps`), and their bridge passes it through untouched — see the
-/// module docs.
+/// The body their suite pins byte-for-byte for a wrong or missing token. The space after the
+/// colon is theirs — the serialiser their stub writes its bodies with puts one after every
+/// colon — and their bridge hands it back untouched; see the module docs.
 const UNAUTHORIZED: &str = "{\"error\": \"unauthorized\"}";
 
 /// The body their stub pins for a path that is not one of the three routes.
 const NOT_FOUND: &str = "{\"error\": \"not found\"}";
+
+/// The sentence for a place in the events this door could not read — the stream's and the poll's
+/// alike, written once so the two can never drift apart by eye.
+///
+/// It says neither "cursor" nor "sequence number", which are this door's own words for the
+/// ring's insides, and it reads nothing of the caller's back at him: their client renders `why`
+/// verbatim behind its own prefix, so every word of it lands on a person's screen, and a person
+/// told what he already typed learns nothing. The text that was wrong goes to the journal,
+/// where whoever is wiring a client can find it.
+const NOT_A_PLACE_IN_THE_EVENTS: &str =
+    "that asked to carry on from a place in the events this door could not read";
 
 /// How many ask envelopes the routing memory will hold. Bounded like everything else that a long
 /// conversation could grow; a shed entry is a choice that must name its conversation, which is the
@@ -195,8 +214,10 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     state: Option<PathBuf>,
 
-    /// The loopback port to bind. `$KICKOFF_DOOR_PORT`, else 8791. There is no flag for an
-    /// address: this door faces this box and nothing else.
+    /// The loopback port to bind. `$KICKOFF_DOOR_PORT`, else 8791 — and a variable set to
+    /// anything that is not a port, or to zero, stops the door rather than quietly falling back
+    /// to 8791 or onto whatever port happened to be free.
+    /// There is no flag for an address: this door faces this box and nothing else.
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
 
@@ -246,6 +267,15 @@ pub fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(1);
     }
 
+    let said = std::env::var_os("KICKOFF_DOOR_PORT");
+    let port = match the_port(args.port, said.as_deref()) {
+        Ok(port) => port,
+        Err(why) => {
+            eprintln!("kickoff-door: {why}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -256,11 +286,6 @@ pub fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
-    let port = args.port.or_else(|| {
-        std::env::var("KICKOFF_DOOR_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-    });
     runtime.block_on(async move {
         let door = match Door::in_state(&state, conversation, args.ping_every_ms) {
             Ok(door) => Arc::new(door),
@@ -269,13 +294,10 @@ pub fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(1);
             }
         };
-        let listener = match TcpListener::bind(("127.0.0.1", port.unwrap_or(DEFAULT_PORT))).await {
+        let listener = match TcpListener::bind(("127.0.0.1", port)).await {
             Ok(listener) => listener,
             Err(err) => {
-                eprintln!(
-                    "kickoff-door: could not bind 127.0.0.1:{} — {err}",
-                    port.unwrap_or(DEFAULT_PORT)
-                );
+                eprintln!("kickoff-door: could not bind 127.0.0.1:{port} — {err}");
                 return std::process::ExitCode::from(1);
             }
         };
@@ -286,6 +308,78 @@ pub fn main() -> std::process::ExitCode {
         door.serve(listener).await;
         std::process::ExitCode::SUCCESS
     })
+}
+
+/// The port this door will bind: the flag if he typed one, else what the environment says, else
+/// the usual one — and a refusal rather than a guess when what it says is not a port.
+///
+/// A setting nobody could read used to be replaced by the default in silence. That is the worst
+/// shape this program has: he is told nothing, the door comes up on an address he did not
+/// choose, and whatever he meant to point at it talks to nobody for as long as it takes him to
+/// notice. A door that refuses to open says it in one line, at the moment he started it.
+///
+/// **Set to nothing at all is SET, not unset.** `KICKOFF_DOOR_PORT=` is what a unit file or a
+/// template renders when the substitution it was written with never happened — the very mistake
+/// this refusal exists for — and nobody reaches for an empty value to ask for a default they
+/// would get by writing no line at all. So it is refused too, with the sentence that says where
+/// the default actually lives.
+///
+/// **Zero is the same mistake wearing a number.** It parses like any other value and opening on
+/// it takes whatever port happens to be free, which is the address nobody chose — reached by the
+/// one value that gets past a parser instead of failing it. So the variable set to zero is
+/// refused as well.
+///
+/// The flag wins without the environment being judged at all: a variable the door is not about
+/// to open on cannot send him anywhere, and refusing to start over a setting nothing reads would
+/// be this program inventing a problem. That is also why the flag may say zero and the variable
+/// may not: whoever typed the flag is standing at the line that prints where the door came up,
+/// so "whatever is free" is an answer he can read and act on, while a variable is rendered into
+/// a unit file by something that will never read that line and dialled by something elsewhere.
+fn the_port(flag: Option<u16>, said: Option<&std::ffi::OsStr>) -> Result<u16, String> {
+    /// What he is told when the setting is there and is not a port. It names the setting,
+    /// because that is his own word for it and the one thing he has to go and change, and it
+    /// reads nothing of his back at him: he can see what he typed, and the door repeating it
+    /// adds only the chance of putting whatever is in that variable somewhere it does not
+    /// belong.
+    const NOT_A_PORT: &str = "KICKOFF_DOOR_PORT is not a port number, so the door will not open on an address \
+         nobody chose";
+    /// And what he is told when it is there and empty — a different mistake, so a different
+    /// sentence: it says the one thing that is not obvious, which is that clearing the line is
+    /// not how the usual port is asked for.
+    const SET_TO_NOTHING: &str = "KICKOFF_DOOR_PORT is set to nothing at all, so the door will not open — leave it \
+         unset to take the door's usual port";
+    /// And what he is told for zero, which is a port number and so cannot be called one that is
+    /// not: what is wrong is what opening on it does, and the sentence has to say what to write
+    /// instead or he is left staring at a line that looks deliberate.
+    const WHATEVER_IS_FREE: &str = "KICKOFF_DOOR_PORT is set to zero, which means whatever port happens to be free, so \
+         the door will not open on an address nobody chose — name the port you mean, or leave it \
+         unset to take the door's usual one";
+
+    if let Some(port) = flag {
+        return Ok(port);
+    }
+    let Some(said) = said else {
+        return Ok(DEFAULT_PORT);
+    };
+    // Bytes that are not even text: set, unreadable, and refused like anything else that is not
+    // a port. Nothing is gained by treating "unreadable" as a second kind of wrong.
+    let Some(raw) = said.to_str() else {
+        return Err(NOT_A_PORT.to_owned());
+    };
+    // Trimmed, the way the token file and the cursor are already trimmed: a hand-edited env file
+    // leaves whitespace behind, and refusing a port he got right teaches him nothing.
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(SET_TO_NOTHING.to_owned());
+    }
+    match raw.parse() {
+        // The one readable value that still opens the door where he did not choose. Refused
+        // here rather than left to the bind, because a door already listening somewhere is a
+        // door nothing dials, discovered whenever he next goes looking.
+        Ok(0) => Err(WHATEVER_IS_FREE.to_owned()),
+        Ok(port) => Ok(port),
+        Err(_) => Err(NOT_A_PORT.to_owned()),
+    }
 }
 
 /// Everything a connection needs: where the files are, what this door defaults to, and the ask
@@ -402,14 +496,18 @@ impl Door {
             .map(|(_, value)| value.as_str());
         let cursor = match a_cursor(from_header, query) {
             Ok(cursor) => cursor,
-            Err(named) => {
+            Err(unreadable) => {
+                // Warn, not below: this line is the ONLY place the text that was wrong survives.
+                // The sentence sent back deliberately withholds it, their client never reads a
+                // 400's body, and an EventSource cannot expose one at all — so below the level
+                // this door runs at when nothing says otherwise, whoever is wiring a client is
+                // left with a refusal and nothing on the box to learn the cause from.
+                tracing::warn!(asked_for = %unreadable, "a stream asked to carry on from nowhere");
                 let _ = say_json(
                     stream,
                     400,
                     "Bad Request",
-                    &the_shape_of_a_refusal(&format!(
-                        "bad cursor: {named:?} is not a sequence number"
-                    )),
+                    &the_shape_of_a_refusal(NOT_A_PLACE_IN_THE_EVENTS),
                 )
                 .await;
                 return;
@@ -468,14 +566,15 @@ impl Door {
     async fn the_poll(self: &Arc<Self>, stream: &mut TcpStream, query: &str) {
         let cursor = match a_cursor(None, query) {
             Ok(cursor) => cursor,
-            Err(named) => {
+            Err(unreadable) => {
+                // Warn for the same reason the stream's is: the refusal says nothing of what he
+                // sent, so a line below this door's own level leaves the cause written nowhere.
+                tracing::warn!(asked_for = %unreadable, "a poll asked to carry on from nowhere");
                 let _ = say_json(
                     stream,
                     400,
                     "Bad Request",
-                    &the_shape_of_a_refusal(&format!(
-                        "bad cursor: {named:?} is not a sequence number"
-                    )),
+                    &the_shape_of_a_refusal(NOT_A_PLACE_IN_THE_EVENTS),
                 )
                 .await;
                 return;
@@ -634,14 +733,14 @@ impl Door {
                 .await;
                 return;
             }
-            Err(field) => {
+            Err(NotWords) => {
                 let _ = say_json(
                     stream,
                     400,
                     "Bad Request",
-                    &the_shape_of_a_refusal(&format!(
-                        "that named the {field} as something other than words"
-                    )),
+                    &the_shape_of_a_refusal(
+                        "that named the conversation it is for as something other than words",
+                    ),
                 )
                 .await;
                 return;
@@ -682,14 +781,14 @@ impl Door {
         // and not words, never stripped. The routing ladder below READS it, and a reader that
         // swallows the wrong shape is how a reply becomes a plain line while the POST says ok —
         // the door quietly rewriting what he wrote.
-        if let Err(field) = the_string(fields, "in_reply_to_ask") {
+        if the_string(fields, "in_reply_to_ask").is_err() {
             let _ = say_json(
                 stream,
                 400,
                 "Bad Request",
-                &the_shape_of_a_refusal(&format!(
-                    "that named the {field} as something other than words"
-                )),
+                &the_shape_of_a_refusal(
+                    "that named the question it answers as something other than words",
+                ),
             )
             .await;
             return;
@@ -778,12 +877,14 @@ impl Door {
 
         // Then the wait: the hub sweeps about once a second, judges, and writes the result. What
         // the POST answers is that and nothing else — and "that" means a result that PARSES and
-        // SAYS a verdict. The hub writes its results open-truncate-then-write, and this door
-        // polls every 50 ms, so a read can land inside the write: half a JSON object on the
-        // disk is a receipt nobody has finished, and answering it — with a refusal, an error,
-        // anything terminal — would be a receipt that lies, because behind the torn bytes the
-        // answer was accepted and delivered. So a result that is not yet a verdict is not yet
-        // arrived: the door waits, and the window's close says only what it always said.
+        // SAYS a verdict. A hub MAY put its results down where this door is already reading
+        // them, and one that does leaves a window where half a JSON object is on the disk; the
+        // hub in this repo no longer does, and this door does not depend on which it is talking
+        // to. It polls every 50 ms, and the tolerance is what makes that safe either way:
+        // answering torn bytes — with a refusal, an error, anything terminal — would be a
+        // receipt that lies, because behind them the answer was accepted and delivered. So a
+        // result that is not yet a verdict is not yet arrived: the door waits, and the window's
+        // close says only what it always said.
         let deadline = tokio::time::Instant::now() + WAIT_FOR_THE_RESULT;
         loop {
             if let Ok(raw) = std::fs::read_to_string(self.drop_dir.join(format!("{name}.result"))) {
@@ -792,14 +893,23 @@ impl Door {
                         // The ok-shape their client expects: `ok`, the kind it sent, an id for
                         // the act, and the lane it went to. The id is the same nonce the answer
                         // file carried as `ref` and the ring's down line echoes as `msg_id` —
-                        // one name in three places, so their client's `r.msg === f.msg_id`
-                        // matching turns a sent line into its own receipt instead of a second
-                        // bubble.
+                        // one name in three places, so their client, matching a down line
+                        // against the name its own row holds, turns a sent line into its own
+                        // receipt instead of a second bubble.
+                        //
+                        // `conversation` is the other fact only this door holds. A client that
+                        // named none rode the ladder above, and the rung it rode is a fact
+                        // written down nowhere it can read — so without the receipt saying where
+                        // its own words landed it can never begin naming the conversation
+                        // itself, and until it does, neither guessing rung can be withdrawn. It
+                        // is safe to say out loud: an id is `p-` or `c-` and twelve hex
+                        // characters, which names nothing on this box.
                         let ok = serde_json::json!({
                             "ok": true,
                             "t": t,
                             "msg_id": name,
                             "lane": lane,
+                            "conversation": conversation,
                         });
                         let _ = say_json(stream, 200, "OK", &ok.to_string()).await;
                         return;
@@ -820,16 +930,34 @@ impl Door {
             if tokio::time::Instant::now() >= deadline {
                 // Not a refusal and never an ok: the hub may still take it, and the words say
                 // exactly that much and no more.
-                let _ = say_json(
-                    stream,
-                    504,
-                    "Gateway Timeout",
-                    &the_shape_of_a_refusal(
-                        "the hub has not said what became of it yet — it may still; sending it \
-                         again may say it twice",
-                    ),
-                )
-                .await;
+                //
+                // Which is precisely why the conversation rides down here too. A write the hub
+                // honours late puts a line on the ring, and a client told only that its POST
+                // failed cannot join that line to the row it already drew, so it draws a second
+                // one beside the failed one and he reads his own sentence twice. `conversation`
+                // rides along for the same reason it rides the ok-shape: the rung is still ours,
+                // and a timed-out write landed somewhere. What does NOT change is `ok:false` and
+                // the sentence — a client that reads this shape as a failure must go on reading
+                // it as one. The 400 refusal gets neither field: a refusal means no ring line
+                // will ever appear, so there is nothing for a client to join.
+                let mut timeout = serde_json::json!({
+                    "ok": false,
+                    "why": "the hub has not said what became of it yet — it may still; \
+                            sending it again may say it twice",
+                    "conversation": conversation,
+                });
+                // The name here is a MESSAGE's name, and is given only where it will be echoed.
+                // A message carries the one minted above on its answer file as `ref`, and the hub
+                // rides that onto the ring's down line, so a client holding it meets it again and
+                // joins the late line to the row it drew. A tap carries none: its file gets no
+                // `ref` (above), the hub mints its own name for the line a tap becomes, and the
+                // ring's down `choice` line has no name on it at all. Naming a timed-out tap
+                // therefore handed a client a string to watch for that nothing on this box will
+                // ever say, and a client told to hold it holds it for ever.
+                if t == "message" {
+                    timeout["msg_id"] = serde_json::json!(name);
+                }
+                let _ = say_json(stream, 504, "Gateway Timeout", &timeout.to_string()).await;
                 return;
             }
             tokio::time::sleep(POLL_FOR_THE_RESULT).await;
@@ -846,7 +974,27 @@ impl Door {
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Routed {
         let in_reply_to_ask = the_string(fields, "in_reply_to_ask").ok().flatten();
+        // Which question this command answers, if any: a choice names it outright, a reply names
+        // the one he typed under. Read once, before the first rung, because BOTH the rung that
+        // reads a named conversation and the rung that has none spend it.
+        let key = if t == "choice" {
+            the_string(fields, "ask_id").ok().flatten()
+        } else {
+            in_reply_to_ask.clone()
+        };
         if let Some(conversation) = named {
+            // A body that names its conversation and no lane is NOT asking for a lane — it is
+            // addressing the conversation's own voice, which is a different live session from
+            // every lane of it, and a conversation whose only connected session is a lane
+            // refuses words sent to a voice nobody is speaking with. Their client is about to
+            // start sending the conversation on every write, and until this rung filled the lane
+            // in too, that one new field would have moved every answer off the rung below and
+            // taken the lane away with it — a tap that landed yesterday refused tomorrow, for
+            // saying MORE about where it belonged.
+            let lane = lane.or_else(|| {
+                key.as_deref()
+                    .and_then(|key| self.the_lane_that_asked_in(&conversation, key))
+            });
             return Routed::To {
                 conversation,
                 lane,
@@ -864,11 +1012,6 @@ impl Door {
         // own rule for a reply, and the one fact the wire holds here. A reply naming a question
         // routes the same way, carrying the ask on the file so the hub can hold it to the session
         // that asked.
-        let key = if t == "choice" {
-            the_string(fields, "ask_id").ok().flatten()
-        } else {
-            in_reply_to_ask.clone()
-        };
         if let Some(key) = key
             && let Some((conversation, ask_lane)) = self.the_one_ask_called(&key)
         {
@@ -897,6 +1040,30 @@ impl Door {
         match asks.open(key).as_slice() {
             [the_one] => Some(the_one.clone()),
             [] => None,
+            _ => None,
+        }
+    }
+
+    /// Which conversation of a project asked under that name — the lane, or `None` for its own
+    /// voice — asked ONLY of the conversation the caller already knows the answer is for.
+    ///
+    /// Scoped on purpose. A question open under the same name in a SIBLING conversation is no
+    /// evidence about this one — ask names are minted per session from a counter that starts
+    /// over, so one name open in two conversations is ordinary — and lending that lane across
+    /// would be this door guessing at an address nobody wrote down, which is the one thing the
+    /// ladder is built never to do. Two conversations of the NAMED project asking under one name
+    /// is the same refusal for the same reason: nothing is filled in, the act goes as the body
+    /// addressed it, and the hub says in its own sentence why it could not take it. A refusal he
+    /// can read beats an answer delivered into the turn of an agent he never meant.
+    fn the_lane_that_asked_in(self: &Arc<Self>, conversation: &str, key: &str) -> Option<String> {
+        let asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut here = asks
+            .open(key)
+            .into_iter()
+            .filter(|(asked_in, _)| asked_in == conversation)
+            .map(|(_, lane)| lane);
+        match (here.next(), here.next()) {
+            (Some(the_one), None) => the_one,
             _ => None,
         }
     }
@@ -981,7 +1148,17 @@ struct Asks {
 impl Asks {
     fn remember(&mut self, key: String, where_: (String, Option<String>)) {
         let fresh = !self.open.contains_key(&key);
-        self.open.entry(key.clone()).or_default().push(where_);
+        let where_it_is_open = self.open.entry(key.clone()).or_default();
+        // The SAME question read twice is still one question. Every line is read twice in the
+        // ordinary case — the door's catch-up over the ring at start, then the client's own poll
+        // from cursor zero, which is the only way that client can learn the name it is about to
+        // answer — and recorded twice it reads as two conversations asking under one name. That
+        // is the door's own ambiguity refusal, so the routing memory was refusing to address the
+        // very question it had just served, and it did so for exactly the clients that read the
+        // ring properly.
+        if !where_it_is_open.contains(&where_) {
+            where_it_is_open.push(where_);
+        }
         if fresh {
             self.order.push_back(key);
         }
@@ -1259,7 +1436,8 @@ fn the_shape_of_a_refusal(why: &str) -> String {
 /// The cursor a client handed us: the `Last-Event-ID` header when there is one (a reconnect's
 /// truth), else `?cursor=`, else zero. Digits and not much of them — the same shape their bridge
 /// holds its own cursor to, so a malformed one is refused by the same rule at both hops. The
-/// `Err` carries the offending text, clamped, for the sentence.
+/// `Err` carries the offending text, clamped, for the JOURNAL — never for the sentence, which is
+/// read by a person and says nothing of his own back at him.
 fn a_cursor(header: Option<&str>, query: &str) -> Result<u64, String> {
     let raw = header
         .map(str::to_owned)
@@ -1280,17 +1458,25 @@ fn a_cursor(header: Option<&str>, query: &str) -> Result<u64, String> {
     Err(raw.chars().take(40).collect())
 }
 
+/// What is left of a known field written as something other than words: nothing at all.
+///
+/// It carries no name on purpose. The field's spelling belongs to the wire, and every refusal
+/// this door writes is read by a person in the app that sent the command — so the caller must
+/// write the sentence himself rather than have one built out of a name he was handed. Building
+/// one out of the name is how `in_reply_to_ask` came to be a word on the operator's screen.
+struct NotWords;
+
 /// A string field that must be a string when it is present at all: `Ok(None)` for absent or
-/// null, `Err(the field's name)` for present-and-not-a-string. Known-field hygiene is the drop's
-/// own law, held before the file is written so the refusal costs one round trip, not a sweep.
+/// null, `Err` for present-and-not-a-string. Known-field hygiene is the drop's own law, held
+/// before the file is written so the refusal costs one round trip, not a sweep.
 fn the_string(
     fields: &serde_json::Map<String, serde_json::Value>,
     name: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, NotWords> {
     match fields.get(name) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(name.to_owned()),
+        Some(_) => Err(NotWords),
     }
 }
 
@@ -1497,6 +1683,27 @@ mod tests {
         request
     }
 
+    /// Every whole number in some bytes, as the token it is rather than as a substring of a
+    /// longer one. A port is five digits and a clock reading is ten, so a naive `contains` finds
+    /// the port inside the clock several times a day and reports a leak that is not one.
+    fn the_whole_numbers_in(raw: &str) -> Vec<String> {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            if !bytes[at].is_ascii_digit() {
+                at += 1;
+                continue;
+            }
+            let from = at;
+            while at < bytes.len() && bytes[at].is_ascii_digit() {
+                at += 1;
+            }
+            out.push(raw[from..at].to_owned());
+        }
+        out
+    }
+
     /// The status line and the body out of one raw reply.
     fn the_answer(raw: &[u8]) -> (u16, &[u8]) {
         let text = String::from_utf8_lossy(raw);
@@ -1545,6 +1752,19 @@ mod tests {
         raw.lines().map(str::to_owned).collect()
     }
 
+    /// The one command the door left in the drop, read back as the hub's sweep would read it.
+    /// Asserting on this rather than on the receipt is what proves where the act was ADDRESSED:
+    /// the receipt echoes the door's own decision, the file is what the hub is handed.
+    fn the_answer_file(state: &State) -> serde_json::Value {
+        let written = std::fs::read_dir(state.the_drop())
+            .expect("the drop")
+            .flatten()
+            .find(|e| !e.file_name().to_string_lossy().ends_with(".result"))
+            .expect("the routed answer");
+        serde_json::from_str(&std::fs::read_to_string(written.path()).expect("readable"))
+            .expect("one object")
+    }
+
     /// The hub writing one result in TWO writes, the way the real one can be read mid-write: the
     /// first half lands, a gap follows, then the file is completed. The gap is long enough that
     /// the door's 50 ms result poll is certain to look at least once — the deterministic stand-in
@@ -1586,10 +1806,14 @@ mod tests {
         std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
             .expect("a minted token");
 
-        // The hub's result is open-truncate-then-write, and this door polls every 50 ms — so a
-        // read that succeeds with half a JSON object on the disk is a read of a receipt the hub
-        // has not finished writing. Answering that with anything terminal is a receipt that
-        // lies, because behind the torn bytes the answer was accepted and delivered.
+        // A hub MAY put its result down where this door is already reading it — the hub in this
+        // repo puts it down elsewhere and moves it on, but an older one on the same box does
+        // not, and this door is not allowed to care which. Where it does, a read that succeeds
+        // with half a JSON object on the disk is a read of a receipt nobody has finished, and
+        // this door polls every 50 ms. Answering that with anything terminal is a receipt that
+        // lies, because behind the torn bytes the answer was accepted and delivered. The faked
+        // hub below writes the torn way on purpose, which is the only writer that can prove the
+        // tolerance is still there.
         the_hub_decides_slowly(
             state.the_drop(),
             r#"{"t": "result", "status": "acce"#,
@@ -1717,8 +1941,8 @@ mod tests {
             refused["why"]
                 .as_str()
                 .expect("a sentence")
-                .contains("in_reply_to_ask"),
-            "the refusal does not name the field it refused: {refused}"
+                .contains("the question it answers"),
+            "the refusal does not say which part of it was refused: {refused}"
         );
         // And nothing was written: a refused command leaves no file for the hub to judge.
         let left = std::fs::read_dir(state.the_drop())
@@ -1945,7 +2169,7 @@ mod tests {
                 refused["why"]
                     .as_str()
                     .expect("a sentence")
-                    .contains("bad cursor"),
+                    .contains("carry on from"),
                 "{bad}: the refusal does not say what was wrong: {refused}"
             );
         }
@@ -2137,6 +2361,316 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_timed_out_write_still_tells_the_client_the_name_its_echo_will_carry() {
+        let state = a_state();
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        // Nothing sweeps the drop, so this write times out — and the hub may still honour it
+        // afterwards, which is the whole reason the timeout is not a refusal. When it does, the
+        // line it puts on the ring carries the name THIS door minted, and no other program on
+        // this box can mint it. A client told only that its POST failed cannot join that echo to
+        // the row it already drew, so it draws a second one beside the failed one and the
+        // operator reads his own sentence twice. The timeout therefore names the write.
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"anyone there?"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(status, 504, "{raw:?}");
+        let timeout: serde_json::Value = serde_json::from_slice(body).expect("one object");
+
+        // The name is added BESIDE what the timeout already said, never in place of it: a client
+        // that reads the shape as a failure must go on reading it as one.
+        assert_eq!(timeout["ok"], serde_json::Value::Bool(false), "{timeout}");
+        assert_eq!(
+            timeout["why"].as_str(),
+            Some(
+                "the hub has not said what became of it yet — it may still; sending it again \
+                 may say it twice"
+            ),
+            "the timeout's sentence changed: {timeout}"
+        );
+
+        // And it is THE name, not a name: the answer still waiting in the drop carries the same
+        // one as its `ref`, which is the field the hub echoes onto the ring's down line.
+        let named = timeout["msg_id"]
+            .as_str()
+            .expect("the name the echo will carry");
+        let answer = std::fs::read_dir(state.the_drop())
+            .expect("the drop")
+            .flatten()
+            .find(|e| !e.file_name().to_string_lossy().ends_with(".result"))
+            .expect("the answer still waiting for the hub");
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(answer.path()).expect("readable"))
+                .expect("one object");
+        assert_eq!(
+            file["ref"].as_str(),
+            Some(named),
+            "the timeout named a write other than the one it left in the drop: {file}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_tap_is_never_named_by_a_nonce_no_line_can_ever_echo() {
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        // A tap, with nothing sweeping the drop, so it times out exactly as a message does.
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","conversation":"p-0123456789ab","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(status, 504, "{raw:?}");
+        let timeout: serde_json::Value = serde_json::from_slice(body).expect("one object");
+
+        // The defect: the timeout named this tap, and the name it gave reached nowhere the
+        // sender could ever meet it again. A message's name is written onto the answer file as
+        // `ref` and ridden from there onto the ring's down line, which is what makes a timeout
+        // worth naming at all; a tap's is written on neither — the file below carries no `ref`,
+        // the hub mints its own name for the line a tap turns into, and the ring's down `choice`
+        // line carries no name whatever. A client told to hold this one holds it for ever.
+        assert!(
+            timeout.get("msg_id").is_none(),
+            "a timed-out tap was given a name no line will ever carry: {timeout}"
+        );
+        let answer = std::fs::read_dir(state.the_drop())
+            .expect("the drop")
+            .flatten()
+            .find(|e| !e.file_name().to_string_lossy().ends_with(".result"))
+            .expect("the tap still waiting for the hub");
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(answer.path()).expect("readable"))
+                .expect("one object");
+        assert!(
+            file.get("ref").is_none(),
+            "a tap now leaves the door carrying a name, so withholding it above has become the \
+             wrong half of this pair: {file}"
+        );
+
+        // Everything the timeout did say is unchanged. The verdict is still open — a client that
+        // reads this shape as a failure must go on reading it as one — and the address is still
+        // a fact only this door holds, as true of a tap as of a message.
+        assert_eq!(timeout["ok"], serde_json::Value::Bool(false), "{timeout}");
+        assert_eq!(
+            timeout["why"].as_str(),
+            Some(
+                "the hub has not said what became of it yet — it may still; sending it again \
+                 may say it twice"
+            ),
+            "the timeout's sentence changed: {timeout}"
+        );
+        assert_eq!(
+            timeout["conversation"], "p-0123456789ab",
+            "the timeout stopped saying where the tap it could not report on had landed: \
+             {timeout}"
+        );
+    }
+
+    /// Somewhere to keep what was written to the journal, so a test can read it back.
+    struct Pen(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Pen {
+        fn write(&mut self, written: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the journal")
+                .extend_from_slice(written);
+            Ok(written.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Two ends of one loopback connection: the door's, and the caller's. A handler taking the
+    /// door's end can then be called straight, on this thread, which is the thread whose journal
+    /// a test can install.
+    async fn a_connection() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("loopback binds");
+        let port = listener
+            .local_addr()
+            .expect("a bound socket names itself")
+            .port();
+        let (dialled, accepted) =
+            tokio::join!(TcpStream::connect(("127.0.0.1", port)), listener.accept());
+        let (door_end, _who) = accepted.expect("the door's end");
+        (door_end, dialled.expect("the caller's end"))
+    }
+
+    #[tokio::test]
+    async fn the_only_word_about_a_cursor_this_door_could_not_read_is_written_where_it_writes() {
+        // The refusal a client meets says nothing of what it sent, on purpose: their app renders
+        // `why` verbatim on a person's screen. So the text that was wrong exists in exactly one
+        // place, the journal — and written below the level this program actually runs at, it
+        // exists in none. `main` filters at warn when nothing in the environment says otherwise,
+        // their client reads no 400 body at all, and an EventSource never exposes one. Whoever is
+        // wiring a client would be left with a refusal and no way on this box to learn which
+        // character of his cursor caused it.
+        let state = a_state();
+        let door =
+            Arc::new(Door::in_state(state.dir.path(), None, 15_000).expect("the door opens"));
+
+        // Filtered the way `main` filters, so this cannot pass at a level the shipped door throws
+        // away, and held on this thread only, so the rest of the suite keeps its own.
+        let ink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let journal = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+            .with_writer({
+                let ink = Arc::clone(&ink);
+                move || Pen(Arc::clone(&ink))
+            })
+            .with_ansi(false)
+            .finish();
+        let reading = tracing::subscriber::set_default(journal);
+
+        let said_to_a_poll = {
+            let (mut door_end, caller) = a_connection().await;
+            door.the_poll(&mut door_end, "cursor=eighteen").await;
+            drop(door_end);
+            read_to_the_end(caller).await
+        };
+        let said_to_a_stream = {
+            let (mut door_end, caller) = a_connection().await;
+            door.the_stream(&mut door_end, &[], "cursor=nineteen").await;
+            drop(door_end);
+            read_to_the_end(caller).await
+        };
+        drop(reading);
+
+        for (what, said) in [("a poll", &said_to_a_poll), ("a stream", &said_to_a_stream)] {
+            assert!(
+                said.contains("400") && said.contains(NOT_A_PLACE_IN_THE_EVENTS),
+                "{what} was not refused in the words it is refused in:\n{said}"
+            );
+        }
+        assert!(
+            !said_to_a_poll.contains("eighteen") && !said_to_a_stream.contains("nineteen"),
+            "a refusal read his own cursor back at him:\n{said_to_a_poll}{said_to_a_stream}"
+        );
+
+        let written = String::from_utf8(ink.lock().expect("the journal").clone())
+            .expect("the journal is text");
+        assert!(
+            written.contains("eighteen"),
+            "a poll's unreadable cursor reached no journal this door would write to:\n{written}"
+        );
+        assert!(
+            written.contains("nineteen"),
+            "a stream's unreadable cursor reached no journal this door would write to:\n{written}"
+        );
+    }
+
+    /// Everything a peer sent before it hung up.
+    async fn read_to_the_end(mut stream: TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("the answer");
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_write_is_answered_with_the_conversation_the_door_resolved_it_to() {
+        // Rung three of the ladder: the body names no conversation, and the only place this
+        // answer's address is written down is the question it answers. A client riding that rung
+        // has no way to learn where its own words landed — and until it can learn that, it can
+        // never start naming the conversation itself and the rung can never be withdrawn.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let ok: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert_eq!(
+            ok["conversation"], "p-0123456789ab",
+            "the receipt never said which conversation the question's own address resolved to: \
+             {ok}"
+        );
+        assert_eq!(ok["ok"], serde_json::Value::Bool(true), "{ok}");
+        assert_eq!(ok["lane"], "fix-17", "{ok}");
+
+        // Rung two: a door started FOR one conversation, and a write that names none. Which
+        // conversation that is, is a deployment choice the client never made and cannot read
+        // anywhere else.
+        let state = a_state();
+        let port = a_door(&state, Some("c-abcdef012345")).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","text":"steer left"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let ok: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert_eq!(
+            ok["conversation"], "c-abcdef012345",
+            "the receipt never said which conversation this door stands for: {ok}"
+        );
+
+        // And the timeout says it for the same reason it says the name: a write the hub may yet
+        // honour is a write whose echo the client will have to place.
+        let state = a_state();
+        let port = a_door(&state, Some("c-abcdef012345")).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","text":"still there?"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(status, 504, "{raw:?}");
+        let timeout: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert_eq!(
+            timeout["conversation"], "c-abcdef012345",
+            "a write the hub may still honour was not told where it went: {timeout}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_command_that_names_no_conversation_is_routed_by_what_it_answers_or_refused() {
         let state = a_state();
         // One question, asked by a lane the body never names: the ring is the only place the
@@ -2276,6 +2810,208 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_choice_that_names_its_conversation_still_reaches_the_lane_that_asked() {
+        // The trap this closes. The rung that reads the conversation the body names returned
+        // before the rung that fills a missing lane in from the question being answered, so a
+        // client that starts naming its conversation — which the surface has agreed to do —
+        // would silently lose the lane it was getting for free. A conversation named with no
+        // lane is the conversation's OWN VOICE, not a lane of it, and a conversation whose only
+        // live session is a lane refuses words addressed to a voice nobody is speaking with. So
+        // the day the field arrived, every tap that used to land would have stopped landing.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        // Read it the way the app reads it: the question reaches the client off the ring, which
+        // is the only place it could have learned the name it is about to answer. The door has
+        // now seen that one question TWICE — its own catch-up at start, then this poll — and one
+        // question seen twice must not read as two conversations asking under one name, or the
+        // fill below has nothing unambiguous left to spend.
+        let raw = ask_the_door(port, get("/v1/events?cursor=0")).await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","conversation":"p-0123456789ab","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, body) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let file = the_answer_file(&state);
+        assert_eq!(
+            file["lane"], "fix-17",
+            "a tap that named its conversation was addressed to the conversation's own voice \
+             instead of the lane that asked: {file}"
+        );
+        let ok: serde_json::Value = serde_json::from_slice(body).expect("one object");
+        assert_eq!(
+            ok["lane"], "fix-17",
+            "the receipt did not say which lane the tap went to: {ok}"
+        );
+
+        // Words typed under that same question ride the same rung and lost the same lane.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","in_reply_to_ask":"a1","text":"the second one"}"#,
+            ),
+        )
+        .await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let file = the_answer_file(&state);
+        assert_eq!(
+            file["lane"], "fix-17",
+            "a reply that named its conversation was addressed to the conversation's own voice \
+             instead of the lane that asked it: {file}"
+        );
+        assert_eq!(file["in_reply_to_ask"], "a1", "{file}");
+
+        // And a lane the body DID name still wins over the question's. The question says where
+        // the answer belongs; a body that named one of the project's own conversations said
+        // where it belongs itself, and this rung has never been allowed to argue with it.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","conversation":"p-0123456789ab","lane":"fix-18","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let file = the_answer_file(&state);
+        assert_eq!(
+            file["lane"], "fix-18",
+            "a lane the body named was overwritten by the question's: {file}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_door_fills_a_lane_only_from_a_question_the_named_conversation_itself_is_asking() {
+        // A question open in ANOTHER conversation says nothing about this one. Ask names are
+        // minted per session from a counter that starts over, so one name being open next door
+        // is ordinary rather than rare — and borrowing that lane would put his answer into the
+        // turn of an agent he never meant. Nothing is filled in: the act goes as the
+        // conversation's own voice, which is what the body said, and the hub refuses it out loud
+        // if nothing there can take it. A refusal he can read beats delivery to the wrong agent.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","conversation":"c-abcdef012345","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let file = the_answer_file(&state);
+        assert_eq!(file["conversation"], "c-abcdef012345", "{file}");
+        assert!(
+            file.get("lane").is_none(),
+            "the door borrowed a lane from a question another conversation is asking: {file}"
+        );
+
+        // The same name open in two conversations at once, one of them the one the body named.
+        // The sibling's question is no argument either way, and the named conversation's own
+        // question settles it alone — that is a fact somebody wrote down, not a guess between
+        // two.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        state.ring.append(
+            &ProjectId::new("c-abcdef012345"),
+            Some(&LaneId::new("somewhere-else")),
+            &BridgeFrame::Ask {
+                ask_id: AskId::new("a1"),
+                text: "Another conversation's question".to_owned(),
+                options: Some(vec![AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".to_owned(),
+                }]),
+            },
+        );
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","conversation":"p-0123456789ab","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let file = the_answer_file(&state);
+        assert_eq!(
+            file["lane"], "fix-17",
+            "a name open next door too stopped the named conversation's own question from \
+             addressing the answer: {file}"
+        );
+
+        // And two conversations of ONE project asking under one name: the door does not pick
+        // between them. No lane goes on the file, the hub reads that as the voice and says so in
+        // its own sentence, and he is refused rather than answered for.
+        let state = a_state();
+        state.asked(Some("fix-17"), "a1");
+        state.asked(Some("fix-18"), "a1");
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+        the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+        let raw = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"choice","conversation":"p-0123456789ab","ask_id":"a1","option_id":"y"}"#,
+            ),
+        )
+        .await;
+        let (status, _) = the_answer(&raw);
+        assert_eq!(status, 200, "{raw:?}");
+        let file = the_answer_file(&state);
+        assert!(
+            file.get("lane").is_none(),
+            "the door picked between two conversations of one project asking under one name: \
+             {file}"
+        );
+    }
+
+    #[tokio::test]
     async fn nothing_the_door_says_over_http_names_this_machine() {
         let state = a_state();
         // Words that would carry a path of this machine if the ring had not scrubbed them — the
@@ -2320,11 +3056,118 @@ mod tests {
             )
             .await,
         );
+
+        // Everything above is a door that turned the caller away. A sweep of refusals alone is a
+        // sweep of the shortest answers this door ever writes, and the bodies with the most in
+        // them — the ones built field by field as the write path learns to say more — were never
+        // looked at at all. So the caller now gets IN, and every shape of the write path's answer
+        // is swept: the ok-shape the hub accepted, the refusal it judged, and the timeout nobody
+        // judged. Each is forced deliberately by what the faked hub does — writes a verdict,
+        // writes a refusal, writes nothing.
+        //
+        // The words the caller sends carry a Telegram-shaped id, in the text and beside it, so
+        // the sweep also holds the rule that this door never hands a caller its own words back:
+        // an id like that has no other route here, because the ring it reads has never carried
+        // one.
+        let telegram_shaped = "-1001770077066";
+        let taken = {
+            the_hub_decides(state.the_drop(), r#"{"t":"result","status":"accepted"}"#);
+            ask_the_door(
+                port,
+                post(
+                    "/v1/commands",
+                    &[("Authorization", "Bearer the-real-one")],
+                    &format!(
+                        r#"{{"t":"message","conversation":"p-0123456789ab",
+                             "text":"tell {telegram_shaped} i said so","chat_id":{telegram_shaped}}}"#
+                    ),
+                ),
+            )
+            .await
+        };
+        assert_eq!(
+            the_answer(&taken).0,
+            200,
+            "the sweep never saw the shape it exists to sweep:\n{}",
+            String::from_utf8_lossy(&taken)
+        );
+        everything.extend_from_slice(&taken);
+
+        let turned_down = {
+            the_hub_decides(
+                state.the_drop(),
+                r#"{"t":"result","status":"refused","why":"Nothing is connected for that conversation right now, so nothing was sent."}"#,
+            );
+            ask_the_door(
+                port,
+                post(
+                    "/v1/commands",
+                    &[("Authorization", "Bearer the-real-one")],
+                    r#"{"t":"message","conversation":"p-0123456789ab","text":"anyone?"}"#,
+                ),
+            )
+            .await
+        };
+        assert_eq!(
+            the_answer(&turned_down).0,
+            400,
+            "the hub's refusal did not reach the wire to be swept:\n{}",
+            String::from_utf8_lossy(&turned_down)
+        );
+        everything.extend_from_slice(&turned_down);
+
+        // Nobody judges this one: no faked hub is waiting, so the wait window closes on it and
+        // the door says the only thing it may.
+        let never_judged = ask_the_door(
+            port,
+            post(
+                "/v1/commands",
+                &[("Authorization", "Bearer the-real-one")],
+                r#"{"t":"message","conversation":"p-0123456789ab","text":"still there?"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            the_answer(&never_judged).0,
+            504,
+            "the timeout's body never reached the wire to be swept:\n{}",
+            String::from_utf8_lossy(&never_judged)
+        );
+        everything.extend_from_slice(&never_judged);
+
         let raw = String::from_utf8_lossy(&everything);
         assert!(
             !raw.contains(&home) && !raw.contains("/tmp/") && !raw.contains("token file"),
             "a fact about this machine reached the HTTP wire:\n{raw}"
         );
+        assert!(
+            !raw.contains(telegram_shaped),
+            "words the caller sent came back out of this door, and one of them was shaped like a \
+             Telegram id:\n{raw}"
+        );
+        // Numbers, judged as whole numbers and never as substrings: a five-digit port sits inside
+        // a ten-digit clock reading often enough that a substring rule would go red on the
+        // calendar rather than on a leak, and the ring's clock is a number this door is allowed
+        // to say.
+        let numbers = the_whole_numbers_in(&raw);
+        assert!(
+            !numbers.contains(&port.to_string()),
+            "the door named the port it is listening on, which is the one fact a reader of this \
+             answer must never learn from it:\n{raw}"
+        );
+        assert!(
+            !numbers.contains(&std::process::id().to_string()),
+            "the door named the process it is running as:\n{raw}"
+        );
+        // What this now covers: every body the door writes over HTTP on both verbs — the events
+        // page, the stream, a turned-away caller on each of the two ways to be turned away, and
+        // all three ends of an authenticated write. What it still does not cover: what the door
+        // says when its own disk fails (the 503 arm, which needs an unwritable drop), and the
+        // headers of the stream beyond the point the reader stops at. And it is a sweep of
+        // STRINGS AND NUMBERS, so it catches a fact of this machine only where that fact is
+        // spelled the way this test spells it: a home path, this port, this pid, a Telegram id.
+        // A new field carrying something of this box under a name none of those matches — a user
+        // name, a host name, a mount — would pass it.
     }
 
     #[tokio::test]
@@ -2424,5 +3267,149 @@ mod tests {
             second.trim().starts_with(&anchor) || true,
             "the new token is a fresh mint"
         );
+    }
+
+    #[test]
+    fn a_port_that_would_open_this_door_where_nobody_chose_is_refused_not_quietly_taken() {
+        use std::ffi::OsStr;
+
+        // Nothing said at all is the one shape that may take the usual port: nobody chose an
+        // address, so opening on the documented one surprises no one.
+        assert_eq!(the_port(None, None), Ok(DEFAULT_PORT));
+        // Said plainly, taken.
+        assert_eq!(the_port(None, Some(OsStr::new("8123"))), Ok(8123));
+        // Typed at the terminal, the flag wins and a variable nobody reads stops nothing: it is
+        // not the address anything is about to open on, so it cannot send him anywhere.
+        assert_eq!(the_port(Some(9123), Some(OsStr::new("banana"))), Ok(9123));
+        // And zero typed at the terminal is a choice, not the mistake below: whoever ran that
+        // line is the one reading the door's own line saying where it came up, so "whatever is
+        // free" is an answer he can act on. The hermetic trial starts its door exactly this way.
+        assert_eq!(the_port(Some(0), None), Ok(0));
+
+        // The defect: a port nobody could read became the usual one in silence, so the door came
+        // up on an address he did not choose while whatever he meant to point at it talked to
+        // nobody. Zero is in the table for that same failure and not for being unreadable: it
+        // parses, and binding it takes whatever port happens to be free — the one value that
+        // reaches the very address nobody chose by getting PAST a parser rather than failing it.
+        for wrong in ["banana", "87 91", "70000", "-1", "8791x", "0", "00", " 0 "] {
+            let refused = the_port(None, Some(OsStr::new(wrong)))
+                .expect_err(&format!("{wrong:?} was taken for a port"));
+            assert!(
+                refused.contains("KICKOFF_DOOR_PORT"),
+                "{wrong:?}: the refusal does not say which setting is wrong: {refused}"
+            );
+            assert!(
+                !refused.contains(wrong),
+                "{wrong:?}: the refusal reads his own mistake back at him: {refused}"
+            );
+        }
+
+        // Whitespace round it is still a port he chose — the token file and the cursor are both
+        // already forgiving of what a hand-edited file leaves behind, and refusing here would
+        // refuse a setting nobody got wrong.
+        assert_eq!(the_port(None, Some(OsStr::new(" 8123 "))), Ok(8123));
+
+        // Set to nothing at all is SET, not unset — it is what a unit file renders when the
+        // substitution it was written with never happened — and the refusal says how the usual
+        // port is actually taken, because clearing the line is not it.
+        for empty in ["", "   "] {
+            let refused = the_port(None, Some(OsStr::new(empty)))
+                .expect_err("a variable set to nothing was taken for one nobody set");
+            assert!(
+                refused.contains("unset"),
+                "the refusal does not say how the door's usual port is taken: {refused}"
+            );
+        }
+
+        // Zero gets a sentence of its own, because "not a port number" would be a lie about a
+        // value that is one: what is wrong is not the writing of it but what opening on it does,
+        // and a man who has to change that line needs to be told what to write instead.
+        for zero in ["0", "00", " 0 "] {
+            let refused = the_port(None, Some(OsStr::new(zero)))
+                .expect_err("a door on whatever port was free was taken for one he chose");
+            assert!(
+                refused.contains("unset"),
+                "{zero:?}: the refusal does not say how the door's usual port is taken: {refused}"
+            );
+            assert!(
+                !refused.contains("not a port number"),
+                "{zero:?}: the refusal calls a port number something that is not one: {refused}"
+            );
+        }
+
+        // Bytes that are not text at all: set, unreadable, refused like any other.
+        use std::os::unix::ffi::OsStrExt as _;
+        assert!(
+            the_port(None, Some(OsStr::from_bytes(&[0xff, 0x38]))).is_err(),
+            "bytes that are not even text were taken for a port"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_doors_own_refusals_name_what_he_wrote_in_his_words_not_the_wires() {
+        let state = a_state();
+        let port = a_door(&state, None).await;
+        std::fs::write(state.dir.path().join(DOOR).join(TOKEN), "the-real-one\n")
+            .expect("a minted token");
+
+        let refusal_for = |body: &'static str| async move {
+            let raw = ask_the_door(
+                port,
+                post(
+                    "/v1/commands",
+                    &[("Authorization", "Bearer the-real-one")],
+                    body,
+                ),
+            )
+            .await;
+            let (status, answered) = the_answer(&raw);
+            assert_eq!(status, 400, "{body}: {raw:?}");
+            let refused: serde_json::Value = serde_json::from_slice(answered).expect("one object");
+            refused["why"].as_str().expect("a sentence").to_owned()
+        };
+
+        // The reply field. Their client renders `why` verbatim behind its own prefix, so the
+        // answer-file's spelling of this field used to land on his screen as a word out of our
+        // wire; what he actually did was reply to a question.
+        let why = refusal_for(
+            r#"{"t":"message","conversation":"p-0123456789ab","text":"go on","in_reply_to_ask":42}"#,
+        )
+        .await;
+        assert!(
+            why.contains("the question it answers"),
+            "the refusal does not say which part of it was wrong: {why}"
+        );
+        assert!(
+            !why.contains("in_reply_to_ask"),
+            "the refusal spells a field of the wire at him: {why}"
+        );
+
+        // The same law on the conversation field, in the same register.
+        let why = refusal_for(r#"{"t":"message","conversation":42,"text":"go on"}"#).await;
+        assert!(
+            why.contains("the conversation it is for"),
+            "the refusal does not say which part of it was wrong: {why}"
+        );
+
+        // The cursor, on both routes that read one. "cursor" and "sequence number" are this
+        // door's own vocabulary for the ring, and the offending text was read straight back —
+        // a refusal that quotes the caller teaches him nothing he did not already type.
+        for route in ["/v1/events?cursor=banana", "/v1/stream?cursor=banana"] {
+            let raw = ask_the_door(port, get(route)).await;
+            let (status, answered) = the_answer(&raw);
+            assert_eq!(status, 400, "{route}: {raw:?}");
+            let refused: serde_json::Value = serde_json::from_slice(answered).expect("one object");
+            let why = refused["why"].as_str().expect("a sentence");
+            assert!(
+                why.contains("carry on from"),
+                "{route}: the refusal does not say what it could not do: {why}"
+            );
+            for jargon in ["cursor", "sequence", "banana"] {
+                assert!(
+                    !why.contains(jargon),
+                    "{route}: the refusal says {jargon:?} to him: {why}"
+                );
+            }
+        }
     }
 }

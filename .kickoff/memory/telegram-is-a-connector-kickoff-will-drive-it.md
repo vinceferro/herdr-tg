@@ -14,7 +14,7 @@ What it settles, together with the 17 September rulings kickoff's memory already
 - **The Telegram connector arrives later, as kickoff work** — built and driven by the
   kickoff program, not grown here as part of this binary's identity. Do not pre-build it.
 - The migration program is therefore: give the hub a law-abiding operator door the PWA can
-  speak (the seam hub.py proved and the PWA already adopted), prove PWA chat on a real
+  speak (the seam their own stub suite proved and the PWA already adopted), prove PWA chat on a real
   herdr-tg conversation first — his own ordering constraint — then widen to the fleet,
   then spawn-and-return, and only then does any Telegram demotion become real.
 

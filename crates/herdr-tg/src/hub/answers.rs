@@ -64,7 +64,7 @@
 //! appended there (`door.rs`'s ack lines), attributed to the conversation and the lane, and the
 //! result is never rewritten to match. Two files, two tenses, and neither may do the other's.
 //!
-//! # Recorded, not fixed: three shapes the door leaves open on purpose
+//! # Recorded, not fixed: four shapes the door leaves open on purpose
 //!
 //! The operator's standing settlement for contrived shapes — the same ruling the write guard's
 //! file received — is to write them down rather than chase them:
@@ -82,11 +82,26 @@
 //!   a second, for ever, and a file the gateway is told about once a second. Recorded because
 //!   only this uid can build it and no bound would mend the cause.
 //! * **Two same-uid TOCTOU windows.** Between the metadata read and the bytes, a plain file can
-//!   be swapped for a link (the door then reads through a link once); and the result write
-//!   follows a link pre-planted at `<name>.result`, writing result bytes wherever it points.
-//!   Both need a writer that is already this user, inside a 0700 directory — at which point the
-//!   writer owns the box and the ring is not the secret worth protecting. Same ruling, same
-//!   file: recorded, closed by nothing, reopened the day the drop moves outside the state home.
+//!   be swapped for a link (the door then reads through a link once); and a result's bytes are
+//!   put down under a staging name first, which is BOTH opened and chmodded, and each of those
+//!   follows a link. So a link planted at the staging name takes the receipt's bytes and has its
+//!   target narrowed to 0600 — and that target need not be in this directory at all, which is
+//!   the reach the chmod adds and the open alone did not have. The half that used to be worth
+//!   something here is gone: a result reaches `<name>.result` by rename, which
+//!   REPLACES a link pre-planted at that name instead of writing through it — and that name is
+//!   the only one of the two the gateway is ever told, so it is the only one anybody could lie
+//!   in wait at knowingly; the staging name carries this pid and has to be guessed at blind.
+//!   What is left needs a writer that is already this user, inside a 0700
+//!   directory — at which point the writer owns the box and the ring is not the secret worth
+//!   protecting. Same ruling, same file: recorded, closed by nothing, reopened the day the drop
+//!   moves outside the state home.
+//! * **A name with no headroom left gets no receipt.** [`where_a_result_is_staged`] adds about
+//!   twenty-one bytes to a result's name, and nothing here bounds how long a name in the drop
+//!   may be, so a name near the filesystem's own limit cannot be staged. The act still happens —
+//!   the file is read, judged and consumed exactly as always — and only the receipt is lost, so
+//!   the gateway waits its whole window and answers its caller that nothing has been said yet.
+//!   No name this hub or the gateway mints comes near it; it needs a program writing into the
+//!   drop directly. Recorded on the same ruling: same uid, inside the 0700 directory.
 
 use std::path::{Path, PathBuf};
 
@@ -417,6 +432,29 @@ pub(crate) fn the_result_of(answer: &Path) -> PathBuf {
     // result the gateway cannot find is a result that was never written, and `PathBuf::from`
     // alone would drop the directory the answer was found in.
     answer.with_file_name(name)
+}
+
+/// Where a result's bytes are put down BEFORE they are put in place.
+///
+/// Two things this name has to be at once, and both are load-bearing.
+///
+/// It ends the way a result's name ends, because [`inventory`] sorts this directory by exactly
+/// that one test: a name wearing the suffix is a receipt, and EVERYTHING ELSE is one of his acts.
+/// A half-written receipt spelled any other way would be read by the very next sweep as an
+/// answer, refused as garbage, consumed, and given a receipt of its own — the hub eating a file
+/// nobody wrote. Wearing the suffix it is also collected by the spent-receipt sweep, so a
+/// leftover from a rename that failed goes away in ten minutes instead of living for ever.
+///
+/// And it sits INSIDE the drop, not beside it: a rename is atomic only within one filesystem, and
+/// the drop is the one directory here that a foreign program is handed by name — anywhere else is
+/// a guess about what is mounted where.
+pub(crate) fn where_a_result_is_staged(result: &Path) -> PathBuf {
+    let mut name = result.file_name().unwrap_or_default().to_os_string();
+    // Pushed onto the name, never `with_extension`: that replaces the LAST extension, which here
+    // is the very suffix the sweep sorts by.
+    name.push(format!(".staging.{}", std::process::id()));
+    name.push(RESULT_SUFFIX);
+    result.with_file_name(name)
 }
 
 /// What this sweep must look at: the answer files, in a deterministic order, and the result
