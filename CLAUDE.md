@@ -67,7 +67,9 @@ credential rule, the handshake, and the thirteen wire rules; §13 is `kickoff-hu
 written to be implementable by a stranger, and `docs/examples/attach-from-the-document.ts` is a
 stranger's adapter that imports nothing of ours and is run against the real door by attach's own suite.
 
-Docs, in the order they are worth reading: `docs/ATTACHING.md` (how anything attaches),
+Docs, in the order they are worth reading: `docs/RUNNING-THE-HUB.md` (the short one — what to
+start, what is deliberately stopped, and what an agent needs to reach the operator),
+`docs/PWA-DOOR.md` (the door the app speaks to), `docs/ATTACHING.md` (how anything attaches),
 `docs/CAPABILITIES.md` (what the hub offers, requires and refuses),
 `docs/INTERFACES.md` (the four seams and the closed list of what this project does), `docs/HUB-AND-KICKOFF.md` (how it wires to kickoff, and two questions
 still open), `docs/HUB-DESIGN.md` (the original redesign — historical, and it predates the

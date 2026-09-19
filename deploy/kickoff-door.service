@@ -1,0 +1,58 @@
+[Unit]
+Description=kickoff-door — the PWA's loopback door onto the hub's ring and its answers drop
+Documentation=https://github.com/vinceferro/herdr-tg/blob/main/docs/PWA-DOOR.md
+After=default.target
+# Never give up restarting. The same reasoning as herdr-tg.service: the operator reads a phone,
+# and a start-limit burst would leave the app's only way in dead until he reaches a keyboard.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# This is the ONE program in this workspace that listens, and it listens on 127.0.0.1 only. There
+# is no flag for an address on purpose: the door faces this box, and the browser reaches it only
+# through the surface's own server-side bridge, which holds the token so the browser never does.
+ExecStart=%h/.local/bin/kickoff-door
+
+# The port, and nothing else, may come from here. A value that is not a port — or is zero — STOPS
+# the door rather than falling back to 8791 or onto whatever port happened to be free: a door on an
+# address nobody chose is a door whatever was pointed at it talks past. An empty value is the shape
+# a template renders when its substitution never happened, and is refused with its own sentence.
+# `-` so a missing file is silence and the default port, not an opaque systemd 203/EXEC.
+EnvironmentFile=-%h/.config/kickoff-door/env
+Environment=RUST_LOG=info
+
+# The token is NOT here and must never be. It is 64 hex characters at <state>/door/token, mode
+# 0600, minted only at a terminal by `herdr-tg door-token`. The door reads that file on EVERY
+# request, so a rotation is live without a restart — and the door mints nothing itself, because a
+# gateway that could mint its own credential would be a credential nobody decided to issue.
+
+# The door holds no claim and speaks no hub-proto. If it dies, agents keep working and the phone
+# surface is unaffected; what stops is the app's view. So it comes back, and quickly.
+Restart=always
+RestartSec=5
+
+# ── Hardening ───────────────────────────────────────────────────────────────────────────────────
+# Tighter than herdr-tg.service can be, because this process does strictly less: it reads two files
+# under the state home and writes one directory of them, holds no bot token, dials nothing outward,
+# and starts no process. It accepts loopback TCP and that is the whole of its network.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Loopback TCP only. No AF_UNIX: this door never touches the hub's socket — the ring file and the
+# answers drop are the entire interface between the two, which is the design and not an accident.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ProtectSystem=yes
+
+[Install]
+WantedBy=default.target
