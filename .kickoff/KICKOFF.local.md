@@ -66,7 +66,7 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
   work surface is the PWA and the herdr TUI; the hub stays the conversation plane for the PWA to
   be proven on, with the Telegram connector arriving later as kickoff work. Ordering, his words:
   PWA chat proven first, then any dismissal. His live comms path meanwhile is agent-mail
-  (claude-kickoff's `kickoff-hub.service` — a different system, never touched from here). A
+  (claude-kickoff's `herdr-tg-app.service` — a different system, never touched from here). A
   session's channel tools failing to reach the hub are the expected state, not an outage to fix;
   reviving any unit or minting a token is his call, in that order.
 - **Never add a call site to `send_text`, `send_keys` or `send_input`.** One audited path exists.

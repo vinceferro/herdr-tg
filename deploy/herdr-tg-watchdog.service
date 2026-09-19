@@ -20,6 +20,15 @@ Environment=HERDR_TG_ENV_FILE=%h/.config/herdr-tg/env
 # a bot token. A shim named `curl` earlier in that PATH would be handed the credential.
 Environment=PATH=/usr/bin:/bin
 
+# ── Hardening ───────────────────────────────────────────────────────────────────────────────────
+# The heading is load-bearing, not decoration: it is what
+# `tests/a_unit_promises_only_what_the_manager_running_it_enforces.rs` reads, and that guard walks
+# every unit in this directory. Without it these twelve lines were shipped and held to nothing,
+# which is the same state the pair of inert address filters were in before anybody ran them.
+#
+# Every line below was measured on the manager that runs it, one probe under `systemd-run --user`
+# twice — once bare, once under this unit's own directives — and a line counts as doing something
+# only where the two runs disagreed. This unit sets none of the pair that does nothing here.
 NoNewPrivileges=yes
 PrivateTmp=yes
 RestrictSUIDSGID=yes

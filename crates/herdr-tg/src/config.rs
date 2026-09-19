@@ -1,5 +1,14 @@
 //! Configuration: structure from a TOML file, the credential from the environment.
 //!
+//! # The plane is told, and it decides whether there is a credential at all
+//!
+//! A hub reaches the operator one of two ways, and [`Config::load`] is given which
+//! ([`Plane`]) rather than working it out. On the phone line the token is required exactly as it
+//! always was. On the app there is no token on the returned configuration at all: the environment
+//! is read once, a line is said if a token is set there, and the value is dropped. Nothing
+//! downstream can build a Bot API client out of a configuration that does not carry one, so the
+//! promise is held by the type rather than by every later caller remembering it.
+//!
 //! # Why the token is not in the file
 //!
 //! PLAN.md contradicted itself on this (`.env` in one place, `herdr-tg.toml` in another) and the
@@ -57,6 +66,24 @@ pub const USER_IDS_ENV: &str = "KICKOFF_CHANNEL_ALLOWED_USER_IDS";
 /// Keys that must never appear in the TOML. Presence is a hard error, not a warning.
 const FORBIDDEN_TOML_KEYS: &[&str] = &["token", "bot_token", "api_token", "secret"];
 
+/// Which way a hub reaches the operator. Told at the terminal, never worked out.
+///
+/// **There is no default and nothing is inferred**, and that is the whole design of this type.
+/// The obvious shortcut — "a token is set, so he must mean the phone" — makes the silent mistake
+/// by construction: a typo in the credential file, or a unit whose environment file was never
+/// rendered, would quietly become the app and every agent on the box would talk into a file while
+/// he waited for a phone that was never going to ring. A default makes one of those two mistakes
+/// depending which way it points. A required argument makes neither, because there is no state
+/// reachable by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Plane {
+    /// The Bot API: one bot, one forum, one topic per conversation. Needs a token.
+    Telegram,
+    /// The app: the ring and the answers drop, read and written through the PWA's own door.
+    /// Nothing here dials a messaging service and nothing here holds a credential.
+    App,
+}
+
 /// The `[bot]` section of the config file. Structure only — never a credential. Existing
 /// `herdr-tg.toml` files remain valid during the source-only rename.
 #[derive(Debug, Default, Deserialize)]
@@ -82,7 +109,13 @@ struct FileConfig {
 /// Everything the bridge needs to start.
 #[derive(Debug, Clone)]
 pub struct Config {
-    token: String,
+    /// The bot token, and `None` whenever this hub reaches him through the app.
+    ///
+    /// Absent rather than empty, because the two are not the same promise. An empty string would
+    /// still build a `Bot`, which would then long-poll the Bot API with no credential; absence
+    /// cannot be handed to one at all, so the app plane's guarantee is held by the type rather
+    /// than by everybody downstream remembering to check.
+    token: Option<String>,
     /// A set, so a duplicated id in the file is not a duplicated grant, and ordering is stable in
     /// the startup log.
     ///
@@ -107,10 +140,13 @@ pub struct Config {
 }
 
 impl Config {
-    /// The bot token. Deliberately a method rather than a public field: it makes every read of the
-    /// credential a visible call site that a reviewer can grep for.
-    pub fn token(&self) -> &str {
-        &self.token
+    /// The bot token, when this hub has one. Deliberately a method rather than a public field: it
+    /// makes every read of the credential a visible call site that a reviewer can grep for.
+    ///
+    /// `None` is a hub reaching him through the app, and the one caller that wants a token has to
+    /// say what it does about that rather than being handed an empty string.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     /// Everyone who may speak anywhere this bot listens: the people listed, plus every person the
@@ -126,8 +162,14 @@ impl Config {
             .collect()
     }
 
-    /// Load structure from `path` (if it exists) and the credential from the environment.
-    pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
+    /// Load structure from `path` (if it exists) and, on the phone line only, the credential from
+    /// the environment.
+    ///
+    /// `to` is not a hint. On [`Plane::App`] the environment is read for the token exactly once
+    /// and for one purpose — to say out loud that one is set here and is not being used — and the
+    /// value is then dropped on the floor. It never reaches the returned configuration, so there
+    /// is nothing for a later caller to find and nothing to build a Bot API client out of.
+    pub fn load(path: Option<&Path>, to: Plane) -> anyhow::Result<Self> {
         let file = match path {
             Some(p) if p.exists() => {
                 let raw = std::fs::read_to_string(p)
@@ -141,7 +183,8 @@ impl Config {
         };
         Self::assemble(
             file,
-            crate::compat::environment("TOKEN")?,
+            to,
+            crate::compat::setting("TOKEN")?,
             crate::compat::environment("ALLOWED_CHAT_IDS")?,
             crate::compat::environment("ALLOWED_USER_IDS")?,
             crate::compat::environment("FORUM_CHAT_ID")?,
@@ -152,19 +195,46 @@ impl Config {
     /// read from the process. Split out so the exact shape the operator's box runs — no file, two
     /// chat ids in the environment, nothing else — can be tested without a test touching the
     /// environment, which is shared by every test in the process.
+    ///
+    /// The token arrives with the NAME it was found under, because the sentence said about it
+    /// quotes that name: an operator who wrote the former spelling and is told about the current
+    /// one has been sent to look for a line he never typed.
     fn assemble(
         file: FileConfig,
-        token: Option<String>,
+        to: Plane,
+        token: Option<crate::compat::Setting>,
         chat_ids_env: Option<String>,
         user_ids_env: Option<String>,
         forum_chat_id_env: Option<String>,
     ) -> anyhow::Result<Self> {
-        let Some(token) = token.filter(|t| !t.trim().is_empty()) else {
-            bail!(
-                "{TOKEN_ENV} is not set. The token never lives in the config file — run \
-                 `bash scripts/setup-token.sh` to write ~/.config/herdr-tg/env, and point the \
-                 systemd unit's EnvironmentFile= at it."
-            );
+        let token = token.filter(|t| !t.value.trim().is_empty());
+        let token = match to {
+            Plane::Telegram => {
+                let Some(token) = token else {
+                    bail!(
+                        "{TOKEN_ENV} is not set. The token never lives in the config file — run \
+                         `bash scripts/setup-token.sh` to write ~/.config/herdr-tg/env, and point \
+                         the systemd unit's EnvironmentFile= at it."
+                    );
+                };
+                Some(token.value.trim().to_string())
+            }
+            Plane::App => {
+                // Said once, and never fatal. A box mid-migration keeps its old credential file
+                // around, and refusing to start over a credential this plane will not touch would
+                // make the app something he cannot switch to without a tidy-up first. But silence
+                // here is the failure that matters: he is the one waiting for a phone to buzz, and
+                // this line is the only thing on the box that will tell him which plane he is on.
+                // The bytes are not printed — a journal is not a place for a live credential.
+                if let Some(found) = token {
+                    tracing::warn!(
+                        setting = %found.name,
+                        "this hub reaches him through the app, where no bot token is used. The \
+                         one set here is being ignored, and nothing will reach a phone."
+                    );
+                }
+                None
+            }
         };
 
         // The env form wins when present, so a probe run can narrow the allowlist without editing
@@ -218,7 +288,7 @@ impl Config {
         }
 
         Ok(Self {
-            token: token.trim().to_string(),
+            token,
             allowed_chat_ids: allowed,
             allowed_user_ids: people,
             forum_chat_id: forum_chat_id_env
@@ -329,7 +399,7 @@ mod tests {
 
     fn cfg(ids: &[i64]) -> Config {
         Config {
-            token: "t".into(),
+            token: Some("t".into()),
             allowed_chat_ids: ids.iter().copied().collect(),
             allowed_user_ids: BTreeSet::new(),
             forum_chat_id: None,
@@ -384,8 +454,16 @@ mod tests {
     #[test]
     fn the_token_is_reachable_only_through_its_accessor() {
         let c = cfg(&[1]);
-        assert_eq!(c.token(), "t");
+        assert_eq!(c.token(), Some("t"));
         assert_eq!(c.allowed_chat_ids, [1i64].into_iter().collect());
+    }
+
+    /// A token as the environment hands one over: the bytes, and the name they were found under.
+    fn a_token(value: &str) -> crate::compat::Setting {
+        crate::compat::Setting {
+            name: TOKEN_ENV.to_owned(),
+            value: value.to_owned(),
+        }
     }
 
     /// The exact shape the operator's box runs: no config file, the chat allowlist alone in the
@@ -394,7 +472,8 @@ mod tests {
     fn the_live_shape(user_ids_env: Option<&str>) -> Config {
         Config::assemble(
             FileConfig::default(),
-            Some("t".into()),
+            Plane::Telegram,
+            Some(a_token("t")),
             Some("9,-1009".into()),
             user_ids_env.map(str::to_owned),
             None,
@@ -441,7 +520,8 @@ mod tests {
         // number, no reason, every five seconds under the unit's restart.
         let err = Config::assemble(
             FileConfig::default(),
-            Some("t".into()),
+            Plane::Telegram,
+            Some(a_token("t")),
             None,
             Some("12,-1009".into()),
             None,
@@ -456,7 +536,7 @@ mod tests {
 
         let file: FileConfig =
             toml::from_str("allowed_user_ids = [12, -1009]\n").expect("the file parses");
-        let err = Config::assemble(file, Some("t".into()), None, None, None)
+        let err = Config::assemble(file, Plane::Telegram, Some(a_token("t")), None, None, None)
             .expect_err("a group in the file loaded");
         let said = err.to_string();
         assert!(
@@ -473,7 +553,8 @@ mod tests {
         // same wrapper, and printed only `parsing HERDR_TG_ALLOWED_CHAT_IDS` for a typo.
         let err = Config::assemble(
             FileConfig::default(),
-            Some("t".into()),
+            Plane::Telegram,
+            Some(a_token("t")),
             Some("9,notanid".into()),
             None,
             None,
@@ -487,7 +568,8 @@ mod tests {
 
         let err = Config::assemble(
             FileConfig::default(),
-            Some("t".into()),
+            Plane::Telegram,
+            Some(a_token("t")),
             None,
             Some("12,twelve".into()),
             None,
@@ -508,5 +590,113 @@ mod tests {
             [9i64, 12].into_iter().collect::<BTreeSet<_>>()
         );
         assert!(people_from_private_chats(&BTreeSet::new()).is_empty());
+    }
+
+    /// Everything `tracing` wrote while the guard lived, so a test can read the line the operator
+    /// reads. One line per event, no colour — the journal's own shape.
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the journal is not poisoned")
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn a_journal() -> (
+        tracing::subscriber::DefaultGuard,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&buf);
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Journal(std::sync::Arc::clone(&sink)))
+            .finish();
+        (tracing::subscriber::set_default(sub), buf)
+    }
+
+    fn read(journal: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(journal.lock().expect("not poisoned").clone()).expect("utf-8")
+    }
+
+    #[test]
+    fn a_hub_reaching_him_through_the_app_never_puts_a_bot_token_on_its_configuration() {
+        // The whole of the app plane's credential story. The environment on a box that has run on
+        // the phone still carries the token — an old credential file, a shell that exported it, a
+        // unit somebody copied — and the plane's promise is that none of it reaches this process's
+        // configuration. Asserted on the Debug shape as well as the accessor, because a token kept
+        // in a field nothing reads is still a token in a crash dump and in a `{cfg:?}` in a log.
+        let cfg = Config::assemble(
+            FileConfig::default(),
+            Plane::App,
+            Some(a_token("123456:AAAAsecretsecret")),
+            Some("9,-1009".into()),
+            None,
+            Some("-1009".into()),
+        )
+        .expect("a hub reaching him through the app loads");
+        assert!(
+            cfg.token().is_none(),
+            "a hub with no phone line is carrying a bot token"
+        );
+        let shape = format!("{cfg:?}");
+        assert!(
+            !shape.contains("AAAAsecretsecret"),
+            "the token's bytes are on the configuration after all: {shape}"
+        );
+    }
+
+    #[test]
+    fn a_hub_reaching_him_through_the_app_says_out_loud_that_it_found_a_token_it_is_not_using() {
+        // A token in the environment of an app-plane hub is not an error — the operator may be
+        // mid-migration, and refusing to start over a credential nothing will touch would be a
+        // plane that cannot be switched to without a tidy-up first. But it must never be SILENT:
+        // a token set here and not used is a box where he is waiting for a phone to buzz, and the
+        // one line in the journal is the only thing that will ever tell him which plane he is on.
+        let (_guard, journal) = a_journal();
+        Config::assemble(
+            FileConfig::default(),
+            Plane::App,
+            Some(a_token("123456:AAAAsecretsecret")),
+            None,
+            None,
+            None,
+        )
+        .expect("a hub reaching him through the app loads");
+        let said = read(&journal);
+        assert!(
+            said.contains(TOKEN_ENV),
+            "the line does not name the setting he has to go and look at: {said}"
+        );
+        assert!(
+            said.contains("no bot token is used"),
+            "the line does not say the token is not being used: {said}"
+        );
+        assert!(
+            !said.contains("AAAAsecretsecret"),
+            "the credential itself was written into the journal: {said}"
+        );
+    }
+
+    #[test]
+    fn a_hub_reaching_him_through_the_app_with_no_token_anywhere_says_nothing_about_one() {
+        // The other half, and the reason the line above is worth having: on the plane's ordinary
+        // box there is no token at all, and a line about one would send him looking for a setting
+        // nobody wrote.
+        let (_guard, journal) = a_journal();
+        Config::assemble(FileConfig::default(), Plane::App, None, None, None, None)
+            .expect("a hub reaching him through the app loads with no token");
+        let said = read(&journal);
+        assert!(
+            !said.to_lowercase().contains("token"),
+            "a hub that found no token talked about one anyway: {said}"
+        );
     }
 }

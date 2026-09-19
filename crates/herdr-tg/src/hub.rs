@@ -203,6 +203,17 @@ pub const EDIT_WINDOW_SECS: u64 = 48 * 60 * 60;
 /// to make space for a paragraph explaining why it went away.
 pub const RETIREMENT_NOTE_ROOM: usize = 500;
 
+/// What the operator reads where a question the hub could not ask is struck off his app.
+///
+/// Two sentences and not one, because which of them is true depends on how far the question got,
+/// and a history that tells him a message he is looking at never arrived is worse than no history.
+/// Both end with the same instruction, which is the only thing he can actually do about either:
+/// the agent is still blocked, and the place to unblock it is the terminal it is running in.
+const NEVER_REACHED_HIM: &str = "this one never reached you — answer it where it is running";
+
+/// The same, for a question that DID land and that the hub can no longer place.
+const CANNOT_BE_ANSWERED: &str = "this one cannot be answered here — answer it where it is running";
+
 /// How long a refused topic creation is remembered before Telegram is asked again.
 ///
 /// Long enough that an agent talking steadily costs one call rather than one per message, short
@@ -457,6 +468,48 @@ pub trait Surface: Send + Sync + 'static {
         file: &Upload,
         caption: &str,
     ) -> impl std::future::Future<Output = SendOutcome> + Send;
+
+    /// Does whatever is carrying these messages ration them?
+    ///
+    /// Telegram's twenty a minute is Telegram's. A surface that is not a messaging app has no such
+    /// wall, and shedding against one anyway is the hub inventing an outage: several busy
+    /// conversations told their words were sent too fast — to a file. Read in
+    /// [`Hub::take_a_turn`], which is the one place the budget is spent.
+    ///
+    /// Defaulted TRUE so that every carrier is rationed unless it says otherwise, which is the
+    /// fail-closed direction: a new surface that forgot to answer is paced rather than allowed to
+    /// flood somebody's chat.
+    fn the_carrier_has_a_ceiling(&self) -> bool {
+        true
+    }
+
+    /// Can an agent's file reach him this way at all?
+    ///
+    /// The seam a caller reads to turn a file away BEFORE it has been read off the disk. Nothing
+    /// reads it yet — [`Self::send_file`] refusing is the backstop until something does — and it
+    /// is declared here rather than later so that adding the early refusal is a change to one
+    /// caller instead of a change to this trait and every implementation of it.
+    // Marked rather than deleted or hidden behind `cfg(test)`, for the reason the outbound half of
+    // `intent.rs` is: this is a seam an implementation answers, it has to ship for one to answer
+    // it, and an `allow` a reviewer can see is more honest than a declaration that quietly is not
+    // in the binary. It disappears the day `say_with_file_and_ack` reads it.
+    #[allow(dead_code)]
+    fn the_carrier_can_take_a_file(&self) -> bool {
+        true
+    }
+
+    /// Is this remembered topic number one THIS carrier could have given out?
+    ///
+    /// A box can change planes: a conversation bound while the operator read the app carries a
+    /// number no forum ever minted, and one bound on the phone carries a thread id nothing but a
+    /// forum can address. Sending into the other plane's number is a message that lands nowhere,
+    /// silently, for every message of that conversation — so the number is checked before it is
+    /// used and a conversation whose number is not this carrier's is given one that is.
+    ///
+    /// Defaulted to a forum's own range, because that is what every carrier here but one is.
+    fn a_topic_number_this_carrier_could_have_minted(&self, topic_id: i32) -> bool {
+        topic_id > 0
+    }
 }
 
 /// A file on its way to his phone, as the hub read it off the descriptor it checked.
@@ -1811,6 +1864,27 @@ pub(crate) struct Kick {
 /// stat a second on a file of a few kilobytes is nothing; the registry is re-read only when the stat
 /// says it changed.
 pub const REGISTRY_WATCH_EVERY: Duration = Duration::from_secs(1);
+
+/// What one pass over the answers drop did, for the one leg of the watchdog contract that watches
+/// it.
+///
+/// Two outcomes and not three, because the leg only ever asks one question: did the loop get
+/// anywhere. A pass that consumed twenty answers and a pass that found none are the same answer —
+/// the drop is readable and the loop is turning — and one bad answer file inside a pass is neither,
+/// because it is consumed and answered with a sentence of its own and never stops the pass.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    /// A whole pass finished.
+    WentRound,
+    /// It ran and could do nothing at all, and this is why in the operator's words.
+    ///
+    /// The sentence is worded here, where the reason is known, for the reason the door's are
+    /// worded in `bot.rs`: a drop this hub may not trust and a drop it cannot list are two
+    /// different mornings and the same silence. Its second copy is a `case` pattern in
+    /// `deploy/herdr-tg-watchdog.sh`, and `tests/the_heartbeat_is_earned_not_scheduled.rs` holds
+    /// the two together.
+    WasRefused(&'static str),
+}
 
 /// Where the highest generation this hub has handed out for each address is written down.
 ///
@@ -3526,7 +3600,38 @@ impl<S: Surface> Hub<S> {
     /// accepts (the sweep cadence, not the file, is the clock).
     ///
     /// Spawned once for the life of the hub; the handle is returned so a test can hold it.
+    ///
+    /// Nothing watches the sweep here, which is what
+    /// [`Self::watch_the_registry_and_say_how_the_sweep_is`] is for. This spelling stays because
+    /// every test that only wants the loop running has no health to hand it, and making them all
+    /// invent one would be thirty-odd call sites' worth of noise around a fact they do not assert.
     pub fn watch_the_registry(self: Arc<Self>, every: Duration) -> tokio::task::JoinHandle<()> {
+        self.watching(every, None)
+    }
+
+    /// The same loop, with the sweep's own half of the watchdog contract written down as it turns.
+    ///
+    /// **This closes a hole that is open on a Telegram box today.** Nothing whatsoever watches
+    /// this sweep, so a task that died — a panic in one answer's handling, a runtime shutting down
+    /// under it — took every tap and every typed line the operator made at the door with it, in
+    /// silence, while the legs that do exist stayed perfectly true. Written by the loop itself and
+    /// never by the tick, for the reason the update stream's half is: a loop nobody is driving any
+    /// more is the wedge this fact exists for, and a timer voting on its behalf would report
+    /// health straight through it.
+    pub fn watch_the_registry_and_say_how_the_sweep_is(
+        self: Arc<Self>,
+        every: Duration,
+        health: Arc<crate::heartbeat::Health>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.watching(every, Some(health))
+    }
+
+    /// The one loop both spellings run, so the watched one cannot drift from the plain one.
+    fn watching(
+        self: Arc<Self>,
+        every: Duration,
+        health: Option<Arc<crate::heartbeat::Health>>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let path = self.registry.lock().await.path().to_path_buf();
             // Nothing seen yet, so the first tick always re-reads once. The baseline used to be
@@ -3537,7 +3642,14 @@ impl<S: Surface> Hub<S> {
             let mut seen: Option<(u64, u64, Option<std::time::SystemTime>)> = None;
             loop {
                 tokio::time::sleep(every).await;
-                self.sweep_the_answers().await;
+                let swept = self.sweep_the_answers().await;
+                if let Some(health) = &health {
+                    let now = std::time::Instant::now();
+                    match swept {
+                        Sweep::WentRound => health.the_answers_were_swept(now),
+                        Sweep::WasRefused(why) => health.the_answers_sweep_was_refused(now, why),
+                    }
+                }
                 let now = registry_fingerprint(&path);
                 if now == seen {
                     continue;
@@ -3546,6 +3658,14 @@ impl<S: Surface> Hub<S> {
                 self.drop_connections_of_switched_off_projects().await;
             }
         })
+    }
+
+    /// Whether the operator's copy of everything an agent says is still being written.
+    ///
+    /// Asked by the app plane's tick every time it runs. A state read and not a heartbeat: see
+    /// [`door::Ring::is_writing`] for what that proves and what it does not.
+    pub fn the_ring_is_writing_what_agents_say(&self) -> bool {
+        self.ring.is_writing()
     }
 
     /// Take the keyboard off every question a run of this CONVERSATION other than this one left
@@ -5011,7 +5131,30 @@ impl<S: Surface> Hub<S> {
             )
         };
         if let Some(id) = existing {
-            return Ok(id);
+            // A number the carrier now in use could not have given out is not a place to send
+            // anything: it belongs to the plane this box was on before. Unchecked, a box switched
+            // back to the phone addressed a forum thread that cannot exist on every message of
+            // that conversation, and Telegram's refusal is the only evidence there would be.
+            // Falling through mints a number this carrier owns and `bind_topic` puts it over the
+            // one that is there, so the conversation is repaired once rather than every message.
+            //
+            // What that costs, said rather than discovered: a conversation remembers ONE number,
+            // so switching planes leaves the other plane's topic behind with its history in it,
+            // and switching back makes a third. That is the accepted price of one field instead of
+            // one per plane — and it is much the cheaper half, because keeping the number would
+            // put every message of that conversation into somewhere that does not exist, with
+            // nothing but the carrier's own refusal to say so.
+            if self
+                .surface
+                .a_topic_number_this_carrier_could_have_minted(id)
+            {
+                return Ok(id);
+            }
+            tracing::warn!(
+                project = %addr.project, lane = addr.lane_field(), remembered = id,
+                "this conversation is remembered against a number the surface now in use could \
+                 not have given it; a new one is made and written down in its place"
+            );
         }
 
         // Refused a moment ago, so do not ask again yet. Nothing about this conversation has
@@ -5317,6 +5460,22 @@ impl<S: Surface> Hub<S> {
         // Nothing has been spent at either, so the frame is refused like the ones queued behind it
         // rather than posted into a topic the operator has just turned off.
         let switch = SWITCH.try_with(Arc::clone).ok();
+        // The OPERATOR's switch is read before anything about the carrier, because the switch is
+        // his and belongs to no carrier: a frame refused for it must be refused whatever is
+        // carrying the words, and the return just below takes a whole plane past everything else
+        // in this function. A plain read of the flag is all this needs — nothing is being waited
+        // on yet, so there is no throw to be woken by, and the raced wait below is still what
+        // covers the time a frame spends in the queue.
+        if switch.as_deref().is_some_and(ConnectionSwitch::is_off) {
+            return Err(self.switched_off_under(addr));
+        }
+        // Nothing to pace against. Telegram's twenty a minute belongs to Telegram, and a carrier
+        // without one must not shed: several busy conversations shed "too fast" against a ceiling
+        // that does not exist is the hub inventing an outage and telling an agent its words were
+        // sent too fast to a file.
+        if !self.surface.the_carrier_has_a_ceiling() {
+            return Ok(());
+        }
         let turn = match unless_switched_off(
             switch.as_deref(),
             tokio::time::timeout_at(until.into(), self.send_permit.lock()),
@@ -6825,6 +6984,9 @@ impl<S: Surface> Hub<S> {
                             &[],
                         )
                         .await;
+                    // The app reads the ring and nothing else, so the line above reaches nobody
+                    // there: without this the question it refuses stands open in the app for ever.
+                    self.a_question_that_can_never_be_answered(addr, &ask_id, NEVER_REACHED_HIM);
                     return (Delivered::No, Some(hub_proto::AckWhy::TelegramRefused));
                 }
 
@@ -6839,6 +7001,11 @@ impl<S: Surface> Hub<S> {
                 // send would leave a ledger entry for a message nobody can see; recording against a
                 // guessed id would let a tap resolve against the wrong question, which is the exact
                 // shape of the defect where a button reading "Reject" confirmed "Allow always".
+                //
+                // Whether one was written is carried out of this block, because an `ask` with no
+                // record is a question NOBODY can ever answer or close, and the ring already holds
+                // it — see `a_question_that_can_never_be_answered` below for what that cost.
+                let mut written_down = false;
                 if let SendOutcome::Sent(msg_id) | SendOutcome::Clamped(msg_id) = &outcome {
                     // Read back for THIS conversation, and refused rather than defaulted. This
                     // ended in `.unwrap_or_default()`, which wrote a zero on a miss: a record
@@ -6862,7 +7029,9 @@ impl<S: Surface> Hub<S> {
                             let record = AskRecord {
                                 project: addr.project.clone(),
                                 lane: addr.lane.clone(),
-                                ask_id,
+                                // Cloned, because the arm below names the question the hub could
+                                // not write down and needs the same id to strike it with.
+                                ask_id: ask_id.clone(),
                                 topic_id,
                                 options,
                                 instance: instance.to_owned(),
@@ -6880,6 +7049,13 @@ impl<S: Surface> Hub<S> {
                                 answered_from: None,
                                 closed: None,
                             };
+                            // Held in memory whether or not the file takes it, so the question is
+                            // answerable NOW even on a disk that is refusing writes — which is why
+                            // a failed write is not the same as no record and must not strike the
+                            // question off. What it does cost is a restart: the record is gone and
+                            // the question is open on the ring with nothing behind it, which is
+                            // what the loud line below is for.
+                            written_down = true;
                             if let Err(e) =
                                 self.ledger
                                     .lock()
@@ -6896,6 +7072,41 @@ impl<S: Surface> Hub<S> {
                             }
                         }
                     }
+                }
+                if !written_down {
+                    // Fail closed, on both halves at once. The operator's app is told the question
+                    // is over, so it strikes it instead of offering a button that answers "I have
+                    // no record of that question"; and the agent is told `no`, so it stops waiting
+                    // for an answer that can never arrive and says so where it is running.
+                    //
+                    // The sentence has to be true of the path that got here, the same rule
+                    // `take_the_question_back` keeps: a question that was shed, refused or never
+                    // put on a button reached him nowhere at all, and one that landed and cannot
+                    // be placed did reach him — telling him it never arrived would be a plain
+                    // untruth about a message he may be looking at.
+                    let landed = matches!(
+                        outcome,
+                        SendOutcome::Sent(_) | SendOutcome::Clamped(_) | SendOutcome::Unseen
+                    );
+                    self.a_question_that_can_never_be_answered(
+                        addr,
+                        &ask_id,
+                        if landed {
+                            CANNOT_BE_ANSWERED
+                        } else {
+                            NEVER_REACHED_HIM
+                        },
+                    );
+                    // `no-topic` and not the outcome's own word: a question that landed somewhere
+                    // the hub cannot name is one it has nowhere to put, which is what that word
+                    // means. An `unseen` send keeps its own answer — "it went out and could not be
+                    // checked" is still the honest thing to tell an agent about it.
+                    return match &outcome {
+                        SendOutcome::Sent(_) | SendOutcome::Clamped(_) => {
+                            (Delivered::No, Some(hub_proto::AckWhy::NoTopic))
+                        }
+                        other => self.ack_for(other),
+                    };
                 }
                 self.ack_for(&outcome)
             }
@@ -7702,6 +7913,36 @@ impl<S: Surface> Hub<S> {
         }
     }
 
+    /// Strike a question the hub never got into a state where anybody could answer it.
+    ///
+    /// **This is the one thing that can ever close such a question.** The record is what a tap is
+    /// judged against and what every retirement in this file walks; an `ask` that leaves `handle`
+    /// without one is beyond all of them — the sweep at a session's arrival, the agent's own
+    /// `ask_resolved`, a tap, a timeout. And the `ask` is already on the ring, because the ring is
+    /// stamped as the words are spoken. So the operator's app showed a question standing open for
+    /// ever, and tapping it answered "I have no record of that question, so I will not answer it
+    /// for you" — a dead button, worded as though he had got something wrong. Driven rather than
+    /// reasoned about: a hub whose registry file had gone unreadable, one `ask`, a real bridge —
+    /// one line on the ring, no retirement, no record, no topic.
+    ///
+    /// **Withholding the `ask` itself was the other candidate and it loses.** The ring is HIS copy
+    /// of what an agent said, not a delivery report, and refusing to write an agent's words
+    /// because the hub's own bookkeeping failed would leave him with no trace that the question
+    /// existed — where this leaves him the question, struck, with a sentence saying where to go.
+    ///
+    /// The line is an `ask_resolved`, the wire's own word for "this stopped being open", so no
+    /// `hub-proto` change and no new word for a reader to learn. The CALLER picks the sentence,
+    /// because only the caller knows whether the question reached him at all.
+    fn a_question_that_can_never_be_answered(&self, addr: &Addr, ask_id: &AskId, how: &str) {
+        tracing::error!(
+            project = %addr.project, lane = addr.lane_field(), ask = %ask_id,
+            "a question was not written down, so nothing here can ever answer or close it; it is \
+             struck off the operator's app and its agent is told it did not ask"
+        );
+        self.ring
+            .could_never_be_answered(&addr.project, addr.lane.as_ref(), ask_id, how);
+    }
+
     /// The operator answered from his phone: take the keyboard away and say what he chose.
     ///
     /// This used to just delete the ledger record. That left the keyboard live forever — the record
@@ -7823,6 +8064,17 @@ impl<S: Surface> Hub<S> {
         {
             Ok(()) => {
                 let _ = self.ledger.lock().await.forget(chat_id, msg_id);
+                // The hub's own word, so it owes the ring a line — no frame carried this and the
+                // record is now gone, which on the app means the question would otherwise stand
+                // open for ever with nothing left that could answer or close it. Written only
+                // here, in the arm where the retirement was OBSERVED to land, and in the same
+                // words the phone is now showing, so the two surfaces cannot disagree.
+                self.ring.resolved_by_the_hub(
+                    &record.project,
+                    record.lane.as_ref(),
+                    &record.ask_id,
+                    note,
+                );
                 Withdrawal::Retired
             }
             Err(e) => {
@@ -8014,7 +8266,7 @@ impl<S: Surface> Hub<S> {
     /// consumed — carried to the conversation it names, or refused with a sentence — whatever
     /// happens on the way. A drop that wedged on one bad file would be a door the gateway waits
     /// on for ever, so nothing here may return early over one answer's troubles.
-    async fn sweep_the_answers(self: &Arc<Self>) {
+    async fn sweep_the_answers(self: &Arc<Self>) -> Sweep {
         // One sweep at a time. The watch loop and a restart's first tick are the same caller in
         // production, but nothing stops a second — and two sweeps racing on one file would read
         // it twice and act twice, which for a message is a duplicate no law downstream can take
@@ -8029,7 +8281,10 @@ impl<S: Surface> Hub<S> {
                 "the answers drop could not be asserted private; this sweep does nothing rather \
                  than read a door this hub cannot vouch for"
             );
-            return;
+            return Sweep::WasRefused(
+                "the place your answers arrive could not be made private, so none of them are \
+                 being read",
+            );
         }
         let now = now_secs();
         let (answers, spent_results) = match answers::inventory(&self.answers, now) {
@@ -8039,7 +8294,10 @@ impl<S: Surface> Hub<S> {
                     error = %e, path = %self.answers.display(),
                     "the answers drop could not be listed; nothing is swept this tick"
                 );
-                return;
+                return Sweep::WasRefused(
+                    "the place your answers arrive could not be read, so none of them are getting \
+                     through",
+                );
             }
         };
         for gone in &spent_results {
@@ -8052,6 +8310,11 @@ impl<S: Surface> Hub<S> {
         for path in answers {
             self.consume_one_answer(&path, now).await;
         }
+        // A whole pass, and only here. One answer's own troubles never reach this line as a
+        // refusal — they are consumed and answered with a sentence of their own, and a drop that
+        // wedged on one bad file would be a door the gateway waits on for ever — so what this
+        // reports is the LOOP, which is the thing the leg is about.
+        Sweep::WentRound
     }
 
     /// Consume one answer: act on it, write its result, remove the file — in that order.

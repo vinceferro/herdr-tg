@@ -117,18 +117,25 @@ const MAY_START_A_PROCESS: [MayStartAProcess; 4] = [
     MayStartAProcess {
         file: "crates/herdr-tg/src/cmd/enroll.rs",
         ships: Ships::Yes {
-            sites: 3,
+            sites: 1,
             argv_heads: &["rev-parse", "check-ignore", "ls-files"],
         },
         programs: &["git"],
         why: "Enrolment asks git whether this project's secret would be committed, because the \
               hand-rolled version read one .gitignore at the repo root and stayed silent for the \
               shape where the danger is greatest. Reached from `main.rs`'s `Cmd::Enroll` and \
-              nowhere else — argv, at the terminal, where a person is. Three sites ship: is this \
-              folder in a working tree at all (`rev-parse`), would the secret be committed \
-              (`check-ignore`), or is it tracked already (`ls-files`), where the advice about a \
-              .gitignore rule would be wrong. Two more build a real repo inside this file's own \
-              test module.",
+              nowhere else — argv, at the terminal, where a person is. It still asks three \
+              QUESTIONS — is this folder in a working tree at all (`rev-parse`), would the secret \
+              be committed (`check-ignore`), is it tracked already (`ls-files`) — but there is now \
+              ONE site that builds the command, and the count says so. It was three literals \
+              until 19 September, when they were routed through \
+              `git_asked_about_nothing_it_inherited()`: git exports `GIT_DIR` and `GIT_INDEX_FILE` \
+              into everything it runs, so this module asked about whatever repository it was \
+              handed rather than the one it names — an answer about the wrong tree, on the \
+              question of whether a credential is about to be committed. One constructor is also \
+              the easier shape to hold: a second literal `Command::new(\"git\")` here now turns \
+              this guard red, which is the point. The test module builds real repositories through \
+              the same constructor.",
     },
     MayStartAProcess {
         file: "crates/herdr-tg/src/presence.rs",
@@ -1182,14 +1189,18 @@ fn a_tree_that_starts_only_what_it_should() -> tempfile::TempDir {
          std::process::Command::new(\"sh\");\n    let _ = std::process::Stdio::null();\n}\n",
     );
 
-    // Enrolment: three that ship, each with the question it asks git, and two in its own tests.
+    // Enrolment: ONE site that builds the command, asking git its three questions through it, and
+    // a test module that goes through the same constructor. The rig has to wear the shape the real
+    // file wears — it was three literals here until the real one stopped being three, and a rig
+    // that lags reality makes every test that plants a defect in it pass for the wrong reason.
     write_at(
         root,
         "crates/herdr-tg/src/cmd/enroll.rs",
-        "fn ask() {\n    std::process::Command::new(\"git\").args([\"rev-parse\", \
-         \"--show-toplevel\"]);\n    std::process::Command::new(\"git\").args([\"check-ignore\", \
-         \"-q\"]);\n    std::process::Command::new(\"git\").args([\"ls-files\", \
-         \"--error-unmatch\"]);\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
+        "fn git_asked_about_nothing_it_inherited() -> std::process::Command {\n    \
+         std::process::Command::new(\"git\")\n}\n\nfn ask() {\n    \
+         git_asked_about_nothing_it_inherited().args([\"rev-parse\", \"--show-toplevel\"]);\n    \
+         git_asked_about_nothing_it_inherited().args([\"check-ignore\", \"-q\"]);\n    \
+         git_asked_about_nothing_it_inherited().args([\"ls-files\", \"--error-unmatch\"]);\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n        \
          std::process::Command::new(\"git\").args([\"init\", \"-q\"]);\n        \
          std::process::Command::new(\"git\").args([\"commit\", \"-qm\", \"{}\"]);\n    }\n}\n",
     );

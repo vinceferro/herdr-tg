@@ -6,6 +6,10 @@ After=default.target
 # the default start-limit burst would leave the bridge dead with no way back until they reach a
 # keyboard — which is the exact situation the bridge exists to avoid.
 StartLimitIntervalSec=0
+# One plane at a time, and it is a hard fact rather than a preference: both hubs bind the same
+# socket and take the same single-hub lock, so the second to start is refused in milliseconds and
+# leaves a failed unit behind. Said here so systemd stops the other one instead.
+Conflicts=herdr-tg-app.service
 
 [Service]
 Type=simple
@@ -16,7 +20,12 @@ Type=simple
 # substitute: a short wait for the one host it needs, and never a refusal to start — if the name
 # still will not resolve, the binary's own error names it and Restart= does the rest.
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do getent hosts api.telegram.org >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
-ExecStart=%h/.local/bin/herdr-tg serve
+# The plane is named here and nowhere else, so `systemctl --user cat` answers "which way does this
+# box reach him" without anybody opening an environment file. It is a required argument with no
+# default: a hub that worked it out from whether a token happened to be set would quietly become
+# the app plane the day a credential file failed to render, and every agent on the box would talk
+# into a file while he waited for a phone that was never going to ring.
+ExecStart=%h/.local/bin/herdr-tg serve --to telegram
 
 # The credential, and only the credential, comes from here. Written by scripts/setup-token.sh at
 # mode 0600. `-` so a missing file is a clear startup error from the binary ("HERDR_TG_TOKEN is not
@@ -49,7 +58,14 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# Outbound TLS to the Bot API plus a Unix socket. Nothing else.
+# The three families this process needs: IPv4 and IPv6 for the Bot API, and a Unix socket for the
+# agents. Measured under `systemd-run --user` — bare, a netlink socket opens; under this list it is
+# refused — so the refusal is real and not a preference.
+#
+# It says nothing about WHERE those two internet families may go, and the comment here used to read
+# "Nothing else", which a reader takes for both. A family list is not a destination list, and on a
+# user manager there is no destination list to be had: see the note in herdr-tg-app.service for
+# what was measured of `IPAddressDeny=`. What limits this process to one host is the code.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 SystemCallFilter=@system-service

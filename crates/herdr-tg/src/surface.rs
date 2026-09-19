@@ -17,6 +17,8 @@
 //! found` coming back from a send. Matching that string is unlovely and it is the only signal there
 //! is; treating it as a transient would make a project's messages vanish quietly and for good.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use hub_proto::{AskOption, MsgId};
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -495,6 +497,215 @@ fn reaction_for(mark: Mark) -> Vec<ReactionType> {
     vec![ReactionType::Emoji {
         emoji: emoji.to_owned(),
     }]
+}
+
+/// The operator reads the app, and there is no phone line at all.
+///
+/// [`Telegram`] above is a CARRIER: it puts words somewhere a person will see them and hands back
+/// the id of what it put there. This one carries nothing, and it does not have to — the operator's
+/// copy of every question and every line is the ring, which the hub appends to as a frame reaches
+/// its handling, before any surface is asked; his answers come back through the drop beside it.
+///
+/// **So what is left here is bookkeeping, and it SUCCEEDS on purpose.** The hub writes down what a
+/// question's buttons mean only where a surface handed back a receipt: a surface that refused would
+/// put every question on the ring with nothing written down behind it, and nothing at the door
+/// could ever answer one. This plane needed a surface that succeeds, not a hub that changes.
+///
+/// Nothing here is a stub for a carrier that is coming. The two things it mints — a number per
+/// conversation and a receipt per message — are what the hub's own records are keyed on, and they
+/// are minted so that a box which later gains a forum cannot collide with them.
+///
+/// It is what `herdr-tg serve --to app` puts where Telegram stands, and the only surface on that
+/// plane: the hub builds one of these, opens its socket, and never dials anything.
+pub struct TheApp {
+    /// The second this run started, stamped on every receipt it mints.
+    ///
+    /// The receipts have to stay apart across the LEDGER's life, not merely this process's: a
+    /// question written down by one run is still open when the next starts, and the ledger is
+    /// keyed on the receipt, so two runs minting the same one means the second's question
+    /// overwrites the first's and the first can never be answered again.
+    ///
+    /// A counter alone starts over at one every restart. This is what keeps a restart's first
+    /// receipt clear of the last run's without a file of its own to keep a counter in: one flock
+    /// lets one hub hold the box at a time, and the unit waits five seconds before starting the
+    /// next, so the ordinary restart cannot land in the same second. Said plainly because it is
+    /// not a proof: somebody restarting by hand inside one second would repeat, and what that
+    /// costs is the questions that were open when he did it.
+    run_started: u64,
+    /// The next number a new conversation gets, or nothing at all once the range is used up.
+    ///
+    /// Counting DOWN, and negative for a reason that outlives this plane: a forum numbers its
+    /// threads from one upward, so a number from here can never be one of those — it cannot
+    /// collide with a topic a box already has, it is unmistakable in an audit line, and a box
+    /// that later gains a forum cannot bind a real topic on top of one of these.
+    next_topic: std::sync::Mutex<Option<i32>>,
+    /// How many receipts this run has minted.
+    minted: AtomicU64,
+}
+
+/// What every receipt minted here starts with.
+///
+/// Distinct from the phone's ids, which are Telegram's own numbers, and from the door's `d…` and
+/// `w…`: a reader of an audit line or an adapter's log can see which surface a message came from
+/// without being told. It carries no colon, because the ledger's key is the conversation and the
+/// message with a colon between them and every record is found again by splitting it there.
+const A_RECEIPT: &str = "app-";
+
+impl TheApp {
+    /// `run_started` is the second this hub started; `lowest_topic_bound` is the floor read off
+    /// the registry ([`crate::registry::Registry::lowest_topic_bound`]).
+    ///
+    /// The floor is clamped at zero before it is stepped past, so a box whose registry holds a
+    /// real forum's thread numbers — one switched to the app after running on the phone — starts
+    /// at −1 rather than counting down from a positive number and walking through the range a
+    /// forum mints from.
+    pub fn new(run_started: u64, lowest_topic_bound: Option<i32>) -> Self {
+        let floor = lowest_topic_bound.unwrap_or(0).min(0);
+        Self {
+            run_started,
+            // `checked_sub`, so a floor at the very bottom of the range leaves nothing rather
+            // than wrapping round into the numbers a forum gives out.
+            next_topic: std::sync::Mutex::new(floor.checked_sub(1)),
+            minted: AtomicU64::new(0),
+        }
+    }
+
+    /// One receipt, unique for the life of the ledger this run writes into.
+    fn a_receipt(&self) -> MsgId {
+        let n = self.minted.fetch_add(1, Ordering::Relaxed) + 1;
+        MsgId::new(format!("{A_RECEIPT}{}-{n}", self.run_started))
+    }
+}
+
+impl Surface for TheApp {
+    async fn create_topic(&self, title: &str, _icon_color: u8) -> Result<i32, Refused> {
+        // The lock is a `std` one and is never held across an await, so there is no order to get
+        // wrong: what it guards is one read and one write of a single number.
+        let given = {
+            let mut next = self.next_topic.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(given) = *next else {
+                // Fail closed. Wrapping would hand the next conversation a number a forum could
+                // have given, which is the one thing the descent exists to make impossible.
+                return Err(Refused {
+                    why: "this hub has run out of numbers to give new conversations".to_owned(),
+                    flood_wait: None,
+                });
+            };
+            *next = given.checked_sub(1);
+            given
+        };
+        tracing::debug!(
+            title,
+            number = given,
+            "a conversation was given a number of its own; nobody is reading a phone, so there is \
+             no topic to make"
+        );
+        Ok(given)
+    }
+
+    async fn send(
+        &self,
+        _topic_id: i32,
+        _text: &str,
+        _buttons: &[AskOption],
+        _reply_to: Option<&MsgId>,
+    ) -> SendOutcome {
+        // A RECEIPT, and never `Clamped`: nothing here shortened anything. Clamped would tell the
+        // bridge its words were cut when the ring holds every one of them, which is the one thing
+        // a bridge acts on by saying less next time.
+        SendOutcome::Sent(self.a_receipt())
+    }
+
+    async fn say_in_general(&self, text: &str) -> SendOutcome {
+        // `Sent`, not a refusal, and the difference is a loop. The hub says this when the chat is
+        // carrying more than it will take, and it keeps the debt set and retries for ever until
+        // something answers; a no-op that leaks a retry loop is worse than a no-op. There is no
+        // chat and no ceiling here, so this line has nowhere to be and nothing to be about.
+        tracing::debug!(text, "nothing was said about a chat that does not exist");
+        SendOutcome::Sent(self.a_receipt())
+    }
+
+    async fn rewrite(&self, msg_id: &MsgId, _text: &str) -> anyhow::Result<()> {
+        // There is no line to edit, and an error here is not free: at the one site that says what
+        // became of a tap, a failed edit falls through to a real send — which on this plane would
+        // be a second event on the ring saying what the ring's own next line already says.
+        tracing::debug!(message = %msg_id, "nothing was rewritten; the ring carries the follow-up");
+        Ok(())
+    }
+
+    async fn retire_buttons(
+        &self,
+        _topic_id: i32,
+        msg_id: &MsgId,
+        _original: &str,
+        note: &str,
+    ) -> anyhow::Result<()> {
+        // The load-bearing one. Success is the only path on which the hub forgets a question's
+        // record, and the only one on which it writes its own retirement onto the ring. An error
+        // here would leave every answered question standing open in the app for ever, with its
+        // record kept for a keyboard that does not exist to be taken off.
+        tracing::debug!(
+            message = %msg_id, note,
+            "a question stopped being asked; there are no buttons to take off"
+        );
+        Ok(())
+    }
+
+    async fn mark(&self, _chat_id: i64, msg_id: &MsgId, mark: Mark) -> Result<(), Refused> {
+        // At DEBUG, because this is not a path a line typed in the app can reach: the hub returns
+        // before a mark for anything that came in by the door. A warning nobody can act on is a
+        // line a reader learns to skip, and the next real one is skipped with it.
+        tracing::debug!(
+            message = %msg_id, ?mark,
+            "no reaction was put on a message nobody sent from a phone"
+        );
+        Ok(())
+    }
+
+    async fn locate(&self, _file_id: &str) -> Result<Located, Refused> {
+        // Refused rather than answered with something made up. A location invented here would
+        // have the hub open a file at a path it minted and stream nothing into it, and then tell
+        // an agent his picture arrived empty. This ends one fetch, under a deadline the hub
+        // already holds.
+        Err(Refused {
+            why: "there is no messaging app here to ask where his file is".to_owned(),
+            flood_wait: None,
+        })
+    }
+
+    async fn download(
+        &self,
+        _file_path: &str,
+        _into: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+    ) -> Result<(), Refused> {
+        Err(Refused {
+            why: "there is no messaging app here to fetch his file from".to_owned(),
+            flood_wait: None,
+        })
+    }
+
+    async fn send_file(&self, _topic_id: i32, file: &Upload, _caption: &str) -> SendOutcome {
+        // A backstop, and it is meant to be one: [`Surface::the_carrier_can_take_a_file`] is the
+        // seam a caller reads to turn a file away before it has been read off the disk. Until
+        // something reads it, this is what stops a file being called sent when it went nowhere.
+        tracing::debug!(file = %file.filename, "an agent's file reached a surface that carries none");
+        SendOutcome::Refused("files do not reach him in the app".to_owned())
+    }
+
+    fn the_carrier_has_a_ceiling(&self) -> bool {
+        false
+    }
+
+    fn the_carrier_can_take_a_file(&self) -> bool {
+        false
+    }
+
+    fn a_topic_number_this_carrier_could_have_minted(&self, topic_id: i32) -> bool {
+        // Exactly the numbers `create_topic` above hands out. A box switched to the app after
+        // running on the phone has real thread numbers in its registry, and each of those names a
+        // conversation this carrier cannot reach — so it is given one of its own instead.
+        topic_id < 0
+    }
 }
 
 #[cfg(test)]

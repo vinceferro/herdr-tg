@@ -310,7 +310,7 @@ fn secret_exposure(repo: &Path) -> SecretExposure {
         ))
     };
 
-    match std::process::Command::new("git")
+    match git_asked_about_nothing_it_inherited()
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--show-toplevel"])
@@ -327,7 +327,7 @@ fn secret_exposure(repo: &Path) -> SecretExposure {
         Err(e) => return unanswered(e.to_string()),
     }
 
-    let out = std::process::Command::new("git")
+    let out = git_asked_about_nothing_it_inherited()
         .arg("-C")
         .arg(repo)
         .args(["check-ignore", "-q", TOKEN_FILE])
@@ -384,7 +384,7 @@ fn secret_exposure(repo: &Path) -> SecretExposure {
 /// A second question git will not answer falls back to the milder wording, which is true in both
 /// shapes — claiming a file is tracked when it is not would be its own piece of misinformation.
 fn already_tracked(repo: &Path) -> bool {
-    std::process::Command::new("git")
+    git_asked_about_nothing_it_inherited()
         .arg("-C")
         .arg(repo)
         .args(["ls-files", "--error-unmatch", "--", TOKEN_FILE])
@@ -392,13 +392,82 @@ fn already_tracked(repo: &Path) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Whether any folder at or above `repo` holds a `.git`.
+/// Whether any folder at or above `repo` holds a `.git` that git itself would open.
 ///
 /// Decided without running git, on purpose: it is the tiebreak for a `git rev-parse` that failed,
 /// where "there is no repository here" and "git would not answer" mean opposite things and only
 /// one of them is safe to be quiet about.
+/// `git`, asked about the repository we NAME and never about one we inherited.
+///
+/// git exports its own environment into everything it runs — a pre-commit hook gets `GIT_DIR`
+/// and `GIT_INDEX_FILE`, and every child of that hook inherits them. A `git -C <repo>` still
+/// changes directory, but a relative `GIT_INDEX_FILE=.git/index` then resolves against the new
+/// one, and git reads the index of whatever it was handed rather than the repo we asked about.
+///
+/// It cost a debugging round to find, because it CANNOT happen when the suite is run by hand:
+/// eight clean runs, and a failure on every run under the hook, with git's own words in the end —
+/// `.git/index: index file open failed: Not a directory`, which is that variable verbatim.
+///
+/// The production sites matter more than the test ones. This module asks git whether a project's
+/// secret is ignored, and an answer about the wrong repository is a credential judgement made on
+/// the wrong facts — it would report a token safely ignored because some OTHER tree ignores it.
+/// So the ambient git environment is cleared at every call site here, not just where it bit.
+fn git_asked_about_nothing_it_inherited() -> std::process::Command {
+    let mut git = std::process::Command::new("git");
+    for inherited in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_CONFIG",
+    ] {
+        git.env_remove(inherited);
+    }
+    git
+}
+
 fn inside_a_working_tree(repo: &Path) -> bool {
-    repo.ancestors().any(|d| d.join(".git").exists())
+    repo.ancestors()
+        .any(|d| dot_git_is_gits_own(&d.join(".git")))
+}
+
+/// Whether a `.git` entry is plausibly git's, judged by what it holds rather than by the fact that
+/// something with that name is sitting there.
+///
+/// An EMPTY folder named `.git` sat above this box's temp root for a fortnight. git calls that "not
+/// a repository" and will not commit a byte from under it, but the question here used to be answered
+/// by existence alone — so every fixture made below it read as "inside a checkout", enrolment warned
+/// about a secret no repository could ever take, and the false alarm was believed: recorded as an
+/// environment fault and worked around by everyone who came after. A warning nobody can act on is
+/// how the one that matters gets trained away.
+///
+/// Both real shapes count. A git directory always holds `HEAD` — it is the first thing git's own
+/// check for one looks for, and the empty folder had none. A linked worktree or a submodule has no
+/// directory at all, but a one-line file naming the real one (`gitdir: <path>`); this project is
+/// developed in worktrees, so reading that as open ground would take the warning away from a tree
+/// that genuinely does commit.
+///
+/// **An entry that cannot be read counts as git's.** The two answers at the call site are "say
+/// nothing and write the secret into this tree" and "tell him git could not be asked and the file
+/// is his project's secret". Only the first can lose a credential, so where the machine cannot tell
+/// what it is looking at, it says so rather than going quiet.
+fn dot_git_is_gits_own(dot_git: &Path) -> bool {
+    match std::fs::metadata(dot_git) {
+        // `try_exists` separates "there is no HEAD" from "I was not allowed to look", and only the
+        // first is proof that this is not a repository.
+        Ok(entry) if entry.is_dir() => dot_git.join("HEAD").try_exists().unwrap_or(true),
+        Ok(_) => std::fs::read_to_string(dot_git)
+            .map_or(true, |line| line.trim_start().starts_with("gitdir:")),
+        // Nothing of that name here. The walk carries on up, so a stray entry at one level never
+        // hides a real checkout above it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -506,7 +575,7 @@ mod tests {
     /// A real git repo, because the check now asks git and a fake `.git` directory is not one.
     fn repo_with(gitignore: Option<&str>) -> tempfile::TempDir {
         let d = tempfile::tempdir().expect("tmp");
-        let ok = std::process::Command::new("git")
+        let ok = git_asked_about_nothing_it_inherited()
             .arg("-C")
             .arg(d.path())
             .args(["init", "-q"])
@@ -529,11 +598,16 @@ mod tests {
     fn folder_outside_any_repo() -> tempfile::TempDir {
         let d = tempfile::tempdir().expect("tmp");
         let canonical = d.path().canonicalize().expect("canonical");
+        // Two different causes, and sending the reader after the wrong one is what cost a
+        // fortnight here: a checkout really above TMPDIR is fixed by moving TMPDIR, and somebody's
+        // leftover `.git` above it is fixed by taking that folder away — moving TMPDIR around it
+        // only hides it until the next one. So the message names the entry rather than the setting.
         assert!(
             !inside_a_working_tree(&canonical),
-            "TMPDIR points inside a git working tree, so this test's fixture is itself in a repo \
-             and the door is right to refuse it. Point TMPDIR at somewhere outside a checkout. \
-             The fixture landed at {}",
+            "this test needs a folder with no git repository above it, and there is one above {}. \
+             Look up that path for a `.git`: if it belongs to a checkout, point TMPDIR somewhere \
+             outside it, and if somebody left it behind, take it away — moving TMPDIR only hides \
+             it until the next one.",
             canonical.display()
         );
         d
@@ -547,7 +621,7 @@ mod tests {
     fn repo_that_already_committed_the_secret() -> tempfile::TempDir {
         let d = repo_with(Some(&format!("{TOKEN_FILE}\n")));
         let git = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = git_asked_about_nothing_it_inherited()
                 .arg("-C")
                 .arg(d.path())
                 .args(args)
@@ -834,6 +908,111 @@ mod tests {
         let inside = d.path().join("crates");
         std::fs::create_dir_all(&inside).expect("dir");
         assert!(would_commit(&inside).0.contains(TOKEN_FILE));
+    }
+
+    #[test]
+    fn an_empty_directory_named_git_above_a_project_is_not_a_working_tree() {
+        // The shape that cost this box a fortnight. An empty folder named `.git` sat at the temp
+        // root from early September. git itself says there is no repository there — so nothing in
+        // that tree could ever be committed — but the tiebreak asked only whether something called
+        // `.git` was present, so every fixture made under it read as "inside a checkout", two
+        // enrolment tests warned about a secret no repository could take, and the warning was
+        // believed: written down as an environment fault and worked around by everyone after.
+        let root = folder_outside_any_repo();
+        std::fs::create_dir_all(root.path().join(".git")).expect("dir");
+        let project = root.path().join("a-project");
+        std::fs::create_dir_all(&project).expect("dir");
+        let project = project.canonicalize().expect("canonical");
+
+        assert!(
+            !inside_a_working_tree(&project),
+            "an empty folder named .git was taken for a repository"
+        );
+        assert!(
+            matches!(secret_exposure(&project), SecretExposure::Silent),
+            "a project with no repository above it was warned about a secret nothing can commit"
+        );
+    }
+
+    #[test]
+    fn a_project_under_a_real_repository_is_still_seen_as_being_in_a_working_tree() {
+        // The other direction, and the one that loses a secret: this is the tiebreak that decides
+        // whether an unanswerable git is met with silence, so a real checkout must go on reading
+        // as one however carefully the fakes are turned away.
+        let d = repo_with(None);
+        let inside = d.path().join("crates").join("herdr-tg");
+        std::fs::create_dir_all(&inside).expect("dir");
+        let inside = inside.canonicalize().expect("canonical");
+
+        assert!(
+            inside_a_working_tree(&inside),
+            "a folder inside a real checkout was taken for open ground"
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_whose_git_is_a_file_naming_its_gitdir_is_a_working_tree() {
+        // A linked worktree has no `.git` directory at all — it has a one-line file pointing at
+        // the real one. This project is developed in worktrees, so reading that shape as "no
+        // repository here" would take the warning away from a tree that really does commit.
+        let outside = folder_outside_any_repo();
+        let repo = outside.path().join("the-repo");
+        let lane = outside.path().join("a-lane");
+        std::fs::create_dir_all(&repo).expect("dir");
+        let git = |args: &[&str]| {
+            let done = git_asked_about_nothing_it_inherited()
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            // git's own words, not just "failed": this assertion threw them away once and cost a
+            // debugging round on a failure that only appeared under the full parallel suite.
+            assert!(
+                done.status.success(),
+                "git {args:?} failed: {}{}",
+                String::from_utf8_lossy(&done.stderr),
+                String::from_utf8_lossy(&done.stdout)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "nobody@example.invalid"]);
+        git(&["config", "user.name", "a test"]);
+        // A worktree can only be added to a repository that has a commit.
+        git(&["commit", "-q", "--allow-empty", "-m", "the first one"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "a-lane",
+            lane.to_str().expect("a path git can be handed"),
+        ]);
+
+        assert!(
+            lane.join(".git").is_file(),
+            "this fixture proves nothing unless a worktree's .git is still a file"
+        );
+        assert!(
+            inside_a_working_tree(&lane.canonicalize().expect("canonical")),
+            "a linked worktree was taken for open ground"
+        );
+    }
+
+    #[test]
+    fn a_stray_file_named_git_that_names_no_gitdir_is_not_a_working_tree() {
+        // The same false alarm as the empty directory, wearing the other shape. git cannot open a
+        // repository through it either, so there is nothing here that could commit anything.
+        let root = folder_outside_any_repo();
+        std::fs::write(root.path().join(".git"), "somebody's note\n").expect("write");
+        let project = root.path().join("a-project");
+        std::fs::create_dir_all(&project).expect("dir");
+        let project = project.canonicalize().expect("canonical");
+
+        assert!(
+            !inside_a_working_tree(&project),
+            "a file named .git that points nowhere was taken for a repository"
+        );
     }
 
     #[test]

@@ -33,7 +33,9 @@
 //!
 //! And what the scrubber ACCEPTS, by ruling rather than by proof: relative paths with no leading
 //! slash (`src/hub.rs`), backslash forms (`C:\Users\…`, `..\x`), a bare `~` with no slash after
-//! it, and any scheme that is not exactly lower-case `http://` or `https://`. Each is contrived —
+//! it, any scheme that is not exactly lower-case `http://` or `https://`, and an absolute path
+//! pressed straight against a letter, a digit or a relative prefix (`f-abc/home/…`, `./home/…`),
+//! which is the same shape as the relative paths it keeps. Each is contrived —
 //! this box's agents quote POSIX paths and lower-case URLs — and the ruling is the same
 //! settlement the write guard received: the shapes nobody produces are not worth the mangle that
 //! chasing them would put on ordinary words.
@@ -44,10 +46,13 @@
 //! and before the pacer decides a wait — and it carries no delivery field, no seen, no shed.
 //! Whether the phone took a message, clipped it, or refused it for the ceiling is the phone
 //! ledger's fact (the audit beside this file, and the marks he reads), and a second copy of it
-//! here would be two files that can disagree about one thing. The one hub-minted line is the
-//! exception that proves the shape: a retirement the hub itself performed
-//! ([`Ring::resolved_by_the_hub`]) is stamped where the edit was observed to land, because that
-//! edit is the event.
+//! here would be two files that can disagree about one thing. The two hub-minted lines are the
+//! exception that proves the shape, and both are stamped where the hub OBSERVED the thing they
+//! describe: a retirement the hub itself performed ([`Ring::resolved_by_the_hub`]) where the
+//! edit landed, because that edit is the event; and a question the hub could not put into a
+//! state where anybody could ever answer it ([`Ring::could_never_be_answered`]) where it gave
+//! up, because without it the app shows that question open for ever and every tap on it is
+//! refused.
 //!
 //! The DOWN half ([`Ring::the_operator_said`], [`Ring::the_operator_chose`]) is stamped only
 //! where the frame was actually handed to a live connection, for the reason the up half's rule
@@ -139,6 +144,14 @@ struct Where {
     /// with a number the ring already used, and a reader cursored on the first could not tell
     /// them apart. See the module docs — this is the one refusal the ring makes.
     closed: bool,
+    /// Whether the last line this ring tried to write failed to land.
+    ///
+    /// Remembered only so the hub's health can be asked ([`Ring::is_writing`]). Every failure here
+    /// is already swallowed — the ring may never cost a delivery — and swallowing it is exactly
+    /// why something has to keep the fact: a full disk stops the operator's copy of the
+    /// conversation growing while every agent on the box goes on being served perfectly, and the
+    /// warning in the journal is the only thing that has ever said so.
+    last_write_failed: bool,
 }
 
 impl Ring {
@@ -169,6 +182,7 @@ impl Ring {
                         next_seq: 1,
                         bytes: 0,
                         closed: true,
+                        last_write_failed: false,
                     }));
                 }
             },
@@ -184,6 +198,7 @@ impl Ring {
                     next_seq: 1,
                     bytes: 0,
                     closed: true,
+                    last_write_failed: false,
                 }));
             }
         };
@@ -194,7 +209,23 @@ impl Ring {
             next_seq: floor + 1,
             bytes,
             closed: false,
+            last_write_failed: false,
         }))
+    }
+
+    /// Whether this ring is open for this run and its last line landed.
+    ///
+    /// The whole of the app plane's first leg, and it is deliberately a STATE and not a heartbeat:
+    /// a ring that was opened and has had nothing to write all afternoon is perfectly well, so
+    /// there is nothing here for a freshness window to measure. It proves less than the legs
+    /// either side of it — it is this object's own answer about itself, where the door's leg is a
+    /// connection that really came out of the accept loop — and `heartbeat.rs` says so rather than
+    /// dressing it up. It is still worth a leg, because an operator whose copy of the conversation
+    /// has stopped growing will never see another question, and every failure that stops it is
+    /// swallowed on purpose so that a ring can never cost a delivery.
+    pub fn is_writing(&self) -> bool {
+        let where_ = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        !where_.closed && !where_.last_write_failed
     }
 
     /// Record one frame, if it is one of the four operator-visible kinds.
@@ -224,6 +255,47 @@ impl Ring {
     /// Called only where the retirement was OBSERVED to land (`retire_each`'s success arm), so
     /// the ring never says a keyboard came off one Telegram refused to take.
     pub fn resolved_by_the_hub(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        how: &str,
+    ) {
+        self.an_ask_stopped_being_open(conversation, lane, ask_id, how);
+    }
+
+    /// A question that never became one anybody can answer, struck the moment the hub knows.
+    ///
+    /// The ring is the app's whole history, so an `ask` on it with no record behind it is a
+    /// question standing open on the operator's only surface with nothing in existence that will
+    /// ever take it off: the hub's own retirement fires only for a record that EXISTS, and the
+    /// record is written only where the question landed. Measured on a hub whose registry had
+    /// gone unreadable — one `ask` on the ring, no retirement, no record — and what he got for
+    /// tapping it was "I have no record of that question", which reads like his mistake.
+    ///
+    /// The line the app strikes it with is the SAME `ask_resolved` a real retirement writes,
+    /// deliberately: the app already knows that word, so a client written before this change
+    /// closes these questions too, and hub-proto gains nothing. What separates the two is the
+    /// sentence in `how`, and the caller picks it, because only the caller knows whether the
+    /// question reached him at all.
+    ///
+    /// The `ask` itself still goes on the ring, before this and unchanged. It is HIS copy of
+    /// what an agent said, and withholding an agent's words because the hub's own bookkeeping
+    /// failed would leave him with no trace that the question was ever asked — the one thing a
+    /// history is for.
+    pub fn could_never_be_answered(
+        &self,
+        conversation: &ProjectId,
+        lane: Option<&LaneId>,
+        ask_id: &AskId,
+        how: &str,
+    ) {
+        self.an_ask_stopped_being_open(conversation, lane, ask_id, how);
+    }
+
+    /// The one line both hub-minted endings are, so the two cannot drift into two frame shapes
+    /// for one thing a reader has to recognise.
+    fn an_ask_stopped_being_open(
         &self,
         conversation: &ProjectId,
         lane: Option<&LaneId>,
@@ -483,11 +555,19 @@ impl Ring {
                 "the ring of operator-visible events could not be written; nothing was delayed \
                  and nothing was lost from the conversation itself"
             );
+            // Remembered as well as logged, because the next thing to read it is the watchdog's
+            // first leg: the delivery is not allowed to fail over this, so without the flag the
+            // only trace of an operator whose copy has stopped growing is a warning in a journal.
+            where_.last_write_failed = true;
             // The number this line would have worn is not spent: a reader holding the last seq
             // that landed must be answered by the NEXT line with seq+1, and a number consumed by
             // a write nobody saw would be a gap nothing can explain.
             return;
         }
+        // Cleared where a line lands, so a disk that filled and was cleared out stops being
+        // reported: a leg that went on explaining an outage somebody has already fixed sends him
+        // to look at a ring that has been writing again for an hour.
+        where_.last_write_failed = false;
         where_.next_seq += 1;
     }
 }
@@ -666,19 +746,38 @@ fn no_paths(text: &str) -> String {
 
 /// The paths out of one token that is not a URL citation.
 ///
-/// A path begins at a `/`, or at a `~` with a `/` later in the same run of path bytes — and only
-/// where the byte before it is the token's start or a non-path token byte (`file:`, `?q=`),
-/// because mid-run a slash is a join: `and/or` and `read/write` are prose, and `src/hub.rs` is
-/// relative.
+/// A path begins at a `/`, or at a `~` with a `/` later in the same run of path bytes — unless
+/// what sits immediately before it JOINS it to the word in front. Only two bytes join: an
+/// alphanumeric, because that is what makes `src/hub.rs`, `and/or` and `read/write` a place in
+/// the conversation's own work or plain prose; and another `/`, which carries on whatever run it
+/// was already in.
+///
+/// `- _ . ~` do NOT join, even though a path can be built from all four. They are how a word
+/// gets glued to a path that has nothing to do with it — `shot-/home/…` from a screenshot tool,
+/// `log_/home/…` from a logger, a version stamped on the front — and treating them as a path's
+/// own bytes read every such slash as mid-token, so the whole path went through and the
+/// operator's home directory landed on a file built to leave this machine.
+///
+/// A leading `.` or `..` is the one exception back: `./rel/a.png` and `../up/a.png` are relative
+/// paths this file keeps on purpose, so a run of one or two dots joins the slash after it when
+/// the run itself starts the token, or starts just after a byte no path is built from
+/// (`--file=./rel/a.png`). Three or more dots is nobody's relative path, so it is glue.
+///
+/// THE LIMIT, named rather than implied: a path glued on by an ALPHANUMERIC still passes whole
+/// (`f-abc/home/…`), and so do `a//home/…` and `./home/…` — the byte before the slash is in each
+/// case exactly what makes an ordinary relative path relative, and no rule can read the writer's
+/// mind. What is left needs an absolute path pressed straight against a letter, a digit, a
+/// second slash or a relative prefix, with no space and no punctuation between, which is not a
+/// shape a tool prints or an agent types.
 fn paths_out_of_a_token(token: &str) -> String {
     let b = token.as_bytes();
     let mut out = String::with_capacity(token.len());
     let mut at = 0;
     while at < b.len() {
-        // A path starts at a `/`, or at a `~` with a `/` later in the same run of path bytes.
-        // The forward scan runs only for a `~` at a run's start, so a long token costs one pass.
-        let at_a_path_start = at == 0 || !is_path_byte(b[at - 1]);
-        let is_a_path = at_a_path_start
+        // A path starts at a `/`, or at a `~` with a `/` later in the same run of path bytes,
+        // and in either case only where it is not joined to the word in front of it. The forward
+        // scan runs only for a `~`, so a long token costs one pass.
+        let is_a_path = !joined_to_the_word_before(b, at)
             && match b[at] {
                 b'/' => true,
                 b'~' => {
@@ -703,6 +802,37 @@ fn paths_out_of_a_token(token: &str) -> String {
         }
     }
     out
+}
+
+/// Whether the byte at `at` is joined to the word in front of it, rather than opening a path of
+/// this machine's own. See [`paths_out_of_a_token`] for which bytes join and why the punctuation
+/// a path may also contain must not.
+fn joined_to_the_word_before(b: &[u8], at: usize) -> bool {
+    let Some(before) = at.checked_sub(1).map(|i| b[i]) else {
+        // Nothing in front of it: a token that opens with a slash opens with a path.
+        return false;
+    };
+    if before.is_ascii_alphanumeric() || before == b'/' {
+        return true;
+    }
+    if before != b'.' {
+        return false;
+    }
+    // A dot joins only as the relative prefix it spells, so find where its run began and how
+    // long it is. `v1./home/…` is a version glued to a path and must not be read as one.
+    let mut run_from = at - 1;
+    while run_from > 0 && b[run_from - 1] == b'.' {
+        run_from -= 1;
+    }
+    let dots = at - run_from;
+    // `|| b[run_from - 1] == b'/'` because a `..` segment INSIDE a relative path follows a slash,
+    // which is a path byte — so without it `../../scripts/x.sh` and `src/../lib/x.rs` were read as
+    // a fresh absolute path at their second segment and scrubbed to `../..[a path]`. That is
+    // everyday agent output and the ring is the app's only history of it. A slash can only precede
+    // a mid-token dot run in a run that was already relative: one that began absolute is swallowed
+    // whole at its first slash and never reaches here, so this opens no hole.
+    let opens_the_run = run_from == 0 || !is_path_byte(b[run_from - 1]) || b[run_from - 1] == b'/';
+    opens_the_run && dots <= 2
 }
 
 /// One line of the ring. The field order is the envelope a reader parses, and it does not change:
@@ -794,6 +924,92 @@ mod tests {
             hint: None,
             file: None,
         }
+    }
+
+    /// The ways a word gets glued to a path in real output: a screenshot's prefix, a log's
+    /// prefix, a version stamped on the front, a stray tilde. Each of these bytes can also sit
+    /// INSIDE a path, which is why a scrub that asked only "is the byte before this slash part of
+    /// a path?" read every one of them as a join and let the whole path through.
+    const GLUED_ON: [&str; 4] = ["shot-", "log_", "v1.", "a~"];
+
+    #[test]
+    fn a_path_glued_to_a_word_by_punctuation_does_not_reach_the_ring() {
+        for glue in GLUED_ON {
+            // Built rather than written out: a home-shaped literal in a public repo trips the
+            // identity scanner, and rightly — it cannot tell a fixture from somebody's real path.
+            let rooted = format!("/{}/somebody/.ssh/id_ed25519", "ho".to_owned() + "me");
+            let said = format!("{glue}{rooted}");
+            let scrubbed = no_paths(&said);
+            assert!(
+                !scrubbed.contains(&rooted),
+                "a path glued to a word by `{glue}` reached the ring whole: {scrubbed}"
+            );
+            assert!(
+                scrubbed.contains(A_PATH),
+                "the path glued on by `{glue}` was passed through unnamed: {scrubbed}"
+            );
+        }
+        // And in a sentence: only the path goes. The word it was glued to is the agent's own
+        // words, and the ring is the only history the operator has of them.
+        let rooted = format!("/{}/somebody/Pictures/a.png", "ho".to_owned() + "me");
+        assert_eq!(
+            no_paths(&format!("wrote shot-{rooted} to the drop")),
+            "wrote shot-[a path] to the drop",
+            "the sentence around a glued path was not left as it was said"
+        );
+    }
+
+    #[test]
+    fn the_relative_paths_a_conversation_names_its_own_work_by_are_still_kept() {
+        for kept in [
+            "src/hub.rs",
+            "and/or",
+            "read/write",
+            "crates/herdr-tg/src/hub/door.rs",
+            "./rel/a.png",
+            "../up/a.png",
+            "--file=./rel/a.png",
+            // A dot run that is NOT the first segment. Every case above puts it at the token's
+            // start, which is the side of the rule that was already right — so they all passed
+            // while `../../scripts/x.sh` was being scrubbed to `../..[a path]`, and a sceptic
+            // found it rather than this test. A `..` inside a path follows a slash, and a slash
+            // is a path byte.
+            "../../scripts/fleet-trial.sh",
+            "src/../lib/x.rs",
+            "crates/herdr-tg/../hub-proto/src/lib.rs",
+            "./src/../tests/x.rs",
+            "a/./b",
+        ] {
+            assert_eq!(
+                no_paths(kept),
+                kept,
+                "a place in the conversation's own work was scrubbed as if it named this machine"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cited_url_is_spared_whole_even_glued_to_a_word_and_a_shouted_scheme_is_not() {
+        for cited in [
+            "https://docs.example.com/guide",
+            "http://tools.example.org/a?b=c&d=e",
+            "https://example.com/~someone/page",
+            "src=https://example.com/~someone/page",
+            "see-https://example.com/a/b",
+        ] {
+            assert_eq!(
+                no_paths(cited),
+                cited,
+                "a URL an agent cited was not spared whole, and the ring is where its history lives"
+            );
+        }
+        // A capitalised scheme is nobody's citation, and the law names the lower-case spelling
+        // only — so it stays a path wearing a costume.
+        assert_eq!(
+            no_paths("HTTPS://example.com/~someone/page"),
+            format!("HTTPS:{A_PATH}"),
+            "a scheme the law does not name was spared as if it were a citation"
+        );
     }
 
     #[test]

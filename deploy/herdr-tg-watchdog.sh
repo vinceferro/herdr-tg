@@ -13,23 +13,59 @@
 #   * Never put it on a tmpfs. A reboot would empty it and disarm the alarm permanently.
 #   * Stamp only when the work loop is alive. A process that stamps from a timer while its
 #     dispatcher is wedged is a hub that is dead to the operator and healthy to this script.
-#   * Withhold the stamp when ANY of the three legs of the control plane has stopped working — the
-#     phone line out to Telegram, the line Telegram sends his taps back down, and the door agents
-#     arrive at. "get_me answered" is a third of this product: a hub whose socket never opened
-#     answers it every forty-five seconds while every agent on the box talks to nobody, and a hub
-#     whose long poll is being held by a second copy of the bot answers it just as cheerfully while
-#     every tap the operator makes is delivered to the other copy and dies there. Withholding is the
-#     only signal this script can hear, so it is the one used.
+#   * Withhold the stamp when ANY of the three legs of the control plane has stopped working — what
+#     carries an agent's words to him, the door agents arrive at, and what carries his own words
+#     back to an agent. "get_me answered" is a third of this product: a hub whose socket never
+#     opened answers it every forty-five seconds while every agent on the box talks to nobody, and a
+#     hub whose long poll is being held by a second copy of the bot answers it just as cheerfully
+#     while every tap the operator makes is delivered to the other copy and dies there. Withholding
+#     is the only signal this script can hear, so it is the one used.
+#
+# TWO PLANES, and both of them stamp. A hub reaches him either through a messaging app or through
+# the app he reads on his phone, and it holds three legs either way: on the phone line they are the
+# line out to Telegram, the door, and the stream his taps come back down; in the app they are what
+# agents say being written down for it to read, the same door, and the sweep of the place his
+# answers arrive. An app hub has no phone line and must still EARN a stamp, because this script arms
+# on the note as well as on the stamp — see the arming block below — so a plane that never stamped
+# would alarm every minute, for ever, on a box where nothing is wrong. That is not a quieter failure
+# than a missed alarm; it teaches him to ignore the one message that has to be trusted.
 #
 # WHICH LEG, and why it is a second file. The stamp's modification time cannot say which leg went
 # quiet, and the operator's next move differs — a dead phone line is a machine to go and look at, a
 # dead door or a held update line is a hub to restart while the phone in his hand keeps working and
 # tells him nothing is wrong. So the hub also writes $STATE_DIR/hub.health on EVERY tick, green or
-# not: a word, then one plain sentence for the phone line, one for the agents' door, and one for the
-# update line. This script reads it ONLY to attribute an alarm it has already decided to raise, never
-# to decide whether to raise one — a hub sick enough to be withholding its stamp is exactly the hub
-# whose account of itself must not be allowed to overrule the stamp. A hub that writes no note at all
-# still alarms, exactly as before, and so does one whose note this script is too old to understand.
+# not: a word, then one plain sentence per leg, in the order above. This script reads it ONLY to
+# attribute an alarm it has already decided to raise, never to decide whether to raise one — a hub
+# sick enough to be withholding its stamp is exactly the hub whose account of itself must not be
+# allowed to overrule the stamp. A hub that writes no note at all still alarms, exactly as before,
+# and so does one whose note this script is too old to understand. Which plane the note came from is
+# read off the note's own sentences, and nothing else: the first line is either a phone line's or an
+# app copy's, and the two sets of words share nothing.
+#
+# THE SECOND PROCESS, and the one fact here that is not a file. Every leg of the hub's stamp on the
+# app plane is the hub watching itself: it writes the ring, it accepts at the agents' door, it lists
+# the place his answers land. The whole of the distance between the operator and those three files
+# is a DIFFERENT program — kickoff-door, its own unit, its own binary, its own port, its own
+# credential — and the hub cannot witness it without becoming a thing that dials a port, which is
+# the one thing it is designed never to be. So on 19 September `serve --to app` was started on a box
+# with no kickoff-door binary anywhere: it stamped this file within a minute, with all three legs
+# green, and an armed watchdog said nothing at all, for ever, while the app the operator holds was
+# dark. That is this system's oldest failure — something answering its own liveness check while
+# every real path through it is dead — recurring exactly one process boundary further out.
+#
+# So the door's own unit is asked about on every check. It is ASKED and never told: is-enabled, then
+# the state, and nothing that starts, stops or restarts anything — the same line this script keeps
+# with the hub, which it reports and never fixes. Two rules keep it from crying wolf. It is watched
+# only where the operator ENABLED it, because his own `systemctl --user enable` is the declaration
+# that he depends on it and a box that never had a door is not a box with a broken one. And it is
+# watched only once this script is armed on a hub, because a door with no hub to serve is a machine
+# mid-setup rather than an outage. Where there is no user manager to ask, nothing is claimed.
+#
+# WHAT THE DOOR'S UNIT STILL DOES NOT PROVE, written down rather than implied like every other limit
+# here: that a door which is RUNNING is serving. A wedged accept loop, a door refusing every write
+# because the token was rotated out from under it, a bridge that cannot reach the port — all three
+# read `running`. This fact is the difference between "it is dead" and "nobody knows", never between
+# "it is dead" and "it is well".
 #
 # WHAT IT WILL NOT DO. It never infers that silence is fine. A clean stop still buzzes: this repo's
 # whole failure history is things going quiet in a way that looked healthy, so the watchdog fails
@@ -38,6 +74,17 @@
 # WHAT IT CANNOT DO, written down rather than implied. It runs in the same user manager, under the
 # same uid, on the same box as the hub. A dead box, a dead systemd, or a dead network takes both.
 # The only alarm that survives those is kickoff's, which carries its own token and its own curl.
+#
+# AND ITS ONE CARRIER IS A BOT TOKEN. Everything below decides, words and throttles an alarm; the
+# only way it ever leaves this machine is sendMessage. On a box whose plane is the app there is no
+# token to find — the hub's own unit deliberately reads no credential file — so `send` says FAILED
+# in the journal and this script exits non-zero, which puts the unit in `failed` and fires whatever
+# OnFailure= is wired to. That is the whole of what an app box gets, and it is said here rather than
+# discovered: the decision, the wording and the throttle are all still right, and a person watching
+# `systemctl --user --failed` or a desktop notification is the one who finds out. Giving this script
+# a second carrier is a change with its own credential, its own failure modes and its own reasons to
+# be got right, and inventing one quietly in the same edit as the plane is how the alarm nobody
+# tested becomes the alarm nobody hears.
 
 set -uo pipefail
 
@@ -51,8 +98,18 @@ LATCH="$STATE_DIR/watchdog.latch"
 # door's half-hourly repeat swallow the first alarm of the phone line going down twenty minutes
 # later — the one message that has no second chance.
 LEGS="$STATE_DIR/watchdog.legs"
+# When the door was last seen down, so that ONE sample of it being up cannot wipe the two files
+# above. The third of the same shape on this page: the stamp gets hysteresis, a flapping leg is
+# remembered as a set rather than compared with the last one, and a door needs both because a
+# single boolean sample of a unit carries no margin at all to be comfortable about.
+DOORWENT="$STATE_DIR/watchdog.door"
 TICK="$STATE_DIR/watchdog.tick"
 ENV_FILE="${HERDR_TG_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-tg/env}"
+# The program the operator's app reaches this machine through. Named here because it is the one
+# thing this script watches that the hub cannot see at all; watched only if he enabled it. The
+# program is reached through PATH and never through a variable — this unit pins PATH to /usr/bin:/bin
+# for the same reason it holds a bot token, and a setting naming a program would put that back.
+DOOR_UNIT="${HERDR_TG_DOOR_UNIT:-kickoff-door.service}"
 STALE_AFTER="${HERDR_TG_STALE_AFTER:-180}"      # seconds without a stamp before the hub counts as dead
 REALARM_EVERY="${HERDR_TG_REALARM_EVERY:-30}"   # further stale checks between repeat alarms
 # Two of the hub's own forty-five-second ticks (`bot::WATCHDOG_TICK`, the constant this is derived
@@ -161,6 +218,36 @@ send() {
   return 1
 }
 
+# ── the door the operator's app reaches this machine through ─────────────────
+# Three answers. `unwatched` is the one that claims nothing — no user manager to ask, a unit he
+# never enabled, a unit he masked — and it is what every box that does not run a door gets, so
+# nothing here can alarm about a door that was never part of the machine.
+#
+# `active` alone is NOT enough and this is the subtlety the whole check turns on: kickoff-door.service
+# sets Restart=always with no start limit, on purpose, so a door crash-looping on a binary that is
+# not there sits in `activating (auto-restart)` for ever and never once reaches `failed`. A missing
+# binary after a partial install is precisely the shape this was written for, and `is-failed` would
+# have called it healthy for the life of the box.
+#
+# Both properties are read by NAME out of one `show`, rather than by the order they come back in: a
+# pair read positionally is a pair that starts reporting the substate as the state the day systemd
+# reorders its output, and the two words are drawn from overlapping vocabularies.
+the_door_unit_is() {
+  local enabled="" props="" state="" sub=""
+  command -v systemctl >/dev/null 2>&1 || { printf unwatched; return; }
+  enabled="$(systemctl --user is-enabled "$DOOR_UNIT" 2>/dev/null)"
+  case "$enabled" in
+    enabled|enabled-runtime|linked|linked-runtime|static) ;;
+    *) printf unwatched; return ;;
+  esac
+  props="$(systemctl --user show -p ActiveState -p SubState "$DOOR_UNIT" 2>/dev/null)"
+  state="$(printf '%s\n' "$props" | sed -n 's/^ActiveState=//p' | head -n1)"
+  sub="$(printf '%s\n' "$props" | sed -n 's/^SubState=//p' | head -n1)"
+  # Anything this script could not read is `stopped`, not `unwatched`: he has told the machine he
+  # depends on this door, and "I asked and could not tell" is a reason to speak, not to go quiet.
+  if [ "$state" = active ] && [ "$sub" = running ]; then printf serving; else printf stopped; fi
+}
+
 # "4 hours 12 minutes", not "252". The one message that has to be trusted should not make the
 # operator do arithmetic at 3am.
 human_age() {
@@ -192,6 +279,13 @@ alarm_text() {
   # at all, and the hub says so in its own sentence just above), but it is much the likeliest and the
   # only one he can check in ten seconds. "Either way" is there because the fix is the same for both.
   local SECOND="This is the watchdog, not the bot — it can tell you, it cannot fix it. The likeliest cause is a second copy of this bot taking your taps; restarting herdr-tg is the usual fix either way."
+  # The app's own closing. "Not the bot" would name something that does not exist on a box whose
+  # hub holds no credential and dials no messaging service, and a second copy of it is not a cause
+  # to point at either: one hub lock and one socket mean the second copy never starts at all.
+  local APP_RESTART="This is the watchdog, not the hub — it can tell you, it cannot fix it. Restarting the hub is the usual fix."
+  # The door's own closing, and it names a different program on purpose: restarting the hub here
+  # fixes nothing and costs him every agent on the box a reconnect for a fault the hub does not have.
+  local DOOR_RESTART="This is the watchdog, not the hub — it can tell you, it cannot fix it. Restarting kickoff-door is the usual fix; the hub itself needs nothing."
   case "$shape" in
     door)
       head="$(hostname): the herd's phone line is up, but agents cannot reach it."
@@ -221,6 +315,43 @@ alarm_text() {
       head="$(hostname): the herd's phone line is down."
       body="Nothing you send reaches an agent, and nothing an agent says reaches you."
       close="$SILENT" ;;
+    # ── the app's seven, in the same order and for the same reason: written out whole, so that
+    # every sentence he can receive is readable here without running the script in your head.
+    app-ring)
+      head="$(hostname): the herd is running, but nothing it says is reaching your app."
+      body="Agents can still reach this machine, and the answers you have already given still get back to them. Nothing new they say is being written down for your app, so you will not see any of it."
+      close="$APP_RESTART" ;;
+    app-sweep)
+      head="$(hostname): the herd is running, but nothing you tap is reaching an agent."
+      body="Agents can still reach this machine and what they say still reaches your app. Your taps and typed lines are not being collected, so they are going nowhere, in silence."
+      close="$APP_RESTART" ;;
+    app-door)
+      head="$(hostname): agents cannot reach the herd."
+      body="No agent can ask you anything, and nothing you tap reaches an agent."
+      close="$APP_RESTART" ;;
+    app-ring+sweep)
+      head="$(hostname): agents can reach the herd, and nothing is getting through to you or back from you."
+      body="Agents are still connecting to this machine. Nothing they say is reaching your app, and nothing you tap is reaching them."
+      close="$APP_RESTART" ;;
+    app-ring+door)
+      head="$(hostname): agents cannot reach the herd, and nothing it says is reaching your app either."
+      body="Nothing you send reaches an agent, and nothing an agent says reaches you."
+      close="$APP_RESTART" ;;
+    app-door+sweep)
+      head="$(hostname): agents cannot reach the herd, and nothing you tap is reaching one either."
+      body="Nothing you send reaches an agent, and nothing an agent says reaches you."
+      close="$APP_RESTART" ;;
+    app-all)
+      head="$(hostname): nothing between you and the agents on this machine is working."
+      body="Nothing about the control plane is working."
+      close="$APP_RESTART" ;;
+    # The one shape the hub's own stamp can never be evidence about, which is why it is the only
+    # shape here reached while that stamp is perfectly fresh. It says so out loud: a man who has
+    # just checked the hub and found it healthy needs to be told that is not the question.
+    app-door-process)
+      head="$(hostname): the herd is running, but the door your app reaches it through has stopped."
+      body="Agents are still working and the hub is still answering for itself. Nothing it says is reaching your app and nothing you tap there is reaching an agent. The hub cannot see this and will go on looking perfectly healthy for as long as it lasts, which is why you are hearing it from something else."
+      close="$DOOR_RESTART" ;;
     *)
       head="$(hostname): the herd has gone quiet, and it is not saying which part stopped."
       body="Nothing you send reaches an agent, and nothing an agent says reaches you."
@@ -296,16 +427,94 @@ else
   exit 0                               # never armed: today's state, and it must stay silent
 fi
 
+# ── the door the app reads this machine through ──────────────────────────────
+# Asked here, past the disarm and past the resume window and inside the arming that every other
+# judgement is inside, but BEFORE the stamp is judged — because this is the one fact on this page
+# that a fresh stamp is not evidence about. A hub with a dead door stamps a green file every
+# forty-five seconds; see the header.
+door="$(the_door_unit_is)"
+door_says=
+[ "$door" = stopped ] && door_says="And the door your app reaches this machine through has stopped as well."
+
+# How long the door has been up EVERY time this script has looked, which is not the same question as
+# whether it is up right now — and the throttle below depends on the difference. kickoff-door.service
+# sets Restart=always with RestartSec=5 and no start limit, deliberately, so a door that binds and
+# dies tens of seconds later (a token rotated out from under it, a panic on a request, an OOM) is
+# `running` when half the checks look and `dead` when the other half do. Reading the instant alone
+# cleared the latch and the record of what had been told on every up-sample, and the next check that
+# caught it down started the repeat interval from zero: six alarms in twelve checks, measured on this
+# script, against one in ten for a door that simply stayed down.
+#
+# So the door is given the same margin the stamp has: it counts as recovered only once it has been
+# up on every check across half the staleness window, which is more than one check apart at any
+# sane timer interval. A clock that moved backwards reads as "seen down just now" rather than as a
+# long recovery — the quiet way to be wrong here, because the set of halves already told still
+# starts the throttle again the moment a DIFFERENT shape appears.
+door_up_for=$(( STALE_AFTER * 2 ))   # nothing remembered: this door has never been seen down here
+door_went=
+# No `|| door_went=` on the read, unlike the tick file above, and the difference is deliberate: a
+# `read` that hits end of file without a newline returns non-zero having set the variable anyway,
+# and the tick file resets to a value that gives the hub MORE room while this one would reset to
+# "never seen down", which is the noisy answer. The validation below is what rejects a torn file.
+[ -r "$DOORWENT" ] && read -r door_went < "$DOORWENT" 2>/dev/null
+case "$door_went" in
+  ''|*[!0-9]*) ;;                    # nothing readable is "never seen down", as it was before this
+  *) door_up_for=$(( now - door_went )); [ "$door_up_for" -lt 0 ] && door_up_for=0 ;;
+esac
+if [ "$door" = stopped ]; then
+  door_up_for=0
+  # Written on every check that finds it down, including a --dry-run: the tick file beside it is
+  # written the same way, and a dry run that decided differently from the real check it is there to
+  # preview would be worse than the side effect.
+  printf '%s\n' "$now" > "$DOORWENT" 2>/dev/null
+fi
+
 if [ "$gone" = no ]; then
   # Hysteresis: clear the latch only on a comfortably fresh stamp. A hub whose cadence sits right
   # at STALE_AFTER would otherwise flap fresh/stale and alarm on every other check, throttle and
   # all — the latch would be reset each time it was about to do its job.
-  if [ "$age" -lt "$(( STALE_AFTER / 2 ))" ]; then
-    rm -f "$LATCH" "$LEGS"
+  #
+  # And only while nothing ELSE is wrong. A stopped door is an outage in progress, and clearing the
+  # record of what has already been told in the middle of one is how a half-hourly repeat becomes
+  # one message a minute.
+  #
+  # `door_up_for` rather than `door` alone, for exactly the reason the stamp is held to half the
+  # window rather than to the whole of it: a door caught up on one check is a door that may have
+  # been down on the last one and down again on the next. Both conditions are spelt out, because
+  # with a one-second STALE_AFTER the window is zero and the age test alone would pass while the
+  # door was down.
+  if [ "$age" -lt "$(( STALE_AFTER / 2 ))" ] && [ "$door" != stopped ]; then
+    # The door's margin clears the DOOR's shape and nothing else. Gating the whole record on it
+    # was worse than the flap it was written for: while a door swung, no leg's record ever
+    # cleared, so a hub outage that had recovered and come back was matched against a set that
+    # still held it and went unsaid for a whole repeat interval — measured at five checks, and it
+    # is the "cleared with the latch, so a recovery starts the next outage with nothing told"
+    # promise two screens down quietly stopping being true. A leg that recovered is news again
+    # whatever the door is doing; the door's own shape is the only one a single up-sample cannot
+    # vouch for.
+    kept=
+    if [ "$door_up_for" -lt "$(( STALE_AFTER / 2 ))" ]; then
+      told_now=
+      [ -r "$LEGS" ] && told_now="$(tr -d '\000-\037\177' < "$LEGS" 2>/dev/null | cut -c1-160)"
+      case " $told_now " in *' app-door-process '*) kept='app-door-process' ;; esac
+    fi
+    if [ -n "$kept" ]; then
+      # The latch stays with it: the door's repeat interval is the one thing still running.
+      printf '%s\n' "$kept" > "$LEGS" 2>/dev/null
+    else
+      rm -f "$LATCH" "$LEGS"
+    fi
     exit 0
   fi
-  [ "$age" -lt "$STALE_AFTER" ] && exit 0
-  when="$(human_age "$age")"
+  if [ "$age" -lt "$STALE_AFTER" ]; then
+    [ "$door" != stopped ] && exit 0
+    # The hub is stamping normally and the SECOND process is the one that stopped. "Last sign of
+    # life" is still answered honestly — there is nothing wrong with the hub's signs of life, and
+    # saying so is the fact that tells him where NOT to look.
+    when="the hub itself is stamping normally; it is the door that stopped"
+  else
+    when="$(human_age "$age")"
+  fi
 elif [ "$gone" = never ]; then
   # NOT "the hub has never once served". There is no stamp here and a hub is writing its note, which
   # is the same picture whether it never earned one or somebody removed the one it had — a tidied
@@ -319,7 +528,7 @@ fi
 # ── which half went quiet ────────────────────────────────────────────────────
 # The stamp is withheld when either half stops working, so by here we know something is wrong and
 # not which thing. This is the only place the note is read, and it changes nothing but the wording.
-shape=unclear; hub_says=
+shape=unclear; hub_says=; plane=unknown
 if [ -r "$NOTE" ]; then
   note_at=$(stat -c %Y "$NOTE" 2>/dev/null) || note_at=0
   note_age=$(( now - note_at ))
@@ -331,11 +540,19 @@ if [ -r "$NOTE" ]; then
     # another process's text to Telegram, and it must not become a way to put arbitrary bytes there.
     said_phone="$(sed -n 2p "$NOTE" 2>/dev/null | tr -d '\000-\037\177' | cut -c1-160)"
     said_door="$(sed -n 3p "$NOTE" 2>/dev/null | tr -d '\000-\037\177' | cut -c1-160)"
+    # The SAME two lines, read a second time as the app's own halves. Line 2 is his phone line on
+    # one plane and the app's copy of what agents say on the other; line 3 is the agents' door
+    # either way and is read once. Two readings of one line rather than one block that knows both
+    # sets of words, because which of the two recognises it is how this script works out which
+    # plane the hub is on — and because the pairs (hub sentence, script pattern) are held together
+    # one half at a time by crates/herdr-tg/tests/the_heartbeat_is_earned_not_scheduled.rs.
+    said_ring="$said_phone"
     # Line 4 is the update line's, and it is APPENDED rather than inserted for a reason that cuts
     # both ways: this script is copied into place at install time, so an installed watchdog older
     # than the hub reads lines 2 and 3 and is simply unaffected, while this one reads a three-line
     # note from an older hub as "it says nothing about the update line" — never as a fault.
     said_updates="$(sed -n 4p "$NOTE" 2>/dev/null | tr -d '\000-\037\177' | cut -c1-160)"
+    said_sweep="$said_updates"
     # THE SENTENCES THE HUB CAN WRITE, in this script's own words because it shares no code with the
     # hub — and pinned to the hub's, both ways, by
     # crates/herdr-tg/tests/the_heartbeat_is_earned_not_scheduled.rs, which fails if either side
@@ -345,6 +562,7 @@ if [ -r "$NOTE" ]; then
     # every outage as total and quoted, as the evidence of the fault, the line saying the half was
     # fine.
     phone_state=unknown; door_state=unknown; updates_state=unknown
+    ring_state=unknown; sweep_state=unknown
     case "$said_phone" in
       'the phone line answered '*)                        phone_state=good ;;
       'the phone line last answered '*)                   phone_state=bad ;;
@@ -369,41 +587,113 @@ if [ -r "$NOTE" ]; then
       'something has pointed this bot at a web address'*) updates_state=bad ;;
       'the hub is being turned away when it goes'*)       updates_state=bad ;;
     esac
-    # The two lines that have always been on the note must BOTH be readable before anything is
-    # named. A note caught with only its first line written, or one whose words this script does not
-    # know, says nothing about either half — and naming a half out of that is naming one at random.
+    # The app's two, on the same two lines. A hub on the phone line writes none of these words and
+    # a hub in the app writes none of the two blocks above, which is what makes the pair of blocks
+    # a plane test as well as a classification.
+    case "$said_ring" in
+      'what agents say is being written down'*)           ring_state=good ;;
+      'what agents say cannot be written down'*)          ring_state=bad ;;
+      'the hub has not begun writing down'*)              ring_state=bad ;;
+    esac
+    case "$said_sweep" in
+      'the hub went to collect your answers '*)           sweep_state=good ;;
+      'the hub last went to collect your answers '*)      sweep_state=bad ;;
+      'the hub has not gone to collect your answers'*)    sweep_state=bad ;;
+      'the place your answers arrive could not be made'*) sweep_state=bad ;;
+      'the place your answers arrive could not be read'*) sweep_state=bad ;;
+    esac
+    # Which way this hub reaches him, decided by nothing but which of the two blocks above knew the
+    # words on line 2. Not a setting and not a guess: the sentence he is about to be quoted is the
+    # same sentence that chose the vocabulary it is quoted in, so the two can never disagree.
+    if   [ "$phone_state" != unknown ]; then plane=phone
+    elif [ "$ring_state"  != unknown ]; then plane=app
+    fi
+    # The door's line and the plane's own first line must BOTH be readable before anything is
+    # named. A note caught with only its first line written, or one whose words this script does
+    # not know, says nothing about either half — and naming a half out of that is naming one at
+    # random. "The plane's own first line" is the same gate the phone line used to be, widened by
+    # exactly the amount that a second plane exists: an unknown first line is now an unknown PLANE,
+    # which is at least as good a reason to say nothing.
     #
-    # The update line is deliberately not in that gate. A hub built before it was a leg writes three
-    # lines, and a note that says nothing about the fourth half must still name the two it does
+    # The third line is deliberately not in that gate. A hub built before it was a leg writes three
+    # lines, and a note that says nothing about the third half must still name the two it does
     # describe — otherwise upgrading the hub before the installed watchdog is what stops the alarm
     # naming anything. It cannot produce a false all-clear either way: the stopped stamp has already
     # decided that there is an alarm, and this block only chooses the words.
-    if [ "$phone_state" != unknown ] && [ "$door_state" != unknown ]; then
+    if [ "$plane" != unknown ] && [ "$door_state" != unknown ]; then
       # Built as a list rather than a nested if, because three legs is eight cases and a chain of
-      # elifs is where one of them quietly stops being reachable.
+      # elifs is where one of them quietly stops being reachable. The app's shapes wear their own
+      # names rather than sharing the phone's: every arm of alarm_text differs by what he has to go
+      # and do, and "your phone line is down" on a box with no phone line is the guess dressed as a
+      # diagnosis that `unclear` exists to avoid.
       failing=
-      [ "$phone_state"   = bad ] && failing="${failing}phone "
-      [ "$updates_state" = bad ] && failing="${failing}updates "
-      [ "$door_state"    = bad ] && failing="${failing}door "
-      case "$failing" in
-        'phone ')              shape=phone ;;
-        'updates ')            shape=updates ;;
-        'door ')               shape=door ;;
-        'phone door ')         shape=both ;;
-        'phone updates ')      shape=phone+updates ;;
-        'updates door ')       shape=door+updates ;;
-        'phone updates door ') shape=all ;;
-        # Every leg the hub describes reads well while the stamp has stopped. shape stays `unclear`
-        # on purpose: the stamp wins, and the honest thing to say is that we cannot tell which.
-        *)                     shape=unclear ;;
-      esac
-      # Quoted in the order the head sentence names them, so the two halves of one message agree.
-      [ "$phone_state"   = bad ] && hub_says="The hub says: $said_phone"
-      [ "$updates_state" = bad ] && hub_says="${hub_says:+$hub_says
+      if [ "$plane" = phone ]; then
+        [ "$phone_state"   = bad ] && failing="${failing}phone "
+        [ "$updates_state" = bad ] && failing="${failing}updates "
+        [ "$door_state"    = bad ] && failing="${failing}door "
+        case "$failing" in
+          'phone ')              shape=phone ;;
+          'updates ')            shape=updates ;;
+          'door ')               shape=door ;;
+          'phone door ')         shape=both ;;
+          'phone updates ')      shape=phone+updates ;;
+          'updates door ')       shape=door+updates ;;
+          'phone updates door ') shape=all ;;
+          # Every leg the hub describes reads well while the stamp has stopped. shape stays
+          # `unclear` on purpose: the stamp wins, and the honest thing to say is that we cannot
+          # tell which.
+          *)                     shape=unclear ;;
+        esac
+        # Quoted in the order the head sentence names them, so the two halves of one message agree.
+        [ "$phone_state"   = bad ] && hub_says="The hub says: $said_phone"
+        [ "$updates_state" = bad ] && hub_says="${hub_says:+$hub_says
 }The hub says: $said_updates"
-      [ "$door_state"    = bad ] && hub_says="${hub_says:+$hub_says
+        [ "$door_state"    = bad ] && hub_says="${hub_says:+$hub_says
 }The hub says: $said_door"
+      else
+        [ "$ring_state"  = bad ] && failing="${failing}ring "
+        [ "$sweep_state" = bad ] && failing="${failing}sweep "
+        [ "$door_state"  = bad ] && failing="${failing}door "
+        case "$failing" in
+          'ring ')             shape=app-ring ;;
+          'sweep ')            shape=app-sweep ;;
+          'door ')             shape=app-door ;;
+          'ring door ')        shape=app-ring+door ;;
+          'ring sweep ')       shape=app-ring+sweep ;;
+          'sweep door ')       shape=app-door+sweep ;;
+          'ring sweep door ')  shape=app-all ;;
+          *)                   shape=unclear ;;
+        esac
+        [ "$ring_state"  = bad ] && hub_says="The hub says: $said_ring"
+        [ "$sweep_state" = bad ] && hub_says="${hub_says:+$hub_says
+}The hub says: $said_sweep"
+        [ "$door_state"  = bad ] && hub_says="${hub_says:+$hub_says
+}The hub says: $said_door"
+      fi
     fi
+  fi
+fi
+
+# ── the door, which the hub's own note can never be evidence about ───────────
+# Placed after the note is read so it can overrule what the note produced, and it overrules in one
+# direction only. Where the hub's stamp is still fresh, a stopped door is the whole of what is
+# wrong and it gets the message to itself — that is the state the hub is blind to and the reason
+# this fact is collected at all. Where the stamp has stopped too, the hub's own shape stands and
+# the door is named BESIDE it: two things broken must never arrive as one of them, and the hub's
+# outage is the one that decides where he goes first.
+if [ "$door" = stopped ]; then
+  if [ "$gone" = no ] && [ "$age" -lt "$STALE_AFTER" ]; then
+    shape=app-door-process
+    # And nothing is quoted from the hub. Its stamp is inside its own window, so by its own rule it
+    # has not earned an alarm yet; a leg its note happens to be grumbling about would arrive here as
+    # a diagnosis the stamp has not made, ninety seconds early, and only because the door went down
+    # beside it. When that leg really does take the stamp down, it alarms then, in its own shape,
+    # which the record of what has been told keeps separate from this one.
+    hub_says=
+  else
+    # Not prefixed "The hub says", because the hub said nothing: it cannot see this program at all.
+    hub_says="${hub_says:+$hub_says
+}$door_says"
   fi
 fi
 
@@ -421,9 +711,11 @@ case "$n" in ''|*[!0-9]*) n=0 ;; esac
 # that recovers starts the next outage with nothing told.
 # The cap bounds the file, nothing more — it is this script's own writing, not the hub's. It was 64
 # when there were two legs and three shapes; with three legs there are eight, and all eight named at
-# once come to 62 characters. A cap two characters clear of the real worst case is one that starts
-# truncating the last shape mid-word the day a ninth is added — and a truncated record matches
-# nothing, which turns the repeat interval off and sends one message a minute.
+# once come to 62 characters. A box runs one plane at a time, so the app's eight are the other worst
+# case, and with the door's own shape beside them they come to 104. A cap two characters clear of the
+# real worst case is one that starts truncating the last shape mid-word the day another is added —
+# and a truncated record matches nothing, which turns the repeat interval off and sends one message a
+# minute.
 told=
 [ -r "$LEGS" ] && told="$(tr -d '\000-\037\177' < "$LEGS" 2>/dev/null | cut -c1-160)"
 case " $told " in *" $shape "*) ;; *) n=0 ;; esac

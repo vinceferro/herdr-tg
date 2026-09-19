@@ -301,17 +301,34 @@ enum Cmd {
         user: i64,
     },
 
-    /// Run the Telegram bridge: long-poll the Bot API and answer the allowlisted chats.
+    /// Run the hub, reaching the operator the way `--to` names.
     ///
-    /// The bridge binds nothing — it dials out to api.telegram.org and opens the hub's Unix
-    /// socket for the projects' bridges, so the box needs no ingress. The token comes from
-    /// `$HERDR_TG_TOKEN`, never from the config file. Two gates, both failing closed: the chat
-    /// allowlist says WHERE the bot listens, and an empty one answers nobody; who may SPEAK there
-    /// is `$HERDR_TG_ALLOWED_USER_IDS` plus one person per private chat on the chat allowlist —
-    /// a private chat's id is its person's id — and, per project, whoever `allow` let in. It
-    /// answers `/projects` and `/help`; anything else typed in a project's topic goes to that
-    /// project's agent as a message in its own turn.
+    /// The hub binds nothing either way — it opens the hub's Unix socket for the projects'
+    /// bridges, so the box needs no ingress.
+    ///
+    /// `--to telegram` is the bridge as it has always been: long-poll the Bot API and answer the
+    /// allowlisted chats. The token comes from `$KICKOFF_CHANNEL_TOKEN`, never from the config
+    /// file. Two gates, both failing closed: the chat allowlist says WHERE the bot listens, and an
+    /// empty one answers nobody; who may SPEAK there is `$KICKOFF_CHANNEL_ALLOWED_USER_IDS` plus
+    /// one person per private chat on the chat allowlist — a private chat's id is its person's id
+    /// — and, per project, whoever `allow` let in. It answers `/projects` and `/help`; anything
+    /// else typed in a project's topic goes to that project's agent as a message in its own turn.
+    ///
+    /// `--to app` holds no credential and dials no messaging service. The operator's copy of
+    /// everything is the ring, and his answers arrive through the drop beside it, both of which
+    /// the PWA reaches over `kickoff-door`. There is no chat, no allowlist and no command set.
     Serve {
+        /// Which way this hub reaches him: `telegram` or `app`.
+        ///
+        /// Required, with no default and nothing inferred — least of all from whether a token
+        /// happens to be set. Working it out would make the silent mistake by construction: a
+        /// credential file that failed to render would quietly become the app, and every agent on
+        /// the box would talk into a file while he waited for a phone that was never going to
+        /// ring. A default makes one of those two mistakes depending which way it points. Being
+        /// told makes neither, because there is no state reachable by omission.
+        #[arg(long, value_enum, value_name = "telegram|app")]
+        to: config::Plane,
+
         /// Structure only — workspace, allowlist, socket. Never the token.
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
@@ -397,7 +414,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Enable { repo } => cmd::enroll::switch(&repo, true),
         Cmd::Allow { repo, user } => cmd::enroll::let_speak(&repo, user, true),
         Cmd::Disallow { repo, user } => cmd::enroll::let_speak(&repo, user, false),
-        Cmd::Serve { config } => {
+        Cmd::Serve { to, config } => {
             // FIRST, before the config is even read, and long before a `Bot` exists.
             //
             // Two processes long-polling one bot token do not share the slot; they take turns
@@ -410,11 +427,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             // this moved below `Config::load`, that test would see a complaint about the token.
             let hub_lock = lock::HubLock::acquire(lock::state_dir())?;
             tracing::debug!(lock = %hub_lock.path().display(), "this process holds the hub lock");
-            let cfg = config::Config::load(config.as_deref())?;
-            // `serve` takes no herdr client. It used to: the bot watched panes and could type
-            // into them. That whole path is deleted, so the bot's only inputs are Telegram and its
-            // own socket, and there is nothing for a herdr connection to do here.
-            let outcome = bot::serve(cfg).await;
+            // Both planes load the configuration, and the app plane then uses none of it. That is
+            // deliberate on both halves: loading is where a token set on a box that has no phone
+            // line is said out loud, and where a malformed setting is still refused before a hub
+            // starts — and nothing the configuration carries, a forum or a chat allowlist or the
+            // people who may speak in one, names anything that exists when there is no messaging
+            // app to name it in.
+            let cfg = config::Config::load(config.as_deref(), to)?;
+            // Neither plane takes a herdr client. `serve` used to: the bot watched panes and
+            // could type into them. That whole path is deleted, so the hub's only inputs are its
+            // own socket and — on the phone line — Telegram.
+            let outcome = match to {
+                config::Plane::Telegram => bot::serve_telegram(cfg).await,
+                config::Plane::App => {
+                    drop(cfg);
+                    bot::serve_the_app().await
+                }
+            };
             // Explicit, and not merely stylistic: the lock lives as long as this binding. Letting
             // it drop before `serve` returns would release it while the bot was still polling,
             // which is precisely the two-poller state it exists to prevent.

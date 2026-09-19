@@ -155,7 +155,7 @@ appears, whatever it is called.
 
 | command | what it does |
 | --- | --- |
-| `serve` | run the bridge: long-poll the Bot API and answer the allowlisted chats |
+| `serve` | run the hub, reaching him the way `--to` names: `telegram` long-polls the Bot API and answers the allowlisted chats, `app` holds no credential and dials nothing. Required, with no default |
 | `open` | open a project as a conversation, writing nothing into its repo |
 | `grant` | grant a project rooms — complete conversations of its own, each with its own secret and topic, vacant until a dispatcher takes one |
 | `enroll` | the older door, and the rotation: enrol a project, or rotate the secret of one already enrolled |

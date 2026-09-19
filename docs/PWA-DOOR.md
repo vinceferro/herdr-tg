@@ -1,12 +1,13 @@
-<!-- CONTRACT, 18 September 2026. Written against the WORKING TREE standing above HEAD dbbaad7 —
-     five rounds of fixes made after that commit and not committed themselves yet, so the hash
-     alone will not hand you this code. Where this file and the code at that hash disagree, the
-     tree is the newer of the two and this file follows the tree; once it is committed, the
-     commit carrying this paragraph is the one to read. Every route, body,
+<!-- CONTRACT, 19 September 2026. Written against the WORKING TREE standing above HEAD 54499fc —
+     the app plane of the hub and the trial that holds it are in that tree and not committed
+     themselves yet, so the hash alone will not hand you this code. Where this file and the code
+     at that hash disagree, the tree is the newer of the two and this file follows the tree; once
+     it is committed, the commit carrying this paragraph is the one to read. Every route, body,
      status code
      and sentence below was read in the code that serves it — crates/herdr-tg/src/gateway.rs (the
      door), crates/herdr-tg/src/hub/door.rs (the ring), crates/herdr-tg/src/hub/answers.rs (the
-     drop), crates/herdr-tg/src/hub/tests.rs (the trial) — and every behaviour named "yours" was
+     drop), crates/herdr-tg/src/surface.rs (the surface a hub with no phone line is built with)
+     and crates/herdr-tg/src/hub/tests.rs (the trials) — and every behaviour named "yours" was
      read in your own repository: your pinned stub suite, your bridge, your push watcher and
      your board. **The precise citations into your tree — which file, which line, and the names
      inside them — are deliberately not published here; this file is public and that code is
@@ -33,6 +34,20 @@ body, every refusal, and the laws underneath them.
 
 Nothing of yours needs to be installed from here. The door serves three routes on loopback;
 your bridge already proxies exactly those three.
+
+**The hub behind this door can now run with your app as its only surface.** It began as a
+Telegram bot that also wrote the ring; on 17 September the operator revoked its bot token, and a
+hub started the other way holds no credential, dials nothing off the box, and has the ring and
+the drop as the only places his half of a conversation lives. **Nothing on this seam changes
+because of it** — same routes, same envelope, same cursor discipline, same refusals, byte for
+byte. Which surface the hub was built with is a fact about the hub; this door reads the same two
+files either way and cannot tell which plane wrote them. The one difference you can observe is
+an absence, and §2 names it: where there is no phone line, every line he says comes in through
+this door, so you will never meet a down `message` line named with a `p…` instead of the `w…`
+your own POST was answered with. A client that already matches on that name needs no change to
+notice either way. It is held by a trial of its own — the second round trip in §7 step 8's
+harness, which stands the real binary in front of a hub with no Telegram surface in the process
+at all.
 
 ---
 
@@ -163,7 +178,10 @@ Every down `message` line carries a `msg_id`, with no exceptions:
   name equals the line's, and against a nameless line that is any row whose name is not yet set
   — an optimistic row mid-POST — so the second phone-typed line your client ever read would have
   been marked as a line it never sent. The `p…` names the line's own `seq` and nothing on this
-  box.
+  box. **Where there is no phone line there is no such line to meet**: every line he says
+  arrives through this door and wears the `w…` it was answered with. That absence is a property
+  of the box, not of this seam — your matcher handles both and needs to know nothing about
+  which one it is reading.
 
 Either way the name joins a line to a row and nothing else; a Telegram message id never rides
 this file. Down `choice` lines carry no name of this kind — your client joins a tap to its
@@ -631,15 +649,26 @@ resolving and re-read `projects --json` rather than caching forever.
    documented and yours to spend ten minutes on; everything else in step 7 is shapes, and this
    one is his screen.
 8. **Or run the smoke harness first:** `bash scripts/pwa-door-trial.sh` — this repo's
-   hermetic trial. One real hub over a real socket with Telegram counted instead of called,
-   and the **real gateway binary** on a loopback port, driven by a client scripted exactly
-   like yours (anchor poll, SSE subscribe, write POSTs). It proves the whole loop — an ask
-   envelope arriving stamped with its conversation and lane, a POSTed choice reaching the
-   lane's session and nobody else's, the POST answered from the hub's own result, a refusing
+   hermetic trial. A real hub over a real socket and the **real gateway binary** on a
+   loopback port, driven by a client scripted exactly like yours (anchor poll, SSE
+   subscribe, write POSTs). **Two round trips run, one per plane**, and both must pass.
+
+   With Telegram counted instead of called, it proves the whole loop — an ask envelope
+   arriving stamped with its conversation and lane, a POSTed choice reaching the lane's
+   session and nobody else's, the POST answered from the hub's own result, a refusing
    bridge's word landing on the ring as a follow-up line, the nonce's three places agreeing,
    the byte-identical 401, exact replay from an old cursor, and nothing on the raw wire
-   naming the machine. Nothing is installed, nothing is sent, nothing is spent; it refuses
-   to run anywhere near a real state home.
+   naming the machine.
+
+   With **no Telegram surface in the process at all** — the plane the box runs on now — it
+   proves the same seam against the hub you will actually be served by: the question on the
+   ring stamped with its conversation and its lane, `GET /v1/events` serving it, a POSTed
+   choice reaching the session that asked and nobody else, the POST answered from the hub's
+   verdict rather than optimistically (the sentence you are refused with is the hub's own,
+   matched against what it wrote in the drop), the ok-shape's `msg_id` echoed on the ring's
+   down line, the question ceasing to be open with the hub's own retirement beside it, and
+   the same wire law. Nothing is installed, nothing is sent, nothing is spent; it refuses to
+   run anywhere near a real state home.
 
 ---
 

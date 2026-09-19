@@ -8,16 +8,27 @@
 //!
 //! # Why a reword is not a cosmetic change
 //!
-//! The hub writes `hub.health`: a word, then one sentence for the phone line, one for the agents'
-//! door, and one for the stream his taps come back down. The watchdog reads those three sentences
-//! ONLY to word an alarm it has already decided to raise — but wording it wrong is not a small
-//! failure. Rename the sentence that means "this half is fine" and the script stops recognising it,
-//! so every outage is reported as total AND the alarm quotes, as the evidence of the fault, the
-//! line saying that half is healthy. It was proved silent:
+//! The hub writes `hub.health`: a word, then one sentence per half. The watchdog reads those three
+//! sentences ONLY to word an alarm it has already decided to raise — but wording it wrong is not a
+//! small failure. Rename the sentence that means "this half is fine" and the script stops
+//! recognising it, so every outage is reported as total AND the alarm quotes, as the evidence of
+//! the fault, the line saying that half is healthy. It was proved silent:
 //! rewording `the phone line answered` in `heartbeat.rs` *and its assertions* — a coherent tidy-up,
 //! which is how this actually happens — left the Rust suite green and the shell suite green, and
 //! turned a dead door into an alarm saying the phone line was down and quoting the hub saying it had
 //! answered twelve seconds ago.
+//!
+//! # Five halves, three per plane
+//!
+//! A hub reaches him one of two ways and holds three halves either way: what carries an agent's
+//! words to him (his phone line, or the app's copy of what agents say), the agents' door — the
+//! same half, same writer and same sentences on both — and what carries his own words back to an
+//! agent (the stream his taps come down, or the sweep of the drop his answers land in). Five
+//! halves in all, and the watchdog has a `case` block for each.
+//!
+//! **Which plane a note came from is decided by which of those blocks recognised its first line**,
+//! so a sentence of one half that any OTHER half's patterns also match would put the alarm on the
+//! wrong plane and give him a sentence about a phone he does not use. That is checked here too.
 //!
 //! This repo has shipped exactly that drift once already: two copies of the bridge's link, thirteen
 //! already-fixed defects apart.
@@ -32,10 +43,13 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Where the hub's two facts and their sentences are written.
+/// Where the hub's facts and their sentences are written.
 const HEARTBEAT: &str = "crates/herdr-tg/src/heartbeat.rs";
 /// Where the door's troubles are worded, and where the tick that rewrites the note lives.
 const BOT: &str = "crates/herdr-tg/src/bot.rs";
+/// Where the answers sweep's refusals are worded — beside the code that is refused, exactly as the
+/// door's are worded beside the code that opens it.
+const HUB: &str = "crates/herdr-tg/src/hub.rs";
 /// The other language. Its literals are the second copy this guard exists to hold still.
 const WATCHDOG: &str = "deploy/herdr-tg-watchdog.sh";
 /// The one place in this binary that reads the stamp back, and holds a copy of the alarm's window.
@@ -174,167 +188,281 @@ struct Sentence {
     origin: String,
 }
 
-/// Every sentence `heartbeat.rs` and `bot.rs` can put on the note's three lines.
+/// One half of a control plane, as the two languages name it.
 ///
-/// Returned as (phone line, agents' door, update stream). The three `Leg::of` arguments are, in order, what the leg
-/// says when it has never been good, when it is fresh, and when it is stale; the fresh and stale
-/// ones are prefixes the code completes with an age, so they are completed here too — the watchdog
-/// matches the whole sentence, not the prefix.
-fn the_sentences_the_hub_can_write() -> (Vec<Sentence>, Vec<Sentence>, Vec<Sentence>) {
-    let heartbeat = read(HEARTBEAT);
-    let bot = read(BOT);
+/// The Rust side is a function name rather than a position in the file, which is what it used to
+/// be: with three halves the order they appeared in was a workable way to tell them apart, and
+/// with five — two of them on the other plane — it is a guard holding the wrong sentences against
+/// the wrong `case` block and reporting agreement.
+struct Half {
+    /// What a failure here calls this half, in the words a person would use.
+    leg: &'static str,
+    /// The function in `heartbeat.rs` that words its three sentences for the note.
+    worded_by: &'static str,
+    /// The variable the watchdog reads its line into, and the state it assigns.
+    said: &'static str,
+    state: &'static str,
+}
 
-    let mut legs: Vec<Vec<Sentence>> = Vec::new();
-    for (nth, at) in heartbeat
-        .match_indices("Leg::of(")
-        .map(|(i, _)| i)
-        .enumerate()
-    {
-        let args = call_args(&heartbeat, at).unwrap_or_else(|| {
-            panic!(
-                "{HEARTBEAT}: a Leg::of call does not close; this guard cannot read its sentences"
-            )
-        });
-        let literals = string_literals(args);
-        assert_eq!(
-            literals.len(),
-            3,
-            "{HEARTBEAT}: a Leg::of call carries {} sentences, not the three this guard knows how \
-             to classify (never / fresh / stale). If a fourth shape of sentence exists, the \
-             watchdog has to learn it and so does this guard.",
-            literals.len()
-        );
-        legs.push(vec![
-            Sentence {
-                text: literals[0].clone(),
-                healthy: false,
-                origin: format!("{HEARTBEAT} Leg::of #{nth}, the never-yet-good sentence"),
-            },
-            Sentence {
-                text: format!("{} 12 seconds ago", literals[1]),
-                healthy: true,
-                origin: format!("{HEARTBEAT} Leg::of #{nth}, the fresh sentence"),
-            },
-            Sentence {
-                text: format!("{} 5 minutes ago", literals[2]),
-                healthy: false,
-                origin: format!("{HEARTBEAT} Leg::of #{nth}, the stale sentence"),
-            },
-        ]);
-    }
-    assert_eq!(
-        legs.len(),
-        3,
-        "{HEARTBEAT}: expected exactly three legs (the phone line, the agents' door and the update \
-         stream) built by Leg::of, found {}. A fourth leg is a fourth line in the note, and the \
-         watchdog reads three.",
-        legs.len()
-    );
-    // Source order: phone line, door, update stream — the order `Health::verdict` builds them in,
-    // which is the order they are written onto the note. Popping reverses it.
-    let mut updates = legs.pop().expect("three legs");
-    let mut door = legs.pop().expect("three legs");
-    let mut phone = legs.pop().expect("three legs");
+/// Every half either plane has. The door is one half and appears once: same writer, same
+/// sentences, same `case` block, whichever way the hub reaches him.
+const HALVES: [Half; 5] = [
+    Half {
+        leg: "the phone line",
+        worded_by: "the_phone_line_says",
+        said: "said_phone",
+        state: "phone_state",
+    },
+    Half {
+        leg: "the agents' door",
+        worded_by: "the_agents_door_says",
+        said: "said_door",
+        state: "door_state",
+    },
+    Half {
+        leg: "the stream his taps come down",
+        worded_by: "the_stream_of_his_taps_says",
+        said: "said_updates",
+        state: "updates_state",
+    },
+    Half {
+        leg: "the app's copy of what agents say",
+        worded_by: "the_ring_says",
+        said: "said_ring",
+        state: "ring_state",
+    },
+    Half {
+        leg: "the sweep of his answers",
+        worded_by: "the_answers_sweep_says",
+        said: "said_sweep",
+        state: "sweep_state",
+    },
+];
 
-    // The phone line's own trouble sentence, worded where the fact is set.
-    let at = heartbeat
-        .find("pub fn the_phone_line_did_not_answer")
-        .unwrap_or_else(|| {
-            panic!(
-                "{HEARTBEAT}: the_phone_line_did_not_answer is gone; this guard is looking for \
-                    the phone line's trouble sentence and cannot find where it is worded"
-            )
-        });
-    let body_end = at
-        + heartbeat[at..].find("\n    }").unwrap_or_else(|| {
-            panic!(
-                "{HEARTBEAT}: the_phone_line_did_not_answer does not end where this guard expects"
-            )
-        });
-    let troubles = string_literals(&heartbeat[at..body_end]);
-    assert_eq!(
-        troubles.len(),
-        1,
-        "{HEARTBEAT}: the_phone_line_did_not_answer holds {} sentences, not one",
-        troubles.len()
-    );
-    phone.push(Sentence {
-        text: troubles[0].clone(),
-        healthy: false,
-        origin: format!("{HEARTBEAT} the_phone_line_did_not_answer"),
+/// The body of a function in an `impl` block, by name, or a failure saying this guard is blind.
+fn body_of(text: &str, what: &str, name: &str) -> String {
+    let at = text.find(&format!("fn {name}")).unwrap_or_else(|| {
+        panic!(
+            "{what}: there is no `fn {name}`. This guard reads that function's sentences and holds \
+             them against the watchdog's copy of them, and it will not guess where they went."
+        )
     });
+    let end = at
+        + text[at..]
+            .find("\n    }")
+            .unwrap_or_else(|| panic!("{what}: `fn {name}` does not end where this guard expects"));
+    text[at..end].to_owned()
+}
 
-    // Every way the door can be shut, and every way a knock can fail. Both are worded in bot.rs,
-    // where the reason is known; heartbeat.rs only carries them.
-    let mut door_troubles: Vec<(String, String)> = Vec::new();
-    for at in bot.match_indices("Door::Shut(").map(|(i, _)| i) {
-        let args =
-            call_args(&bot, at).unwrap_or_else(|| panic!("{BOT}: a Door::Shut does not close"));
-        for lit in string_literals(args) {
-            door_troubles.push((lit, format!("{BOT} Door::Shut")));
-        }
-    }
+/// Every sentence the hub can put on this half's line of the note.
+///
+/// Two shapes of leg, and a third is a failure rather than a guess. A leg worded by `Leg::of` says
+/// one thing when it has never been good, one when it is fresh and one when it is stale, and the
+/// last two are prefixes the code completes with an age — so they are completed here too, because
+/// the watchdog matches the whole sentence and not the prefix. A leg worded by
+/// `Leg::of_what_is_true` is a state and has no age at all: one sentence for "nobody has said",
+/// one for well, one for unwell.
+fn the_sentences_one_half_can_write(half: &Half) -> Vec<Sentence> {
+    let heartbeat = read(HEARTBEAT);
+    let body = body_of(&heartbeat, HEARTBEAT, half.worded_by);
+    let by_the_clock = body.contains("Leg::of(");
+    let by_its_state = body.contains("Leg::of_what_is_true(");
     assert!(
-        door_troubles.len() >= 3,
-        "{BOT}: only {} ways the door can be shut carry a sentence. Every one of them is a way the \
-         operator's agents reach nobody while his phone still answers, and each needs words the \
-         watchdog can repeat.",
-        door_troubles.len()
-    );
-    let mut knock_sentences = 0;
-    for at in bot
-        .match_indices("the_door_is_not_answering(")
-        .map(|(i, _)| i)
-    {
-        let args = call_args(&bot, at)
-            .unwrap_or_else(|| panic!("{BOT}: a the_door_is_not_answering call does not close"));
-        for lit in string_literals(args) {
-            knock_sentences += 1;
-            door_troubles.push((lit, format!("{BOT} the_door_is_not_answering")));
+        by_the_clock != by_its_state,
+        "{HEARTBEAT}: `fn {}` words {} with {}. This guard knows two shapes of leg — one measured \
+         by a clock and one that is a state — and a third is one the watchdog has to learn too.",
+        half.worded_by,
+        half.leg,
+        if by_the_clock {
+            "both shapes at once"
+        } else {
+            "neither shape"
         }
-    }
-    assert!(
-        knock_sentences >= 2,
-        "{BOT}: the knock at the door words fewer than two failures. It can fail to reach the \
-         socket at all and it can reach one nobody is accepting on, and those are different \
-         sentences to the operator."
     );
-    for (text, origin) in door_troubles {
-        door.push(Sentence {
+    let needle = if by_the_clock {
+        "Leg::of("
+    } else {
+        "Leg::of_what_is_true("
+    };
+    let at = body.find(needle).expect("just found above");
+    let args = call_args(&body, at).unwrap_or_else(|| {
+        panic!(
+            "{HEARTBEAT}: the call wording {} does not close; this guard cannot read its sentences",
+            half.leg
+        )
+    });
+    let literals = string_literals(args);
+    assert_eq!(
+        literals.len(),
+        3,
+        "{HEARTBEAT}: {} is worded with {} sentences, not the three this guard knows how to \
+         classify. A fourth shape of sentence is one the watchdog has to learn and so does this \
+         guard.",
+        half.leg,
+        literals.len()
+    );
+    // The never-yet-good sentence is in the same place either way, and it is NOT healthy: a hub
+    // that has said nothing about a half has not proved it.
+    let mut out = vec![Sentence {
+        text: literals[0].clone(),
+        healthy: false,
+        origin: format!(
+            "{HEARTBEAT} fn {}, the nothing-said-yet sentence",
+            half.worded_by
+        ),
+    }];
+    if by_the_clock {
+        out.push(Sentence {
+            text: format!("{} 12 seconds ago", literals[1]),
+            healthy: true,
+            origin: format!("{HEARTBEAT} fn {}, the fresh sentence", half.worded_by),
+        });
+        out.push(Sentence {
+            text: format!("{} 5 minutes ago", literals[2]),
+            healthy: false,
+            origin: format!("{HEARTBEAT} fn {}, the stale sentence", half.worded_by),
+        });
+    } else {
+        out.push(Sentence {
+            text: literals[1].clone(),
+            healthy: true,
+            origin: format!("{HEARTBEAT} fn {}, the well sentence", half.worded_by),
+        });
+        out.push(Sentence {
+            text: literals[2].clone(),
+            healthy: false,
+            origin: format!("{HEARTBEAT} fn {}, the unwell sentence", half.worded_by),
+        });
+    }
+    out.extend(the_troubles_of(half));
+    out
+}
+
+/// The named failures this half can report, worded where the reason is known rather than where the
+/// sentence is carried.
+///
+/// Each list has a floor, because the floor is the property: two ways a thing fails that a person
+/// would act on differently are two sentences, and collapsing them into one is how an alarm starts
+/// sending him to the wrong machine.
+fn the_troubles_of(half: &Half) -> Vec<Sentence> {
+    let mut out: Vec<Sentence> = Vec::new();
+    let mut take = |text: String, origin: String| {
+        out.push(Sentence {
             text,
             healthy: false,
             origin,
-        });
-    }
-
-    // Every way Telegram can refuse to hand the updates over. Worded in bot.rs beside the error it
-    // is reading, exactly as the door's are — a second copy of this bot holding the update slot and
-    // a hub being turned away for any other reason are different mornings and the same silence.
-    let mut refusals = 0;
-    for at in bot
-        .match_indices("the_update_stream_was_refused(")
-        .map(|(i, _)| i)
-    {
-        let args = call_args(&bot, at).unwrap_or_else(|| {
-            panic!("{BOT}: a the_update_stream_was_refused call does not close")
-        });
-        for lit in string_literals(args) {
-            refusals += 1;
-            updates.push(Sentence {
-                text: lit,
-                healthy: false,
-                origin: format!("{BOT} the_update_stream_was_refused"),
-            });
+        })
+    };
+    match half.leg {
+        "the phone line" => {
+            let heartbeat = read(HEARTBEAT);
+            let troubles = string_literals(&body_of(
+                &heartbeat,
+                HEARTBEAT,
+                "the_phone_line_did_not_answer",
+            ));
+            assert_eq!(
+                troubles.len(),
+                1,
+                "{HEARTBEAT}: the_phone_line_did_not_answer holds {} sentences, not one",
+                troubles.len()
+            );
+            take(
+                troubles[0].clone(),
+                format!("{HEARTBEAT} the_phone_line_did_not_answer"),
+            );
         }
+        "the agents' door" => {
+            // Every way the door can be shut, and every way a knock can fail. Both are worded in
+            // bot.rs, where the reason is known; heartbeat.rs only carries them.
+            let bot = read(BOT);
+            let mut shut = 0;
+            for at in bot.match_indices("Door::Shut(").map(|(i, _)| i) {
+                let args = call_args(&bot, at)
+                    .unwrap_or_else(|| panic!("{BOT}: a Door::Shut does not close"));
+                for lit in string_literals(args) {
+                    shut += 1;
+                    take(lit, format!("{BOT} Door::Shut"));
+                }
+            }
+            assert!(
+                shut >= 3,
+                "{BOT}: only {shut} ways the door can be shut carry a sentence. Every one of them \
+                 is a way the operator's agents reach nobody while his phone still answers, and \
+                 each needs words the watchdog can repeat."
+            );
+            let mut knocks = 0;
+            for at in bot
+                .match_indices("the_door_is_not_answering(")
+                .map(|(i, _)| i)
+            {
+                let args = call_args(&bot, at).unwrap_or_else(|| {
+                    panic!("{BOT}: a the_door_is_not_answering call does not close")
+                });
+                for lit in string_literals(args) {
+                    knocks += 1;
+                    take(lit, format!("{BOT} the_door_is_not_answering"));
+                }
+            }
+            assert!(
+                knocks >= 2,
+                "{BOT}: the knock at the door words fewer than two failures. It can fail to reach \
+                 the socket at all and it can reach one nobody is accepting on, and those are \
+                 different sentences to the operator."
+            );
+        }
+        "the stream his taps come down" => {
+            // Every way Telegram can refuse to hand the updates over. Worded in bot.rs beside the
+            // error it is reading — a second copy of this bot holding the update slot and a hub
+            // being turned away for any other reason are different mornings and the same silence.
+            let bot = read(BOT);
+            let mut refusals = 0;
+            for at in bot
+                .match_indices("the_update_stream_was_refused(")
+                .map(|(i, _)| i)
+            {
+                let args = call_args(&bot, at).unwrap_or_else(|| {
+                    panic!("{BOT}: a the_update_stream_was_refused call does not close")
+                });
+                for lit in string_literals(args) {
+                    refusals += 1;
+                    take(lit, format!("{BOT} the_update_stream_was_refused"));
+                }
+            }
+            assert!(
+                refusals >= 2,
+                "{BOT}: the update stream words fewer than two refusals. A second copy of this bot \
+                 taking his taps is a thing he can go and fix in ten seconds and any other refusal \
+                 is not, so they are different sentences to the operator."
+            );
+        }
+        "the app's copy of what agents say" => {
+            // None, and that is the shape of this half rather than an omission: it is a state with
+            // two values, and the sentence for the unwell one is the whole of what it can say.
+        }
+        "the sweep of his answers" => {
+            // Worded in hub.rs, beside the code that is refused, exactly as the door's are worded
+            // beside the code that opens it.
+            let hub = read(HUB);
+            let mut refusals = 0;
+            for at in hub.match_indices("Sweep::WasRefused(").map(|(i, _)| i) {
+                let args = call_args(&hub, at)
+                    .unwrap_or_else(|| panic!("{HUB}: a Sweep::WasRefused does not close"));
+                for lit in string_literals(args) {
+                    refusals += 1;
+                    take(lit, format!("{HUB} Sweep::WasRefused"));
+                }
+            }
+            assert!(
+                refusals >= 2,
+                "{HUB}: the answers sweep words fewer than two refusals. A drop this hub may not \
+                 trust and a drop it cannot list are different mornings and the same silence — \
+                 every answer he gives going nowhere."
+            );
+        }
+        other => panic!("this guard has no idea where {other}'s named failures are worded"),
     }
-    assert!(
-        refusals >= 2,
-        "{BOT}: the update stream words fewer than two refusals. A second copy of this bot taking \
-         his taps is a thing he can go and fix in ten seconds and any other refusal is not, so \
-         they are different sentences to the operator."
-    );
-
-    (phone, door, updates)
+    out
 }
 
 // ── pulling the same sentences out of the shell ──────────────────────────────────────────────────
@@ -441,26 +569,13 @@ fn american_paren() -> char {
 /// case it was written for.
 #[test]
 fn the_watchdog_and_the_hub_use_the_same_sentences_for_the_same_half() {
-    let (phone, door, updates) = the_sentences_the_hub_can_write();
     let mut problems: Vec<String> = Vec::new();
 
-    for (leg, sentences, patterns) in [
-        (
-            "the phone line",
-            &phone,
-            how_the_watchdog_reads("said_phone", "phone_state"),
-        ),
-        (
-            "the agents' door",
-            &door,
-            how_the_watchdog_reads("said_door", "door_state"),
-        ),
-        (
-            "the update stream",
-            &updates,
-            how_the_watchdog_reads("said_updates", "updates_state"),
-        ),
-    ] {
+    for half in &HALVES {
+        let leg = half.leg;
+        let sentences = the_sentences_one_half_can_write(half);
+        let patterns = how_the_watchdog_reads(half.said, half.state);
+        let sentences = &sentences;
         let mut used: BTreeSet<usize> = BTreeSet::new();
         for s in sentences {
             let hits: Vec<&Pattern> = patterns
@@ -520,24 +635,76 @@ fn the_watchdog_and_the_hub_use_the_same_sentences_for_the_same_half() {
     );
 }
 
-/// The stamp is what the verdict earned, and the verdict is both legs.
+/// No sentence of one half is read as another half's — which is how the alarm tells the planes
+/// apart.
+///
+/// The note's three lines are read by position, and the first line is his phone line on one plane
+/// and the app's copy of what agents say on the other. The watchdog decides WHICH by seeing which
+/// of those two `case` blocks recognised the line. So a sentence both blocks match is not a near
+/// miss: it is an app box sent an alarm about a phone he does not use, or a phone box told its app
+/// has stopped — with the closing line naming a fix for the wrong machine, on the one message that
+/// has to be trusted.
+///
+/// It is also what keeps the door's two neighbours honest. The door's own sentences are quoted
+/// under whichever half failed, and a door sentence that a sweep pattern also matched would put
+/// the door's words under the answers line of the alarm.
+#[test]
+fn no_sentence_of_one_half_is_read_as_another_halfs() {
+    let every_block: Vec<(&Half, Vec<Pattern>)> = HALVES
+        .iter()
+        .map(|h| (h, how_the_watchdog_reads(h.said, h.state)))
+        .collect();
+    let mut problems: Vec<String> = Vec::new();
+
+    for half in &HALVES {
+        for s in the_sentences_one_half_can_write(half) {
+            for (other, patterns) in &every_block {
+                if std::ptr::eq(*other, half) {
+                    continue;
+                }
+                for p in patterns {
+                    if s.text.starts_with(&p.prefix) {
+                        problems.push(format!(
+                            "\"{}\" ({}) is {}'s sentence, and {WATCHDOG}:{} reads it as {}'s. \
+                             The alarm works out which way the hub reaches him from exactly this, \
+                             so it would name the wrong half on the wrong plane.",
+                            s.text, s.origin, half.leg, p.line, other.leg
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "two halves' sentences have grown together:\n  - {}",
+        problems.join("\n  - ")
+    );
+}
+
+/// The stamp is what the verdict earned, and the verdict is every leg it holds.
 ///
 /// The whole of item 4 in two lines of source: a Bot API round trip on its own used to write the
 /// file, so a hub whose socket never opened reported health for a week. Pinned as text because the
-/// failure is a one-word edit — an `||` for an `&&`, or a second caller of `stamp` that does not ask.
+/// failure is a one-word edit — an `any` for an `all`, a leg indexed out of the list, or a second
+/// caller of `stamp` that does not ask.
 #[test]
-fn a_stamp_is_written_only_where_the_verdict_earned_it_and_a_verdict_needs_both_legs() {
+fn a_stamp_is_written_only_where_the_verdict_earned_it_and_a_verdict_needs_every_leg_it_holds() {
     let heartbeat = read(HEARTBEAT);
 
-    let at = heartbeat
-        .find("pub fn earned(&self) -> bool")
-        .expect("heartbeat.rs no longer has Verdict::earned; the stamp's one rule has moved");
-    let body = &heartbeat[at..at + 200];
+    let body = body_of(&heartbeat, HEARTBEAT, "earned(&self) -> bool");
     assert!(
-        body.contains("self.phone_line.is_fresh() && self.door.is_fresh()"),
-        "Verdict::earned no longer requires BOTH legs. One leg is the defect item 4 exists for: \
-         Telegram answering while the agents' door is shut is the state that looked green for a \
-         week. Found: {body}"
+        body.contains("self.legs.iter().all(Leg::is_fresh)"),
+        "Verdict::earned is no longer every leg the verdict holds. A subset is the defect item 4 \
+         exists for: Telegram answering while the agents' door was shut is the state that looked \
+         green for a week, and an app-plane hub whose answers sweep had died would look just as \
+         green. Found: {body}"
+    );
+    assert!(
+        !body.contains(".any("),
+        "Verdict::earned is an `any` over its legs, so ONE working half now stamps for all of \
+         them. Found: {body}"
     );
 
     let at = heartbeat
@@ -813,4 +980,145 @@ fn the_wait_the_hub_promises_before_his_phone_buzzes_is_one_its_own_numbers_can_
              working alarm into a bug report."
         );
     }
+}
+
+// ── the fourth fact: the door the operator's app reaches this machine through ────────────────────
+//
+// Every leg of the hub's stamp on the app plane is the hub watching itself — it writes the ring, it
+// accepts at the agents' door, it lists the place his answers land — and the whole of the distance
+// between the operator and those three files is a DIFFERENT program. Proved by running it: a hub
+// started with no `kickoff-door` binary on the box at all stamped a green file within a minute and
+// went on stamping, with an armed watchdog silent beside it, while the app was dark.
+//
+// So the watchdog asks the user manager, and these three hold the arrangement together: the hub
+// says in its own file that it does not watch this, the script watches a unit this repo really
+// ships, and the asking never becomes a telling.
+
+/// The hub's health module, where the stamp's whole meaning is written down.
+const DOOR_UNIT_FILE_PREFIX: &str = "deploy/";
+
+/// Everything before the first `#` on each line, which for this file is its code.
+///
+/// An approximation, and a safe one in this direction: a `#` inside a string truncates a line
+/// early, so the scan can only ever look at LESS code than there is — it cannot invent a call. The
+/// header of that script discusses `systemctl --user enable` at length, so reading its comments as
+/// code would make the guard below fail on the very paragraph explaining why it passes.
+fn shell_code(text: &str) -> Vec<(usize, String)> {
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| {
+            let code = match line.find('#') {
+                Some(at) => &line[..at],
+                None => line,
+            };
+            (i + 1, code.to_owned())
+        })
+        .collect()
+}
+
+/// **The hub says in its own file that no leg of it watches the door the app reads through.**
+///
+/// The limit that is named is the limit that survives a refactor; the limit that is merely true is
+/// the one somebody widens a sentence past on a quiet afternoon. This module already does exactly
+/// this for "a tap that arrived was acted on", and the second process is a bigger gap than that
+/// one: it is every word the operator would ever see.
+#[test]
+fn the_hub_writes_down_that_no_leg_of_its_stamp_watches_the_door_the_app_reads_through() {
+    let hub = read(HEARTBEAT);
+    let doc: String = hub
+        .lines()
+        .take_while(|l| l.starts_with("//!") || l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !doc.is_empty(),
+        "{HEARTBEAT} no longer opens with a module doc, so this guard has read nothing"
+    );
+    assert!(
+        doc.contains("kickoff-door"),
+        "{HEARTBEAT} never names the program that stands between the operator and every file this \
+         module's app plane reports on. A hub with no door at all earns every leg of that stamp, \
+         which was proved by running one — and a reader who is not told that reads a green stamp \
+         as a working app."
+    );
+    assert!(
+        doc.contains("herdr-tg-watchdog.sh"),
+        "{HEARTBEAT} names the gap without naming what closes it, so the next reader has to \
+         discover for himself whether anything does"
+    );
+}
+
+/// **The watchdog watches a unit this repo actually ships.**
+///
+/// A unit name is a string in a shell script and a file in `deploy/`, and nothing but this holds
+/// the two together. It is not a hypothetical: the app plane's own unit was called `kickoff-hub`
+/// for an hour, collided with another organisation's live service on this box, and was renamed —
+/// and every reference to it had to be found by hand. A watchdog pointed at a unit that does not
+/// exist asks about it, is told nothing, and stays quiet for ever.
+#[test]
+fn the_watchdog_watches_a_door_unit_this_repo_actually_ships() {
+    let script = read(WATCHDOG);
+    let at = script.find("DOOR_UNIT=\"$").unwrap_or_else(|| {
+        panic!(
+            "{WATCHDOG} no longer names the door's unit, so nothing on this box is watching the \
+             program the operator's app reaches it through"
+        )
+    });
+    let from = at + script[at..].find(":-").expect("a default") + 2;
+    let to = from + script[from..].find('}').expect("a default that ends");
+    let unit = script[from..to].trim();
+    let shipped = workspace_root().join(format!("{DOOR_UNIT_FILE_PREFIX}{unit}"));
+    assert!(
+        shipped.exists(),
+        "{WATCHDOG} watches `{unit}`, and this repo ships no such unit ({}). The alarm would ask \
+         the user manager about a name nobody installed and be told nothing, for ever.",
+        shipped.display()
+    );
+}
+
+/// **The watchdog asks the user manager and never tells it anything.**
+///
+/// This script decides, words and throttles an alarm; it restarts nothing and kills nothing, and
+/// that line is older than the door check. Asking systemd a question does not cross it — telling
+/// systemd to do something does, and the two are one command apart. A `systemctl --user restart`
+/// slipped in beside the question would turn the one thing that can still speak when the hub
+/// cannot into another thing that acts on the box in the dark.
+#[test]
+fn the_watchdog_only_asks_the_user_manager_about_the_door_and_never_tells_it_anything() {
+    let script = read(WATCHDOG);
+    // Questions. Anything else — start, stop, restart, kill, enable, disable, reset-failed,
+    // daemon-reload — is an act, and an act here is this script trying to fix what it may only
+    // report.
+    const ASKING: [&str; 4] = ["is-enabled", "is-active", "is-failed", "show"];
+    let mut asked = 0;
+    for (line, code) in shell_code(&script) {
+        let Some(at) = code.find("systemctl") else {
+            continue;
+        };
+        // `command -v systemctl` asks whether the program is there at all and runs nothing, which
+        // is how the script stays silent on a box that has no user manager to ask. Counting it as
+        // a call would read its redirection as the verb.
+        if code[..at].trim_end().ends_with("command -v") {
+            continue;
+        }
+        asked += 1;
+        let verb = code[at + "systemctl".len()..]
+            .split_whitespace()
+            // Flags and redirections are not the verb. A redirection read as one would name
+            // `>/dev/null` as the thing this script told systemd to do.
+            .find(|w| !w.starts_with('-') && !w.starts_with('>') && !w.starts_with('<'))
+            .unwrap_or("");
+        assert!(
+            ASKING.contains(&verb),
+            "{WATCHDOG}:{line} says `systemctl … {verb}`, which is not a question. This script \
+             reports and never acts, and the whole of its independence is that it cannot take the \
+             box down with the thing it watches."
+        );
+    }
+    assert!(
+        asked > 0,
+        "{WATCHDOG} asks the user manager nothing at all, so nothing on this box watches the \
+         program the operator's app reaches the hub through. This guard reports a clean scan only \
+         when there was something to scan."
+    );
 }

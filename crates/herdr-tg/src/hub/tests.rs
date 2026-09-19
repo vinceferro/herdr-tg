@@ -17032,6 +17032,8 @@ async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
     // Words whose payloads would naturally carry this machine's identifiers: an agent quotes the
     // path it edited, names a file by where it saved it, asks about overwriting one, and reports
     // a log so long it must be clipped. If any of that survives to the ring, the law is broken.
+    // One of them is glued straight onto a word by a tool's own prefix, because that is the
+    // shape that reads as an ordinary relative path to anything scanning byte by byte.
     // The same sentence cites URLs, because coding agents cite them constantly and the ring will
     // be the PWA's only history: http and https are spared whole, every other scheme is a path
     // wearing a costume and dies with the paths.
@@ -17041,7 +17043,8 @@ async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
                 "edited {home}/src/hub.rs and/or {home}/docs/ATTACHING.md by hand — the guide is \
                  https://docs.example.com/guide, the tool is \
                  http://tools.example.org/a?b=c&d=e, the tilde one is \
-                 https://example.com/~someone/page, and the key at file://{home}/.ssh/id_ed25519 is \
+                 https://example.com/~someone/page, the screenshot is \
+                 shot-{home}/Pictures/a.png, and the key at file://{home}/.ssh/id_ed25519 is \
                  not a citation"
             ),
             hint: Some(SayHint::Output),
@@ -17176,6 +17179,10 @@ async fn the_ring_names_no_chat_no_topic_no_person_and_no_telegram_id() {
     assert!(
         text.contains("and/or"),
         "ordinary prose was mangled by the path scrub: {text}"
+    );
+    assert!(
+        text.contains("shot-[a path]"),
+        "a path a tool glued onto a word by its own prefix was not withheld: {text}"
     );
     assert!(
         text.contains("https://docs.example.com/guide"),
@@ -17343,6 +17350,124 @@ async fn a_session_that_dies_holding_a_question_writes_its_retirement_to_the_rin
 }
 
 #[tokio::test]
+async fn a_question_the_hub_could_not_place_is_closed_on_the_ring_rather_than_left_open_for_ever() {
+    // Driven the way it was found, not reasoned about: let the hub load the registry, then make
+    // that file unreadable, so nothing can be bound to a place to put a question — and ask one.
+    //
+    // The question still reaches the ring, because the ring is his copy of what the AGENT said and
+    // it is stamped as the words are spoken. Nothing ever followed it: the record a tap is judged
+    // against is written only where the message landed, so the app offered him a question with
+    // nothing behind it and every tap on it was refused with "I have no record of that question" —
+    // a dead button, worded as though he had made the mistake.
+    let h = harness().await;
+    // A truncated write, a bad byte, a disk that answered badly once. `bind_topic` refuses rather
+    // than writing over a file it could not read, so this conversation never gets a topic.
+    std::fs::write(h.dir.path().join("projects.json"), "{ not json at all").expect("corrupt it");
+
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    bridge.become_live().await;
+    let asked = bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite it?".to_owned(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y"),
+                label: "Yes".to_owned(),
+            }]),
+        })
+        .await;
+    // The ack is the hub having finished with the frame, so everything it was going to write is
+    // written by the time this returns.
+    let delivered = bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        delivered,
+        Delivered::No,
+        "the agent was told its question had been put to him"
+    );
+
+    // Nothing is written down, which is what makes the question unanswerable: a tap at the door
+    // finds no record and is refused.
+    assert!(
+        h.hub.ledger.lock().await.records.is_empty(),
+        "a question with no record is the premise of this test; something wrote one"
+    );
+
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING)).expect("the ring");
+    let lines = ring_so_far(h.dir.path());
+    assert_eq!(lines[0]["frame"]["t"], "ask", "{raw}");
+    assert_eq!(lines[0]["frame"]["ask_id"], "a1", "{raw}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "the question stands open on his only surface with nothing that will ever take it \
+         off:\n{raw}"
+    );
+    assert_eq!(lines[1]["frame"]["t"], "ask_resolved", "{raw}");
+    assert_eq!(lines[1]["frame"]["ask_id"], "a1", "{raw}");
+    assert_eq!(
+        lines[1]["frame"]["how"], "this one never reached you — answer it where it is running",
+        "{raw}"
+    );
+    assert_eq!(lines[1]["conversation"], *h.project.as_str(), "{raw}");
+    assert_eq!(lines[1]["lane"], "-", "{raw}");
+    assert_eq!(lines[1]["dir"], "up", "{raw}");
+}
+
+#[tokio::test]
+async fn a_question_refused_for_its_answer_ids_is_closed_on_the_ring_too() {
+    // The same hole by the other door, and the one an ordinary healthy box can reach: an answer id
+    // too long for a button is refused before anything is sent, and the ring already holds the
+    // question. Everything else about this run is well — the topic exists, the phone is answering —
+    // so nothing but this line stops the app showing a question nobody will ever answer.
+    let h = harness().await;
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, "i1", "p-somebody-else").await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+
+    let asked = bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new("a1"),
+            text: "Overwrite it?".to_owned(),
+            options: Some(vec![AskOption {
+                option_id: OptionId::new("y".repeat(CALLBACK_DATA_MAX)),
+                label: "Yes".to_owned(),
+            }]),
+        })
+        .await;
+    let delivered = bridge
+        .wait_for(|f| match f {
+            HubFrame::Ack {
+                r#ref, delivered, ..
+            } if r#ref == &asked => Some(*delivered),
+            _ => None,
+        })
+        .await;
+    assert_eq!(delivered, Delivered::No, "the agent was told it had asked");
+
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING)).expect("the ring");
+    let lines = ring_so_far(h.dir.path());
+    assert_eq!(lines[0]["frame"]["t"], "ask", "{raw}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "a question the hub would not put on a button is left open on the app for ever:\n{raw}"
+    );
+    assert_eq!(lines[1]["frame"]["t"], "ask_resolved", "{raw}");
+    assert_eq!(lines[1]["frame"]["ask_id"], "a1", "{raw}");
+    assert_eq!(
+        lines[1]["frame"]["how"], "this one never reached you — answer it where it is running",
+        "{raw}"
+    );
+}
+
+#[tokio::test]
 async fn a_ring_that_cannot_be_written_costs_no_delivery() {
     let blocked = harness().await;
     // A directory standing where the ring's file must be: every append on it fails, the way a
@@ -17408,12 +17533,23 @@ async fn a_ring_that_cannot_be_written_costs_no_delivery() {
 
 /// The drop, where a gateway will write his taps and his typed words.
 fn the_drop(h: &Harness) -> PathBuf {
-    h.dir.path().join(crate::hub::answers::ANSWERS)
+    the_drop_in(h.dir.path())
+}
+
+/// The same, for a hub whose state this test holds as a bare path rather than as a [`Harness`].
+fn the_drop_in(state: &std::path::Path) -> PathBuf {
+    state.join(crate::hub::answers::ANSWERS)
 }
 
 /// One operator action into the drop, the way a gateway writes it: one JSON object, one file.
 fn drop_an_answer(h: &Harness, name: &str, body: serde_json::Value) -> PathBuf {
-    let path = the_drop(h).join(name);
+    drop_an_answer_in(h.dir.path(), name, body)
+}
+
+/// The same, wherever the state is. One body, so two harnesses cannot come to disagree about
+/// what a gateway's file looks like.
+fn drop_an_answer_in(state: &std::path::Path, name: &str, body: serde_json::Value) -> PathBuf {
+    let path = the_drop_in(state).join(name);
     std::fs::write(
         &path,
         serde_json::to_string(&body).expect("the answer as one object"),
@@ -17445,7 +17581,12 @@ fn words_at(
 
 /// The result a consumed answer left behind, parsed.
 fn the_result_of(h: &Harness, name: &str) -> serde_json::Value {
-    let path = the_drop(h).join(format!("{name}.result"));
+    the_result_in(h.dir.path(), name)
+}
+
+/// The same, wherever the state is.
+fn the_result_in(state: &std::path::Path, name: &str) -> serde_json::Value {
+    let path = the_drop_in(state).join(format!("{name}.result"));
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{name}'s result is not there to read: {e}"));
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name}'s result is not one object: {e}"))
@@ -17508,6 +17649,62 @@ async fn a_tap_at_the_door_cannot_answer_what_the_phone_already_answered() {
         !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
         "a question the phone had answered was answered again from the door: {seen:?}"
     );
+}
+
+#[tokio::test]
+async fn a_question_taken_back_after_the_agent_refused_his_answer_is_closed_on_the_ring_too() {
+    // The same hole by another door, found while closing the first two. A tap is written down as
+    // answered BEFORE it is delivered, so an agent that then says it could not act on the answer
+    // leaves the hub taking the question back — and taking it back forgets the record, on purpose,
+    // because a question that cannot be answered is worse than none. On the phone that is the
+    // whole story: the keyboard comes off with the reason on it and he can see it. The app reads
+    // the ring and nothing else, so the question stood open there with no record behind it, and
+    // the next tap on it was refused with "I have no record of that question".
+    //
+    // Driven through the one ordinary way the record outlives the tap: Telegram refuses the
+    // keyboard edit at the moment he taps and takes it a moment later. The two co-occur — the
+    // trouble that refuses an edit is the trouble that loses a session — and this one mends.
+    let h = harness().await;
+    let mut bridge =
+        FakeBridge::connect_confirming_choices(&h.sock, &h.secret, "i1", h.project.as_str()).await;
+    bridge.become_live().await;
+    until(async || !h.fake.sends.lock().await.is_empty()).await;
+    let msg = one_open_question(&h, &mut bridge, "a1").await;
+
+    *h.fake.retire_fails.lock().await = true;
+    let receipt = MsgId::new("9002");
+    let frame = tap_as_the_bot_does(&h, &msg, "n", "No", &receipt).await;
+    let _ = bridge.next_choice().await;
+    *h.fake.retire_fails.lock().await = false;
+
+    bridge
+        .send(BridgeFrame::Ack {
+            r#ref: frame,
+            status: AckStatus::Refused,
+            reason: Some("the session that asked has ended".into()),
+            files: None,
+        })
+        .await;
+    // The keyboard coming off is the hub having finished taking the question back.
+    until(async || !h.fake.retired.lock().await.is_empty()).await;
+
+    let raw = std::fs::read_to_string(h.dir.path().join(crate::hub::door::RING)).expect("the ring");
+    let lines = ring_so_far(h.dir.path());
+    let closed: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["frame"]["t"] == "ask_resolved" && l["frame"]["ask_id"] == "a1")
+        .collect();
+    assert_eq!(
+        closed.len(),
+        1,
+        "the question was taken away and the app was never told, so it stands open there with \
+         nothing behind it:\n{raw}"
+    );
+    assert_eq!(
+        closed[0]["frame"]["how"], "not taken — the agent could not act on your answer",
+        "the app must read the same words the phone does:\n{raw}"
+    );
+    assert_eq!(closed[0]["dir"], "up", "{raw}");
 }
 
 #[tokio::test]
@@ -19454,6 +19651,420 @@ async fn an_answer_cannot_reach_into_another_conversation_s_ask() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────────────────────
+// A hub whose operator reads the app. The bot token was revoked on 17 September and the phone
+// line went with it, so `surface::TheApp` stands where Telegram stood: it carries nothing, and
+// the operator's copy of every question is the ring the hub writes before any surface is asked,
+// with his answers coming back through the drop beside it.
+//
+// What these prove is that the plane still WORKS, which is not obvious: the hub writes down what
+// a question's buttons mean only inside the arm where a surface handed back a receipt, so a
+// surface that refused would put every question on the ring with nothing behind it and nothing
+// at the door could ever be answered.
+
+/// A hub with no phone line: the same registry, ledger, audit, ring and drop on disk as every
+/// harness above, a real socket for a bridge to dial, and `TheApp` where Telegram would be.
+struct AppHarness {
+    hub: Arc<Hub<crate::surface::TheApp>>,
+    secret: String,
+    project: ProjectId,
+    sock: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+impl AppHarness {
+    /// The project speaking for itself, which is what a bridge that names no lane is.
+    fn own(&self) -> Addr {
+        Addr::project_itself(self.project.clone())
+    }
+
+    /// One worktree of it.
+    fn lane(&self, lane: &str) -> Addr {
+        Addr::lane_of(self.project.clone(), hub_proto::LaneId::new(lane))
+    }
+}
+
+async fn app_harness() -> AppHarness {
+    app_harness_with_budget(crate::queue::PER_MINUTE).await
+}
+
+/// The same hub with a per-minute ceiling of the test's choosing — which on this plane is a
+/// ceiling belonging to a carrier that is not there.
+async fn app_harness_with_budget(per_minute: u32) -> AppHarness {
+    let dir = tempfile::tempdir().expect("tmp");
+    let repo = dir.path().join("herdr-tg");
+    std::fs::create_dir_all(&repo).expect("repo");
+    let mut registry = Registry::load(dir.path().join("projects.json"));
+    let (project, secret) = registry.enrol(&repo).expect("enrols");
+    let project = project.id;
+    // Built the way a hub with no token would build it: the run's own second, and the floor read
+    // back off the registry so the numbers go on descending across a restart.
+    let app = Arc::new(crate::surface::TheApp::new(
+        now_secs(),
+        registry.lowest_topic_bound(),
+    ));
+    let hub = Arc::new(
+        Hub::new(
+            app,
+            registry,
+            AskLedger::load(dir.path().join("asks.json")),
+            HubAudit::new(dir.path().join("hub.audit.log")),
+            vec![ALLOWED_CHAT],
+            vec![OPERATOR],
+            ALLOWED_CHAT,
+        )
+        .with_settle(Duration::from_millis(500))
+        .with_budget(per_minute, Duration::from_millis(5)),
+    );
+    let sock = dir.path().join("hub.sock");
+    let listener = crate::transport::LocalSocket::bind(&sock).expect("bind");
+    {
+        let hub = Arc::clone(&hub);
+        tokio::spawn(async move {
+            while let Ok(accepted) = listener.accept().await {
+                let hub = Arc::clone(&hub);
+                tokio::spawn(async move {
+                    let _ = hub.serve_connection(accepted).await;
+                });
+            }
+        });
+    }
+    Arc::clone(&hub).watch_the_registry(Duration::from_millis(50));
+    AppHarness {
+        hub,
+        secret,
+        project,
+        sock,
+        dir,
+    }
+}
+
+/// A live bridge on the app plane with one open question, and how many records the ask left.
+async fn an_app_session_with_one_open_question(
+    h: &AppHarness,
+    instance: &str,
+    ask: &str,
+) -> FakeBridge {
+    let mut bridge = FakeBridge::connect(&h.sock, &h.secret, instance, h.project.as_str()).await;
+    bridge.become_live().await;
+    // The conversation has to have a number before the question, because the record is written
+    // against the one the registry holds and a question asked before it exists is not written
+    // down at all.
+    until_within(
+        "the conversation given a number of its own",
+        5,
+        async || h.hub.registry.lock().await.topic_of(&h.own()).is_some(),
+    )
+    .await;
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new(ask),
+            text: "Overwrite it?".into(),
+            options: Some(vec![
+                AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                },
+                AskOption {
+                    option_id: OptionId::new("n"),
+                    label: "No".into(),
+                },
+            ]),
+        })
+        .await;
+    until_within(
+        "the question written down where an answer can find it",
+        5,
+        async || !open_records_for(h, ask).await.is_empty(),
+    )
+    .await;
+    bridge
+}
+
+/// Every message a question is written down against, in the app plane's ledger.
+async fn open_records_for(h: &AppHarness, ask: &str) -> Vec<(i64, MsgId)> {
+    let want = AskId::new(ask);
+    h.hub
+        .ledger
+        .lock()
+        .await
+        .matching(|r| r.ask_id == want && r.refusal_if_closed().is_none())
+}
+
+#[tokio::test]
+async fn a_question_asked_with_no_phone_line_is_still_written_down_and_can_still_be_answered() {
+    let h = app_harness().await;
+    let mut bridge = an_app_session_with_one_open_question(&h, "i1", "a1").await;
+
+    // Written down twice over, and both copies matter. The ring is the operator's own history,
+    // appended before any surface is asked; the ledger is what an answer is resolved against, and
+    // it is written only where a surface handed back a receipt.
+    let asked: Vec<_> = ring_so_far(h.dir.path())
+        .into_iter()
+        .filter(|e| e["frame"]["t"] == "ask")
+        .collect();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the question is not in the operator's own history: {asked:?}"
+    );
+    let records = open_records_for(&h, "a1").await;
+    assert_eq!(
+        records.len(),
+        1,
+        "a question nobody could put on a phone was not written down, so nothing can answer it"
+    );
+
+    // And it is answerable: one file in the drop, swept, carried into the agent's turn.
+    drop_an_answer_in(
+        h.dir.path(),
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    let result = the_result_in(h.dir.path(), "tap-1");
+    assert_eq!(
+        result["status"], "accepted",
+        "an answer at the door was not carried: {result:?}"
+    );
+    let (_, chosen) = bridge.next_choice().await;
+    assert_eq!(
+        chosen,
+        OptionId::new("y"),
+        "the agent was handed an answer nobody gave"
+    );
+
+    // The record is forgotten only where the question was actually taken off the surface, so a
+    // ledger with nothing left under that name is the proof the retirement went through rather
+    // than a keyboard nothing can ever take off.
+    assert!(
+        open_records_for(&h, "a1").await.is_empty(),
+        "an answered question is still written down as open, so it is open in the app for ever"
+    );
+}
+
+#[tokio::test]
+async fn a_question_answered_once_can_never_be_answered_twice_when_no_surface_ever_saw_it() {
+    let h = app_harness().await;
+    let mut bridge = an_app_session_with_one_open_question(&h, "i1", "a1").await;
+
+    drop_an_answer_in(
+        h.dir.path(),
+        "tap-1",
+        a_tap_at(h.project.as_str(), "a1", "y", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    assert_eq!(
+        the_result_in(h.dir.path(), "tap-1")["status"],
+        "accepted",
+        "the first answer was refused, so this test is not about the second"
+    );
+    let (_, first) = bridge.next_choice().await;
+    assert_eq!(first, OptionId::new("y"));
+
+    // The same question, the other button, a moment later — which is what a second reader of the
+    // app, or one pane left open on a stale view, sends.
+    drop_an_answer_in(
+        h.dir.path(),
+        "tap-2",
+        a_tap_at(h.project.as_str(), "a1", "n", now_secs()),
+    );
+    h.hub.sweep_the_answers().await;
+    let second = the_result_in(h.dir.path(), "tap-2");
+    assert_eq!(
+        second["status"], "refused",
+        "one question was answered twice: {second:?}"
+    );
+    let seen = bridge.drain_for(Duration::from_millis(150)).await;
+    assert!(
+        !seen.iter().any(|f| matches!(f, HubFrame::Choice { .. })),
+        "a second, contradicting answer reached the agent's turn: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_runs_of_a_hub_with_no_phone_line_never_mint_the_same_message_id() {
+    use crate::surface::TheApp;
+
+    // Two runs a second apart. They cannot be closer: one flock lets one hub hold the box at a
+    // time, and the unit waits five seconds before starting the next — so the second a run began
+    // in is a number no other run of it shares.
+    let first = TheApp::new(1_700_000_000, None);
+    let second = TheApp::new(1_700_000_001, None);
+
+    let mut seen = BTreeMap::new();
+    for (run, surface) in [("first", &first), ("second", &second)] {
+        for n in 0..64 {
+            let SendOutcome::Sent(id) = surface.send(-1, "a line", &[], None).await else {
+                panic!("a receipt was not minted for the {run} run's message {n}");
+            };
+            let id = id.as_str().to_owned();
+            // The ledger's key is the conversation and the message with a colon between them, and
+            // every record is found again by splitting it there. A receipt carrying the separator
+            // is a key that no longer says which half is which.
+            assert!(
+                !id.contains(':'),
+                "a minted receipt carries the character the ledger's key is split on: {id}"
+            );
+            if let Some(earlier) = seen.insert(id.clone(), run) {
+                panic!("the {earlier} run and the {run} run both minted {id}");
+            }
+        }
+    }
+
+    // And the mechanism, not just this sample: every receipt carries the second its own run
+    // started in, which is what makes two runs' receipts disjoint however many each mints.
+    assert!(
+        seen.iter()
+            .filter(|(_, run)| **run == "first")
+            .all(|(id, _)| id.contains("1700000000")),
+        "a receipt does not carry the second its run started in, so two runs can overlap"
+    );
+}
+
+#[tokio::test]
+async fn a_topic_minted_with_no_forum_can_never_be_the_number_of_a_real_one() {
+    use crate::surface::TheApp;
+
+    // A forum numbers its threads from one upward, so nothing this mints can ever collide with
+    // one — and a box that later gains a forum cannot bind a real topic on top of one of these.
+    let app = TheApp::new(1_700_000_000, None);
+    let mut minted = Vec::new();
+    for n in 0..64 {
+        let id = app
+            .create_topic("herdr-tg", 0)
+            .await
+            .unwrap_or_else(|e| panic!("a conversation got no number at all ({n}): {e}"));
+        assert!(
+            id < 0,
+            "a conversation was given {id}, which is a number a forum could have given"
+        );
+        minted.push(id);
+    }
+    let distinct: std::collections::BTreeSet<i32> = minted.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "two conversations were given the same number: {minted:?}"
+    );
+
+    // Seeded from the floor the registry already holds, so a restart carries on below whatever
+    // the last run left rather than handing a new conversation a number one of them is on.
+    let after_a_restart = TheApp::new(1_700_000_001, Some(*distinct.first().expect("one")));
+    assert_eq!(
+        after_a_restart.create_topic("herdr-tg", 0).await.ok(),
+        Some(distinct.first().expect("one") - 1),
+        "a restart started over on numbers an earlier run is still bound to"
+    );
+
+    // A forum's own numbers are a floor this must not follow: reading one back must not push the
+    // next one up into the range a forum mints from.
+    let beside_a_forum = TheApp::new(1_700_000_002, Some(1001));
+    assert_eq!(
+        beside_a_forum.create_topic("herdr-tg", 0).await.ok(),
+        Some(-1),
+        "a forum's own thread number was taken as the floor to count down from"
+    );
+
+    // And the bottom of the range refuses rather than wrapping round into a forum's numbers.
+    let at_the_bottom = TheApp::new(1_700_000_003, Some(i32::MIN + 1));
+    assert_eq!(
+        at_the_bottom.create_topic("herdr-tg", 0).await.ok(),
+        Some(i32::MIN),
+        "the last number in the range was not handed out"
+    );
+    assert!(
+        at_the_bottom.create_topic("herdr-tg", 0).await.is_err(),
+        "the numbers wrapped round past the bottom of the range instead of refusing"
+    );
+}
+
+#[tokio::test]
+async fn a_hub_with_no_phone_line_never_sheds_a_message_for_a_ceiling_that_does_not_exist() {
+    // Two a minute, one of which is held back for the operator — so an agent gets exactly one,
+    // and the next thing it says meets the wall. On the phone that shed is correct, and it is
+    // proved below on the same number so this test cannot pass by the budget being too generous
+    // to bite.
+    let phone = harness_with_budget(2).await;
+    phone
+        .hub
+        .registry
+        .lock()
+        .await
+        .bind_topic(&phone.own(), 1001)
+        .expect("bind");
+    assert!(
+        matches!(
+            phone
+                .hub
+                .say_as(&phone.own(), "first", &[], Perishable::Question)
+                .await,
+            SendOutcome::Sent(_)
+        ),
+        "the one message the budget allows was shed, so the rest of this proves nothing"
+    );
+    assert!(
+        matches!(
+            phone
+                .hub
+                .say_as(&phone.own(), "second", &[], Perishable::Question)
+                .await,
+            SendOutcome::TooFast(_)
+        ),
+        "a chat with one message a minute took a second one, so this budget is not a ceiling"
+    );
+
+    // The same number, with nobody reading a phone. There is no ceiling to shed against — the
+    // words go to the ring, which has none — so an agent told its question was sent too fast
+    // would be told about an outage this hub invented.
+    let app = app_harness_with_budget(2).await;
+    for n in 0..8 {
+        let outcome = app
+            .hub
+            .say_as(&app.own(), "a line", &[], Perishable::Question)
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::Sent(_)),
+            "message {n} was shed against a ceiling that does not exist: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_box_switched_back_to_the_phone_re_mints_over_a_number_no_forum_could_have_given() {
+    let h = harness().await;
+    // What a run with no phone line leaves in the registry: a conversation bound to a number
+    // counted down from zero. Telegram numbers its threads from one upward, so sending into this
+    // one addresses a thread that cannot exist — every message of that conversation, silently.
+    h.hub
+        .registry
+        .lock()
+        .await
+        .bind_topic(&h.own(), -1)
+        .expect("bind");
+
+    let outcome = h.hub.say(&h.own(), "a line", &[]).await;
+    assert!(
+        matches!(outcome, SendOutcome::Sent(_)),
+        "a message was lost on a box that had been switched back to the phone: {outcome:?}"
+    );
+    assert_eq!(
+        h.fake.topics.lock().await.len(),
+        1,
+        "no topic was made to replace the number the app plane left behind"
+    );
+    let sends = h.fake.sends.lock().await.clone();
+    assert!(
+        sends.iter().all(|(topic, _, _)| *topic > 0),
+        "a message went into a thread number no forum could have given: {sends:?}"
+    );
+    assert_eq!(
+        h.hub.registry.lock().await.topic_of(&h.own()),
+        Some(1001),
+        "the conversation is still bound to a number that cannot be a topic"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
 // The hermetic PWA-door trial: one real hub, one real gateway binary, a scripted client shaped
 // like the PWA's, and nothing whatever reaching Telegram or this box's real state.
 //
@@ -20005,5 +20616,441 @@ async fn the_pwa_s_door_round_trip_reaches_the_hub_and_back_through_the_real_gat
     }
 
     let _ = refused_frame;
+    door.stop().await;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// The same door, in front of a hub with no Telegram surface in the process at all.
+//
+// The trial above stands a counted Telegram where the phone is, and waits on it recording a send.
+// On a box whose bot token was revoked that is a wait on the one thing that is gone — so this one
+// builds the hub the app plane builds (`surface::TheApp`) and waits on the RING instead: the hub
+// appends there as a frame reaches its handling, before any surface is asked, so a sequence that
+// has moved is the hub having HANDLED what an agent said. That is the better wait wherever it is
+// used — a count of what some carrier was asked to send is a fact about the carrier, not about
+// the hub — and on this plane it is the only one there is.
+//
+// What this proves that nothing else does: the whole app plane, end to end, through a real
+// process. The hub writes down what a question's buttons mean ONLY where a surface handed back a
+// receipt, so a plane whose surface refused would put every question on the ring with nothing
+// written down behind it and the door would refuse every tap that ever reached it. Nothing in the
+// hub had to change for that; what had to exist was a surface that SUCCEEDS, and this is where
+// that is held against the real binary rather than asserted.
+
+/// An agent's own half of the wire: a hub-proto speaker on the real socket.
+///
+/// Named again for this section on purpose. Everything in the trial below is real — the hub, the
+/// socket, the registry, the ledger, the ring, the drop, and the door as a process — and the one
+/// thing no test can start for real is the agent behind the wire. A name saying "fake" carried
+/// into a trial whose whole claim is that nothing stands in for a surface any more would be the
+/// one line in it suggesting something still does.
+type ABridge = FakeBridge;
+
+/// How far the hub's own record of what agents said has got.
+fn the_ring_s_head(state: &std::path::Path) -> u64 {
+    ring_so_far(state)
+        .last()
+        .and_then(|line| line["seq"].as_u64())
+        .unwrap_or(0)
+}
+
+/// Wait until the hub has handled something new, said as the ring's sequence moving past `was`.
+///
+/// `what` is what is being waited FOR, in words, because a trial with half a dozen of these that
+/// gives up without naming one is a timeout with no name on it.
+async fn the_ring_moves_past(state: &std::path::Path, was: u64, what: &str) {
+    until_within(what, 5, async || the_ring_s_head(state) > was).await;
+}
+
+/// Every result the hub has written beside an answer the door dropped, parsed.
+///
+/// Read by name-pattern rather than by name because the door mints the answer file's name itself
+/// — which is the point: what a POST was answered with can be matched against what the HUB said
+/// became of it, with nothing but the drop joining the two.
+fn the_hub_s_verdicts_in_the_drop(state: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut verdicts = Vec::new();
+    for entry in std::fs::read_dir(the_drop_in(state))
+        .expect("the drop")
+        .flatten()
+    {
+        if !entry.file_name().to_string_lossy().ends_with(".result") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(entry.path()).expect("one result");
+        verdicts.push(serde_json::from_str(&raw).expect("one result is one object"));
+    }
+    verdicts
+}
+
+/// One raw reply as a person reads it, for a failure message.
+///
+/// Because the panic a reader actually meets is the whole of what a failing trial gives them, and
+/// `[72, 84, 84, 80, 47, 49, …]` is a reply nobody can read at three in the morning.
+fn as_read(raw: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(raw)
+}
+
+/// Every byte that crossed the door's socket in the trial below, kept for one assertion at the end.
+///
+/// The two directions are kept apart because they are different facts. What the DOOR said is what
+/// this box disclosed to a reader that speaks only HTTP. What the CLIENT asked carries the
+/// client's own credential — their bridge presents a bearer on every write — so the credential
+/// appearing in a request is the request working, where the same string in a reply would be the
+/// door saying a secret back into a log, a proxy and a browser's network pane.
+#[derive(Default)]
+struct TheWire {
+    both_ways: Vec<u8>,
+    what_the_door_said: Vec<u8>,
+}
+
+impl TheWire {
+    /// One request and the reply it earned, kept whole.
+    fn crossed(&mut self, request: &str, reply: &[u8]) {
+        self.both_ways.extend_from_slice(request.as_bytes());
+        self.both_ways.extend_from_slice(reply);
+        self.what_the_door_said.extend_from_slice(reply);
+    }
+}
+
+/// A live bridge on the app plane — the conversation's own voice (`lane: None`), or one worktree
+/// of it — with its number already given.
+///
+/// The number first, because a question's record is written against the number the registry
+/// holds: one asked before there is a number is not written down at all, and the door would then
+/// have nothing to answer for a reason that has nothing to do with the door.
+async fn a_live_app_voice(h: &AppHarness, lane: Option<&str>, instance: &str) -> ABridge {
+    let mut bridge =
+        ABridge::connect_as(&h.sock, &h.secret, instance, h.project.as_str(), lane).await;
+    bridge.become_live().await;
+    let addr = match lane {
+        Some(lane) => h.lane(lane),
+        None => h.own(),
+    };
+    until_within(
+        "the conversation given a number of its own",
+        5,
+        async || h.hub.registry.lock().await.topic_of(&addr).is_some(),
+    )
+    .await;
+    bridge
+}
+
+/// One open question from that voice, waited for twice because the two facts are different and
+/// the trial needs both.
+///
+/// The ring is the operator's own copy, appended before any surface is asked — that is what the
+/// door serves. The ledger is what an answer is resolved against, and it is written only where a
+/// surface handed back a receipt — that is what the door's writes need. A question on the ring
+/// with nothing in the ledger is exactly the shape a plane with no working surface would have.
+async fn an_open_question_from(h: &AppHarness, bridge: &mut ABridge, addr: &Addr, ask: &str) {
+    let was = the_ring_s_head(h.dir.path());
+    bridge
+        .send(BridgeFrame::Ask {
+            ask_id: AskId::new(ask),
+            text: "Overwrite it?".into(),
+            options: Some(vec![
+                AskOption {
+                    option_id: OptionId::new("y"),
+                    label: "Yes".into(),
+                },
+                AskOption {
+                    option_id: OptionId::new("n"),
+                    label: "No".into(),
+                },
+            ]),
+        })
+        .await;
+    the_ring_moves_past(
+        h.dir.path(),
+        was,
+        "the question reach the operator's own record",
+    )
+    .await;
+    until_within(
+        "the question written down where an answer can find it",
+        5,
+        async || !still_open(h, addr, ask).await.is_empty(),
+    )
+    .await;
+}
+
+/// Every message one address's question is still written down against.
+async fn still_open(h: &AppHarness, addr: &Addr, ask: &str) -> Vec<(i64, MsgId)> {
+    h.hub.ledger.lock().await.matching(|r| {
+        r.addr_is(addr) && r.ask_id.as_str() == ask && r.refusal_if_closed().is_none()
+    })
+}
+
+#[tokio::test]
+#[ignore = "the hermetic PWA-door trial with no phone line: spawns the real kickoff-door binary, \
+            which must be built and on PATH; run it with scripts/pwa-door-trial.sh"]
+async fn the_pwa_s_door_round_trip_reaches_a_hub_that_has_no_telegram_surface_at_all() {
+    let h = app_harness().await;
+    let home = h.dir.path().display().to_string();
+    // Kept whole, both directions, from the first request to the last: what an HTTP reader could
+    // have learned about this machine is exactly what ends up in here.
+    let mut wire = TheWire::default();
+
+    // Two speakers, one question name between them: the conversation's own voice and one worktree
+    // of it. That is the ambiguity a lane at the door has to resolve, and it is what makes "and
+    // nobody else" mean anything at all.
+    let mut voice = a_live_app_voice(&h, None, "i1").await;
+    let mut lane = a_live_app_voice(&h, Some("fix-17"), "i2").await;
+    an_open_question_from(&h, &mut voice, &h.own(), "a1").await;
+    an_open_question_from(&h, &mut lane, &h.lane("fix-17"), "a1").await;
+
+    // The token as the terminal verb leaves it — trimmed, in the door's own directory. The verb
+    // mints into the real state home this trial must not go near, and what is under trial is the
+    // door's behaviour under a minted token, not the minting.
+    let door_dir = h.dir.path().join("door");
+    std::fs::create_dir_all(&door_dir).expect("the door's directory");
+    std::fs::write(door_dir.join("token"), "the-trial-s-token\n").expect("a minted token");
+    let door = TheRealDoor::start(h.dir.path()).await;
+
+    // ── the ring holds both questions, each stamped with its conversation and its lane, and the
+    //    door serves them ───────────────────────────────────────────────────────────────────────
+    let asked = "GET /v1/events?cursor=0 HTTP/1.1\r\nHost: the-door\r\n\r\n".to_owned();
+    let raw = door.ask(asked.clone()).await;
+    wire.crossed(&asked, &raw);
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{}", as_read(&raw));
+    let poll: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(poll["ok"], serde_json::Value::Bool(true), "{poll:?}");
+    let events = poll["events"].as_array().expect("a list").clone();
+    let head = poll["cursor"].as_u64().expect("a head");
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["seq"].as_u64().expect("a seq"))
+            .collect::<Vec<_>>(),
+        (1..=head).collect::<Vec<_>>(),
+        "the served events do not continue the cursor exactly: {poll:?}"
+    );
+    let asks: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["frame"]["t"] == "ask").collect();
+    assert_eq!(
+        asks.len(),
+        2,
+        "a hub with no phone line did not put both questions where he can read them: {poll:?}"
+    );
+    assert!(
+        asks.iter()
+            .all(|e| e["conversation"] == *h.project.as_str()),
+        "a question was served under a conversation nobody asked in: {asks:?}"
+    );
+    assert_eq!(
+        asks.iter()
+            .map(|e| e["lane"].as_str().expect("a lane"))
+            .collect::<Vec<_>>(),
+        vec!["-", "fix-17"],
+        "the worktree that asked is not on its own question: {asks:?}"
+    );
+    assert!(
+        asks.iter().all(|e| e["frame"]["ask_id"] == "a1"),
+        "{asks:?}"
+    );
+
+    // ── a tap naming the worktree reaches the session that asked, and nobody else ─────────────
+    let tap = a_pwa_post(
+        "/v1/commands",
+        Some("the-trial-s-token"),
+        r#"{"t":"choice","conversation":"h.project","lane":"fix-17","ask_id":"a1","option_id":"y"}"#
+            .replace("h.project", h.project.as_str())
+            .as_str(),
+    );
+    let raw = door.ask(tap.clone()).await;
+    wire.crossed(&tap, &raw);
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{}", as_read(&raw));
+    let taken: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(taken["ok"], serde_json::Value::Bool(true), "{taken:?}");
+    assert_eq!(taken["t"], "choice", "{taken:?}");
+    let (_frame, chosen) = lane.next_choice().await;
+    assert_eq!(
+        chosen.as_str(),
+        "y",
+        "the worktree's session was handed an answer nobody gave"
+    );
+    let nobody_else =
+        |frames: Vec<HubFrame>| !frames.iter().any(|f| matches!(f, HubFrame::Choice { .. }));
+    assert!(
+        nobody_else(voice.drain_for(Duration::from_millis(150)).await),
+        "an answer naming a worktree reached the conversation's own voice"
+    );
+
+    // ── and it was answered from the HUB's verdict, not from the door's optimism ──────────────
+    //
+    // The same question, the other button, a moment later — which is what a second reader of the
+    // app, or one pane left open on a stale view, sends. The door cannot know that is stale; it
+    // reads the hub's own result and says what that says. The proof is stronger than a status
+    // code: the sentence the POST came back with is one the HUB wrote into the drop, joined by
+    // nothing but the drop itself.
+    let again = a_pwa_post(
+        "/v1/commands",
+        Some("the-trial-s-token"),
+        r#"{"t":"choice","conversation":"h.project","lane":"fix-17","ask_id":"a1","option_id":"n"}"#
+            .replace("h.project", h.project.as_str())
+            .as_str(),
+    );
+    let raw = door.ask(again.clone()).await;
+    wire.crossed(&again, &raw);
+    let (status, body) = the_reply(&raw);
+    assert_eq!(
+        status,
+        400,
+        "a question that was already answered was answered again: {}",
+        as_read(&raw)
+    );
+    let refused: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(refused["ok"], serde_json::Value::Bool(false), "{refused:?}");
+    let why = refused["why"].as_str().expect("a sentence").to_owned();
+    let verdicts = the_hub_s_verdicts_in_the_drop(h.dir.path());
+    assert!(
+        verdicts.iter().any(|v| v["status"] == "accepted"),
+        "the tap that was carried left no word from the hub behind it: {verdicts:?}"
+    );
+    assert!(
+        verdicts
+            .iter()
+            .any(|v| v["status"] == "refused" && v["why"] == *why),
+        "the door refused in words of its own; the hub said {verdicts:?}"
+    );
+    for jargon in ["ask_id", "option_id", "None", "parse", "refused{"] {
+        assert!(
+            !why.contains(jargon),
+            "the refusal he reads says {jargon:?} to him: {why}"
+        );
+    }
+    assert!(
+        nobody_else(lane.drain_for(Duration::from_millis(150)).await),
+        "a second, contradicting answer reached the session that had already answered"
+    );
+
+    // ── the question stops being open ─────────────────────────────────────────────────────────
+    //
+    // The record is forgotten only where the question was actually taken off the surface, so a
+    // ledger with nothing left under that name is the proof the retirement went through. On a
+    // plane whose surface refused it, every answered question would stand open for ever.
+    assert!(
+        still_open(&h, &h.lane("fix-17"), "a1").await.is_empty(),
+        "an answered question is still written down as open, so it is open in the app for ever"
+    );
+
+    // ── typed words reach the worktree, and the name the POST answered with is the name the ring
+    //    echoes — so a sent line is its own receipt ─────────────────────────────────────────────
+    let typed = a_pwa_post(
+        "/v1/commands",
+        Some("the-trial-s-token"),
+        r#"{"t":"message","conversation":"h.project","lane":"fix-17","text":"check the worktree's own build"}"#
+            .replace("h.project", h.project.as_str())
+            .as_str(),
+    );
+    let raw = door.ask(typed.clone()).await;
+    wire.crossed(&typed, &raw);
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 200, "{}", as_read(&raw));
+    let sent: serde_json::Value = serde_json::from_slice(body).expect("one object");
+    assert_eq!(sent["ok"], serde_json::Value::Bool(true), "{sent:?}");
+    let the_nonce = sent["msg_id"].as_str().expect("a name").to_owned();
+    let carried = lane
+        .wait_for(|f| match f {
+            HubFrame::Message { text, msg_id, .. } if text == "check the worktree's own build" => {
+                Some(msg_id.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        carried, the_nonce,
+        "the name on the wire is not the name the POST answered with"
+    );
+    until_within(
+        "the line he sent echoed on the ring under its own name",
+        5,
+        async || {
+            ring_so_far(h.dir.path()).iter().any(|l| {
+                l["dir"] == "down"
+                    && l["frame"]["t"] == "message"
+                    && l["frame"]["msg_id"] == *the_nonce
+            })
+        },
+    )
+    .await;
+
+    // ── and the hub's own retirement is on the ring ───────────────────────────────────────────
+    //
+    // The one operator-visible line minted hub-side: the conversation's own voice still holds an
+    // open question, and a session of it starting again is what sweeps that question away. This
+    // is the line that exists ONLY where the surface's retirement succeeded, which is why it
+    // belongs in a trial about a plane that has no surface to refuse.
+    let was = the_ring_s_head(h.dir.path());
+    drop(voice);
+    let _next = a_live_app_voice(&h, None, "i3").await;
+    the_ring_moves_past(
+        h.dir.path(),
+        was,
+        "the hub write its own retirement of the question nobody is waiting on any more",
+    )
+    .await;
+    let retirement = ring_so_far(h.dir.path())
+        .into_iter()
+        .find(|l| l["frame"]["t"] == "ask_resolved")
+        .expect("the hub's own retirement line");
+    assert_eq!(retirement["frame"]["ask_id"], "a1", "{retirement:?}");
+    assert_eq!(
+        retirement["frame"]["how"],
+        "the session that asked this restarted, so it is not waiting for an answer any more",
+        "the retirement does not say in plain words what became of the question: {retirement:?}"
+    );
+    assert_eq!(retirement["conversation"], *h.project.as_str());
+    assert_eq!(retirement["lane"], "-", "{retirement:?}");
+    assert_eq!(retirement["dir"], "up", "{retirement:?}");
+    assert!(
+        still_open(&h, &h.own(), "a1").await.is_empty(),
+        "the swept question is still written down as open"
+    );
+
+    // ── the refusal a wrong token earns, byte for byte, as their bridge passes it through ─────
+    let stranger = a_pwa_post(
+        "/v1/commands",
+        Some("not-the-token"),
+        r#"{"t":"message","text":"no"}"#,
+    );
+    let raw = door.ask(stranger.clone()).await;
+    wire.crossed(&stranger, &raw);
+    let (status, body) = the_reply(&raw);
+    assert_eq!(status, 401, "{}", as_read(&raw));
+    assert_eq!(body, b"{\"error\": \"unauthorized\"}");
+
+    // ── and nothing that crossed the wire named this machine ──────────────────────────────────
+    //
+    // Asserted on the raw bytes of everything above, both directions: the requests carry what the
+    // client sent and the replies carry what the door said. The last entry is this plane's own:
+    // the surface mints a receipt per message that carries the second this hub started, which is
+    // a fact about this box, and no reader over HTTP may be handed one.
+    let last = "GET /v1/events?cursor=0 HTTP/1.1\r\nHost: the-door\r\n\r\n".to_owned();
+    let raw = door.ask(last.clone()).await;
+    wire.crossed(&last, &raw);
+    let both_ways = String::from_utf8_lossy(&wire.both_ways);
+    for named in [
+        home.as_str(),
+        "/tmp/",
+        &format!("-{ALLOWED_CHAT}"),
+        h.secret.as_str(),
+        "app-",
+    ] {
+        assert!(
+            !both_ways.contains(named),
+            "the identifier {named:?} reached the HTTP wire:\n{both_ways}"
+        );
+    }
+    // The credential is the one string the client itself puts on this wire, on every write. What
+    // it must never be is something the door says BACK.
+    let what_the_door_said = String::from_utf8_lossy(&wire.what_the_door_said);
+    assert!(
+        !what_the_door_said.contains("the-trial-s-token"),
+        "the door said the credential back:\n{what_the_door_said}"
+    );
+
     door.stop().await;
 }

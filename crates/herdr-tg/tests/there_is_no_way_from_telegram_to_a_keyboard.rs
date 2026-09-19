@@ -94,15 +94,24 @@ fn the_modules_that_could_type_are_not_declared_again() {
 }
 
 #[test]
-fn serve_takes_no_herdr_connection() {
-    // The signature is the evidence. The bot needed a herdr client only to watch panes and type
-    // into them; a `serve` that took one again would mean something had been rebuilt.
+fn neither_way_of_serving_takes_a_herdr_connection() {
+    // The signatures are the evidence. The bot needed a herdr client only to watch panes and type
+    // into them; a way of serving that took one again would mean something had been rebuilt.
+    //
+    // There are two of them now — the phone line and the app — and BOTH are named here on
+    // purpose. A guard that watched one while the other was free to grow a herdr client would
+    // watch the wrong half the moment the second became the one that ships.
     let bot = std::fs::read_to_string(repo().join("crates/herdr-tg/src/bot.rs"))
         .expect("bot.rs is readable");
     assert!(
-        bot.contains("pub async fn serve(config: Config)"),
-        "serve's signature changed. It takes the config and nothing else: its inputs are Telegram \
-         and its own socket."
+        bot.contains("pub async fn serve_telegram(config: Config)"),
+        "the phone line's signature changed. It takes the config and nothing else: its inputs are \
+         Telegram and its own socket."
+    );
+    assert!(
+        bot.contains("pub async fn serve_the_app()"),
+        "the app plane's signature changed. It takes nothing at all: its one input is its own \
+         socket."
     );
     assert!(
         !bot.contains("HerdrClient"),

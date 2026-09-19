@@ -26,7 +26,27 @@ bad()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
 rc_is() { [ "$2" = "$3" ] && ok "$1 (rc=$3)" || bad "$1: want rc=$2, got rc=$3"; }
 
 case_dir() { local d="$T/$1"; mkdir -p "$d"; printf '%s' "$d"; }
-wd() { HERDR_TG_STATE_DIR="$1" HERDR_TG_ENV_FILE="$E" bash "$W" "${@:2}"; }
+
+# A stand-in user manager, first on PATH for every case below. The watchdog asks systemd whether the
+# door the operator's app reads this machine through is running, and a suite whose answer came from
+# THIS box's own units would pass here and mean nothing anywhere else — or, worse, start alarming in
+# cases that are about something entirely different the day somebody enables a door here. The
+# neutral answer is what every case gets unless it says otherwise: he never enabled one.
+mkdir -p "$T/bin"
+# door_unit_says <what is-enabled prints> <ActiveState> <SubState>
+door_unit_says() {
+  cat > "$T/bin/systemctl" <<EOF
+#!/bin/sh
+case "\$*" in
+  *is-enabled*) printf '%s\n' '$1'; [ '$1' = enabled ] || exit 1; exit 0 ;;
+  *show*)       printf 'ActiveState=%s\nSubState=%s\n' '$2' '$3'; exit 0 ;;
+esac
+exit 1
+EOF
+  chmod +x "$T/bin/systemctl"
+}
+door_unit_says disabled inactive dead
+wd() { HERDR_TG_STATE_DIR="$1" HERDR_TG_ENV_FILE="$E" PATH="$T/bin:$PATH" bash "$W" "${@:2}"; }
 
 # stamp <dir> <seconds ago> — the heartbeat, aged on the wall clock, which is the clock the
 # watchdog reads. The hub writes a word into it; staging it empty would test a shape only a fixture
@@ -450,6 +470,122 @@ printf '%s' "$out" | grep -q 'operator was NOT told' \
   && bad "the record of which halves were told no longer holds every shape, so the repeat interval stopped applying" \
   || ok "the record of which halves were told holds every shape of outage without losing one"
 
+# ── the second process: the door the operator's app reads this machine through ──
+# Every leg of the hub's stamp on the app plane is the hub watching itself — it writes the ring, it
+# accepts at the agents' door, it lists the place his answers land — so a box with no kickoff-door
+# binary on it AT ALL stamps a green file every forty-five seconds while the app he is holding is
+# dark. That was proved by running one, not argued. The hub cannot close it: it binds nothing and
+# dials nothing, and every trace the door leaves in the state home appears only when the OPERATOR
+# acts, so "nothing has been written for ten minutes" is a man asleep and a dead door wearing one
+# face. So this script asks the user manager, which is the one place the answer exists.
+APP_RING_OK="what agents say is being written down for the app"
+APP_RING_BAD="what agents say cannot be written down for the app to read"
+APP_SWEEP_OK="the hub went to collect your answers 12 seconds ago"
+
+d=$(case_dir doordead); stamp "$d" 12; note "$d" 10 serving "$APP_RING_OK" "$DOOR_OK" "$APP_SWEEP_OK"
+: > "$d/watchdog.armed"; ago > "$d/watchdog.tick"; door_unit_says enabled inactive dead
+out=$(wd "$d" --dry-run 2>&1); rc=$?
+rc_is "a dead door beside a hub whose every leg is green alarms" 0 $rc
+printf '%s' "$out" | grep -q 'the door your app reaches it through has stopped' \
+  && ok "and it names the thing that stopped, which the hub cannot see at all" \
+  || bad "the hub was stamping, its door was dead, and nothing was said: $out"
+printf '%s' "$out" | grep -q 'Restarting kickoff-door' \
+  && ok "and it says what to restart" || bad "it named no fix: $out"
+printf '%s' "$out" | grep -q 'Restarting the hub is the usual fix' \
+  && bad "it sent him to restart a hub that is stamping perfectly: $out" \
+  || ok "and it does not send him to restart a hub that is perfectly well"
+
+# Restart=always with no start limit is deliberate in kickoff-door.service, so a unit whose binary
+# is missing after a partial install restarts every five seconds for the life of the box and never
+# once reaches `failed`. A check written on is-failed calls that healthy.
+d=$(case_dir doorlooping); stamp "$d" 12; note "$d" 10 serving "$APP_RING_OK" "$DOOR_OK" "$APP_SWEEP_OK"
+: > "$d/watchdog.armed"; ago > "$d/watchdog.tick"; door_unit_says enabled activating auto-restart
+out=$(wd "$d" --dry-run 2>&1)
+printf '%s' "$out" | grep -q 'the door your app reaches it through has stopped' \
+  && ok "a door restarting for ever on a binary that is not there is dead, not starting" \
+  || bad "a crash loop was read as a door on its way up: $out"
+
+d=$(case_dir doorok); stamp "$d" 12; note "$d" 10 serving "$APP_RING_OK" "$DOOR_OK" "$APP_SWEEP_OK"
+: > "$d/watchdog.armed"; ago > "$d/watchdog.tick"; door_unit_says enabled active running
+out=$(wd "$d" --dry-run 2>&1); rc=$?
+rc_is "a running door leaves it as quiet as it has always been" 0 $rc
+[ -z "$out" ] && ok "and it says nothing at all" || bad "it spoke: $out"
+
+# A door that FLAPS is still one outage, and every case above it here is a single sample — which is
+# the one shape a door does not take when it fails the way its own unit is written to fail.
+# kickoff-door.service sets Restart=always with RestartSec=5 and no start limit, so a door that
+# binds and dies tens of seconds later — a token rotated out from under it, a panic on a request, an
+# OOM — is `running` when half of these checks look and `dead` when the other half do. One sample of
+# `active` used to wipe the latch and the record of what had already been told, so the next check
+# that caught it down started the repeat interval from zero: measured here, six alarms in twelve
+# checks, against one in ten for a door that simply stayed down. It is the shape the two cases above
+# already guard for the hub's stamp and for a flapping leg, and the ending is the same either way —
+# one message a minute, all night. Run for real: --dry-run exits before the latch is written, so a
+# dry case cannot measure a throttle at all.
+d=$(case_dir doorflapping); : > "$d/watchdog.armed"; sent=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  stamp "$d" 12; note "$d" 10 serving "$APP_RING_OK" "$DOOR_OK" "$APP_SWEEP_OK"; ago > "$d/watchdog.tick"
+  if [ $(( i % 2 )) -eq 0 ]; then door_unit_says enabled active running
+  else                            door_unit_says enabled inactive dead; fi
+  out=$(wd "$d" 2>&1)
+  printf '%s' "$out" | grep -q 'operator was NOT told' && sent=$(( sent + 1 ))
+done
+[ "$sent" -ge 1 ] \
+  && ok "a door that is down on half the checks is still told about" \
+  || bad "the door was down on six checks of twelve and the operator was never told once"
+[ "$sent" -le 2 ] \
+  && ok "and a door that comes back between two checks is not a message a minute ($sent alarms in 12 checks)" \
+  || bad "a flapping door sent $sent alarms in 12 checks; every swing reset the repeat interval"
+
+# The other half of that margin, and the defect that a fix for the flap introduces if nobody drives
+# it: a record that is never cleared silences the NEXT outage of the same shape for a whole repeat
+# interval. A door that has really come back — up on every check across the window — clears it, and
+# the outage after that is told at once. Only the passage of time is staged, the way every other
+# clock in this suite is staged; the decisions are the script's own.
+d=$(case_dir doorrecovers); : > "$d/watchdog.armed"
+stamp "$d" 12; note "$d" 10 serving "$APP_RING_OK" "$DOOR_OK" "$APP_SWEEP_OK"; ago > "$d/watchdog.tick"
+door_unit_says enabled inactive dead
+wd "$d" >/dev/null 2>&1
+[ "$(cat "$d/watchdog.latch" 2>/dev/null)" = "1" ] && ok "a dead door latches" || bad "no latch"
+printf '%s\n' "$(( $(date +%s) - 600 ))" > "$d/watchdog.door"   # ten minutes of checks finding it up
+stamp "$d" 12; ago > "$d/watchdog.tick"; door_unit_says enabled active running
+wd "$d" >/dev/null 2>&1
+if [ -e "$d/watchdog.latch" ] || [ -e "$d/watchdog.legs" ]; then
+  bad "a door that came back for good left the record of the old outage behind"
+else
+  ok "a door that has been up across the whole window clears the record"
+fi
+stamp "$d" 12; ago > "$d/watchdog.tick"; door_unit_says enabled inactive dead
+out=$(wd "$d" 2>&1)
+printf '%s' "$out" | grep -q 'operator was NOT told' \
+  && ok "so the next time the door dies he is told at once, not in half an hour" \
+  || bad "the next outage was swallowed by the last one's repeat interval: $out"
+
+# The cry-wolf half, and the half that decides whether this is worth having. Most boxes have no
+# door: the phone plane is the older product and a hub can serve a herd with no app near it.
+d=$(case_dir nodoorhere); stamp "$d" 12; note "$d" 10 serving "$APP_RING_OK" "$DOOR_OK" "$APP_SWEEP_OK"
+: > "$d/watchdog.armed"; ago > "$d/watchdog.tick"; door_unit_says disabled inactive dead
+out=$(wd "$d" --dry-run 2>&1)
+[ -z "$out" ] && ok "a door nobody enabled is never alarmed about" \
+               || bad "a box that never ran a door was alarmed about the one it does not have: $out"
+
+d=$(case_dir hubanddoor); stamp "$d" 3600
+note "$d" 10 'not serving' "$APP_RING_BAD" "$DOOR_OK" "$APP_SWEEP_OK"
+: > "$d/watchdog.armed"; ago > "$d/watchdog.tick"; door_unit_says enabled inactive dead
+out=$(wd "$d" --dry-run 2>&1)
+printf '%s' "$out" | grep -q 'nothing it says is reaching your app' \
+  && ok "a hub that has gone quiet is still the headline when its door has gone too" \
+  || bad "the hub's own outage stopped being the headline: $out"
+printf '%s' "$out" | grep -q 'has stopped as well' \
+  && ok "and the door is named beside it, so fixing the hub leaves no dark app unexplained" \
+  || bad "the door was swallowed by the hub's outage: $out"
+printf '%s' "$out" | grep -q 'The hub says: And the door' \
+  && bad "a fact the hub cannot witness was put in the hub's mouth: $out" \
+  || ok "and it is not attributed to the hub, which cannot see that program at all"
+
+# Back to the neutral answer for anything after this point.
+door_unit_says disabled inactive dead
+
 # ── what the watchdog is not allowed to become ───────────────────────────────
 # A "reset the state and see" refactor is the realistic way this script starts deleting the record
 # of who asked what — while the operator is being told his phone line is down and has no way to
@@ -457,17 +593,40 @@ printf '%s' "$out" | grep -q 'operator was NOT told' \
 # Comments are stripped first: this script's header explains at length what it must never do, and a
 # guard that reads its own warning as the offence is a guard nobody can keep green.
 code() { sed 's/#.*//' "$W"; }
+# Read into a variable rather than piped into a quitting `grep -q`. Under `set -o pipefail` a
+# function feeding `grep -q` returns 141 whenever grep wins the race and closes the pipe first, so
+# these guards reported a clean scan on a coin flip — measured here, on this file, before the door
+# check was added: the same command answered "matches" and "no match" on consecutive runs.
 owned='hub\.heartbeat|hub\.health|hub\.generations\.json|hub\.connected\.json|hub\.audit\.log|asks\.json|\$BEAT|\$AGENTS'
-if code | grep -nE '\brm\b' | grep -qE "$owned"; then
-  bad "the watchdog removes a file the hub owns: $(code | grep -nE '\brm\b' | grep -E "$owned")"
+removes="$(code | grep -nE '\brm\b' | grep -E "$owned")"
+if [ -n "$removes" ]; then
+  bad "the watchdog removes a file the hub owns: $removes"
 else
   ok "the watchdog never removes a file the hub owns"
 fi
-if code | grep -qE '\b(systemctl|systemd-run|kill)\b'; then
-  bad "the watchdog tries to act on the hub instead of reporting it: $(code | grep -nE '\b(systemctl|systemd-run|kill)\b')"
+
+# The watchdog now ASKS systemd one thing — is the door the operator's app reads through running? —
+# and it must never TELL it anything. The two are one word apart on the same command line. Asking
+# cannot take the box down with the thing it watches; acting can, and acting is somebody else's job
+# in this system by design. `command -v systemctl` is a lookup that runs nothing and is not a call.
+calls="$(code | grep -nE '\bsystemctl\b' | grep -v 'command -v systemctl')"
+acts='\b(start|stop|restart|try-restart|reload|daemon-reload|kill|enable|disable|mask|unmask|reset-failed|set-property|edit)\b'
+told="$(printf '%s\n' "$calls" | sed -E 's/\bis-(enabled|active|failed)\b//g' | grep -E "$acts")"
+if [ -n "$told" ]; then
+  bad "the watchdog tells systemd to do something instead of asking it: $told"
+else
+  ok "the watchdog asks the user manager about the door and never tells it anything"
+fi
+other="$(code | grep -nE '\b(systemd-run|kill)\b')"
+if [ -n "$other" ]; then
+  bad "the watchdog tries to act on the hub instead of reporting it: $other"
 else
   ok "the watchdog alarms and restarts nothing — restarting is somebody else's job"
 fi
+# And a guard that scanned a file with nothing in it to scan is a green light nobody will question.
+[ -n "$calls" ] \
+  && ok "and it really does ask about the door, which is the whole of what watches that program" \
+  || bad "nothing in this script asks about the door the operator's app reads this machine through"
 
 printf '\npass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

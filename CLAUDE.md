@@ -83,7 +83,18 @@ env -u RUSTUP_TOOLCHAIN TMPDIR=<a real absolute dir> PATH="$HOME/.cargo/bin:$PAT
 
 `PATH` because mise shims hide cargo. `env -u RUSTUP_TOOLCHAIN` because mise exports it globally and it
 overrides `rust-toolchain.toml`. `TMPDIR` because an agent session inherits it as the literal string
-`%h/.cache/tmp`, which fails seven `herdr-client` transport tests for a reason you did not cause.
+`%h/.cache/tmp` — an unexpanded systemd specifier, which is not an absolute path — and that fails
+seven `herdr-client` transport tests for a reason you did not cause. It must be **short** as well as
+real: those tests bind Unix sockets under it, and a socket path caps at 108 bytes, so a deep
+scratch directory fails them the same way.
+
+**That is the whole of what TMPDIR explains**, and it did not used to be. Two enrolment tests were
+red here for a fortnight and blamed on the same environment fault; the cause was an empty directory
+named `.git` somebody had left above the temp root. git says there is no repository in one, but
+`enroll.rs` asked only whether something of that name existed, so every fixture below it read as
+"inside a checkout" and enrolment warned about a secret no repository could take. The folder is
+gone, the predicate now asks what the entry holds, and no enrolment test wants TMPDIR pointed
+anywhere in particular. A red test you have been told to expect is a red test you stop reading.
 
 The same applies to `git commit`: the pre-commit hook runs six gates in your environment, so prefix
 the commit too, or it is refused with seven red tests you did not break.
@@ -100,10 +111,10 @@ re-run is a red test you have learned not to read. Nobody has found the cause; t
 binary's own path, which is the part that makes it worth an hour rather than a `#[ignore]`. Until
 somebody does: hitting it is not a red gate, and it is not licence to re-run anything else.
 
-Fourteen tests are `#[ignore]`d — eleven need bun (one runs the plugin from before conversations
+Fifteen tests are `#[ignore]`d — eleven need bun (one runs the plugin from before conversations
 existed against the new hub, one dispatches three rooms with the real adapter, one is the fleet
 trial below), one is a proxy-driven child, one runs the pre-change bridge against the new hub, and
-one is the hermetic PWA-door trial (`scripts/pwa-door-trial.sh`). The count is held to the tree by
+two are the hermetic PWA-door trials, one per plane (`scripts/pwa-door-trial.sh` runs both). The count is held to the tree by
 nothing, so it has been wrong before: when you add one, move the number in the same commit.
 `scripts/install-channel-plugin.sh` runs the bun ones and refuses to install a bridge that
 disagrees with the hub. It does NOT run the fleet trial: four conversations crossing is a property
@@ -298,6 +309,59 @@ until the number moves, which is the point.
   which arrived was **acted on** — a handler that took one and hung looks well here until the wedge
   backs up far enough to stop the stream being driven — and `heartbeat.rs` says so rather than
   implying it. The alarm still restarts nothing; that belongs to whoever dispatches.
+- **The hub runs with the app as its only surface, and the door in front of it is proven with no
+  Telegram in the process at all** (19 September). `serve --to app` puts `surface::TheApp` where
+  the phone stood. It carries nothing — the operator's copy of every question is the ring the hub
+  appends before any surface is asked, and his answers come back through the drop beside it — and
+  what it does instead is **succeed**: the hub writes down what a question's buttons mean only
+  inside the arm where a surface handed back a receipt, so a plane whose surface refused would put
+  every question on the ring with nothing behind it and the door could answer none of them. The
+  two things it mints are the hub's own keys: a number per conversation counting DOWN from zero, so
+  a box that later gains a forum cannot collide with one, and a receipt per message stamped with
+  the second the run began, so a restart's first receipt is clear of the last run's. **Nothing in
+  the hub changed for any of it.**
+  `the_pwa_s_door_round_trip_reaches_a_hub_that_has_no_telegram_surface_at_all` is the whole loop
+  through the real `kickoff-door` binary on a loopback port: a question on the ring stamped with
+  its conversation and its lane, `GET /v1/events` serving it, a POSTed choice reaching the session
+  that asked and nobody else, the POST answered from the hub's own verdict — the sentence it is
+  refused with is matched against what the hub wrote in the drop, not merely against a status code
+  — the ok-shape's name echoed on the ring's down line, the question ceasing to be open with the
+  hub's own retirement beside it, and nothing on the raw HTTP wire naming this box. It waits on
+  the RING's sequence rather than on a carrier recording a send, which is the better wait wherever
+  it is used and here the only one there is. `scripts/pwa-door-trial.sh` runs both round trips and
+  refuses a run in which either matched no test.
+- **An app-plane hub earns the same stamp, over its own three legs.** `--to app` has no phone line
+  and no stream of taps, and the three legs are what agents say being written down for the app (the
+  ring open for the run and its last append landed — a state, not a heartbeat, and the code says
+  which it is and that it proves the less for it), the **same** door with the same writer and the
+  same sentences, and the sweep of the answers drop. The sweep leg is new on both planes and closes
+  a hole a Telegram box has today: nothing whatsoever watched that sweep, so a sweep task that died
+  took every tap from the app with it in silence. It is modelled on the update stream because its
+  two failure shapes are the same two — stopped going round, and going round and being refused —
+  and the watched loop is a sibling of `watch_the_registry` so the existing call sites are
+  untouched. **A hub that could not stamp would be the worse bug, not the safer one**: the alarm
+  arms on the note as well, so a plane that wrote the note every tick and never stamped would buzz
+  every minute for ever on a healthy box and teach him to ignore the one message that has to be
+  trusted. `Verdict` carries its plane and `earned` is an `all` over every leg it holds. The
+  script's only carrier is still a bot token, so on an app box an alarm it decides is journalled
+  and exits non-zero into `systemctl --user --failed` and `OnFailure=` — no second carrier was
+  invented here.
+- **Every leg of that stamp stops at the process boundary, so the watchdog watches the door's unit
+  itself.** This is the repo's oldest mistake one process out, and it was proved by running it: a
+  hub started with no `kickoff-door` binary anywhere on PATH stamped `serving` and went on stamping,
+  with no door, no app and no possible reader, and the watchdog said nothing for ever. The hub
+  cannot honestly witness the door — it binds nothing, starts nothing, and every trace the door
+  leaves in the state home is written only when the operator acts, so "nobody has touched the drop
+  for ten minutes" is a man asleep and a dead door wearing one face. So the hub writes the gap down
+  rather than implying it is covered, and the SCRIPT asks the user manager about
+  `kickoff-door.service` — the one thing here the hub cannot see. It reads `ActiveState` **and**
+  `SubState`, never `is-failed`: that unit is `Restart=always` with no start limit, so a door
+  crash-looping on a binary that is not there is `activating/auto-restart` for ever and never
+  reaches `failed` — a check written on `is-failed` would have called that box healthy for its whole
+  life. And the door gets the stamp's own margin before it counts as recovered, because one sample
+  of `running` on a door that binds and dies every five seconds otherwise wiped the record of what
+  had been told: six alarms in twelve checks, measured. That margin clears the **door's** shape
+  only — gating the whole record on it silenced a hub outage that recovered and came back.
 - **A project has an off switch, at the terminal only.** `herdr-tg disable <repo>` writes the flag
   for the project's seed AND every room of it (a room's id in place of the folder switches that
   one room);

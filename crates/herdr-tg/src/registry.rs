@@ -550,6 +550,28 @@ impl Registry {
         }
     }
 
+    /// The lowest topic number anything here is bound to — every conversation's own and every
+    /// lane's — or nothing when no conversation has one yet.
+    ///
+    /// For a carrier that has no forum to ask and mints its own numbers downward instead. That
+    /// carrier holds its counter in memory, so without a floor read back off this file at start a
+    /// restart would hand the next brand-new conversation a number an older one is still bound
+    /// to — and two conversations on one number share every question written down against it.
+    ///
+    /// Across ALL of them and not just the project being asked about, because the numbers are a
+    /// box's, not a project's: a second conversation minting from a floor it read off its own row
+    /// alone would start again where the first already is.
+    pub fn lowest_topic_bound(&self) -> Option<i32> {
+        self.projects
+            .values()
+            .flat_map(|p| {
+                p.topic_id
+                    .into_iter()
+                    .chain(p.lane_topics.values().copied())
+            })
+            .min()
+    }
+
     /// Remember which topic a conversation's messages go to.
     pub fn bind_topic(&mut self, addr: &Addr, topic_id: i32) -> Result<(), EnrolError> {
         // Read-modify-write under the lock, never write-what-I-remember. Writing the in-memory map

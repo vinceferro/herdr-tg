@@ -28,13 +28,41 @@ Environment=RUST_LOG=info
 
 # The door holds no claim and speaks no hub-proto. If it dies, agents keep working and the phone
 # surface is unaffected; what stops is the app's view. So it comes back, and quickly.
+#
+# THE STATE OF THIS UNIT IS WHAT WATCHES THIS PROGRAM, and it is the only thing that can. The hub
+# writes the ring and sweeps the answers drop and is in no position to notice that nobody is
+# serving them: it binds nothing, dials nothing, and every trace this door leaves in the state home
+# appears only when the operator acts — so a hub with no door on the box at all stamps a green
+# heartbeat every forty-five seconds while the app is dark, which is exactly what happened when
+# somebody went and tried it. deploy/herdr-tg-watchdog.sh therefore asks the user manager, on every
+# check, whether this unit is `active (running)` — and only where the operator ENABLED it, because
+# a box that never had a door is not a box with a broken one.
+#
+# Note what Restart=always with no start limit means for that: a door whose binary is missing after
+# a partial install restarts every five seconds for the life of the box and sits in
+# `activating (auto-restart)` for ever, never once reaching `failed`. That is the right behaviour
+# for a door — giving up leaves the app dark with no way back — and it is precisely why this unit
+# cannot announce its own death through OnFailure=, and why the watchdog reads the substate rather
+# than asking whether it has failed.
 Restart=always
 RestartSec=5
 
 # ── Hardening ───────────────────────────────────────────────────────────────────────────────────
-# Tighter than herdr-tg.service can be, because this process does strictly less: it reads two files
-# under the state home and writes one directory of them, holds no bot token, dials nothing outward,
-# and starts no process. It accepts loopback TCP and that is the whole of its network.
+# The same sandbox the two hub units run in, directive for directive, with one address family fewer.
+# This process does strictly less than either of them: it reads two files under the state home and
+# writes one directory of them, holds no bot token, dials nothing outward, and starts no process.
+#
+# It used to say it was TIGHTER than herdr-tg.service. The two lines that were supposed to carry
+# that difference turn out not to run here at all — the note below them is what was measured — so
+# the whole of the difference is the missing AF_UNIX, and "tighter" was a word doing work the
+# kernel was not.
+#
+# Every line here was run rather than taken on trust: one probe under `systemd-run --user`, twice —
+# once bare, once under this unit's own directive list read out of this file — and a line counts as
+# doing something only where the two runs disagreed.
+# `tests/a_unit_promises_only_what_the_manager_running_it_enforces.rs` carries what each one said.
+# It WALKS this directory rather than naming units, because this unit was missing from the list it
+# used to keep, and so kept three claims the same round deleted from its two siblings.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectControlGroups=yes
@@ -44,9 +72,31 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-# Loopback TCP only. No AF_UNIX: this door never touches the hub's socket — the ring file and the
-# answers drop are the entire interface between the two, which is the design and not an accident.
+# Two internet families and no AF_UNIX: this door never touches the hub's socket — the ring file
+# and the answers drop are the entire interface between the two, which is the design and not an
+# accident. Measured under `systemd-run --user`: a netlink socket opens bare and is refused under
+# this list, so the refusal is real.
+#
+# This line said "Loopback TCP only", which a reader takes for a bound destination, and it is not
+# one: a family list says which kinds of socket may be opened and nothing whatever about where one
+# may go. What holds this door to 127.0.0.1 is the code — `gateway.rs` binds that address and there
+# is no flag for another, which is the design this unit's own header describes.
 RestrictAddressFamilies=AF_INET AF_INET6
+# The next two lines do nothing on this box, and neither the unit nor systemd will tell you so.
+# Filtering by address is a cgroup BPF program, an unprivileged user manager cannot install one,
+# and every install this repo documents is `systemctl --user`.
+#
+# Measured on 19 September 2026 rather than reasoned about. A curl to 1.1.1.1 under
+# `systemd-run --user` with both lines set answered 301; the control run, with no properties at
+# all, answered 301. Nothing warns: the unit starts clean, `systemctl show` reads the addresses
+# back as though they were in force, and the whole of the evidence is one journal line that no unit
+# fails on — "bpf-firewall: Preparation of BPF allow maps failed: Operation not permitted".
+# herdr-tg-app.service carries the same measurement beside the same pair.
+#
+# Kept rather than deleted, for two reasons. They are real the moment this unit is started by a
+# system manager, or by a user manager with the BPF controller delegated to it — a change in how it
+# is installed, not a change to this file. And a measurement is worth more beside the lines it is
+# about than anywhere else.
 IPAddressDeny=any
 IPAddressAllow=localhost
 SystemCallArchitectures=native

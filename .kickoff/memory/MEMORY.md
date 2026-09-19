@@ -21,3 +21,4 @@
 - [Telegram is a connector, and kickoff work will drive it](telegram-is-a-connector-kickoff-will-drive-it.md) — the 17 Sept ruling: the PWA is the work surface, the hub stays, the Telegram connector is later kickoff work.
 - [A guard that fires only on the whole leak](a-guard-that-fires-only-on-the-whole-leak.md) — three guards passed while what they named was broken; break each half separately or the comment is lying.
 - [The wire already carried files](the-wire-already-carried-files.md) — hub-proto has had the file vocabulary since 6 September; read frame.rs before proposing a wire change.
+- [A unit name is a shared namespace](a-unit-name-is-a-shared-namespace.md) — we nearly had systemd stop another org's live hub; prefix every unit `herdr-tg` and check the box first.

@@ -47,15 +47,30 @@ fn hold_the_lock(state: &Path, name_itself: bool) -> std::fs::File {
 }
 
 /// Run `herdr-tg serve` against a state dir, with no credentials whatsoever in the environment.
+///
+/// **Told to reach him on the phone line, explicitly.** Which way a hub reaches him is a required
+/// argument with no default, and this whole file is about the ordering on the plane that has a
+/// token to reach too late for. Leaving it off would make every run here a usage error — which
+/// every assertion below about what the hub did NOT say is satisfied by, so all three tests would
+/// go green while proving nothing at all.
+///
+/// Both spellings of every setting are removed, not only the former ones: `compat.rs` accepts
+/// either, so a developer's own shell exporting the current spelling would hand this test the very
+/// credential it is proving the hub never reaches.
 fn second_hub(home: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_herdr-tg"))
-        .arg("serve")
-        .env("XDG_STATE_HOME", home)
-        .env_remove("HERDR_TG_TOKEN")
-        .env_remove("HERDR_TG_ALLOWED_CHAT_IDS")
-        .env_remove("HERDR_TG_FORUM_CHAT_ID")
-        .output()
-        .expect("run the second hub")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_herdr-tg"));
+    cmd.arg("serve").arg("--to").arg("telegram");
+    cmd.env("XDG_STATE_HOME", home);
+    for suffix in [
+        "TOKEN",
+        "ALLOWED_CHAT_IDS",
+        "ALLOWED_USER_IDS",
+        "FORUM_CHAT_ID",
+    ] {
+        cmd.env_remove(format!("KICKOFF_CHANNEL_{suffix}"));
+        cmd.env_remove(format!("HERDR_TG_{suffix}"));
+    }
+    cmd.output().expect("run the second hub")
 }
 
 #[test]
@@ -130,6 +145,14 @@ fn a_hub_starts_when_nothing_holds_the_lock() {
         "a lone hub was told another was running. stderr: {said}"
     );
     // It still fails — there is no token here — and that failure is the evidence that the lock let
-    // it through to the config it was always going to trip over.
+    // it through to the config it was always going to trip over. Asserted on the SENTENCE and not
+    // merely on the exit code: every way of never starting at all also exits non-zero, and this
+    // test's whole job is to prove the hub got as far as the one thing the other two prove it
+    // never reaches.
     assert!(!out.status.success(), "a hub with no token must not start");
+    assert!(
+        said.contains("token"),
+        "a lone hub did not get as far as looking for a token, so this test can no longer tell a \
+         lock that let it through from a hub that never started. stderr: {said}"
+    );
 }

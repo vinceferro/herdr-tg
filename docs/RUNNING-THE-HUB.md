@@ -9,7 +9,8 @@ to start, you need §1 and §2.
 
 ## 0. What is actually running today, and why
 
-**Nothing. By decision, not by accident.**
+**Nothing is running. That is still a decision — but it is no longer the whole truth, because
+what CAN run changed.**
 
 On 17 September the operator revoked the Telegram bot token himself, and `herdr-tg.service`,
 `herdr-tg-watchdog.timer` and `kickoff-hub-attach@oc-dogfood.service` were stopped and disabled the
@@ -17,11 +18,30 @@ same hour — so a dead credential would not be polled, refused and nagged about
 surface is the PWA and the herdr TUI now; Telegram survives as a connector to be configured from
 the PWA, and that is later kickoff work.
 
-**So if your channel tools cannot reach the hub, that is the expected state and not an outage.**
-Do not try to fix it. Reviving a unit or minting a token is the operator's call, in that order, and
-his stated ordering is: the app's chat proven first, then anything else.
+**What no longer needs a token:** the hub itself. `herdr-tg serve --to app` builds the hub with
+the app where Telegram stood — no credential read, nothing dialled off this box — and everything
+an agent says reaches the operator's own record instead of a chat, with his answers coming back
+through the drop beside it. `kickoff-door` serves those two files to the PWA, and it never needed
+a token either. So the app plane is a hub, a door and a worker, all of which can start today:
 
-His live path meanwhile is agent-mail.
+```
+systemctl --user enable --now herdr-tg-app.service
+herdr-tg door-token
+systemctl --user enable --now kickoff-door.service
+```
+
+Held end to end by `bash scripts/pwa-door-trial.sh`, whose second round trip is the real door in
+front of a hub with no Telegram surface in the process at all.
+
+**What still needs his decision, and nobody else's:** starting any of it on this box. Nothing
+above has been enabled here, and enabling it is his call — minting the door's credential is
+issuing a credential, and a hub that starts is a hub that takes the box's one lock and the one
+socket every agent on it dials. **The phone plane needs more than a decision**: `--to telegram`
+needs a bot token that does not exist, and minting one is a separate call he has stated comes
+second — the app's chat proven first, then anything else.
+
+**So if your channel tools cannot reach the hub, that is still the expected state and not an
+outage.** Do not start a unit to fix it. His live path meanwhile is agent-mail.
 
 ---
 
@@ -50,6 +70,7 @@ about `kickoff-door` at all. So after running it:
 install -m 0755 target/release/herdr-tg     ~/.cargo/bin/herdr-tg
 install -m 0755 target/release/kickoff-door ~/.local/bin/kickoff-door
 install -m 0644 deploy/kickoff-door.service ~/.config/systemd/user/kickoff-door.service
+install -m 0644 deploy/herdr-tg-app.service  ~/.config/systemd/user/herdr-tg-app.service
 systemctl --user daemon-reload
 ```
 
@@ -66,7 +87,59 @@ existed, and §2's first step will fail with a verb that does not exist.
 
 ## 2. What to start, in what order
 
-**The hub** — dials out to Telegram, listens on a Unix socket that is not a port, binds nothing:
+**The hub, and which way it reaches him.** There are two planes, and `serve` has to be told which:
+`--to telegram` or `--to app`. It is required, there is no default, and nothing is inferred from
+whether a token happens to be set — inference would flip the box to the app the day a credential
+file failed to render, and every agent here would talk into a file while he waited for a phone that
+was never going to ring.
+
+**One at a time.** Both planes bind the same socket and take the same lock, so each unit names the
+other in `Conflicts=` and systemd stops it rather than leaving you a failed one.
+
+**A unit name is a namespace, and it is shared with every other organisation on this box.** There
+is one `systemctl --user` namespace per user, not one per project, and nothing warns you that a
+name is taken. So every unit this repo ships is prefixed `herdr-tg` — `herdr-tg.service`,
+`herdr-tg-app.service`, `herdr-tg-watchdog.*` — and `kickoff-door.service` and
+`kickoff-hub-attach@.service` are named for the things they actually are. It is not a style rule.
+On 19 September the app plane's unit was written as `kickoff-hub.service`, which is another
+organisation's service, enabled and running on this box at the time. Two lines in this repo then
+pointed at it: an `install` line in §1 that would have overwritten their unit file, and a
+`Conflicts=` in the other plane's unit that would have had systemd **stop their running hub** the
+moment ours started. It was caught before either ran.
+
+So: before you add a unit, or copy an `install -m 0644 … ~/.config/systemd/user/<name>` line out
+of this document, check that the name is yours.
+
+```
+systemctl --user list-unit-files '<name>*'   # anything listed here belongs to somebody
+```
+
+An install that overwrites a name somebody else owns is how one organisation stops another's
+service, and it does it silently.
+
+*The app plane* — holds no credential, dials nothing off this box, listens on a Unix socket that is
+not a port:
+
+```
+systemctl --user enable --now herdr-tg-app.service
+```
+
+It needs no token and no environment file. If it finds a token set anyway it says so in one line
+and ignores it. `systemctl --user cat` shows the plane in `ExecStart`, so which one a box is on is
+never a question about a file.
+
+Its sandbox is real and was measured rather than assumed — every directive run twice under
+`systemd-run --user`, bare and hardened, and counted only where the two runs disagreed. **Two lines
+in it are inert here**, and the unit says so at the line: `IPAddressDeny=`/`IPAddressAllow=` need a
+cgroup BPF program that an unprivileged user manager cannot install, so under `systemctl --user`
+they do nothing at all while `systemctl show` reads them back as if they were in force. What keeps
+this hub's traffic on the box is the binary, not systemd. **`kickoff-door.service` carries the same
+two lines and they are just as inert there**; what holds the door to `127.0.0.1` is its own code,
+which binds that address and offers no flag for another. Every unit under `deploy/` is walked by
+`tests/a_unit_promises_only_what_the_manager_running_it_enforces.rs`, so the next one added is held
+to the same measurements without anybody remembering to add it to a list.
+
+*The phone plane* — dials out to Telegram, binds nothing:
 
 ```
 systemctl --user enable --now herdr-tg.service
