@@ -146,13 +146,30 @@ until the number moves, which is the point.
 
 ## The state of the repo
 
-- **The product is called `kickoff-channel`; `herdr-tg` is the same command under its first name**
-  (20 September). Everything a person types or reads says the new name, and the crate directory,
-  the units and the docs moved with it. The old verb is **kept on purpose**: it is built, installed
-  into both bin directories beside the new one, and is not going away, because other organisations
-  on this box call it — one shells out to `herdr-tg projects --json` from a service that is running
-  now — and `src/bin/herdr-tg.rs` is named by three tests through `env!("CARGO_BIN_EXE_herdr-tg")`,
-  so dropping it is a compile error rather than a red test. The paths did not move either:
+- **The product is called `kickoff-channel`. `herdr-tg` is the same command under its first name,
+  and that name is RETIRED** (20 September). Everything a person types or reads says the new name,
+  and the crate directory, the units and the docs moved with it. **Retired, not removed**, and the
+  two halves are separate promises. Retired: nothing new may use it, and every invocation prints
+  two lines saying so — **on stderr and nowhere else**. That last part is the whole design and not
+  a style choice: another organisation's service PARSES the JSON this program writes to stdout, so
+  one byte of prose there does not warn it, it stops it. `src/bin/herdr-tg.rs` prints before
+  parsing (a `--help` never returns from clap, and one script merges the streams and keeps the last
+  line), and the byte-for-byte guard in
+  `tests/the_kickoff_channel_name_is_a_compatible_change.rs` holds the two commands' stdout
+  identical for `projects --json`, for `--help` and on a refusal — which is why `bin_name` is
+  pinned in `lib.rs`, as clap would otherwise put the invoked name in the usage line.
+  It still SHIPS because deleting it today would leave this box with **no working command at all**:
+  `kickoff-channel` is not installed here yet, and five call sites in one organisation's code
+  invoke the old name — `bridge/pushwatch.py`, from a unit that is active right now, and four more
+  in `bin/rooms.sh`.
+  **The condition for deleting it is not a date — it is that no caller is left on this box.**
+  All of: `kickoff-channel` installed into both bin directories; those five call sites moved onto
+  it; nothing else on the box found to invoke the old verb. Whoever does it must delete
+  `src/bin/herdr-tg.rs` **and** the three test files that name it through
+  `env!("CARGO_BIN_EXE_herdr-tg")` — `the_kickoff_channel_name_is_a_compatible_change.rs`,
+  `a_hub_is_told_which_way_it_reaches_him.rs`, `a_second_hub_never_reaches_the_token.rs` — because
+  that variable then stops existing and the workspace stops COMPILING. It is a build break, not a
+  red test, so it is not something a test report will point at. The paths did not move either:
   `~/.local/state/herdr-tg` and `~/.config/herdr-tg/env` are read by other people's code by path.
   **Fifteen bytes is the ceiling on every future name.** `/proc/<pid>/comm` holds `TASK_COMM_LEN -
   1` characters and `kickoff-channel` is exactly fifteen — it survives whole with nothing to

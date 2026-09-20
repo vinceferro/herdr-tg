@@ -912,10 +912,14 @@ it — and `kickoff-channel adopt-secrets` copies every such secret across, once
 open, grant or enrol anything**; they are terminal-only acts, on purpose, and `open`, `grant` and
 `remove-repo-secret` refuse unless a person is at the keyboard.
 
-**The command has two names and both are installed.** `kickoff-channel` is the product's name and
-the one every instruction in this document uses; `herdr-tg` is the same program under the name it
-shipped under first, kept because other software on that box already calls it by that name. Either
-spelling runs any verb here, and every sentence the HUB prints names the new one, the transcripts
+**The command has two names, both are installed, and one of them is retired.** `kickoff-channel` is
+the product's name and the one every instruction in this document uses; `herdr-tg` is the same
+program under the name it shipped under first, **retired** but still installed, because other
+software on that box already calls it by that name. Either spelling runs any verb here — the
+retired one says on stderr, every time, that it is retired, and puts not one byte of that on
+stdout, which stays byte-for-byte what the other command prints so that a caller parsing it cannot
+tell the two apart. **Write nothing new against the old name**: it goes when the last caller on a
+box has moved off it. Every sentence the HUB prints names the new one, the transcripts
 in §13.4 included — a guard holds those transcripts to what the command really prints. One
 exception, said rather than glossed: `herdr-client`, the read-only client for herdr's own
 protocol, still names the old spelling in one handshake message, because nothing has made it

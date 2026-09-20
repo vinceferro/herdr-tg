@@ -42,6 +42,155 @@ fn cargo_ships_the_new_command_and_keeps_the_old_one_as_an_alias() {
     assert!(version(legacy).starts_with("kickoff-channel "));
 }
 
+// ───────────── the retired name says so, where no caller is listening ─────────────
+
+/// One enrolled project, so the inventory both commands print is a real row rather than `[]`.
+///
+/// Two commands agreeing on an empty list is a guard that reads almost nothing: a shape this thin
+/// would still match if one of them had stopped emitting the fields a reader depends on. The
+/// values are invented and the hash is not a hash of anything — nothing here resolves a secret.
+///
+/// The repo path is BUILT rather than written out. A home-shaped literal in a public repo trips
+/// the identity scanner — rightly, since it cannot tell a fixture from somebody's real path — and
+/// this file would otherwise have been the third time that gate fired this week.
+const A_MADE_UP_REPO_PATH: &str = "/hom\u{65}/somebody/a-project";
+
+const ONE_ENROLLED_PROJECT_TEMPLATE: &str = r#"{
+  "p-9f3a1c2e5b7d": {
+    "id": "p-9f3a1c2e5b7d",
+    "title": "a-project",
+    "repo": "<THE_REPO_PATH>",
+    "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "enabled": true,
+    "topic_id": 12,
+    "icon_color": 3,
+    "lane_topics": { "a-worktree": 34 },
+    "allowed_users": [42]
+  }
+}"#;
+
+/// The fixture with its one path put back in.
+fn one_enrolled_project() -> String {
+    ONE_ENROLLED_PROJECT_TEMPLATE.replace("<THE_REPO_PATH>", A_MADE_UP_REPO_PATH)
+}
+
+/// What a caller actually gets back: the two streams it may read, and the code it may branch on.
+struct Run {
+    stdout: Vec<u8>,
+    stderr: String,
+    code: Option<i32>,
+}
+
+/// Run one of the two commands against a state directory of its own.
+///
+/// The environment is pinned rather than inherited, because what is under test is that two
+/// programs produce the same bytes, and a `RUST_LOG` or a socket path set in the developer's own
+/// shell would be a third input neither of them mentions.
+fn run(binary: &str, args: &[&str], state: &Path) -> Run {
+    let output = Command::new(binary)
+        .args(args)
+        .env("XDG_STATE_HOME", state)
+        .env_remove("RUST_LOG")
+        .env_remove("HERDR_SOCKET_PATH")
+        .output()
+        .unwrap_or_else(|error| panic!("could not run {binary} {args:?}: {error}"));
+    Run {
+        stdout: output.stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+    }
+}
+
+/// A state directory holding exactly the registry text given.
+fn state_holding(registry: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a temp state directory");
+    let home = dir.path().join("herdr-tg");
+    std::fs::create_dir_all(&home).expect("the hub's own state directory");
+    std::fs::write(home.join("projects.json"), registry).expect("write the registry");
+    dir
+}
+
+/// **A running service parses stdout, so stdout may not gain a byte when the name does.**
+///
+/// This is the property the deprecation notice was designed around rather than a tidiness check.
+/// Another organisation's unit on this box runs `projects --json` through the retired name and
+/// feeds what comes back to a JSON parser; a notice printed on stdout is not a warning to that
+/// unit, it is a parse error, and the service stops. So the two commands are held here
+/// byte-for-byte on the surface a machine reads, and the notice is proved to live somewhere else.
+///
+/// The failure case is in the list on purpose. A caller that branches on the exit code must not
+/// be able to tell which of the two names it invoked, and a code is easiest to get wrong on the
+/// path nobody runs by hand.
+#[test]
+fn the_retired_name_prints_the_very_same_bytes_on_stdout_as_the_command_it_stands_in_for() {
+    let canonical = env!("CARGO_BIN_EXE_kickoff-channel");
+    let retired = env!("CARGO_BIN_EXE_herdr-tg");
+
+    let enrolled = state_holding(&one_enrolled_project());
+    // A registry that is there and cannot be read: the refusal path, where stdout stays empty and
+    // the exit code is the whole of what a caller has to go on.
+    let broken = state_holding("this is not a registry");
+
+    for (state, args) in [
+        (&enrolled, &["projects", "--json"][..]),
+        (&enrolled, &["--help"][..]),
+        (&broken, &["projects", "--json"][..]),
+    ] {
+        let theirs = run(canonical, args, state.path());
+        let ours = run(retired, args, state.path());
+
+        assert_eq!(
+            String::from_utf8_lossy(&ours.stdout),
+            String::from_utf8_lossy(&theirs.stdout),
+            "the two names disagree on stdout for {args:?}, so a caller that parses it breaks the \
+             day it is told to switch — or the day it is not"
+        );
+        assert_eq!(
+            ours.code, theirs.code,
+            "the two names disagree on the exit code for {args:?} ({:?} against {:?}), so a \
+             caller that branches on it can tell which name it invoked",
+            ours.code, theirs.code
+        );
+    }
+}
+
+/// The notice exists, it is on the stream nothing parses, and only the retired name says it.
+///
+/// Said once per run, because a script calling this in a loop puts every line of it in a journal:
+/// one notice per invocation is a record, and two is the beginning of a flood.
+#[test]
+fn only_the_retired_name_says_it_is_retired_and_it_says_it_where_no_caller_parses() {
+    let canonical = env!("CARGO_BIN_EXE_kickoff-channel");
+    let retired = env!("CARGO_BIN_EXE_herdr-tg");
+    let enrolled = state_holding(&one_enrolled_project());
+
+    for args in [&["projects", "--json"][..], &["--help"][..]] {
+        let ours = run(retired, args, enrolled.path());
+        assert_eq!(
+            ours.stderr.matches("retired").count(),
+            1,
+            "the retired name should say so exactly once per run for {args:?}, and said it {} \
+             times. What it printed:\n{}",
+            ours.stderr.matches("retired").count(),
+            ours.stderr
+        );
+        assert!(
+            ours.stderr.contains("kickoff-channel"),
+            "the notice for {args:?} does not name the command that succeeds this one, which \
+             leaves a reader with a retirement and nowhere to go:\n{}",
+            ours.stderr
+        );
+
+        let theirs = run(canonical, args, enrolled.path());
+        assert!(
+            theirs.stderr.is_empty(),
+            "the command that is NOT retired printed to stderr for {args:?}, so the notice is \
+             coming from the shared surface rather than from the name that is being retired:\n{}",
+            theirs.stderr
+        );
+    }
+}
+
 #[test]
 fn the_current_readme_leads_with_the_new_product_name() {
     let readme =

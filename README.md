@@ -148,11 +148,13 @@ is run against the real door by the suite.
 
 Sixteen, and every one of them is run at a keyboard. Nothing in Telegram can reach any of them.
 
-The command is installed under two names. `kickoff-channel` is the product's name and the one
-everything here uses; `herdr-tg` is the same program under the name it shipped under first, kept
-because other software on the operator's box already calls it by that name. Either spelling runs
-any verb below, and the state directory and the credential file keep the older name too, because
-other programs read both by path.
+The command is installed under two names, and one of them is retired. `kickoff-channel` is the
+product's name and the one everything here uses; `herdr-tg` is the same program under the name it
+shipped under first — **retired**, still installed, and not for anything new — because other
+software on the operator's box already calls it by that name, and it goes when the last of those
+callers has moved off it. Either spelling runs any verb below; the retired one says on stderr that
+it is retired and puts nothing on stdout that the other would not. The state directory and the
+credential file keep the older name too, because other programs read both by path.
 
 The phone has two commands of its own and the set is closed: `/projects`, which says which projects
 are enrolled, which are connected and which are switched off, and `/help`. Neither can change

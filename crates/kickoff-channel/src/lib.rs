@@ -61,8 +61,14 @@ use clap::{Parser, Subcommand};
 use herdr_client::{HerdrClient, HerdrError};
 
 /// Steer a herd of coding agents from the socket herdr already speaks.
+// `bin_name` is pinned, and that is not decoration. Without it clap takes the usage line from
+// whatever name the process was invoked under, so the retired alias printed `Usage: <old name>`
+// and taught every reader of its help to keep typing the name being retired — the one sentence
+// the whole retirement is trying to stop. Pinning it also makes the two commands' `--help`
+// byte-identical on stdout, which is the property a caller parsing this program depends on and
+// `the_retired_name_prints_the_very_same_bytes_on_stdout_as_the_command_it_stands_in_for` holds.
 #[derive(Debug, Parser)]
-#[command(name = "kickoff-channel", version, about, long_about = None)]
+#[command(name = "kickoff-channel", bin_name = "kickoff-channel", version, about, long_about = None)]
 struct Cli {
     /// Socket to dial. Overrides `$HERDR_SOCKET_PATH` and the `~/.config/herdr/herdr.sock`
     /// fallback.

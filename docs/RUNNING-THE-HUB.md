@@ -60,12 +60,25 @@ it overrides `rust-toolchain.toml`; `TMPDIR` because a session inherits it as th
 Three commands come out: `kickoff-channel` (the hub and every verb in this document), `herdr-tg`
 and `kickoff-door` (the PWA's door).
 
-**`herdr-tg` is still installed, it still works, and it is not going away.** It is the same program
-under the name this box already knew — every verb below behaves identically whichever of the two you
-type — and it is kept because other software here calls it by that name: one organisation's service
-shells out to `herdr-tg projects --json` while you are reading this, and a command somebody else
-depends on is not ours to withdraw. Everything written from now on says `kickoff-channel`; nothing
-that already says `herdr-tg` has to be rewritten to keep working.
+**`herdr-tg` is RETIRED. It is still installed and it still works, and nothing new may use it.**
+It is the same program under the name this box already knew — every verb below behaves identically
+whichever of the two you type — and it is still built and installed because other software here
+calls it by that name: one organisation's service shells out to `herdr-tg projects --json` while
+you are reading this, and a command somebody else depends on is not ours to withdraw. So nothing
+that already says `herdr-tg` has to be rewritten today, and everything written from now on says
+`kickoff-channel`.
+
+Running it says so. Every invocation prints two lines on **stderr** — that it is retired, and that
+the program is now called `kickoff-channel` — and **never on stdout**, because the service above
+parses the JSON that comes out of stdout and a line of prose there would not warn it, it would stop
+it. The two commands' stdout is byte-for-byte identical, `--help` included, so a caller reading it
+cannot tell which name it invoked; only the exit code and stderr are ever worth comparing, and the
+exit code is identical too.
+
+**It is removed when no caller is left on this box, and not on any date.** That means all of:
+`kickoff-channel` installed into both bin directories below; every call site of the old verb moved
+onto it; nothing else found to invoke it. Until then, the alias is the thing keeping those callers
+alive.
 
 The paths did not move with the name, for the same reason. The credential file is still
 `~/.config/herdr-tg/env` and the hub's state directory is still `~/.local/state/herdr-tg`; other
@@ -108,8 +121,9 @@ systemctl --user daemon-reload
 
 Both binaries go into both directories because `~/.cargo/bin` shadows `~/.local/bin` on this box's
 PATH, and a stale copy in the shadowing one is how this box has twice run a build from a fortnight
-earlier. `herdr-tg` is installed beside `kickoff-channel` on purpose: other organisations here call
-that verb from services that are running, and it keeps working for ever.
+earlier. The retired `herdr-tg` is installed beside `kickoff-channel` on purpose: other
+organisations here call that verb from services that are running, and it keeps working until the
+last of them has moved off it. Do not point anything new at it.
 
 If you are on a box that HAS a token and wants the phone plane, `scripts/install-service.sh` does
 all of the above and proves it came up. It leaves the door's own unit to you either way:
