@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# herdr-tg-watchdog — the one alarm that must not depend on the thing it watches.
+# kickoff-channel-watchdog — the one alarm that must not depend on the thing it watches.
+#
+# The FILE keeps its former name because nobody types it: several guards and both scripts read it
+# at this path, and the operator meets it as the unit `kickoff-channel-watchdog` and the command
+# `~/.local/bin/kickoff-channel-watchdog` that scripts/install-watchdog.sh lays down from it.
 #
 # The hub is one bot holding the only phone line between the operator and a herd of coding agents.
 # If it dies, the phone simply goes quiet — and quiet looks exactly like "nothing is happening".
@@ -120,14 +124,14 @@ REALARM_EVERY="${HERDR_TG_REALARM_EVERY:-30}"   # further stale checks between r
 NOTE_TRUSTED_FOR="${HERDR_TG_NOTE_TRUSTED_FOR:-90}"
 DISARM_EXPIRES="${HERDR_TG_DISARM_EXPIRES:-86400}"  # a silence you forgot about is the failure again
 
-log()  { printf '%s herdr-tg-watchdog: %s\n' "$(date -Is)" "$*" >&2; }
+log()  { printf '%s kickoff-channel-watchdog: %s\n' "$(date -Is)" "$*" >&2; }
 # `~`-form for anything the operator reads: the full path is his home directory, and every alarm
 # leaves this machine. Nothing that goes to Telegram needs to carry it.
 tilde() { printf '%s' "${1/#$HOME/\~}"; }
 
 usage() {
   cat >&2 <<USAGE
-herdr-tg-watchdog — buzz the operator when the hub stops answering.
+kickoff-channel-watchdog — buzz the operator when the hub stops answering.
 
   (no arguments)   one check. Alarms only if the hub is armed and has gone quiet.
   --test           send one drill message and exit. Proves the alarm can reach the operator.
@@ -272,13 +276,13 @@ human_age() {
 alarm_text() {
   local head body close
   local SILENT="This is the watchdog, not the bot — it can tell you, it cannot fix it. Someone has to look at the machine."
-  local RESTART="This is the watchdog, not the bot — it can tell you, it cannot fix it. Restarting herdr-tg is the usual fix."
+  local RESTART="This is the watchdog, not the bot — it can tell you, it cannot fix it. Restarting kickoff-channel is the usual fix."
   # The one cause worth naming: a stray `serve` in a terminal, a unit started twice, a laptop and a
   # server sharing one token. Telegram hands the taps to one copy, and the other — the one with the
   # agents — never sees them. It is not the only way this leg dies (a wedged dispatcher stops looking
   # at all, and the hub says so in its own sentence just above), but it is much the likeliest and the
   # only one he can check in ten seconds. "Either way" is there because the fix is the same for both.
-  local SECOND="This is the watchdog, not the bot — it can tell you, it cannot fix it. The likeliest cause is a second copy of this bot taking your taps; restarting herdr-tg is the usual fix either way."
+  local SECOND="This is the watchdog, not the bot — it can tell you, it cannot fix it. The likeliest cause is a second copy of this bot taking your taps; restarting kickoff-channel is the usual fix either way."
   # The app's own closing. "Not the bot" would name something that does not exist on a box whose
   # hub holds no credential and dials no messaging service, and a second copy of it is not a cause
   # to point at either: one hub lock and one socket mean the second copy never starts at all.
@@ -363,7 +367,7 @@ alarm_text() {
 }
 
 if [ "$MODE" = test ]; then
-  send "$(hostname): herdr-tg watchdog drill. Nothing is wrong. This message only proves the alarm can reach you." \
+  send "$(hostname): kickoff-channel watchdog drill. Nothing is wrong. This message only proves the alarm can reach you." \
     && exit 0 || exit 1
 fi
 
@@ -545,7 +549,7 @@ if [ -r "$NOTE" ]; then
     # either way and is read once. Two readings of one line rather than one block that knows both
     # sets of words, because which of the two recognises it is how this script works out which
     # plane the hub is on — and because the pairs (hub sentence, script pattern) are held together
-    # one half at a time by crates/herdr-tg/tests/the_heartbeat_is_earned_not_scheduled.rs.
+    # one half at a time by crates/kickoff-channel/tests/the_heartbeat_is_earned_not_scheduled.rs.
     said_ring="$said_phone"
     # Line 4 is the update line's, and it is APPENDED rather than inserted for a reason that cuts
     # both ways: this script is copied into place at install time, so an installed watchdog older
@@ -555,7 +559,7 @@ if [ -r "$NOTE" ]; then
     said_sweep="$said_updates"
     # THE SENTENCES THE HUB CAN WRITE, in this script's own words because it shares no code with the
     # hub — and pinned to the hub's, both ways, by
-    # crates/herdr-tg/tests/the_heartbeat_is_earned_not_scheduled.rs, which fails if either side
+    # crates/kickoff-channel/tests/the_heartbeat_is_earned_not_scheduled.rs, which fails if either side
     # rewords one. A sentence matching NONE of them is a hub newer than this copy of the script (it
     # is copied into place at install time, so hub and watchdog drift apart as a matter of course)
     # and is read as "cannot tell", never as that half being unwell: reading it as unwell reported

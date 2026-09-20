@@ -2,10 +2,16 @@
 
 Rules for **agents running in a herdr pane** whose operator answers from Telegram.
 
-This is the other half of `crates/herdr-tg/src/voice.rs`. That module governs what the *bridge*
-says; this governs what the *agent* says, and the agent's words are most of what the operator
-actually reads. No amount of cleaning on the bridge side can rescue a question that was written for
-a 100-column terminal and a reader who has the whole transcript in view.
+This used to be the other half of `voice.rs` — the module that governed what the *bridge* said,
+where this governs what the *agent* says. **`voice.rs` was deleted with the screen-scraper and no
+module replaced it**; CLAUDE.md records that under "The screen-scraper is deleted, not disabled".
+Do not go looking for it. What is left of the bridge's half is spread thin — the sentences the hub
+writes for the phone live in `hub.rs` and `surface.rs`, and `summarize.rs` (which cites this
+document back) is the only piece still cleaning up an agent's own words.
+
+Which makes this document the load-bearing half, not the junior one: the agent's words are most of
+what the operator actually reads, and there is now even less on the bridge side to rescue a question
+written for a 100-column terminal and a reader who has the whole transcript in view.
 
 ## The one fact that changes how you should write
 

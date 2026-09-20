@@ -72,7 +72,7 @@ export type RelayConfig = {
   carrier: string | null
   /**
    * The enrolled project, resolved AFRESH on every attempt — never once, because the operator may
-   * `herdr-tg open` or `enroll` while this is running and that is the documented recovery from
+   * `kickoff-channel open` or `enroll` while this is running and that is the documented recovery from
    * unknown_project.
    */
   secretOf: () => Project | null

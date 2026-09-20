@@ -249,7 +249,7 @@ export function conversationSecret(home: string, id: string): { tokenFile: strin
 /**
  * Find the enrolled project this session is inside.
  *
- * Looked up afresh on every attempt, never resolved once: the operator may run `herdr-tg enroll`
+ * Looked up afresh on every attempt, never resolved once: the operator may run `kickoff-channel enroll`
  * while the session is running, and that is the recovery a tool result tells him to perform.
  *
  * The search goes UPWARD from the launch directory, because the directory an engine names is

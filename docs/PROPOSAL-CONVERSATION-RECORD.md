@@ -26,7 +26,7 @@ Everything else in this document is consequence.
 `findProject` walks up to the nearest `.kickoff/hub.token` (`where.ts:135-158`). So a session in a
 repo's main tree presents `(that repo's secret, no lane)` — always, whatever it was started to do.
 Three rooms of one org launched in that repo present the identical address and the second is refused
-`already_claimed` at `crates/herdr-tg/src/hub.rs:1127`. `docs/TAXONOMY.md` §1 has the full trace.
+`already_claimed` at `crates/kickoff-channel/src/hub.rs:1127`. `docs/TAXONOMY.md` §1 has the full trace.
 
 The address is a *function of the launch directory*. Two rooms in one directory is a collision that
 function cannot avoid, and no amount of care in the hub can fix it, because the hub is given one
@@ -45,7 +45,7 @@ no second occupant to interoperate with, so "follow the Claude convention" would
 directory name. What is worth copying is the *shape*: a channel owns a space, keyed by channel, and
 arranges it as it sees fit.
 
-`${XDG_STATE_HOME:-~/.local/state}/herdr-tg/` (`crates/herdr-tg/src/lock.rs:39`) is already that
+`${XDG_STATE_HOME:-~/.local/state}/herdr-tg/` (`crates/kickoff-channel/src/lock.rs:39`) is already that
 space. It is already outside every repo, already the channel's, already unimposed-upon. What it is
 not is *scoped by conversation* — it is one flat pile of twelve files. This proposal adds exactly one
 level of scoping inside it:
@@ -342,15 +342,15 @@ Listed because the honest ones are the useful ones.
 
 | file | change | shape |
 | --- | --- | --- |
-| `crates/herdr-tg/src/lock.rs` | 0700 assertion, optional `HERDR_TG_STATE_DIR` | ~6 lines |
-| `crates/herdr-tg/src/registry.rs` (936 ln) | `handle`; `write_token_file` → channel space; pointer write; handle uniqueness + shape; containment guard scoped to unnamed | ~130 lines changed |
-| `crates/herdr-tg/src/cmd/enroll.rs` (663 ln) | `--as`; new printed lines; `adopt-secrets`; then −130 for the git guard | net **negative** |
-| `crates/herdr-tg/src/main.rs` | one flag, one subcommand | ~15 lines |
+| `crates/kickoff-channel/src/lock.rs` | 0700 assertion, optional `HERDR_TG_STATE_DIR` | ~6 lines |
+| `crates/kickoff-channel/src/registry.rs` (936 ln) | `handle`; `write_token_file` → channel space; pointer write; handle uniqueness + shape; containment guard scoped to unnamed | ~130 lines changed |
+| `crates/kickoff-channel/src/cmd/enroll.rs` (663 ln) | `--as`; new printed lines; `adopt-secrets`; then −130 for the git guard | net **negative** |
+| `crates/kickoff-channel/src/main.rs` | one flag, one subcommand | ~15 lines |
 | `plugins/kickoff-channel/where.ts` (168 ln) | `findConversation` replaces `findProject`; `:143` deleted | net negative |
 | `plugins/kickoff-channel/server.ts` (778 ln) | the env term, `enrolHint`, three refusal sentences | ~30 lines |
 | `adapters/opencode-bridge/bridge.ts` (529 ln) | same, second time | ~20 lines |
 | tests | 48 token-writing lines across 6 files; new RED tests for the handle door | ~150 lines |
-| **`crates/herdr-tg/src/hub.rs`** | **none** | 0 |
+| **`crates/kickoff-channel/src/hub.rs`** | **none** | 0 |
 | **`crates/hub-proto/`** | **none** | 0 |
 
 **The riskiest part is not the migration.** The migration cannot lose a topic (no id moves) and

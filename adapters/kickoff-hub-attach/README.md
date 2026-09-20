@@ -84,7 +84,7 @@ otherwise the child's own status, `128 + n` for a signal.
 
 ## Running one, on this box
 
-Once per project, at a terminal: `herdr-tg enroll <repo>`. Once per box: `bun` and `opencode` on
+Once per project, at a terminal: `kickoff-channel enroll <repo>`. Once per box: `bun` and `opencode` on
 `PATH`, and the shim `~/.local/bin/kickoff-hub-attach` that `scripts/install-attach.sh` writes.
 Then, in the worktree the worker is for:
 
@@ -119,7 +119,7 @@ As a supervised **opencode worker on a desk**, `deploy/kickoff-hub-attach@.servi
 ## `--check`, and why it makes no topic
 
 The hub's admission is ordered: it sends `welcome`, then `ping`, and makes the topic **only after
-the pong** (confirmed in `crates/herdr-tg/src/hub.rs`). So `--check` dials, is welcomed, sends `bye`
+the pong** (confirmed in `crates/kickoff-channel/src/hub.rs`). So `--check` dials, is welcomed, sends `bye`
 and closes **without ever ponging** — proving socket, uid, secret, an enabled project, a
 well-formed and echoed address, and a free claim, while creating nothing. Two honest costs: it holds
 the claim for one round trip (released the instant it closes), and it leaves one

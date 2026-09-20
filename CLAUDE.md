@@ -2,7 +2,7 @@
 @.kickoff/KICKOFF.md
 <!-- kickoff:end -->
 
-# herdr-tg
+# kickoff-channel
 
 One Telegram bot, one forum, one topic per project. A project's agent connects to a Unix socket and
 says what it is doing and what it is asking; the operator reads it on his phone and taps an answer,
@@ -20,12 +20,12 @@ Three crates in one Cargo workspace.
   down. Knows nothing about herdr, kickoff, claude or panes, and must not learn — nor about what
   carries it: that is `transport.rs`, the one file in the bot that knows what a socket and a peer
   uid are, and `tests/the_hub_does_not_know_what_a_socket_is.rs` fails if the hub learns either.
-- `crates/herdr-tg` — the bot. A `clap` binary: `enroll`, `projects`, `serve`, plus four read-only
+- `crates/kickoff-channel` — the bot. A `clap` binary: `enroll`, `projects`, `serve`, plus four read-only
   herdr subcommands (`status`, `read`, `doctor`, `watch`). **The hub binds nothing** — no listening
   port, and the Unix socket is not one. The one program in this workspace that listens is
   `kickoff-door` (`src/bin/kickoff-door.rs` + `src/gateway.rs`), a separate binary that binds
   **127.0.0.1 only** and serves the ring and the answers drop over HTTP to the kickoff PWA's
-  bridge; its write door takes a bearer token minted at the terminal by `herdr-tg door-token`, and
+  bridge; its write door takes a bearer token minted at the terminal by `kickoff-channel door-token`, and
   nothing reachable from a message, a tap or a frame names a port outside it.
 - `crates/herdr-client` — the typed client for herdr protocol 20. Used ONLY by the read-only
   subcommands now; the bot does not talk to herdr at all.
@@ -146,6 +146,18 @@ until the number moves, which is the point.
 
 ## The state of the repo
 
+- **The product is called `kickoff-channel`; `herdr-tg` is the same command under its first name**
+  (20 September). Everything a person types or reads says the new name, and the crate directory,
+  the units and the docs moved with it. The old verb is **kept on purpose**: it is built, installed
+  into both bin directories beside the new one, and is not going away, because other organisations
+  on this box call it — one shells out to `herdr-tg projects --json` from a service that is running
+  now — and `src/bin/herdr-tg.rs` is named by three tests through `env!("CARGO_BIN_EXE_herdr-tg")`,
+  so dropping it is a compile error rather than a red test. The paths did not move either:
+  `~/.local/state/herdr-tg` and `~/.config/herdr-tg/env` are read by other people's code by path.
+  **Fifteen bytes is the ceiling on every future name.** `/proc/<pid>/comm` holds `TASK_COMM_LEN -
+  1` characters and `kickoff-channel` is exactly fifteen — it survives whole with nothing to
+  spare, so a command name one character longer arrives at `presence.rs` already truncated and
+  presence goes blind without ever saying so. All four spellings stay in `HUB_COMMAND_NAMES`.
 - **The hub is the product.** Slice 1 is functionally complete: identity, presence, delivery,
   resolution, retirement, alarm. `an_ask_becomes_a_tap_becomes_a_choice` passes, and so does
   `the_real_plugin_and_the_real_hub_agree_on_the_wire` — the real bun bridge against the real hub
@@ -190,14 +202,15 @@ until the number moves, which is the point.
   (`onUnanswered`), never kept in silence and never re-sent. The bridge from before this change is
   run against the new hub by `a_bridge_from_before_this_change_still_works_against_the_new_hub`.
 - **A conversation is a row, and its secret lives outside every repo** (6 September;
-  `docs/CONVERSATIONS.md` built through step 6). `herdr-tg open <repo>` mints a project's
+  `docs/CONVERSATIONS.md` built through step 6). `kickoff-channel open <repo>` mints a project's
   conversation writing nothing into the repo; `grant <repo> --rooms N` mints rooms — siblings of
   the seed, in its repo, each its own secret and topic, sixteen vacant at once, taken by a
   dispatcher renaming a slot in `<state>/grants/<seed>/` and setting `KICKOFF_HUB_CONVERSATION`;
   `adopt-secrets --apply` copies the three enrolled projects' secrets across once, never writing
   `projects.json`; `remove-repo-secret <repo>` is step 7's verb, per project, at his hand, and
   has NOT been run on any real repo. **Before either runs on the real box, install this build
-  where the shell finds `herdr-tg` (`~/.cargo/bin` shadows `~/.local/bin` on PATH; both got this build on 6 September) and
+  where the shell finds the command (`~/.cargo/bin` shadows `~/.local/bin` on PATH; both got this
+  build on 6 September) and
   restart the hub on it**: an older `enroll` rewrites the repo's copy alone and leaves the
   channel's stale, and every new session then presents the stale one. The bridge answers "which
   conversation am I" by a four-term ladder (`attach.ts`) — told, bound (a link looked for on the
@@ -362,7 +375,8 @@ until the number moves, which is the point.
   of `running` on a door that binds and dies every five seconds otherwise wiped the record of what
   had been told: six alarms in twelve checks, measured. That margin clears the **door's** shape
   only — gating the whole record on it silenced a hub outage that recovered and came back.
-- **A project has an off switch, at the terminal only.** `herdr-tg disable <repo>` writes the flag
+- **A project has an off switch, at the terminal only.** `kickoff-channel disable <repo>` writes the
+  flag
   for the project's seed AND every room of it (a room's id in place of the folder switches that
   one room);
   the hub watches the registry file and, within a second, drops a LIVE connection's claim and ends
@@ -371,10 +385,11 @@ until the number moves, which is the point.
   even when the loud bridge's backlog has the read loop parked on a full queue. `/projects` on the
   phone says "switched off". `enable` is the way back, and re-enrolling keeps the switch where it
   was. No Telegram command can do this; the command set is pinned as a closed list of two.
-- **`herdr-tg projects --json` is built.** `connected` (the project's own voice) and
+- **`kickoff-channel projects --json` is built.** `connected` (the project's own voice) and
   `connected_lanes` (its addresses live now) come from `hub.connected.json`, which the hub rewrites
   on every claim and release under its own pid — and unlinks when a rewrite fails — and the command
-  believes it only when the lock's holder is alive, is a herdr-tg, and wrote it — otherwise `null`.
+  believes it only when the lock's holder is alive, is one of this product's own commands, and wrote
+  it — otherwise `null`.
   A registry that cannot be read is refused, never printed as `[]`. See `presence.rs`.
 - **His typed line carries a reaction for the stage it reached**: 👀 when the hub handed it on,
   👍 when the bridge acked it, 👎 (plus the line saying why) when the bridge refused it. The Claude

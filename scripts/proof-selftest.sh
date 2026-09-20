@@ -204,7 +204,7 @@ if [ "$CHEAT_BAD" -gt 0 ]; then
   cat >&2 <<'EOF'
 
 BLOCKER — a cheating client got further than it should have.
-A script or a wrapper around the `herdr` CLI is not a herdr-tg client, and a client that prints a
+A script or a wrapper around the `herdr` CLI is not a Kickoff Channel client, and one that prints a
 canned string has not decoded anything. If one of these passed, the sandbox or the witness is not
 being applied and every green the proof has ever printed is theatre. Do not report slice 1 as
 proven. Fix the named gate before anything else.

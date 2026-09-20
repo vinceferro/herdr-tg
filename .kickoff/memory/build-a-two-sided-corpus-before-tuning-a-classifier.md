@@ -13,7 +13,7 @@ coloured transcript rows became dialogs.
 Each fix was correct about the defect in front of it and wrong about the population.
 
 **The cause was the corpus.** One genuine capture
-(`crates/herdr-tg/tests/fixtures/opencode-permission.ansi`), seventeen hand-drawn. A rule fitted to
+(`crates/kickoff-channel/tests/fixtures/opencode-permission.ansi`), seventeen hand-drawn. A rule fitted to
 screens you imagined passes on screens you imagined. Round 4's sceptic broke it with three perfectly
 ordinary renderings; round 5's broke the replacement using real `tmux capture-pane -p -e` output.
 

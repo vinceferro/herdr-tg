@@ -6,7 +6,7 @@ taps an answer, and that answer arrives back inside the agent's own turn.
 
 It is a **control surface, not a console.** This binary **cannot type into a terminal** — not "does
 not by default", cannot. The path that drove a terminal was deleted rather than switched off, and
-two guards hold the deletion open: `crates/herdr-tg/tests/there_is_no_way_from_telegram_to_a_keyboard.rs`
+two guards hold the deletion open: `crates/kickoff-channel/tests/there_is_no_way_from_telegram_to_a_keyboard.rs`
 fails the build if the modules or the switch come back, and
 `crates/herdr-client/tests/no_live_write_call_site.rs` fails it if a write RPC is so much as named
 in any Rust file in the workspace.
@@ -127,7 +127,7 @@ Three crates in one Cargo workspace, plus the adapters that attach to them.
 
 * `crates/hub-proto` — the wire contract. NDJSON, nine frames up, six down. It knows nothing about
   herdr, kickoff, Claude or any engine, and must not learn.
-* `crates/herdr-tg` — the bot and the hub. **The hub binds nothing**: no listening port, and a
+* `crates/kickoff-channel` — the bot and the hub. **The hub binds nothing**: no listening port, and a
   Unix socket is not one. The one binary here that listens is `kickoff-door`, a separate program
   that binds loopback only and serves the ring and the answers drop over HTTP to the PWA's bridge;
   nothing reachable from a message, a tap or a frame names a port outside it.
@@ -147,6 +147,12 @@ is run against the real door by the suite.
 ## The commands
 
 Sixteen, and every one of them is run at a keyboard. Nothing in Telegram can reach any of them.
+
+The command is installed under two names. `kickoff-channel` is the product's name and the one
+everything here uses; `herdr-tg` is the same program under the name it shipped under first, kept
+because other software on the operator's box already calls it by that name. Either spelling runs
+any verb below, and the state directory and the credential file keep the older name too, because
+other programs read both by path.
 
 The phone has two commands of its own and the set is closed: `/projects`, which says which projects
 are enrolled, which are connected and which are switched off, and `/help`. Neither can change
@@ -212,10 +218,12 @@ does not change the session that performed it.
 
 | file | what it answers |
 | --- | --- |
+| `docs/RUNNING-THE-HUB.md` | the runbook: what to build, what to start, and how an agent reaches the operator |
 | `docs/ATTACHING.md` | how anything attaches — one namespace, the address, the credential, the handshake, the wire rules |
 | `docs/CAPABILITIES.md` | what the hub offers, requires and refuses, and what is still open |
 | `docs/INTERFACES.md` | the four seams, and the closed list of what this project does |
 | `docs/CONVERSATIONS.md` | how a project, a room and a lane each get a conversation |
+| `docs/PWA-DOOR.md` | the door the app reads the hub through, route by route |
 | `docs/RATE-PROBE.md` | the measurements the envelope above rests on, and what is still unmeasured |
 | `CLAUDE.md` | the state of the repo, kept current, and the quality bar |
 | `docs/HUB-DESIGN.md`, `docs/SLICE-3-REVIEW.md` | historical: the redesign, and why the screen-reading product died |

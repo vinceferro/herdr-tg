@@ -278,10 +278,10 @@ All paths under `$HOME/Projects/herdr-tg/`.
 | `crates/herdr-client/tests/support/mod.rs` | `MockHerdr`: a real `UnixListener` in a `tempfile::TempDir`; answers one request per connection **and closes**, mirroring the real server; records raw request bytes and connection count. |
 | `crates/herdr-client/tests/fixtures/*` | Frames captured from the live socket (see build order step 3). |
 | `crates/herdr-client/tests/{wire,events,golden,failure_paths,schema_drift}.rs` | The offline suite. |
-| `crates/herdr-tg/Cargo.toml` | Bin manifest. teloxide stays **commented out** until slice 2. |
-| `crates/herdr-tg/src/main.rs` | clap parse, tracing-subscriber init, dispatch, exit-code mapping. |
-| `crates/herdr-tg/src/cmd/{status,read,doctor,watch}.rs` | The four subcommands. |
-| `crates/herdr-tg/src/render.rs` | The human herd table. |
+| `crates/kickoff-channel/Cargo.toml` | Bin manifest. teloxide stays **commented out** until slice 2. |
+| `crates/kickoff-channel/src/main.rs` | clap parse, tracing-subscriber init, dispatch, exit-code mapping. |
+| `crates/kickoff-channel/src/cmd/{status,read,doctor,watch}.rs` | The four subcommands. |
+| `crates/kickoff-channel/src/render.rs` | The human herd table. |
 | `scripts/proof-slice1.sh` | The seven gates, with a `GATES=0,1,…` selector. |
 | `scripts/normalize.jq` | The canonicalizer, drop list documented inline. |
 | `scripts/mock-herdr.py` | The protocol-skew one-shot server for gate 6. |
@@ -337,7 +337,7 @@ exact manifests).
 # $HOME/Projects/herdr-tg/Cargo.toml
 [workspace]
 resolver = "3"
-members  = ["crates/herdr-client", "crates/herdr-tg"]
+members  = ["crates/herdr-client", "crates/kickoff-channel"]
 
 [workspace.package]
 edition      = "2024"
@@ -389,7 +389,7 @@ tempfile = { workspace = true }
 ```
 
 ```toml
-# crates/herdr-tg/Cargo.toml
+# crates/kickoff-channel/Cargo.toml
 [package]
 name = "herdr-tg"
 version = "0.1.0"
@@ -961,7 +961,7 @@ pub(crate) async fn round_trip(
 ```
 
 ```rust
-// ══════════════════════ crates/herdr-tg/src/main.rs ══════════════════════
+// ══════════════════════ crates/kickoff-channel/src/main.rs ══════════════════════
 #[derive(clap::Parser)]
 struct Cli {
     /// Overrides $HERDR_SOCKET_PATH and the ~/.config/herdr/herdr.sock fallback. Gate 6 needs it.

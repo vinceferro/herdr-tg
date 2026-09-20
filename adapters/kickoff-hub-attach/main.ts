@@ -222,7 +222,7 @@ const relay = createRelay({
   hubSocket: CONFIG.hubSocket,
   graceMs: CONFIG.relayGraceMs,
   carrier: WATCHER_INSTANCE,
-  // Resolved AFRESH on every attempt: the operator may `herdr-tg open` or `enroll` while this runs.
+  // Resolved AFRESH on every attempt: the operator may `kickoff-channel open` or `enroll` while this runs.
   secretOf: () => secretFor(CONFIG),
   whenNotEnrolled: notEnrolled(CONFIG),
   note,

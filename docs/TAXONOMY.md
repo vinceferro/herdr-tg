@@ -44,10 +44,10 @@ at the source.
 **The address is opaque to the hub, and the secret proves only the project.** That one sentence is
 why this taxonomy is a naming question rather than a rebuild.
 
-`Addr` is `(ProjectId, Option<LaneId>)` and nothing more (`crates/herdr-tg/src/hub.rs:719`).
+`Addr` is `(ProjectId, Option<LaneId>)` and nothing more (`crates/kickoff-channel/src/hub.rs:719`).
 `LaneId` is an opaque string that is "never parsed here, and never resolved to anything"
 (`crates/hub-proto/src/ids.rs:79`). The only check on it is shape — non-empty, at most 64 bytes,
-no `.` or `..`, no separator, no control character (`crates/herdr-tg/src/hub.rs:773`) — and every
+no `.` or `..`, no separator, no control character (`crates/kickoff-channel/src/hub.rs:773`) — and every
 clause of that check is justified by audit-forging, never by meaning. The project half never comes
 from the wire, so a bridge naming an address can only ever reach the repo it has already proved it
 holds the secret for.
@@ -94,7 +94,7 @@ against the seed (`hub.rs:1127`).
 
 Nor can it be its own project instead: `enrol` refuses any folder strictly below an already-enrolled
 one, saying it "would split one project across two chats"
-(`crates/herdr-tg/src/registry.rs:412`). And enrolment is terminal-only by design
+(`crates/kickoff-channel/src/registry.rs:412`). And enrolment is terminal-only by design
 (`docs/INTERFACES.md`), so nothing kickoff spawns can mint a room's identity for itself.
 
 There is no env var, file or argument that can supply an address today. Git is the only producer.

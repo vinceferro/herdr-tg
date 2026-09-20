@@ -289,7 +289,7 @@ console.log('\nwhen the hub refuses, beside a live door:')
   const doorPath = relaySocketPath(relayDir, doorKeyFor(repo), lane)
   const holder = Bun.listen({ unix: doorPath, socket: { open() {}, data() {}, close() {}, error() {} } })
   const sentences: Record<string, RegExp> = {
-    unknown_project: /the hub does not know this project.*herdr-tg open/,
+    unknown_project: /the hub does not know this project.*kickoff-channel open/,
     bad_token: /the secret is not one the hub knows/,
     not_enabled: /enrolled but switched off/,
     version_skew: /do not speak the same version/,
@@ -543,7 +543,7 @@ console.log('\nwhen the hub accepts and never speaks:')
     KICKOFF_HUB_RELAY_DIR: relayDir,
   })
   check('a mute hub is named as running but wedged, with the fix',
-    r.code === 1 && r.out.some(l => /said nothing for 6 seconds.*wedged.*restart herdr-tg/.test(l)) &&
+    r.code === 1 && r.out.some(l => /said nothing for 6 seconds.*wedged.*restart kickoff-channel/.test(l)) &&
       !r.out.some(l => /settling window/.test(l)),
     JSON.stringify(r.out.filter(l => l.startsWith('NOT'))))
   hub.stop()
@@ -613,7 +613,7 @@ console.log('\nwhen attach is told a conversation:')
 
 // ── R. a secret the channel keeps that the hub refuses ─────────────────────────────────────────
 //
-// A stale channel copy — left by a rotation typed with a herdr-tg from before conversations
+// A stale channel copy — left by a rotation typed with a build from before conversations
 // existed — arrives as `unknown_project`, and the sentence sent whoever read it to `open`, which
 // says "already open". The verb that mends it is adopt-secrets.
 console.log('\nwhen the secret the channel keeps is one the hub refuses:')
@@ -633,7 +633,7 @@ console.log('\nwhen the secret the channel keeps is one the hub refuses:')
   check('a bound secret the hub refuses names adopt-secrets --apply, not open',
     r.out.some(l => /the secret: .*bound to/.test(l)) &&
       r.out.some(l => /^NOT\s+.*adopt-secrets --apply/.test(l)) &&
-      !r.out.some(l => /^NOT\s+.*herdr-tg open/.test(l)),
+      !r.out.some(l => /^NOT\s+.*kickoff-channel open/.test(l)),
     JSON.stringify(r.out.filter(l => /secret|NOT/.test(l))))
   hub.stop()
 }

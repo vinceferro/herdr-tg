@@ -1,0 +1,16 @@
+[Unit]
+Description=Kickoff Channel watchdog — check every minute that the hub is still answering
+Documentation=https://github.com/vinceferro/herdr-tg
+
+[Timer]
+# Both are monotonic and both PAUSE while the laptop is suspended, so resume does not replay the
+# checks that were missed — it simply resumes the remaining slice. The script does not rely on
+# that: it measures the gap between its own runs and gives the hub a fresh window whenever the gap
+# says it was not running. Nothing here can fix the suspend case, and an earlier comment claiming
+# AccuracySec did was wrong.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

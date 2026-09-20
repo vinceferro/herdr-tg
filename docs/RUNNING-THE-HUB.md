@@ -12,21 +12,23 @@ to start, you need §1 and §2.
 **Nothing is running. That is still a decision — but it is no longer the whole truth, because
 what CAN run changed.**
 
-On 17 September the operator revoked the Telegram bot token himself, and `herdr-tg.service`,
-`herdr-tg-watchdog.timer` and `kickoff-hub-attach@oc-dogfood.service` were stopped and disabled the
-same hour — so a dead credential would not be polled, refused and nagged about for ever. The work
+On 17 September the operator revoked the Telegram bot token himself, and the phone hub, the
+watchdog timer and `kickoff-hub-attach@oc-dogfood.service` were stopped and disabled the same
+hour — under the names they carried then, `herdr-tg.service` and `herdr-tg-watchdog.timer` — so
+that a dead credential would not be polled, refused and nagged about for ever. The work
 surface is the PWA and the herdr TUI now; Telegram survives as a connector to be configured from
 the PWA, and that is later kickoff work.
 
-**What no longer needs a token:** the hub itself. `herdr-tg serve --to app` builds the hub with
-the app where Telegram stood — no credential read, nothing dialled off this box — and everything
-an agent says reaches the operator's own record instead of a chat, with his answers coming back
-through the drop beside it. `kickoff-door` serves those two files to the PWA, and it never needed
-a token either. So the app plane is a hub, a door and a worker, all of which can start today:
+**What no longer needs a token:** the hub itself. `kickoff-channel serve --to app` builds the hub
+with the app where Telegram stood — no credential read, nothing dialled off this box — and
+everything an agent says reaches the operator's own record instead of a chat, with his answers
+coming back through the drop beside it. `kickoff-door` serves those two files to the PWA, and it
+never needed a token either. So the app plane is a hub, a door and a worker, all of which can
+start today:
 
 ```
-systemctl --user enable --now herdr-tg-app.service
-herdr-tg door-token
+systemctl --user enable --now kickoff-channel-app.service
+kickoff-channel door-token
 systemctl --user enable --now kickoff-door.service
 ```
 
@@ -55,29 +57,72 @@ env -u RUSTUP_TOOLCHAIN TMPDIR=/tmp/hverify PATH="$HOME/.cargo/bin:$PATH" cargo 
 it overrides `rust-toolchain.toml`; `TMPDIR` because a session inherits it as the literal string
 `%h/.cache/tmp` and it must also be **short** — a Unix socket path caps at 108 bytes.
 
-Two binaries come out: `herdr-tg` (the hub and its verbs) and `kickoff-door` (the PWA's door).
+Three commands come out: `kickoff-channel` (the hub and every verb in this document), `herdr-tg`
+and `kickoff-door` (the PWA's door).
 
-**Install BOTH copies of `herdr-tg`, or you will run a stale one.** `~/.cargo/bin` shadows
-`~/.local/bin` on this box's PATH, and an older `enroll` rewrites a repo's secret while leaving the
-channel's stale — after which every new session presents the wrong one.
+**`herdr-tg` is still installed, it still works, and it is not going away.** It is the same program
+under the name this box already knew — every verb below behaves identically whichever of the two you
+type — and it is kept because other software here calls it by that name: one organisation's service
+shells out to `herdr-tg projects --json` while you are reading this, and a command somebody else
+depends on is not ours to withdraw. Everything written from now on says `kickoff-channel`; nothing
+that already says `herdr-tg` has to be rewritten to keep working.
 
-`scripts/install-service.sh` does **not** cover this on its own, and knowing what it leaves out is
-the whole of this section. It builds, installs `herdr-tg` to `~/.local/bin` only, and installs
-`herdr-tg.service`. It does not touch `~/.cargo/bin` — the copy that wins — and it does not know
-about `kickoff-door` at all. So after running it:
+The paths did not move with the name, for the same reason. The credential file is still
+`~/.config/herdr-tg/env` and the hub's state directory is still `~/.local/state/herdr-tg`; other
+programs on this box read both by path, so both stay exactly where they are.
+
+**Every one of the three commands is installed into BOTH bin directories, or you will run a stale one.**
+`~/.cargo/bin` shadows `~/.local/bin` on this box's PATH, and an older `enroll` rewrites a repo's
+secret while leaving the channel's stale — after which every new session presents the wrong one.
+
+`scripts/install-service.sh` now does all of it: it builds `--release`, installs all three commands
+into `~/.local/bin` **and** `~/.cargo/bin`, installs **both** hub planes' unit files —
+`kickoff-channel.service` and `kickoff-channel-app.service` — retires `herdr-tg.service` and
+`herdr-tg-app.service` where those files are ours, and proves the phone plane came up.
+
+**It lays both planes down and starts one.** Installing a unit file and enabling it are different
+acts: the file is what makes a name exist on this box, and the hub's own refusal when a second copy
+holds the line tells him to stop *either* plane, because which one is holding it is genuinely
+unknown at that moment. A name he pastes into `systemctl` that is not on his box answers "Unit not
+found" and leaves him nothing to try, so both files go down. Starting both is the opposite problem —
+they bind the same socket and name each other in `Conflicts=` — so which plane runs is §2, and his.
+`tests/every_unit_this_product_names_in_an_instruction_is_one_an_installer_here_lays_down.rs` holds
+every unit name this product prints to what an installer here really writes.
+
+**It requires a bot token, and the app plane does not.** `install-service.sh` refuses to run
+without `~/.config/kickoff-channel/env`, because the last thing it does is prove the PHONE plane
+came up, and that needs a credential. On a box whose token has been revoked — which is this box —
+the script stops before it installs anything, and following §1 leaves you with nothing. That is the
+script being honest about what it proves, not a bug, but it means the app plane has its own path:
 
 ```
-install -m 0755 target/release/herdr-tg     ~/.cargo/bin/herdr-tg
-install -m 0755 target/release/kickoff-door ~/.local/bin/kickoff-door
+env -u RUSTUP_TOOLCHAIN TMPDIR=/tmp/hverify PATH="$HOME/.cargo/bin:$PATH" cargo build --release
+for b in kickoff-channel herdr-tg kickoff-door; do
+  install -m 0755 "target/release/$b" ~/.local/bin/"$b"
+  install -m 0755 "target/release/$b" ~/.cargo/bin/"$b"
+done
+install -m 0644 deploy/kickoff-channel-app.service ~/.config/systemd/user/kickoff-channel-app.service
+install -m 0644 deploy/kickoff-door.service        ~/.config/systemd/user/kickoff-door.service
+systemctl --user daemon-reload
+```
+
+Both binaries go into both directories because `~/.cargo/bin` shadows `~/.local/bin` on this box's
+PATH, and a stale copy in the shadowing one is how this box has twice run a build from a fortnight
+earlier. `herdr-tg` is installed beside `kickoff-channel` on purpose: other organisations here call
+that verb from services that are running, and it keeps working for ever.
+
+If you are on a box that HAS a token and wants the phone plane, `scripts/install-service.sh` does
+all of the above and proves it came up. It leaves the door's own unit to you either way:
+
+```
 install -m 0644 deploy/kickoff-door.service ~/.config/systemd/user/kickoff-door.service
-install -m 0644 deploy/herdr-tg-app.service  ~/.config/systemd/user/herdr-tg-app.service
 systemctl --user daemon-reload
 ```
 
 Then check what the shell actually finds, rather than what you just built:
 
 ```
-command -v herdr-tg && herdr-tg --help | grep door-token
+command -v kickoff-channel && kickoff-channel --help | grep door-token
 ```
 
 If `door-token` is missing from that output, the shell is running a copy from before the door
@@ -98,8 +143,9 @@ other in `Conflicts=` and systemd stops it rather than leaving you a failed one.
 
 **A unit name is a namespace, and it is shared with every other organisation on this box.** There
 is one `systemctl --user` namespace per user, not one per project, and nothing warns you that a
-name is taken. So every unit this repo ships is prefixed `herdr-tg` — `herdr-tg.service`,
-`herdr-tg-app.service`, `herdr-tg-watchdog.*` — and `kickoff-door.service` and
+name is taken. So every unit this repo ships is prefixed `kickoff-channel` —
+`kickoff-channel.service`, `kickoff-channel-app.service`, `kickoff-channel-watchdog.*`, each name
+checked free on this box before it was taken — and `kickoff-door.service` and
 `kickoff-hub-attach@.service` are named for the things they actually are. It is not a style rule.
 On 19 September the app plane's unit was written as `kickoff-hub.service`, which is another
 organisation's service, enabled and running on this box at the time. Two lines in this repo then
@@ -121,7 +167,7 @@ service, and it does it silently.
 not a port:
 
 ```
-systemctl --user enable --now herdr-tg-app.service
+systemctl --user enable --now kickoff-channel-app.service
 ```
 
 It needs no token and no environment file. If it finds a token set anyway it says so in one line
@@ -142,7 +188,7 @@ to the same measurements without anybody remembering to add it to a list.
 *The phone plane* — dials out to Telegram, binds nothing:
 
 ```
-systemctl --user enable --now herdr-tg.service
+systemctl --user enable --now kickoff-channel.service
 ```
 
 It needs a bot token at `~/.config/herdr-tg/env` (`scripts/setup-token.sh` writes it, mode 0600).
@@ -151,7 +197,7 @@ Without one the binary says so by name and exits; it does not start half-alive.
 **The door** — the one program here that listens, and it listens on `127.0.0.1` only:
 
 ```
-herdr-tg door-token                                  # mint the credential, at a terminal, once
+kickoff-channel door-token                           # mint the credential, at a terminal, once
 systemctl --user enable --now kickoff-door.service   # deploy/kickoff-door.service
 ```
 
@@ -166,9 +212,10 @@ interface between them. `docs/PWA-DOOR.md` is its contract.
 **A worker** — `deploy/kickoff-hub-attach@.service`, one instance per worker. See `docs/ATTACHING.md`
 §13. There is one thing to run under `adapters/`, on purpose.
 
-**Is it alive?** `herdr-tg projects --json` tells you what is enrolled and what is connected right
-now. `~/.local/state/herdr-tg/hub.health` says in sentences which leg is down. The watchdog is a
-separate script that shares no code and no process with the hub — that is the point of it.
+**Is it alive?** `kickoff-channel projects --json` tells you what is enrolled and what is
+connected right now. `~/.local/state/herdr-tg/hub.health` says in sentences which leg is down.
+The watchdog is a separate script that shares no code and no process with the hub — that is the
+point of it.
 
 ---
 

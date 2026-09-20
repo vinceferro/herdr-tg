@@ -103,7 +103,7 @@ export type DialEnd = { code: string } | { closedBeforeWelcome: true }
 
 export type HubLinkOptions = {
   /**
-   * Resolved AFRESH on every attempt, never once: the operator may run `herdr-tg enroll` while the
+   * Resolved AFRESH on every attempt, never once: the operator may run `kickoff-channel enroll` while the
    * session is running, and that is the recovery a tool result tells him to perform.
    */
   identify: () => Identity

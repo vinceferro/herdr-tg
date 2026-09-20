@@ -14,7 +14,7 @@
      stays as the LAST term of the ladder, with the git guard at the enrol door.
 
      What shipped, against the tree as it is (the file:lines below predate ten commits):
-       step 0  `crates/herdr-tg/src/conversations.rs` — the home and every tree under it 0700,
+       step 0  `crates/kickoff-channel/src/conversations.rs` — the home and every tree under it 0700,
                re-asserted; the seven bare `create_dir_all` sites of the state directory go
                through `private_state_dir`. A conversation id is shape-refused at every door and
                canonicalised containment is asserted immediately before every write.
@@ -147,9 +147,9 @@ uniqueness within a project belongs to whoever dispatches, and REFUSES #1 is "na
 project's conversation".
 
 **Held against that line, this design does not move it.** Every slot exists as a row in
-`projects.json` before any dispatcher runs, put there by `herdr-tg grant` at a keyboard. When kickoff
-opens a room it **takes a file** — an `O_EXCL` rename of a slot the operator minted — and sends no
-message to anything. The hub then sees an ordinary `hello` carrying a secret it enrolled days ago,
+`projects.json` before any dispatcher runs, put there by `kickoff-channel grant` at a keyboard.
+When kickoff opens a room it **takes a file** — an `O_EXCL` rename of a slot the operator minted —
+and sends no message to anything. The hub then sees an ordinary `hello` carrying a secret it enrolled days ago,
 from a process it cannot distinguish from any other. The dispatcher SELECTS from what the machine
 already knows and NAMES nothing new. It cannot mint an N+1th slot, cannot reach another seed's grant
 directory, cannot enrol, cannot flip `enabled`.
@@ -162,9 +162,9 @@ a **narrowing** of what already ships in the dimension that is currently infinit
 
 ### Argv is not a person
 
-`herdr-tg open` and `herdr-tg grant` are gated on `std::io::stdin().is_terminal()`, not merely on
-being argv. The precedent is already in the tree and it was paid for: `enroll.rs:19` passes that fact
-in, and `enroll.rs:38-52` explains why — *"the likeliest reader of this refusal is an autonomous
+`kickoff-channel open` and `kickoff-channel grant` are gated on `std::io::stdin().is_terminal()`,
+not merely on being argv. The precedent is already in the tree and it was paid for: `enroll.rs:19`
+passes that fact in, and `enroll.rs:38-52` explains why — *"the likeliest reader of this refusal is an autonomous
 agent that was just told to run this command."* This graft is from **"The door is the credential"**,
 which made the same point about `open` and then did not apply it to itself.
 
@@ -259,7 +259,7 @@ sentence becomes unwritable rather than fixed.
 
 ### A seed
 
-`herdr-tg open <repo> [--title <name>]`, at a terminal. Mints the row, writes
+`kickoff-channel open <repo> [--title <name>]`, at a terminal. Mints the row, writes
 `conversations/<id>/secret`, writes `by-repo/<hash of that repo's main tree>` → that id, prints the
 one line a launcher needs. **Writes nothing into any repo.**
 
@@ -276,10 +276,10 @@ One conversation, two lockouts.
 
 Under this design:
 
-1. **Once, at a keyboard:** `herdr-tg grant <seed> --rooms 8`. Eight complete conversations are
-   minted — eight rows with `enabled: true`, `topic_id: None`, eight secrets in the keyring, eight
-   `NNN.vacant` slot files under `grants/<seed>/`. A vacant slot is genuinely free: a topic binds only
-   on first LIVE connection (`registry.rs:63`, `hub.rs:1340`), so it costs a directory and a row and
+1. **Once, at a keyboard:** `kickoff-channel grant <seed> --rooms 8`. Eight complete conversations
+   are minted — eight rows with `enabled: true`, `topic_id: None`, eight secrets in the keyring,
+   eight `NNN.vacant` slot files under `grants/<seed>/`. A vacant slot is genuinely free: a topic
+   binds only on first LIVE connection (`registry.rs:63`, `hub.rs:1340`), so it costs a directory and a row and
    never appears on his phone.
 2. **The seed's conversation proposes a function.** He taps yes.
 3. **The dispatcher takes the next slot** — an `O_EXCL` rename `000.vacant` → `000.taken`, so two
@@ -396,9 +396,10 @@ undeletably, carrying his history.
    hypothetical: `UMask=0022`, bare `create_dir_all` → `755`. Nothing else may land before this,
    because everything after it puts credentials there. No live effect; reversible.
 1. **Widen additively.** `conversations/`, `by-repo/`, `grants/` created. Nothing reads them.
-2. **`herdr-tg adopt-secrets`** — one shot, idempotent, dry-run by default, **no service touch**. Per
-   row: create `conversations/<its existing id>/`, copy the bytes of `<repo>/.kickoff/hub.token` into
-   `secret` at 0600, write `by-repo/<sha256 of that repo's canonical main tree>` → that id.
+2. **`kickoff-channel adopt-secrets`** — one shot, idempotent, dry-run by default, **no service
+   touch**. Per row: create `conversations/<its existing id>/`, copy the bytes of
+   `<repo>/.kickoff/hub.token` into `secret` at 0600, write `by-repo/<sha256 of that repo's
+   canonical main tree>` → that id.
    **`projects.json` is not written at all**, and `token_sha256` does not change. A crash halfway
    leaves a second copy of a secret nobody is reading yet. Rollback is `rm -rf` on the new tree.
 3. **The terminal doors.** `open` and `grant`, both `is_terminal()`-gated, writing the new place. The
@@ -417,7 +418,7 @@ undeletably, carrying his history.
    conversation id (`where.ts:115-118`, `fanin.ts:74`, `server.ts:130-134`).
 7. **Delete the repo token files, one project at a time, at his pace.** For each: confirm its bridge
    has reconnected on the new path, then `rm <repo>/.kickoff/hub.token`. This is the first
-   irreversible step and it is per-project. Rollback before it is `herdr-tg enroll <repo>`, and the
+   irreversible step and it is per-project. Rollback before it is `kickoff-channel enroll <repo>`, and the
    topic comes back because the id never moved.
 8. **Only then delete the old path:** `TOKEN_FILE` (`registry.rs:37`), `write_token_file`
    (`registry.rs:581`), the git guard, `--even-if-git-would-commit-it`, term 3 of the ladder, and the

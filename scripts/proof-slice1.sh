@@ -11,7 +11,7 @@
 # author. Reference output, a byte-compare, a witness socket, a request journal, a per-run nonce.
 set -uo pipefail
 HERDR="${HERDR:-herdr}"
-BIN="${BIN:-$PWD/target/debug/herdr-tg}"
+BIN="${BIN:-$PWD/target/debug/kickoff-channel}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 NORM="$DIR/normalize.jq"
 ATTEMPTS="${ATTEMPTS:-5}"
@@ -24,7 +24,7 @@ ONLY="${GATES:-$ALL_GATES}"
 # fail gate 2 by construction — that is the anti-cheat working, not a harness bug.
 usage(){ cat >&2 <<EOF
 usage: $0 [--gates=0,1,2,3,4,5,6] [--attempts=N]
-  env: BIN=<path to herdr-tg>  HERDR=<path to herdr>  GATES=...  ATTEMPTS=N
+  env: BIN=<path to kickoff-channel>  HERDR=<path to herdr>  GATES=...  ATTEMPTS=N
 EOF
 }
 for arg in "$@"; do
@@ -166,7 +166,7 @@ fi
 # ---- gate 2: the client is a real client, not a herdr-CLI wrapper -------------
 if want 2; then
   [ -f "$BIN" ] && [ -x "$BIN" ] || die 2 "sandboxed client" "\$BIN is not an executable file: $BIN"
-  # A shell stand-in dies here whatever it prints. `\x7fELF` is the magic; target/debug/herdr-tg
+  # A shell stand-in dies here whatever it prints. `\x7fELF` is the magic; the built binary
   # matches, every `#!/bin/…` script does not.
   head -c 4 "$BIN" | grep -qa $'^\x7fELF' \
     || die 2 "sandboxed client" "\$BIN is not an ELF executable (magic: $(head -c 4 "$BIN" | od -An -c | tr -s ' ')) — a script cannot prove a Rust client speaks the wire"
@@ -197,7 +197,7 @@ if want 3; then
     LR="$R"; LA="$A"
   done
   if [ "${MATCHED:-0}" != 1 ]; then
-    { echo "--- diff: herdr api snapshot (<) vs herdr-tg status --json (>) ---"; diff <(printf '%s' "$LR") <(printf '%s' "$LA")
+    { echo "--- diff: herdr api snapshot (<) vs kickoff-channel status --json (>) ---"; diff <(printf '%s' "$LR") <(printf '%s' "$LA")
       echo "--- normalized out of BOTH sides: $DROPPED ---"; } >&2
     die 3 "snapshot equivalence" "client disagrees with herdr on all $ATTEMPTS attempts"
   fi
@@ -256,7 +256,7 @@ fi
 # WHAT 5a DOES NOT PROVE, measured rather than assumed: a shell script that dials the socket with
 # socat, sends a correct ping + events.subscribe, and reformats the frame with jq DOES pass this
 # gate — verified. That is the right answer: it really did read the frame off the wire and render
-# its fields, which is what 5a asks. What rules it out as a herdr-tg proof is gate 2 (not an ELF,
+# its fields, which is what 5a asks. What rules it out as a Kickoff Channel proof is gate 2 (not an ELF,
 # and every herdr CLI neutered). Neither gate is the property on its own; the pair is.
 #
 # The nonce is fed to the mock on STDIN, never argv — see the spawn below.
@@ -358,7 +358,7 @@ fi
 # A subset run must NOT print the full verdict: proof-selftest.sh calls this with --gates=3 many
 # times over passing fakes, and "SLICE 1 PROOF: PASS" from a one-gate run would be a lie.
 if [ "$ONLY" = "$ALL_GATES" ]; then
-  echo "SLICE 1 PROOF: PASS — herdr-tg agrees with herdr 0.8.2 / protocol 20 on ${NW:-?} workspaces / ${NP:-?} panes"
+  echo "SLICE 1 PROOF: PASS — kickoff-channel agrees with herdr 0.8.2 / protocol 20 on ${NW:-?} workspaces / ${NP:-?} panes"
 else
   echo "gates $ONLY passed — SUBSET RUN, not the full slice-1 proof"
 fi

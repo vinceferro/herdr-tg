@@ -24,7 +24,7 @@ so the menu stayed live on his phone with the hub believing the question open.
 
 **What holds now.** The ledger is written first. `AskLedger::close_all` marks every message of an ask
 closed under one lock before any edit and hands back only the keyboards somebody still has to take
-off (`crates/herdr-tg/src/hub.rs:1018`). A tap after that is refused, in his words, by the single
+off (`crates/kickoff-channel/src/hub.rs:1018`). A tap after that is refused, in his words, by the single
 predicate both the unlocked look and the lock-held re-check use — `AskRecord::refusal_if_closed`
 (`hub.rs:614`): answered on either side reads as *already answered*, withdrawn or timed out reads as
 *nobody is asking any more*. The record survives a failed edit and carries the note its keyboard must
@@ -72,7 +72,7 @@ on the box talked to nobody.
 **What holds now.** `heartbeat.rs` holds three facts apart — the phone line answering, a connection
 coming out the far end of the accept loop, and the dispatcher still being handed his taps — and
 `stamp_if` touches the file only when all three were true inside `FRESH_FOR` (90 s)
-(`crates/herdr-tg/src/heartbeat.rs:82`, `:303`, `:522`). Withholding is the only signal a script that
+(`crates/kickoff-channel/src/heartbeat.rs:82`, `:303`, `:522`). Withholding is the only signal a script that
 reads a modification time can hear, so the diagnosis goes in a **second** file, `hub.health`, rewritten
 every tick (`heartbeat.rs:542`) — writing "degraded" into the stamp would refresh the very timestamp
 the alarm watches. The watchdog reads that note **only** to word an alarm it has already decided to
@@ -84,13 +84,13 @@ The boot hole found afterwards: a hub that could not reach Telegram at boot prop
 before anything built the health machinery, so nothing ever stamped or wrote a note and the watchdog —
 which arms itself the first time something does — never armed. The health and the heartbeat are now
 constructed **before** the first fallible call, and the note is written on the way in and on the way
-out (`crates/herdr-tg/src/bot.rs:732`, `:756`, `:789`). The stamp was not weakened: an unreachable
+out (`crates/kickoff-channel/src/bot.rs:732`, `:756`, `:789`). The stamp was not weakened: an unreachable
 phone line still withholds it. `deploy/herdr-tg.service` gained the comment saying that `Restart=always`
 is what keeps that note young enough for the alarm to quote.
 
 `herdr-tg doctor` reported an armed watchdog on any box with a hub on it, because it inferred the
 answer from the hub's two files and read none of the four the watchdog writes. It reads them now and
-reports what it **observed** apart from what it **infers** (`crates/herdr-tg/src/cmd/doctor.rs:40`, `:203`, `:311`).
+reports what it **observed** apart from what it **infers** (`crates/kickoff-channel/src/cmd/doctor.rs:40`, `:203`, `:311`).
 
 **The defect, fence half.** The reverse-direction agent check was fail-open on the case that matters.
 It withheld a question only when the running agent was known **and** different, while the lookup
@@ -120,7 +120,7 @@ and promises no confirmation — so on the operator's own sessions, silently, fo
 as *Sent* for ever and the run-replaced fence never engaged.
 
 **What holds now.** `the_channel_plugins_version_moves_with_its_content`
-(`crates/herdr-tg/tests/the_channel_plugin_install_is_reproducible.rs:142`) walks back to the oldest
+(`crates/kickoff-channel/tests/the_channel_plugin_install_is_reproducible.rs:142`) walks back to the oldest
 commit still carrying the working tree's version and compares that commit's bytes with the tree's, so
 a change without a bump turns the whole workspace red and a bump not yet committed is not punished. A
 hand-bumped number was chosen over a content hash because the version is also what the tool lists,
@@ -140,7 +140,7 @@ and a terminal mirror — a product that was deleted. `TRACKER.md` spent six day
 live round trip to a phone had not happened; it had, the evening the tracker was last written.
 
 **What holds now.** Both rewritten, and
-`crates/herdr-tg/tests/the_public_docs_describe_the_product_that_ships.rs` (9 tests) fails if either
+`crates/kickoff-channel/tests/the_public_docs_describe_the_product_that_ships.rs` (9 tests) fails if either
 drifts back. The rule it keeps is the one that matters: **a number in a public file is checked against
 the thing that produces it, never against a second copy of itself.** The command list is read out of
 `main.rs`, the rates out of `queue.rs`, and no number above Telegram's measured twenty may stand beside
@@ -151,7 +151,7 @@ the thing that produces it, never against a second copy of itself.** The command
 **The transport seam (`ea52545`).** The north star asks for the transport behind an interface —
 authenticated `AF_UNIX` today, a mutually authenticated remote stream later, identical semantics.
 None of that is buildable while the semantics layer takes a `UnixStream` and reads `SO_PEERCRED`
-itself. `crates/herdr-tg/src/transport.rs` (new, 537 lines) is now the only file in the bot that knows
+itself. `crates/kickoff-channel/src/transport.rs` (new, 537 lines) is now the only file in the bot that knows
 what a socket and a peer uid are; it hands the hub an `Accepted` — a byte stream and a
 `ConnectionIdentity`. Everything moved rather than being rewritten. Two things fall out of naming the
 identity: a peer that does not share this machine's filesystem is offered no outbox (bytes cross by
@@ -277,7 +277,7 @@ test that captures every frame of a run with the flag set.
 
 Generated from `git diff --stat c6c8266..HEAD`: **48 files, +21 846 / −855**.
 
-**Hub and bot (`crates/herdr-tg/`)**
+**Hub and bot (`crates/kickoff-channel/`)**
 
 | file | ± | what moved |
 | --- | --- | --- |
@@ -313,7 +313,7 @@ when the identity slice touched the plugin — which is the rule working).
 (three questions answered, header now says the rest is history), `docs/examples/attach-from-the-document.ts`
 +87 −14, plus `README.md`, `TRACKER.md`, `CLAUDE.md`, `adapters/kickoff-hub-attach/README.md`.
 
-**New test files: five**, all under `crates/herdr-tg/tests/`.
+**New test files: five**, all under `crates/kickoff-channel/tests/`.
 
 | file | tests | what it guards |
 | --- | --- | --- |

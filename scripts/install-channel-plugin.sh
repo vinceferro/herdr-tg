@@ -546,13 +546,22 @@ fi
 
 say
 say "Then, per project:"
-say "    herdr-tg enroll <repo>"
+say "    kickoff-channel enroll <repo>"
 say "    echo 'CHANNEL_SPEC=plugin:$SPEC' >> <repo>/.kickoff/instance.env"
 
 # The two halves ship from one repo and are installed by two different commands, and this one only
 # ever touches the bridge. A bridge that knows about worktrees against a hub that does not is the
 # ordinary intermediate state of an upgrade — the bridge now refuses rather than quietly taking the
 # whole project's place, but a refusal is still a session that cannot reach him.
+#
+# It used to end by naming a unit, and that was wrong for a reason worth keeping written down: this
+# script installs the bridge and NOTHING else — no binary, no unit — so whatever name it printed was
+# the name this repo happened to give the hub, not the name the box in front of him had been given.
+# The day the hub's unit was renamed, the line started answering "Unit not found" on a box whose hub
+# was perfectly fine under its former name. What this script can honestly say is the ACT; the name
+# belongs to whoever installed the hub, so the listing below is how he finds his own.
 say
-say "And restart the hub, or a session in a worktree will refuse to connect:"
-say "    systemctl --user restart herdr-tg"
+say "And restart the hub, or a session in a worktree will refuse to connect."
+say "This script installs the bridge only, so it cannot know how your hub is started."
+say "If it runs under systemd, this lists the hub units on this box — restart the one you see:"
+say "    systemctl --user list-unit-files 'kickoff-channel*' 'herdr-tg*'"

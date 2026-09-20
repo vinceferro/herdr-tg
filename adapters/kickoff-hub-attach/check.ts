@@ -226,7 +226,7 @@ export async function runCheck(opts: CheckOptions): Promise<number> {
       // RUNNING (the connect succeeded) and wedged, which is a different fix from "not running".
       setTimeout(() => {
         if (settled) return
-        not('the hub accepted the connection and said nothing for 6 seconds; it is running but wedged — restart herdr-tg')
+        not('the hub accepted the connection and said nothing for 6 seconds; it is running but wedged — restart kickoff-channel')
         finish()
       }, 6000)
     })
@@ -418,25 +418,25 @@ function refusalSentence(reason: string, address: string | null, project: { how?
     case 'unknown_project':
     case 'bad_token': {
       // A secret the CHANNEL keeps that the hub refuses is most often a stale copy — a rotation
-      // typed with a herdr-tg from before conversations existed rewrites the repo's copy alone —
+      // typed with a build from before conversations existed rewrites the repo's copy alone —
       // and `open` on such a project says "already open", so the verb named is the one that
       // copies the current bytes across. A room has no folder to enrol at all.
       if (project?.how === 'named') {
-        return `the secret the channel keeps for conversation ${project.conversation} is not one the hub knows; grant it again at a terminal (herdr-tg grant), or name a conversation that is with KICKOFF_HUB_CONVERSATION`
+        return `the secret the channel keeps for conversation ${project.conversation} is not one the hub knows; grant it again at a terminal (kickoff-channel grant), or name a conversation that is with KICKOFF_HUB_CONVERSATION`
       }
       if (project?.how === 'bound') {
-        return 'the secret the channel keeps for this project is not one the hub knows; at a terminal, copy the repo\'s current secret across: herdr-tg adopt-secrets --apply (or, if the repo holds none, enrol it again: herdr-tg enroll)'
+        return 'the secret the channel keeps for this project is not one the hub knows; at a terminal, copy the repo\'s current secret across: kickoff-channel adopt-secrets --apply (or, if the repo holds none, enrol it again: kickoff-channel enroll)'
       }
       return reason === 'unknown_project'
-        ? 'the hub does not know this project; open it at a terminal: herdr-tg open (or, if it was enrolled before, enrol it again: herdr-tg enroll)'
-        : 'the secret is not one the hub knows; enrol the project again at a terminal: herdr-tg enroll'
+        ? 'the hub does not know this project; open it at a terminal: kickoff-channel open (or, if it was enrolled before, enrol it again: kickoff-channel enroll)'
+        : 'the secret is not one the hub knows; enrol the project again at a terminal: kickoff-channel enroll'
     }
     case 'not_enabled':
       return 'this project is enrolled but switched off'
     case 'version_skew':
       return 'this command and the hub do not speak the same version; upgrade one of them'
     case 'bad_lane':
-      return `the hub will not address a conversation called ${address ?? 'this one'}; if the hub is older than this command, restart herdr-tg`
+      return `the hub will not address a conversation called ${address ?? 'this one'}; if the hub is older than this command, restart kickoff-channel`
     case 'already_claimed':
       return 'another connection holds this conversation right now; if it is your own worker, run the check before it and not beside it; if nothing of yours is running, a stray process is squatting the claim'
     case 'stale_generation':

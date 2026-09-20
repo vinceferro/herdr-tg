@@ -62,7 +62,7 @@ await until('the relay to say hello to the hub', () => hub.got.some(f => f.t ===
 // Nothing is attached yet. The operator's typed words used to be dropped here in silence — no
 // producer to hand them to, no note, and no ack — so the hub went on believing they were read.
 // The wire has always had `ack{status: refused, reason}` for exactly this; the door answers with
-// it, and the hub's own half (the line in his topic) is `crates/herdr-tg/src/hub/tests.rs`.
+// it, and the hub's own half (the line in his topic) is `crates/kickoff-channel/src/hub/tests.rs`.
 hub.to({ v: 1, id: 'h-m0', t: 'message', msg_id: 'm0', text: 'anyone home?', from: { chat_id: -1, user_id: 1 } })
 await until('the refusal', () => hub.got.some(f => f.t === 'ack' && f.ref === 'h-m0')).catch(() => {})
 const nobody = hub.got.find(f => f.t === 'ack' && f.ref === 'h-m0')

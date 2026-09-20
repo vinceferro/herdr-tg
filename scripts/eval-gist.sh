@@ -31,8 +31,8 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROMPT="$REPO/crates/herdr-tg/prompts/gist.txt"
-CASES="$REPO/crates/herdr-tg/tests/fixtures/gist-cases.json"
+PROMPT="$REPO/crates/kickoff-channel/prompts/gist.txt"
+CASES="$REPO/crates/kickoff-channel/tests/fixtures/gist-cases.json"
 ENVF="${HERDR_TG_ENV:-$HOME/.config/herdr-tg/env}"
 CLASS=""
 COMPARE=0
@@ -90,7 +90,7 @@ def ask(excerpt, cls, model=None, timeout=90):
     except Exception as e:                       # noqa: BLE001 - any failure is a failed case
         return ("", "?", int((time.time() - t) * 1000), str(e))
 
-# Mirrors crates/herdr-tg/src/summarize.rs::plausible. Kept in step by hand; the Rust side is the
+# Mirrors crates/kickoff-channel/src/summarize.rs::plausible. Kept in step by hand; the Rust side is the
 # authority, and a divergence shows up here as a score that disagrees with what the bot sends.
 FILLER = ("please provide", "the necessary information", "no question", "not asking")
 def grade(out, excerpt):

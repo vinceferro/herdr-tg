@@ -1,0 +1,83 @@
+[Unit]
+Description=Kickoff Channel (phone plane) — the hub that reaches him through a messaging app
+Documentation=https://github.com/vinceferro/herdr-tg
+After=default.target
+# Never give up restarting. A phone-only operator cannot run `systemctl --user reset-failed`, so
+# the default start-limit burst would leave the bridge dead with no way back until they reach a
+# keyboard — which is the exact situation the bridge exists to avoid.
+StartLimitIntervalSec=0
+# One plane at a time, and it is a hard fact rather than a preference: both hubs bind the same
+# socket and take the same single-hub lock, so the second to start is refused in milliseconds and
+# leaves a failed unit behind. Said here so systemd stops the other one instead.
+Conflicts=kickoff-channel-app.service
+
+[Service]
+Type=simple
+# Wait for a name to resolve before starting, bounded at thirty seconds. On 5 September the box
+# came up, this unit started before the network did, `getMe` failed, and systemd brought it back
+# five seconds later — a red line in the journal and NRestarts=1 for a failure nobody caused. A
+# user unit cannot order itself after the system's network-online.target, so this is the honest
+# substitute: a short wait for the one host it needs, and never a refusal to start — if the name
+# still will not resolve, the binary's own error names it and Restart= does the rest.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do getent hosts api.telegram.org >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
+# The plane is named here and nowhere else, so `systemctl --user cat` answers "which way does this
+# box reach him" without anybody opening an environment file. It is a required argument with no
+# default: a hub that worked it out from whether a token happened to be set would quietly become
+# the app plane the day a credential file failed to render, and every agent on the box would talk
+# into a file while he waited for a phone that was never going to ring.
+ExecStart=%h/.local/bin/kickoff-channel serve --to telegram
+
+# The credential, and only the credential, comes from here. Written by scripts/setup-token.sh at
+# mode 0600. `-` so a missing file is a clear startup error from the binary
+# ("KICKOFF_CHANNEL_TOKEN is not set", naming the fix) rather than an opaque systemd 203/EXEC. The
+# file may still spell the key `HERDR_TG_TOKEN`: the binary accepts the former name, and a box that
+# has one working credential file must not need it rewritten to survive a rename.
+EnvironmentFile=-%h/.config/herdr-tg/env
+
+# herdr's socket. The binary already falls back to this path, but naming it here means the unit
+# does not depend on that fallback staying the default.
+Environment=HERDR_SOCKET_PATH=%h/.config/herdr/herdr.sock
+Environment=RUST_LOG=info
+
+# Not only so the bridge comes back. A hub that dies on the way up — the phone line unreachable —
+# writes down which half was down and exits, and the alarm quotes that note only while it is under
+# ninety seconds old. Nothing inside the binary can keep it young; this restart is what does. Stop
+# restarting, or wait as long as that window, and the operator's phone says "the herd has gone
+# quiet" about a machine that had already named its own failure.
+Restart=always
+RestartSec=5
+
+# ── Hardening ───────────────────────────────────────────────────────────────────────────────────
+# This process holds a Telegram bot token. It cannot type into a terminal — that path was deleted,
+# not gated. It binds no port: it dials out to api.telegram.org and listens on a local Unix socket
+# that is not a port, so nothing here needs to accept traffic from the network.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The three families this process needs: IPv4 and IPv6 for the Bot API, and a Unix socket for the
+# agents. Measured under `systemd-run --user` — bare, a netlink socket opens; under this list it is
+# refused — so the refusal is real and not a preference.
+#
+# It says nothing about WHERE those two internet families may go, and the comment here used to read
+# "Nothing else", which a reader takes for both. A family list is not a destination list, and on a
+# user manager there is no destination list to be had: see the note in
+# kickoff-channel-app.service for what was measured of `IPAddressDeny=`. What limits this process
+# to one host is the code.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# ProtectSystem/ProtectHome are deliberately NOT set to their strict values: the bridge reads
+# herdr's socket and (slice 4) writes an append-only audit log, both under $HOME, and enumerating
+# those in ReadWritePaths would break the moment herdr moves its socket. Revisit with the audit log
+# in hand.
+ProtectSystem=yes
+
+[Install]
+WantedBy=default.target

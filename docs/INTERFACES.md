@@ -196,8 +196,8 @@ comes back as the same voice rather than voiding what its producers are still wa
 
 The direct path was never exposed to any of that, and the earlier draft of this paragraph was wrong
 to say it was: a channel plugin mints one `instance` for the life of its session and the hub reloads
-its ledger from disk, so restarting `herdr-tg` under a live Claude session leaves that session's
-questions answerable — its arrival sweep skips its own instance by construction, and a tap resolves
+its ledger from disk, so restarting `kickoff-channel` under a live Claude session leaves that
+session's questions answerable — its arrival sweep skips its own instance by construction, and a tap resolves
 because the instance on the record still matches the claim.
 
 The sentences an agent reads differ between the engines wherever the ENGINE decides whether they are
@@ -289,7 +289,7 @@ requires, what it refuses, and the date it was decided.
    crosses it, no claim is held through it, and OPEN 4 (a peer elsewhere) is unchanged by it. What
    it offers is the PWA's contract, transcribed from that org's own pinned stub rather than
    designed here — the shapes are theirs, byte-compat is the adoption's whole cost advantage. What
-   it requires is a token minted at the terminal (`herdr-tg door-token`), read per request,
+   it requires is a token minted at the terminal (`kickoff-channel door-token`), read per request,
    constant-time compared, never minted by the gateway itself. What it refuses: any address but
    loopback (no flag exists for one); any answer it was not given by the hub's own result file —
    never an optimistic ok; and anything new through the egress law the ring already holds to,

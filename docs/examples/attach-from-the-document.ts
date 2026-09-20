@@ -94,7 +94,7 @@ if (wanted !== undefined) {
 // the upward search, because §5 says an adapter that does not search needs the secret at
 // `<project dir>/.kickoff/hub.token` or needs to be told the path, and being told is cheaper.
 const tokenFile = named(env.KICKOFF_HUB_TOKEN_FILE) ?? join(projectDir, '.kickoff', 'hub.token')
-if (!existsSync(tokenFile)) refuse(`there is no secret at ${tokenFile}; run: herdr-tg enroll ${projectDir}`)
+if (!existsSync(tokenFile)) refuse(`there is no secret at ${tokenFile}; run: kickoff-channel enroll ${projectDir}`)
 const token = readFileSync(tokenFile, 'utf8').trim()
 if (!token) refuse(`the secret at ${tokenFile} is empty`)
 

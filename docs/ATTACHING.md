@@ -904,13 +904,24 @@ keeps it**: under the hub's own state directory — `$XDG_STATE_HOME/herdr-tg`, 
 <state>/by-repo/<sha256(canonical main tree)[..16]>   one line: the id that repo defaults to
 ```
 
-`herdr-tg open <repo>` mints a project's row and writes nothing into the repo; `herdr-tg grant <repo>
---rooms N` mints N rooms, each its own conversation with an id of the shape `c-` and twelve hex
-characters. The older door, `herdr-tg enroll <repo>`, still writes `<repo>/.kickoff/hub.token` at
-mode `0600` as well — refusing outright if git would commit it — and `herdr-tg adopt-secrets` copies
-every such secret across, once. **No message can open, grant or enrol anything**; they are
-terminal-only acts, on purpose, and `open`, `grant` and `remove-repo-secret` refuse unless a person
-is at the keyboard.
+`kickoff-channel open <repo>` mints a project's row and writes nothing into the repo;
+`kickoff-channel grant <repo> --rooms N` mints N rooms, each its own conversation with an id of
+the shape `c-` and twelve hex characters. The older door, `kickoff-channel enroll <repo>`, still
+writes `<repo>/.kickoff/hub.token` at mode `0600` as well — refusing outright if git would commit
+it — and `kickoff-channel adopt-secrets` copies every such secret across, once. **No message can
+open, grant or enrol anything**; they are terminal-only acts, on purpose, and `open`, `grant` and
+`remove-repo-secret` refuse unless a person is at the keyboard.
+
+**The command has two names and both are installed.** `kickoff-channel` is the product's name and
+the one every instruction in this document uses; `herdr-tg` is the same program under the name it
+shipped under first, kept because other software on that box already calls it by that name. Either
+spelling runs any verb here, and every sentence the HUB prints names the new one, the transcripts
+in §13.4 included — a guard holds those transcripts to what the command really prints. One
+exception, said rather than glossed: `herdr-client`, the read-only client for herdr's own
+protocol, still names the old spelling in one handshake message, because nothing has made it
+print that message yet and a sentence nobody has read is a poor thing to claim about. **The paths did not move with the name**: the state directory above
+is still `herdr-tg`, and so is the hub's own credential file (§14.1), because a path other programs
+read is not a thing a rename may take away.
 
 An adapter finds the secret by a **ladder of four terms, in strict order**, and ours is
 `secretFor` in `plugins/kickoff-channel/attach.ts`:
@@ -942,15 +953,16 @@ An adapter finds the secret by a **ladder of four terms, in strict order**, and 
    project for the same repository and moved a live conversation somewhere new on his phone.
 
 **A secret the channel keeps that the hub refuses** — `unknown_project` on a term-1 or term-2
-secret — is most often a stale copy: a rotation typed with a `herdr-tg` from before conversations
-existed rewrites the repo's copy alone. The sentence an agent reads then names
-`herdr-tg adopt-secrets --apply` (which copies the repo's current bytes across) for a bound
-secret, and the grant for a room; `herdr-tg open` on such a project refuses with the same verb
-rather than saying "already open".
+secret — is most often a stale copy: a rotation typed with a copy of the command from before
+conversations existed rewrites the repo's copy alone. The sentence an agent reads then names
+`adopt-secrets --apply` (which copies the repo's current bytes across) for a bound secret, and the
+grant for a room; `kickoff-channel open` on such a project refuses with the same verb rather than
+saying "already open".
 
-**Resolve it afresh on every connection attempt, never once.** The operator may run `herdr-tg open`
-or `enroll` while your adapter is running, and that is the documented recovery from
-`unknown_project`. An adapter that caches "no secret" and stops retrying makes that recovery a lie.
+**Resolve it afresh on every connection attempt, never once.** The operator may run
+`kickoff-channel open` or `enroll` while your adapter is running, and that is the documented
+recovery from `unknown_project`. An adapter that caches "no secret" and stops retrying makes that
+recovery a lie.
 
 ### What the secret proves
 
@@ -1082,9 +1094,9 @@ real one, byte for byte:
 
 | reason | mends itself? | what a person must do |
 | --- | --- | --- |
-| `unknown_project` | on its own, no | `herdr-tg enroll <repo>` — and keep retrying, because that can happen while you run. |
+| `unknown_project` | on its own, no | `kickoff-channel enroll <repo>` — and keep retrying, because that can happen while you run. |
 | `bad_token` | no | Re-enrol. The secret on disk is not one the hub knows. |
-| `not_enabled` | no | Enrolled but switched off — `herdr-tg disable <repo>` at a terminal, and `enable` is the way back. A live connection gets this too, then a close, the moment the switch is thrown. |
+| `not_enabled` | no | Enrolled but switched off — `kickoff-channel disable <repo>` at a terminal, and `enable` is the way back. A live connection gets this too, then a close, the moment the switch is thrown. |
 | `version_skew` | no | The major protocol version differs. Upgrade one side. |
 | `frame_too_large` | **yes, if you split** | Your frame was over 64 KiB. It was refused, never truncated. The hub releases your claim *before* closing, so an immediate reconnect is not refused. |
 | `bad_lane` | no | §4. Rename the address, or restart a hub that is older than you. |
@@ -1360,14 +1372,14 @@ the whole signal, so there is no word to read and nothing for you to send.
 the operator nothing when a connection goes away, so an adapter that dies quietly is a conversation
 that simply stops. If your agent going silent needs to be noticed, that is your job.
 
-**8 · Read-only inventory.** `herdr-tg projects --json`, at a terminal, built 5 September. One JSON
-array, one object per project, sorted by title, fields in this order and no others:
+**8 · Read-only inventory.** `kickoff-channel projects --json`, at a terminal, built 5 September.
+One JSON array, one object per project, sorted by title, fields in this order and no others:
 `{project_id, title, repo, enabled, topic_id, connected, lanes, connected_lanes, allowed_users,
 seed}`.
 `topic_id` is `null` until a bridge of that project has been live once — a topic does not exist at
 enrolment. `allowed_users` is `[<user_id>]`, sorted: the people let into THAT project's
-conversations with `herdr-tg allow`, and never the people who may speak anywhere, who are not in
-the file this reads.
+conversations with `kickoff-channel allow`, and never the people who may speak anywhere, who are
+not in the file this reads.
 `lanes` is every address of the project that has ever been given a topic, `{<address>: <topic_id>}`.
 `connected` is whether the project's OWN voice has a bridge on the socket right now — a project
 whose sessions are all dispatched into worktrees never has one, so it is `false` for such a project
@@ -1401,9 +1413,9 @@ looks right from inside — a real secret, an admission, a title you could not h
 
 ### REQUIRES — how you satisfy each one
 
-**1 · Enrolment, at a terminal, per conversation.** `herdr-tg open <repo>`, `herdr-tg grant <repo>
---rooms N`, or the older `herdr-tg enroll <repo>`. Not something your adapter can do, arrange, or
-work around; §5. A room is handed to what you start as `KICKOFF_HUB_CONVERSATION=<id>`.
+**1 · Enrolment, at a terminal, per conversation.** `kickoff-channel open <repo>`,
+`kickoff-channel grant <repo> --rooms N`, or the older `kickoff-channel enroll <repo>`. Not
+something your adapter can do, arrange, or work around; §5. A room is handed to what you start as `KICKOFF_HUB_CONVERSATION=<id>`.
 
 **2 · An address unique within its project.** §4. Set `KICKOFF_HUB_ADDRESS`, keep it unique yourself,
 keep it inside the shape rules, and check the echo.
@@ -1457,9 +1469,9 @@ real debugging session:
    so a squatting claim becomes a permanent 1 Hz hammer.
 8. **An unknown `refused` reason is temporary.** Treating it as permanent means a hub shipped after
    you stops you for the life of the process.
-9. **"No secret" is temporary too.** The documented recovery is `herdr-tg enroll` *while you are
-   running*. An adapter that sets a permanent flag and never retries makes that recovery impossible —
-   and says so only on a stderr nobody reads.
+9. **"No secret" is temporary too.** The documented recovery is `kickoff-channel enroll` *while
+   you are running*. An adapter that sets a permanent flag and never retries makes that recovery
+   impossible — and says so only on a stderr nobody reads.
 10. **Your send function must return what actually happened**, and the caller must use it. "Written to
     a live socket", "parked in a queue for a link that has never come up" and "refused for size" are
     three different things, and every one of them was once reported to an agent as success. Bound the
@@ -1837,8 +1849,8 @@ through unprefixed, so a journal shows both and a reader can tell them apart.
 
 #### Worked invocation 1 — a local worker on this box
 
-Once, per project, at a terminal: `herdr-tg enroll <repo>`. Once, per box: bun and opencode on
-`PATH`, and the shim `~/.local/bin/kickoff-hub-attach` that `scripts/install-attach.sh` writes
+Once, per project, at a terminal: `kickoff-channel enroll <repo>`. Once, per box: bun and opencode
+on `PATH`, and the shim `~/.local/bin/kickoff-hub-attach` that `scripts/install-attach.sh` writes
 (§13.6). Then, in the worktree the worker is for:
 
 ```
@@ -2176,7 +2188,12 @@ to tell the hub the difference turned out to be one the check was already sendin
 
 **What it prints.** One line per fact, in the order the facts are established, each beginning `ok`
 or `NOT`; a `NOT` line carries the sentence that says what to do. The last line is the count. Exit
-`0` when every line is `ok`, `1` otherwise. In order:
+`0` when every line is `ok`, `1` otherwise. The lines are quoted below exactly as the command
+prints them — taken from runs of it, not written out from memory — with `<…>` standing where a run
+fills in a path, a name or a number of its own. A guard reads every line quoted here and fails the
+suite if one of them tells a person to type a command this product no longer ships, because a
+transcript is the one kind of sentence a rename can falsify without touching the document it sits
+in, and that is exactly what happened to this table once. In order:
 
 | fact | `ok` reads | `NOT` reads |
 | --- | --- | --- |
@@ -2184,11 +2201,11 @@ or `NOT`; a `NOT` line carries the sentence that says what to do. The last line 
 | attach as a producer | *(no line)* | `NOT  KICKOFF_HUB_RELAY is set on attach itself; it belongs on a producer that attaches to attach, not on attach` — the start refuses this, so the check does; it arrives by inheritance, since every `--run` child has it pinned |
 | the project | `ok   speaking for /workspace (not inside a repository)` — or `(the main tree of a repository)`, `(a linked worktree of <main>)` | *(a refusal is the configuration row above)* |
 | the address | `ok   the conversation: lane-0904-1200 (named by KICKOFF_HUB_ADDRESS)` — or `(git's name for this worktree)`, or `ok   the conversation: the project itself` | *(a refusal is the configuration row above)* |
-| the secret | `ok   the secret: <path> (told by KICKOFF_HUB_TOKEN_FILE)` — or `(conversation c-…, named by KICKOFF_HUB_CONVERSATION)`, `(conversation p-…, the one this repository is bound to)`, `(found above /home/<you>/proj, the older way)` — which term of §5's ladder found it | `NOT  no secret at <path> (KICKOFF_HUB_TOKEN_FILE); mount it there, or at a terminal: herdr-tg open` · `NOT  no secret for conversation c-…; open it at a terminal (herdr-tg open / herdr-tg grant), or fix KICKOFF_HUB_CONVERSATION` · `NOT  no secret for this project; open it at a terminal with herdr-tg open` — a verb, never a path |
+| the secret | `ok   the secret: <path> (told by KICKOFF_HUB_TOKEN_FILE)` — or `(conversation c-…, named by KICKOFF_HUB_CONVERSATION)`, `(conversation p-…, the one this repository is bound to)`, `(found above /home/<you>/proj, the older way)` — which term of §5's ladder found it | `NOT  no secret at <path> (KICKOFF_HUB_TOKEN_FILE); mount it there, or at a terminal: kickoff-channel open` · `NOT  no secret for conversation c-…; open it at a terminal (kickoff-channel open / kickoff-channel grant), or fix KICKOFF_HUB_CONVERSATION` · `NOT  no secret for this project; open it at a terminal with kickoff-channel open` — a verb, never a path |
 | the secret, by value | *(no line)* | `NOT  KICKOFF_HUB_TOKEN is set, and the secret never travels as a value; put it in a file and name the file with KICKOFF_HUB_TOKEN_FILE` — and a `KICKOFF_HUB_TOKEN_FILE` that is 64 hex characters and no path reads `NOT  KICKOFF_HUB_TOKEN_FILE looks like the secret itself; it takes the path to the file` |
 | the hub's socket | `ok   the hub's socket: /run/user/<uid>/kickoff/hub.sock is there` | `NOT  nothing at /run/user/<uid>/kickoff/hub.sock; the hub is not running, or the directory /run/user/<uid>/kickoff/ is not mounted here (mount the directory, never the socket file)` · a directory this uid cannot look into (it is `0700`): `NOT  this user may not look inside /run/user/<uid>/kickoff/ (it is the hub's, mode 0700); run as the same user as the hub` — the first thing a foreign uid hits, before any connect |
 | reached | `ok   reached the hub` | `EACCES`: `NOT  the hub's socket refused this user; run as the same user as the hub` · `ECONNREFUSED`: `NOT  a socket file is there but nothing is listening behind it; the hub is not running` |
-| admitted | `ok   admitted as "oc-dogfood · lane-0904-1200"` — the hub's own title for the conversation, once | closed after `hello` with no frame: `NOT  the hub took the hello and closed without a word; either this process is not running as the hub's user, or the hello was malformed, and from outside the two cannot be told apart` — and *only* then: the close that follows a `refused` is not reported, so a refusal is exactly one line · accepted and mute: `NOT  the hub accepted the connection and said nothing for 6 seconds; it is running but wedged — restart herdr-tg` · `unknown_project`: `NOT  the hub does not know this project; open it at a terminal: herdr-tg open` · `bad_token`: `NOT  the secret is not one the hub knows; enrol the project again at a terminal: herdr-tg enroll` · `not_enabled`: `NOT  this project is enrolled but switched off` · `version_skew`: `NOT  this command and the hub do not speak the same version; upgrade one of them` · `bad_lane`: `NOT  the hub will not address a conversation called <x>; if the hub is older than this command, restart herdr-tg` · `already_claimed`: `NOT  another connection holds this conversation right now; if it is your own worker, run the check before it and not beside it; if nothing of yours is running, a stray process is squatting the claim` · echo missing: `NOT  the hub did not give <x> a place of its own; it is older than this command` · anything else: `NOT  the hub refused for a reason this command does not know (<reason>)` |
+| admitted | `ok   admitted as "oc-dogfood · lane-0904-1200"` — the hub's own title for the conversation, once | closed after `hello` with no frame: `NOT  the hub took the hello and closed without a word; either this process is not running as the hub's user, or the hello was malformed, and from outside the two cannot be told apart` — and *only* then: the close that follows a `refused` is not reported, so a refusal is exactly one line · accepted and mute: `NOT  the hub accepted the connection and said nothing for 6 seconds; it is running but wedged — restart kickoff-channel` · `unknown_project`: `NOT  the hub does not know this project; open it at a terminal: kickoff-channel open (or, if it was enrolled before, enrol it again: kickoff-channel enroll)` · `bad_token`: `NOT  the secret is not one the hub knows; enrol the project again at a terminal: kickoff-channel enroll` · `not_enabled`: `NOT  this project is enrolled but switched off` · `version_skew`: `NOT  this command and the hub do not speak the same version; upgrade one of them` · `bad_lane`: `NOT  the hub will not address a conversation called <x>; if the hub is older than this command, restart kickoff-channel` · `already_claimed`: `NOT  another connection holds this conversation right now; if it is your own worker, run the check before it and not beside it; if nothing of yours is running, a stray process is squatting the claim` · echo missing: `NOT  the hub did not give <x> a place of its own; it is older than this command` · anything else: `NOT  the hub refused for a reason this command does not know (<reason>)` |
 | the door | `ok   the door: <path> (worked out from git), free` — or `(named by KICKOFF_HUB_RELAY_SOCKET), free`, or under `--run` with no git `ok   the door: will be made in a private folder under <TMPDIR> when the worker starts, and handed to its engine` | `NOT  another attach already holds the door at <path>; this conversation has a worker already` · no git, no `--run`: `NOT  this folder is not inside a repository and nothing named a door; set KICKOFF_HUB_RELAY_SOCKET` · under `--run` with no git: `NOT  TMPDIR is "%h/.cache/tmp", which is not an absolute path, so a private door cannot be made under it; set TMPDIR to a real directory` (or "does not exist", or "past the 108-byte socket limit") — the start's own refusal, made here without making the folder |
 | the tool server | `ok   a tool server that works out its door from git here finds this one` — or, with no git, `ok   a tool server here must be told the door, and a worker started with --run tells it` / `ok   a tool server here cannot work out a door from git, so it must be given the same KICKOFF_HUB_RELAY_SOCKET=<door>` — or, when attach's door is not git's: under `--run`, `ok   the tool server the engine spawns is told this door by --run; a config that overlays KICKOFF_HUB_RELAY_SOCKET with - would look for <other> instead and never find this one`; told without `--run`, `ok   the door was named by KICKOFF_HUB_RELAY_SOCKET, so a tool server that works one out from git would look for <other>; give the engine the same KICKOFF_HUB_RELAY_SOCKET=<door>` | derived from a minted address, without `--run`: `NOT  a tool server that works out its door from git here would look for <other>; either use the worktree's own name as the address, or give the engine a config that names KICKOFF_HUB_RELAY_SOCKET=<door>`. Whichever line prints, attach prints the same sentence as a warning when it starts, from the same function. |
 | the engine's address, with `--opencode` | `ok   the engine's address: http://127.0.0.1:9711` | `NOT  --opencode http://127.0.0.1: names no port; the watcher would dial the wrong server. Give it the port opencode serve was given, e.g. --opencode http://127.0.0.1:9711` — the start refuses the same URL; the unit's `${OPENCODE_PORT}` unset is how it arrives |
@@ -2290,7 +2307,7 @@ it from one that does not.
 ### 13.6 The unit
 
 `deploy/kickoff-hub-attach@.service`, a `systemd --user` **template**, so that a worker on a box is
-supervised the way `herdr-tg.service` already is: restarted on a crash, started at login, its
+supervised the way `kickoff-channel.service` already is: restarted on a crash, started at login, its
 output in a journal. It reads the same namespace and nothing else; the only thing it adds is the one
 number that is the engine's rather than the hub's.
 
@@ -2299,7 +2316,7 @@ number that is the engine's rather than the hub's.
 Description=kickoff-hub-attach — the worker "%i", wired to the hub
 Documentation=https://github.com/vinceferro/herdr-tg/blob/main/docs/ATTACHING.md
 After=default.target
-# Never give up. The same reasoning as herdr-tg.service: the operator is on a phone, and a
+# Never give up. The same reasoning as kickoff-channel.service: the operator is on a phone, and a
 # start-limit burst would leave a worker dead until he reaches a keyboard.
 StartLimitIntervalSec=0
 
@@ -2356,8 +2373,8 @@ TimeoutStopSec=20
 Restart=always
 RestartSec=5
 # No hardening block, on purpose. This unit runs an agent's shell, and every line of
-# herdr-tg.service's hardening is a line that agent would trip. The wall is the safety, and the
-# wall is kickoff's; this unit is for a worker on the operator's own desk.
+# kickoff-channel.service's hardening is a line that agent would trip. The wall is the safety, and
+# the wall is kickoff's; this unit is for a worker on the operator's own desk.
 
 [Install]
 WantedBy=default.target
@@ -3181,8 +3198,8 @@ reaches the Bot API and nothing is spent. And the engine —
 `fakeOpencode()`, the same fake every bun suite here uses, prints where it is, and then does exactly
 what it is told, one JSON line at a time. Nothing under `adapters/` gained a second thing to run.
 
-**The shape.** Four rooms of one repo, minted the way `herdr-tg grant` mints them, each with its own
-secret, its own topic and its own door. **One** engine for all four, with four root sessions in
+**The shape.** Four rooms of one repo, minted the way `kickoff-channel grant` mints them, each
+with its own secret, its own topic and its own door. **One** engine for all four, with four root sessions in
 **one** directory running **one** agent — so the four bindings differ in exactly one thing, which
 session each names. That is deliberate: give each room its own directory or its own agent and "each
 spoke only to its own" stops being a proof.
@@ -3243,8 +3260,9 @@ why no assertion past the spend block is about anything reaching a phone.
 wait asserts a condition and panics. No spec resolution: the four bindings are constants the test
 writes and never interprets, and `agent` is an opaque string. No process supervision and no health
 inference: nothing in the trial reads or writes `hub.health`. And no `serve --fake-telegram` — the
-hub with a faked surface is built only inside the test module, because `herdr-tg` ships no library
-and a fake Telegram in the shipped binary would be a fake Telegram in the egress owner's file set.
+hub with a faked surface is built only inside the test module, because `kickoff-channel` ships no
+library and a fake Telegram in the shipped binary would be a fake Telegram in the egress owner's
+file set.
 
 **What no fake here can prove** is written at the top of the test itself, where the next person to
 run it will meet it: the real Bot API's refusals (and whether `createForumTopic` is charged at all
@@ -3309,7 +3327,7 @@ Two directions, two trees, one rule each:
 ### 14.1 The two directories
 
 `<state>` is the hub's state directory: `$XDG_STATE_HOME/herdr-tg`, or `$HOME/.local/state/herdr-tg`
-when that is unset — **as the hub's own process sees them**, which under `deploy/herdr-tg.service`
+when that is unset — **as the hub's own process sees them**, which under `deploy/kickoff-channel.service`
 is the operator's home with no `XDG_STATE_HOME` unless `~/.config/herdr-tg/env` sets one. The two
 segments after the tree are the conversation's, and both are things a dispatcher already holds:
 `<conversation>` is the conversation's own id — `welcome.conversation`, the first column offer 8
@@ -3630,7 +3648,7 @@ engine started it. The watcher carries nothing up.
 ### 14.6 A wall, worked — the two extra bind mounts
 
 §10 mounts two things; a wall that carries files mounts four. `STATE` is the hub's state directory
-as the hub sees it (§14.1), `PROJECT_ID` is from `herdr-tg projects --json`, and `ADDRESS` is the
+as the hub sees it (§14.1), `PROJECT_ID` is from `kickoff-channel projects --json`, and `ADDRESS` is the
 address the dispatcher minted — the same value it puts in `KICKOFF_HUB_ADDRESS`, or `-` when it
 sets none:
 

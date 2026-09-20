@@ -4,10 +4,10 @@
      at that hash disagree, the tree is the newer of the two and this file follows the tree; once
      it is committed, the commit carrying this paragraph is the one to read. Every route, body,
      status code
-     and sentence below was read in the code that serves it — crates/herdr-tg/src/gateway.rs (the
-     door), crates/herdr-tg/src/hub/door.rs (the ring), crates/herdr-tg/src/hub/answers.rs (the
-     drop), crates/herdr-tg/src/surface.rs (the surface a hub with no phone line is built with)
-     and crates/herdr-tg/src/hub/tests.rs (the trials) — and every behaviour named "yours" was
+     and sentence below was read in the code that serves it — crates/kickoff-channel/src/gateway.rs (the
+     door), crates/kickoff-channel/src/hub/door.rs (the ring), crates/kickoff-channel/src/hub/answers.rs (the
+     drop), crates/kickoff-channel/src/surface.rs (the surface a hub with no phone line is built with)
+     and crates/kickoff-channel/src/hub/tests.rs (the trials) — and every behaviour named "yours" was
      read in your own repository: your pinned stub suite, your bridge, your push watcher and
      your board. **The precise citations into your tree — which file, which line, and the names
      inside them — are deliberately not published here; this file is public and that code is
@@ -451,13 +451,14 @@ plain sentence above — never silently dropped.
 ## 5. Auth and trust
 
 **The token.** One credential opens the write door: 64 hex characters in
-`<state>/door/token`, mode `0600`, minted only at a terminal by `herdr-tg door-token` (the
-canonical binary is `kickoff-channel`; `herdr-tg` is its installed alias — same verb). The
+`<state>/door/token`, mode `0600`, minted only at a terminal by `kickoff-channel door-token`
+(the command is also installed as `herdr-tg`, which is the same program and the same verb — you
+will see that spelling in older notes and in some of its own messages). The
 gateway **never mints one itself** — a gateway that could mint its own credential would be a
 credential nobody decided to issue — and it reads the file on every request, so rotating it
 is live without a restart.
 
-Rotation refuses to overwrite silently, and is *anchored*: `herdr-tg door-token --rotate
+Rotation refuses to overwrite silently, and is *anchored*: `kickoff-channel door-token --rotate
 <first characters of the old one>` refuses if the token on disk does not start with what you
 named — rotating over a token that is not the one you believed you had (a second door, a
 restored backup) is a decision the verb declines to make blind. The token is never printed;
@@ -554,7 +555,7 @@ end — keep it, as your tests already insist.
    without the other noticing, and a door that is not running is a bridge that cannot reach it
    rather than a hub that has lost anything. Writing the unit is adoption work somebody has to
    do, and this document would rather say so than let you find it out from a dead port.
-2. **Mint the token at the terminal** (`herdr-tg door-token`), and point your bridge's
+2. **Mint the token at the terminal** (`kickoff-channel door-token`), and point your bridge's
    `HUB_TOKEN_FILE` at it. Your bridge's own closed-door 503 covers its file being unset,
    unreadable or empty; the door's named 503 covers the same family on our side, and both
    speak the refusal shape your client renders.

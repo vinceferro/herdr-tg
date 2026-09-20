@@ -379,7 +379,7 @@ impl HerdrClient {
     //
     //   * no call site anywhere outside `#[cfg(test)]` — checked by
     //     `tests/no_live_write_call_site.rs`, which fails the suite if one appears;
-    //   * no subcommand in `crates/herdr-tg` that reaches them, and no mention of their names in
+    //   * no subcommand in `crates/kickoff-channel` that reaches them, and no mention of their names in
     //     that crate's source at all;
     //   * the key grammar behind a validating newtype under an UNVERIFIED-ON-P20 banner
     //     ([`crate::keys`]), never a closed enum that would encode protocol-16 evidence as truth.

@@ -19,7 +19,7 @@
 #     old cursor is exact, and nothing on the HTTP wire names this machine;
 #
 #   * with NO Telegram surface in the process at all — the plane the box runs on now that the
-#     bot token is revoked. The hub is built the way `herdr-tg serve --to app` builds it, and the
+#     bot token is revoked. The hub is built the way `kickoff-channel serve --to app` builds it, and
 #     trial waits on the ring's own sequence rather than on anything a carrier was asked to do.
 #     It proves a question reaches the ring stamped with its conversation and its lane, that
 #     `GET /v1/events` serves it, that a POSTed choice reaches the session that asked and nobody
@@ -28,7 +28,7 @@
 #     the hub's own retirement is on the ring, and the same wire law.
 #
 # Nothing here installs anything, sends anything to Telegram, or touches a real state home:
-# the token is written into the trial's own throwaway state directory the way `herdr-tg
+# the token is written into the trial's own throwaway state directory the way `kickoff-channel
 # door-token` would leave it (the verb itself is unit-held, and it mints into the real state
 # home this trial refuses to go near).
 #
@@ -177,6 +177,6 @@ done
 say
 say "Nothing was kept outside the run's own directory, nothing was spent, nothing was sent, and"
 say "the real state directory holds what it held. What this did NOT prove is written at the top of"
-say "each test, in crates/herdr-tg/src/hub/tests.rs — search for the trial's name."
+say "each test, in crates/kickoff-channel/src/hub/tests.rs — search for the trial's name."
 say "The shapes the door speaks are pinned by the PWA org's own stub suite, in their repo; this"
 say "trial is the real-binary half of that agreement."

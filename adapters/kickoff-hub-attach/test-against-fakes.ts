@@ -368,7 +368,7 @@ try {
   // the bridge down for good — emptying its queue and giving up on the question an agent was
   // blocked on, while telling whoever read stderr to go and kill a process that does not exist.
   //
-  // The script below is what an ordinary box produces: herdr-tg restarting with a lingering claim,
+  // The script below is what an ordinary box produces: the hub restarting with a lingering claim,
   // this bridge restarting and racing its predecessor. The connection SUCCEEDS twice in between,
   // which is exactly what tells a run apart from a tally.
   const claimSock = join(dir, 'restarting-hub.sock')
@@ -666,7 +666,7 @@ try {
   //     with a reason when there was nothing to hand the words to, so the hub can tell him.
   //
   // Every ack below is read off the wire the fake hub saw; the hub's own half — that a refused
-  // ack becomes a line in the topic he typed in — is `crates/herdr-tg/src/hub/tests.rs`.
+  // ack becomes a line in the topic he typed in — is `crates/kickoff-channel/src/hub/tests.rs`.
   const typed = (id: string, text: string, extra: Record<string, unknown> = {}) =>
     hubSock?.write(
       JSON.stringify({ v: 1, id, t: 'message', msg_id: `m-${id}`, text, from: { chat_id: -1001, user_id: 7 }, ...extra }) + '\n',

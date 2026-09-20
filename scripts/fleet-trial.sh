@@ -134,5 +134,5 @@ until then this run proves nothing"
 say
 say "Nothing was kept outside the run's own directory, and the real state directory holds what it held."
 say "What this did NOT prove is written at the top of the test, in"
-say "  crates/herdr-tg/src/hub/tests.rs — search for the trial's name."
+say "  crates/kickoff-channel/src/hub/tests.rs — search for the trial's name."
 say "The contract an adapter attaches by is docs/ATTACHING.md; §13.12 is this trial."

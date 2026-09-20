@@ -107,12 +107,12 @@ So the checkpoint's binding object splits cleanly in two, and only one half is o
   |---|---|---|
   | stable project id | `ProjectId`, minted once at enrolment, opaque, never a counter | `crates/hub-proto/src/ids.rs:51-57` |
   | stable domain id | `LaneId`, an ADDRESS and never a credential | `crates/hub-proto/src/ids.rs:80-91` |
-  | the pair, as one thing | `Addr { project, lane: Option<LaneId> }` | `crates/herdr-tg/src/hub.rs:2005-2008` |
-  | `run_id` | `Claim.instance`, the run of the worker | `crates/herdr-tg/src/hub.rs:1575` |
-  | generation | `Envelope.generation`, minted on the claim, stamped on every frame both ways | `crates/hub-proto/src/frame.rs:84` (HEAD), `crates/herdr-tg/src/hub.rs:1571-1574` |
+  | the pair, as one thing | `Addr { project, lane: Option<LaneId> }` | `crates/kickoff-channel/src/hub.rs:2005-2008` |
+  | `run_id` | `Claim.instance`, the run of the worker | `crates/kickoff-channel/src/hub.rs:1575` |
+  | generation | `Envelope.generation`, minted on the claim, stamped on every frame both ways | `crates/hub-proto/src/frame.rs:84` (HEAD), `crates/kickoff-channel/src/hub.rs:1571-1574` |
   | lease metadata | the generation IS the lease; there is no second field | `crates/hub-proto/src/frame.rs:47-76` (HEAD) |
 
-  And the construction that makes it safe is one sentence at `crates/herdr-tg/src/hub.rs:1995-2000`:
+  And the construction that makes it safe is one sentence at `crates/kickoff-channel/src/hub.rs:1995-2000`:
 
   > Built ONLY from the project a SECRET resolved to plus the lane the bridge named. That
   > construction is the entire security argument: the project half never comes from the wire, so a
@@ -164,7 +164,7 @@ one. This matters because they answer different questions and a design that conf
 of them wrong.
 
 **The reclaim fence** — a run whose generation has been replaced cannot come back — runs at
-`crates/herdr-tg/src/hub.rs:2727-2748`, inside the same critical section as the claim, and it is read
+`crates/kickoff-channel/src/hub.rs:2727-2748`, inside the same critical section as the claim, and it is read
 *before* the incumbent is:
 
 > A run whose generation has been replaced is not a rival for the address — it is over. Told "already
@@ -177,7 +177,7 @@ mint climbs past it (`hub.rs:1786-1810`), because refusing that would lock a pro
 hub with no way back from a phone.
 
 **The delivery fence** — a run that keeps talking after a later one took the address has every frame
-answered `no` — runs at `crates/herdr-tg/src/hub.rs:5274-5320`, in the per-connection read loop
+answered `no` — runs at `crates/kickoff-channel/src/hub.rs:5274-5320`, in the per-connection read loop
 rather than inside `handle`, and the comment says exactly why:
 
 > this loop is the one place every frame of a connection passes through, and it goes on running AFTER
@@ -198,7 +198,7 @@ resolved by the address written into the record, never re-derived — `hub.rs:25
 > or missed and called a lane not connected while it sat waiting.
 
 And there is **no most-recent fallback anywhere in the hub**. `addr_for_topic`
-(`crates/herdr-tg/src/hub.rs:3665-3681`) is explicit about refusing one:
+(`crates/kickoff-channel/src/hub.rs:3665-3681`) is explicit about refusing one:
 
 > A lane's topic answers with the LANE. There is deliberately no falling back to the project when a
 > lane's topic is not found: that would put what the operator typed at a worktree into the project's
@@ -262,7 +262,7 @@ Three properties of it are load-bearing and this proposal inherits all three:
   names the failure: a reader that asks whether the promise was *present* rather than whether it
   *names this frame* tells the operator his answer was never taken by a session that took it. The
   hub reads it once, at admission, and stores the answer on the claim
-  (`crates/herdr-tg/src/hub.rs:4853`, `crates/herdr-tg/src/hub.rs:1587-1591`).
+  (`crates/kickoff-channel/src/hub.rs:4853`, `crates/kickoff-channel/src/hub.rs:1587-1591`).
 * **An empty list is no promise** — `crates/hub-proto/src/frame.rs:151-162` (HEAD) — because an
   adapter that builds the list by filtering writes the empty one every time it promises nothing.
 
@@ -321,11 +321,11 @@ existing seam-④ sketch always assumed (`docs/INTERFACES.md:245-256`).
 ### What already holds today
 
 * **Every frame the hub sends has an id, and exactly one answer comes back for it.**
-  `mint_frame_id` (`crates/herdr-tg/src/hub.rs:2620-2622`) mints it *before* the frame goes down,
+  `mint_frame_id` (`crates/kickoff-channel/src/hub.rs:2620-2622`) mints it *before* the frame goes down,
   deliberately: *"so the one caller that waits to hear what became of a frame can write the id down
   BEFORE the frame is on the wire."*
 * **The hub already keeps a record of a thing it sent and has not been answered for.** `Down`
-  (`crates/herdr-tg/src/hub.rs:1914-1923`) holds the frame id, the address, the chat and message it
+  (`crates/kickoff-channel/src/hub.rs:1914-1923`) holds the frame id, the address, the chat and message it
   is about, and which of the operator's actions it was; `His` (`hub.rs:1927-1934`) is the two-variant
   discriminant. The list is bounded at 256 (`hub.rs:1979`) *"so a bridge that never answers must not
   turn a record nobody will read into a leak."* A window of twenty seconds
@@ -339,7 +339,7 @@ existing seam-④ sketch always assumed (`docs/INTERFACES.md:245-256`).
   > not have landed, and there is no way to ask. `Unseen` is that state named.
 
 * **The operator is authenticated before anything is resolved.** `standing_of`
-  (`crates/herdr-tg/src/hub.rs:2481-2503`) fails closed on the shape of the id itself before any list
+  (`crates/kickoff-channel/src/hub.rs:2481-2503`) fails closed on the shape of the id itself before any list
   is read (`hub.rs:2486-2488`), and `Standing::may_command` (`hub.rs:844-846`) is the bot-wide list
   and nothing narrower.
 
@@ -370,7 +370,7 @@ or the field renamed**; §9 lists it as an open decision rather than settling it
 ### What already holds today
 
 **Acquire is fenced, in one critical section, and it was not always.**
-`claim_the_address` (`crates/herdr-tg/src/hub.rs:2702-2818`) does the fence, the incumbent check, the
+`claim_the_address` (`crates/kickoff-channel/src/hub.rs:2702-2818`) does the fence, the incumbent check, the
 mint and the reservation under one lock, and the comment at `hub.rs:2681-2694` records what it cost
 to learn that:
 
@@ -380,15 +380,15 @@ to learn that:
 
 **Renew is not a verb here, and that is correct.** There is no renewal frame. The lease is granted
 once per claim on the `welcome`'s own envelope and holds for the life of the connection
-(`crates/hub-proto/src/frame.rs:47-58`, HEAD; `crates/herdr-tg/src/hub.rs:1571-1574`). A run that
+(`crates/hub-proto/src/frame.rs:47-58`, HEAD; `crates/kickoff-channel/src/hub.rs:1571-1574`). A run that
 loses its socket redials and is re-welcomed with a fresh number, and the backlog it carried in is
 safe because those frames were written before it could read the new welcome and so carry the old
-number, which the delivery fence lets through (`crates/herdr-tg/src/hub.rs:5288-5296`). **Nothing in
+number, which the delivery fence lets through (`crates/kickoff-channel/src/hub.rs:5288-5296`). **Nothing in
 this proposal adds a renewal**, because a renewal is a second way to hold an address and the whole
 value of the current design is that there is one.
 
 **Withdraw is fenced by generation as well as pid.** `release_this_run`
-(`crates/herdr-tg/src/hub.rs:3143`) drops the claim only if it is still the one holding it. The
+(`crates/kickoff-channel/src/hub.rs:3143`) drops the claim only if it is still the one holding it. The
 generations file (`hub.rs:1668`, `GENERATIONS_FILE`) survives the process precisely so a floor is not
 lost across a restart — `hub.rs:1670-1690` says the failure it prevents is a clock stepping
 *backwards*, which would re-hand a number already given, and *"a hub that re-hands a number it has
@@ -400,7 +400,7 @@ for and the hub already holds it, in three places:
 * `Delivered::Unseen` (`crates/hub-proto/src/frame.rs:178-180`, HEAD) exists so the hub never claims
   a rung it did not observe.
 * `presence.rs` is believed by a reader *only* when the lock's holder is alive, is a herdr-tg, and
-  wrote it — otherwise `null` (`CLAUDE.md`, and the writer at `crates/herdr-tg/src/hub.rs:2905-2960`
+  wrote it — otherwise `null` (`CLAUDE.md`, and the writer at `crates/kickoff-channel/src/hub.rs:2905-2960`
   removes the file rather than leaving a stale one: *"Unknown is the honest answer; nothing connected
   is not."*).
 * `docs/CAPABILITIES.md:240` (offer 7): *"**The alarm tells him and restarts nothing.** Restarting
@@ -412,11 +412,11 @@ for and the hub already holds it, in three places:
 not create, renew or end one. Two additions to the *record* beside it:
 
 1. `Claim` gains `controls`, read once at admission exactly as `confirms_choices` is
-   (`crates/herdr-tg/src/hub.rs:1587-1591`, filled at `hub.rs:4853`). Read from the claim and never
+   (`crates/kickoff-channel/src/hub.rs:1587-1591`, filled at `hub.rs:4853`). Read from the claim and never
    remembered elsewhere — `deliver_tap` already states the rule at `hub.rs:3263-3265`: *"the promise
    belongs to the connection that made it, and a run that has since been replaced cannot have its
    successor nagged for it."*
-2. `His` (`crates/herdr-tg/src/hub.rs:1927-1934`) gains a third variant for an intent awaiting its
+2. `His` (`crates/kickoff-channel/src/hub.rs:1927-1934`) gains a third variant for an intent awaiting its
    outcome. One list and not two, for the reason already written at `hub.rs:1906-1911`: *"a bridge
    answers both with the same `ack{ref}`, one id counter mints both […] Two lists keyed the same way
    is two places for the same id to be looked up and one of them to win."*
@@ -502,18 +502,18 @@ contract.
 | field | on | who mints it | why the hub may carry it |
 |---|---|---|---|
 | `spec_id` | `hello.controls`, `intent` | the controller | **Opaque, and the hub cannot dereference it.** Same treatment as `AskId`/`OptionId` (`crates/hub-proto/src/ids.rs:8-9`): stored and echoed, never read into. It cannot smuggle an image because the hub has no table to resolve it against and the controller resolves it only against its own approved one. Length-bounded and shape-checked exactly as a lane is, so it cannot forge an audit line. |
-| `domain?` | `hello.controls`, `intent` | the controller | **An address, never a credential** — the whole `LaneId` argument (`crates/hub-proto/src/ids.rs:80-91`), and it is checked by the same rule (`lane_is_addressable`, `crates/herdr-tg/src/hub.rs:2067-2081`). Absent means the conversation itself, exactly as `hello.lane` absent does (`crates/hub-proto/src/frame.rs:425-426`, HEAD). |
+| `domain?` | `hello.controls`, `intent` | the controller | **An address, never a credential** — the whole `LaneId` argument (`crates/hub-proto/src/ids.rs:80-91`), and it is checked by the same rule (`lane_is_addressable`, `crates/kickoff-channel/src/hub.rs:2067-2081`). Absent means the conversation itself, exactly as `hello.lane` absent does (`crates/hub-proto/src/frame.rs:425-426`, HEAD). |
 | `allowed` | `hello.controls` | the controller | **A list of names the HUB owns**, filtered against a table compiled into this binary. A name the hub does not know is dropped; the control survives. The controller cannot widen the set by naming something. |
 | `max?` | `hello.controls` | the controller | A bound the controller sets on itself. The hub only ever compares `count` against it and refuses; it never raises it. |
 | `op` | `intent` | **the hub** | Never a string from the wire. It is a variant the hub selected from its own closed set because the operator tapped a button the hub drew from an admitted control. |
 | `count?` | `intent` | the hub | A small integer from a button the hub drew, bounded by `max`. |
-| `intent_id` | `intent`, `intent_outcome` | **the hub** | The correlation. Minted like a frame id (`crates/herdr-tg/src/hub.rs:2620-2622`) and written down before the frame is on the wire. |
+| `intent_id` | `intent`, `intent_outcome` | **the hub** | The correlation. Minted like a frame id (`crates/kickoff-channel/src/hub.rs:2620-2622`) and written down before the frame is on the wire. |
 | `idempotency_key` | `intent` | **the hub** | §7.1. Minted by the hub so a controller cannot choose its own collisions. |
-| `expected_generation?` | `intent` | **the hub** | A number this hub minted (`crates/herdr-tg/src/hub.rs:1786-1810`). It is never believed from anywhere else. |
+| `expected_generation?` | `intent` | **the hub** | A number this hub minted (`crates/kickoff-channel/src/hub.rs:1786-1810`). It is never believed from anywhere else. |
 | `from` | `intent` | **the hub** | Reuses the existing `From { chat_id, user_id }` (`crates/hub-proto/src/frame.rs:665-668`, HEAD), which the hub already sends on every `message` and whose doc says it is *"for the audit record and for the allowlist decision that has already been made by the time this frame exists."* No new exposure; one type; one spelling in the audit. |
-| `valid_for_ms` | `intent` | **the hub** | A **duration, not a wall-clock instant**. A deadline compares two clocks; a duration compares one. The hub already reasons in milliseconds (`now_millis`, `crates/herdr-tg/src/hub.rs:1899-1904`) and keeps its audit timestamps deliberately dependency-free (`hub.rs:1381-1384`). |
+| `valid_for_ms` | `intent` | **the hub** | A **duration, not a wall-clock instant**. A deadline compares two clocks; a duration compares one. The hub already reasons in milliseconds (`now_millis`, `crates/kickoff-channel/src/hub.rs:1899-1904`) and keeps its audit timestamps deliberately dependency-free (`hub.rs:1381-1384`). |
 | `status` | `intent_outcome` | the controller | A closed set of four: `accepted`, `refused`, `completed`, `failed`. §7.3. |
-| `reason?` | `intent_outcome` | the controller | One short sentence in **his** words. Clamped, and **never written to the audit** — `HubAudit::file` already refuses to write a name from a phone into the log for exactly this reason (`crates/herdr-tg/src/hub.rs:1290-1293`): *"This file is one record per line, and a name from a phone can carry a newline — which would be a second record of the sender's choosing."* |
+| `reason?` | `intent_outcome` | the controller | One short sentence in **his** words. Clamped, and **never written to the audit** — `HubAudit::file` already refuses to write a name from a phone into the log for exactly this reason (`crates/kickoff-channel/src/hub.rs:1290-1293`): *"This file is one record per line, and a name from a phone can carry a newline — which would be a second record of the sender's choosing."* |
 
 ### 6.6 The exhaustive list of what the hub REFUSES to carry
 
@@ -570,7 +570,7 @@ field somebody deletes.
 **Minted by the hub**, from the offer message, the option tapped, and the generation shown — so two
 taps on one button are one key, and the same button drawn again after the world moved is a different
 one. Recorded before the frame goes down, on the discipline `resolve_tap` already holds at
-`crates/herdr-tg/src/hub.rs:2585-2591`:
+`crates/kickoff-channel/src/hub.rs:2585-2591`:
 
 > Fail closed: if the answer cannot be written down, it must not be sent. An unrecorded answer is one
 > that can be given again.
@@ -594,7 +594,7 @@ Which ops require it, and what each answer is:
 
 Compared against the live claim's generation at `Addr { project, lane: domain }`, or — when nothing
 is connected there — against the highest this hub has handed out (`highest_for`,
-`crates/herdr-tg/src/hub.rs:1839-1841`). An address never claimed returns `0` from that map
+`crates/kickoff-channel/src/hub.rs:1839-1841`). An address never claimed returns `0` from that map
 (`hub.rs:1840`), which is **not** a generation: `crates/hub-proto/src/frame.rs:68-76` (HEAD) says a
 zero *"is read as absent"*. So a domain the hub has never seen must be its own refusal and never a
 comparison against zero.
@@ -604,7 +604,7 @@ comes back and taps *Scale to 1*. Without the fence that scales the *new* run to
 told, in words: *"That has changed since you were shown these buttons. Look again."*
 
 This is the same fence the wire already runs twice — the reclaim fence at
-`crates/herdr-tg/src/hub.rs:2727-2748` and the delivery fence at `hub.rs:5274-5320` — applied to a
+`crates/kickoff-channel/src/hub.rs:2727-2748` and the delivery fence at `hub.rs:5274-5320` — applied to a
 number the operator's *view* was built from rather than to a connection.
 
 ### 7.3 The outcome vocabulary
@@ -633,14 +633,14 @@ it.
 **Legal transitions, enforced at the hub.** `accepted` → one of `completed` / `failed`. A terminal
 status may arrive first, with no `accepted` before it. Nothing follows a terminal status; a second
 one is dropped with one audit line. An outcome for an intent the hub never sent writes nothing in his
-topic and one line in the audit — `HubAudit::refused` (`crates/herdr-tg/src/hub.rs:1282-1286`) is
+topic and one line in the audit — `HubAudit::refused` (`crates/kickoff-channel/src/hub.rs:1282-1286`) is
 already the shape, and its doc says why: *"A branch that sends nothing still writes a line, so silence
 in this file always means the process stopped rather than that the hub decided something quietly."*
 
 ### 7.4 The audit record
 
 One line per intent sent and one per outcome, in the existing tab-separated format
-(`crates/herdr-tg/src/hub.rs:1337-1350`), with `subject(addr)` (`hub.rs:1374-1379`) so a search for a
+(`crates/kickoff-channel/src/hub.rs:1337-1350`), with `subject(addr)` (`hub.rs:1374-1379`) so a search for a
 project finds every line its domains wrote. Fields: the op, the spec id, the intent id, the
 idempotency key, the expected generation, and the user id — the last for the reason
 `HubAudit::stranger` gives at `hub.rs:1316-1322`, that an id in this file is one the operator can
@@ -656,9 +656,9 @@ copy. **`reason` is never written**, per §6.5.
 |---|---|
 | `crates/hub-proto/src/ids.rs` | two `opaque_id!` newtypes: `SpecId`, `IntentId` |
 | `crates/hub-proto/src/frame.rs` | `hello.controls?`, `welcome.controls?`, `HubFrame::Intent`, `BridgeFrame::IntentOutcome`, a `Control` struct, an `IntentStatus` enum, an `Op` enum, one new `RefusedReason` |
-| `crates/herdr-tg/src/hub.rs` | controls admitted and shape-checked; `Claim.controls`; `Hub::intend`; `intent_outcome` handling; a third `His` variant; the audit lines |
+| `crates/kickoff-channel/src/hub.rs` | controls admitted and shape-checked; `Claim.controls`; `Hub::intend`; `intent_outcome` handling; a third `His` variant; the audit lines |
 | a new module | the intent ledger: the record, the idempotency map, the bounds, and the operator's sentences |
-| `crates/herdr-tg/tests/` | the guards of §9 widened, and the adversarial suite of §10 |
+| `crates/kickoff-channel/tests/` | the guards of §9 widened, and the adversarial suite of §10 |
 | `docs/` | `ATTACHING.md` (a new section, and the frame tables), `CAPABILITIES.md` (a tenth offer, OPEN 1 narrowed), `INTERFACES.md` (seam ④, and the closed list gains a seventh **as a decision**) |
 
 ### Left to Kickoff, entirely
@@ -689,12 +689,12 @@ as it now stands, and one more is a hazard rather than an error.
 1. **`domain` spelled `-` for "the conversation itself" is refused by the hub's own rule.** F2 says
    *"absent lane = the conversation itself, spelled `-`"* and that the shape rule is *"generalised
    from `lane_is_addressable`"*. Those two sentences contradict each other:
-   `lane_is_addressable` explicitly refuses `-` (`crates/herdr-tg/src/hub.rs:2073`), and the doc
+   `lane_is_addressable` explicitly refuses `-` (`crates/kickoff-channel/src/hub.rs:2073`), and the doc
    comment at `hub.rs:2058-2066` gives a hard operational reason — `-` **is** the project's own voice
    on disk in both file trees, so a lane admitted under that name would be handed the project's own
    media and outbox directories. **This proposal omits `domain` instead**, which is the spelling
    `hello.lane` and `Addr.lane` already use for exactly this meaning
-   (`crates/hub-proto/src/frame.rs:425-426`, HEAD; `crates/herdr-tg/src/hub.rs:2006-2008`), and which
+   (`crates/hub-proto/src/frame.rs:425-426`, HEAD; `crates/kickoff-channel/src/hub.rs:2006-2008`), and which
    the whole wire's omit-when-absent rule already covers (`docs/ATTACHING.md:908-909`).
 2. **`Op` must not be `#[serde(other)] Unknown`.** F2 specifies exactly that. This repo has already
    measured what it costs: `crates/herdr-client/src/proto/model.rs:37-42` records that
@@ -712,7 +712,7 @@ as it now stands, and one more is a hazard rather than an error.
 3. **"There is no `Command` in the binary" is false as written, and F2's test name inherits it.** F2
    plans `nothing_the_bot_reads_can_reach_a_process_and_the_hub_has_no_command`. The hub binary
    contains three `std::process::Command::new("git")` call sites today, all in enrolment:
-   `crates/herdr-tg/src/cmd/enroll.rs:313`, `:330` and `:387`. They are terminal-only, reached from
+   `crates/kickoff-channel/src/cmd/enroll.rs:313`, `:330` and `:387`. They are terminal-only, reached from
    argv, with fixed argv and no string from the wire — which is the property that actually matters —
    but `docs/INTERFACES.md:278` (*"There is no `Command` in the binary"*) and
    `docs/HUB-AND-KICKOFF.md:112` (*"zero `Command` in the binary"*) are both literally untrue and
@@ -728,7 +728,7 @@ as it now stands, and one more is a hazard rather than an error.
    launcher has declared in advance — never as an image, a command, a mount, a secret, an environment
    variable or a host path from Telegram."* Q2 is later and is the operator's ruling; §4 is stale.
 5. **PLAN-v2's line citations no longer land.** F1 cites *"hub.rs:3670-3684"* for the welcome fill;
-   at HEAD that range is `addr_for_topic` (`crates/herdr-tg/src/hub.rs:3668`). Treat every file:line
+   at HEAD that range is `addr_for_topic` (`crates/kickoff-channel/src/hub.rs:3668`). Treat every file:line
    in PLAN-v2 as needing re-checking before use.
 6. **The hazard, not an error.** F2's `expected_generation` sits one qualifier away from
    `generation`, the one payload name this wire forbids
@@ -755,7 +755,7 @@ stating as a mechanism rather than as an intention.
 
 1. A controller connects and declares, at `hello`, what it can be asked to do. Nothing the operator
    ever types can add to that list — a control arrives on a connection that has already proved a
-   secret (`crates/herdr-tg/src/hub.rs:2702-2818`), and the hub admits it or drops it.
+   secret (`crates/kickoff-channel/src/hub.rs:2702-2818`), and the hub admits it or drops it.
 2. When a controller becomes live, the hub posts **one message with buttons** into that conversation's
    topic — one button per (spec, domain, op) the controller declared and the hub knows. The labels
    are the hub's own words. The callback payload is a key into a record the hub wrote.
@@ -771,9 +771,9 @@ Nothing typed can enter this path. The four guards, quoted:
 > **Opaque.** The hub does not parse it, does not act on it, and does not let it name anything.
 > **Inbound content selects; it never names.**
 
-The same sentence is on the relay path at `crates/herdr-tg/src/hub.rs:3685-3686`.
+The same sentence is on the relay path at `crates/kickoff-channel/src/hub.rs:3685-3686`.
 
-**A line that is not a command is never parsed. `crates/herdr-tg/src/bot.rs:332-340`:**
+**A line that is not a command is never parsed. `crates/kickoff-channel/src/bot.rs:332-340`:**
 
 > A command opens with a slash; nothing else is one. The parser is trusted only past that point […]
 > ```rust
@@ -783,7 +783,7 @@ The same sentence is on the relay path at `crates/herdr-tg/src/hub.rs:3685-3686`
 > ```
 
 `Typed::Steering` is *"Words for whatever is running in the topic. Relayed verbatim; never parsed"*
-(`crates/herdr-tg/src/bot.rs:314-315`). There is no branch anywhere that reads a word out of it.
+(`crates/kickoff-channel/src/bot.rs:314-315`). There is no branch anywhere that reads a word out of it.
 
 **A button is resolved against a written record, never against its position.
 `crates/hub-proto/src/ids.rs:73-75`:**
@@ -791,11 +791,11 @@ The same sentence is on the relay path at `crates/herdr-tg/src/hub.rs:3685-3686`
 > Resolved against the record written down beside the message, never against a button's position.
 > Position is how a button reading "Reject" once confirmed "Allow always".
 
-Enforced at `crates/herdr-tg/src/hub.rs:2538-2540`: an option that is not one of the ones written down
+Enforced at `crates/kickoff-channel/src/hub.rs:2538-2540`: an option that is not one of the ones written down
 is `TapRefusal::NotAnOption`, before anything is delivered.
 
 **The command set is a closed list of two, and a test fails the build if it grows.**
-`crates/herdr-tg/tests/nothing_inbound_can_add_a_person.rs:238-248`:
+`crates/kickoff-channel/tests/nothing_inbound_can_add_a_person.rs:238-248`:
 
 > ```rust
 > assert_eq!(
@@ -824,7 +824,7 @@ names are first.
 1. **`two_sessions_in_one_directory_are_two_addresses_and_an_intent_for_one_never_reaches_the_other`**
    Two claims at `Addr{p, Some("a")}` and `Addr{p, Some("b")}` from one process — which is the real
    shape, since one opencode adapter holds every lane and they therefore share an `instance`
-   (`crates/herdr-tg/src/hub.rs:2557-2561`). An intent for `a` arrives on `a`'s connection and `b`'s
+   (`crates/kickoff-channel/src/hub.rs:2557-2561`). An intent for `a` arrives on `a`'s connection and `b`'s
    sees nothing. **Proves** the address and not the directory is the unit of confinement, and that
    the instance check cannot be relied on to separate them.
 
@@ -832,13 +832,13 @@ names are first.
    Deliver an intent whose `domain` names a different lane than the record it was built from.
    **Proves** the frame cannot retarget itself — a globally resolvable id on the wire buys the sender
    nothing, because routing reads `Addr` from the record and the claim, exactly as `resolve_tap`
-   already does (`crates/herdr-tg/src/hub.rs:2547-2556`).
+   already does (`crates/kickoff-channel/src/hub.rs:2547-2556`).
 
 3. **`an_intent_naming_a_lease_that_is_not_the_one_held_there_now_is_refused_before_delivery`**
    The claim at the domain is at generation *g*. `Some(g-1)` → refused. `Some(g)` → delivered. The
    worker reconnects at *g′ > g*; `Some(g)` → refused. A domain never claimed → its own refusal, and
    **not** a comparison against the zero `highest_for` returns
-   (`crates/herdr-tg/src/hub.rs:1839-1841`). `None` on `restart` → refused. `Some(g)` on `start` →
+   (`crates/kickoff-channel/src/hub.rs:1839-1841`). `None` on `restart` → refused. `Some(g)` on `start` →
    refused. **Both spellings of the conversation itself are pinned** — omitted `domain`, and the
    `domain` a caller might be tempted to spell `-` — so the lease an intent names can never be
    compared against a different address's claim. **Proves** the fence points the right way in all
@@ -868,7 +868,7 @@ names are first.
    **Proves** the checkpoint's fifth question end to end: a disconnect reports communication state
    only. Queued delivery is the other half: frames the hub held for a bridge that never ponged are
    acked `no` before the connection is refused (`CLAUDE.md`, and the pre-pong hold at
-   `crates/herdr-tg/src/hub.rs:2377-2380`), and an intent must be no exception.
+   `crates/kickoff-channel/src/hub.rs:2377-2380`), and an intent must be no exception.
 
 ### The ones this proposal adds
 
@@ -898,11 +898,11 @@ names are first.
 
 14. **`an_outcome_reason_carrying_a_newline_writes_no_second_line_in_the_audit`**
     **Proves** the clamp. The failure is already documented for a filename at
-    `crates/herdr-tg/src/hub.rs:1290-1293`.
+    `crates/kickoff-channel/src/hub.rs:1290-1293`.
 
 15. **`an_intent_this_hub_holds_no_capability_for_is_refused_in_words_that_name_no_id_and_no_enum`**
     Every operator-facing sentence, walked. **Proves** the quality bar's *"Operator-facing strings
-    carry no jargon"*, which `TapRefusal::say` (`crates/herdr-tg/src/hub.rs:851-874`) already holds
+    carry no jargon"*, which `TapRefusal::say` (`crates/kickoff-channel/src/hub.rs:851-874`) already holds
     to.
 
 16. **`nothing_the_bot_reads_can_reach_a_process`**
@@ -930,7 +930,7 @@ Beyond the field-level refusals of §6.6, which are the substance:
    not appear in this design in any form, and §8.4 records that `docs/HUB-AND-KICKOFF.md:110-121`
    still says otherwise and is stale.
 3. **A Telegram command for any of this.** The command set stays two, guarded at
-   `crates/herdr-tg/tests/nothing_inbound_can_add_a_person.rs:238-248`. An intent is a tap on a
+   `crates/kickoff-channel/tests/nothing_inbound_can_add_a_person.rs:238-248`. An intent is a tap on a
    keyboard the hub drew, or it does not exist.
 4. **Learning what any of the words mean.** `docs/CAPABILITIES.md:324-331` (REFUSES 6). The hub does
    not know what an AgentSpec is, what scaling does, or what a domain contains. It knows the

@@ -5,7 +5,7 @@
 //! `error`, `ids`, `keys`, `transport` (crate-private), `proto::model`, `proto::response`
 //! (crate-private), `proto::request` (crate-private), `client` (reads, writes, `subscribe`),
 //! `handshake`, `proto::event` and `stream`. What remains in slice 1 is the BINARY
-//! (`crates/herdr-tg`, step 9) and the proof harness (step 10). Do not add a module here without
+//! (`crates/kickoff-channel`, step 9) and the proof harness (step 10). Do not add a module here without
 //! its file — the clippy gate is `-D warnings`, so an item nothing calls yet fails the commit.
 //!
 //! # The write methods have NO live call site, and that is a load-bearing property

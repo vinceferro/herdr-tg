@@ -88,7 +88,7 @@ console.log('\nwhen the hub goes away under the relay:')
   //
   // RED, before the fix: 'The link to his phone dropped and is being rebuilt.'
   check('a_hub_that_is_simply_not_running_is_named_rather_than_promised_to_come_back',
-    /herdr-tg/.test(after.text) && !/being rebuilt/.test(after.text), after.text)
+    /kickoff-channel/.test(after.text) && !/being rebuilt/.test(after.text), after.text)
 
   // A producer that arrives DURING the outage was greeted out of a `welcome` from a connection that
   // had been dead for minutes.

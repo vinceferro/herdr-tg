@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Capture the herdr-tg bot credentials into the file the systemd unit will read.
+# Capture the Kickoff Channel bot credentials into the file the systemd unit will read.
 #
 # WHY THIS EXISTS: a bot token must not reach an agent transcript, a shell history file, or a
 # process argument list. This script reads it from a hidden prompt (never argv), writes it to a
@@ -29,7 +29,7 @@ api() {
     curl --silent --show-error --max-time 20 --config - "$@"
 }
 
-say "herdr-tg — bot credential setup"
+say "Kickoff Channel — bot credential setup"
 say "──────────────────────────────────────────────────────────────────"
 say "Target: $ENV_FILE (mode 0600, outside the git repo)"
 say
@@ -74,7 +74,7 @@ esac
 # D-decision: the identity gate is a fail-closed chat-id allowlist. Without it the bot answers
 # anyone who finds it, and this one types into real terminals.
 say
-say "herdr-tg only answers chat ids on its allowlist. Everything else is dropped."
+say "Kickoff Channel only answers chat ids on its allowlist. Everything else is dropped."
 CHAT_ID=""
 if [ -n "$BOT_USERNAME" ]; then
   printf 'Discover your chat id now? (you will send the bot a message) [Y/n] '
@@ -119,7 +119,10 @@ fi
 ( umask 077
   tmp="$ENV_FILE.tmp.$$"
   {
-    printf '# herdr-tg credentials — written by scripts/setup-token.sh\n'
+    # The KEYS keep their former spelling on purpose. The hub reads this name and the current
+    # `KICKOFF_CHANNEL_` one, refusing only if both are set to different bytes — and rewriting a
+    # live credential file is a way to strand a box for a rename nothing needed.
+    printf '# Kickoff Channel credentials — written by scripts/setup-token.sh\n'
     printf '# Read by the systemd --user unit via EnvironmentFile=. Never commit this file.\n'
     printf 'HERDR_TG_TOKEN=%s\n' "$TOKEN"
     [ -n "$CHAT_ID" ] && printf 'HERDR_TG_ALLOWED_CHAT_IDS=%s\n' "$CHAT_ID"
@@ -137,7 +140,9 @@ say "Wrote $ENV_FILE"
 ls -l "$ENV_FILE" | sed 's/^/  /'
 say
 say "Contents, with the token masked:"
-sed 's/^\(HERDR_TG_TOKEN=\).*/\1<redacted>/' "$ENV_FILE" | sed 's/^/  /'
+# Both spellings are masked. This script writes one of them, but the file it is printing back may
+# have been written by hand, and a redaction that only knows one name prints the other in full.
+sed -E 's/^((KICKOFF_CHANNEL|HERDR_TG)_TOKEN=).*/\1<redacted>/' "$ENV_FILE" | sed 's/^/  /'
 say
 say "Nothing else needs doing. Tell the coordinator the file exists —"
 say "it can check that the token LOADS without ever reading its value."

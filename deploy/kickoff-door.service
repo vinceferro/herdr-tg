@@ -2,7 +2,7 @@
 Description=kickoff-door — the PWA's loopback door onto the hub's ring and its answers drop
 Documentation=https://github.com/vinceferro/herdr-tg/blob/main/docs/PWA-DOOR.md
 After=default.target
-# Never give up restarting. The same reasoning as herdr-tg.service: the operator reads a phone,
+# Never give up restarting. The same reasoning as kickoff-channel.service: the operator reads a phone,
 # and a start-limit burst would leave the app's only way in dead until he reaches a keyboard.
 StartLimitIntervalSec=0
 
@@ -22,7 +22,7 @@ EnvironmentFile=-%h/.config/kickoff-door/env
 Environment=RUST_LOG=info
 
 # The token is NOT here and must never be. It is 64 hex characters at <state>/door/token, mode
-# 0600, minted only at a terminal by `herdr-tg door-token`. The door reads that file on EVERY
+# 0600, minted only at a terminal by `kickoff-channel door-token`. The door reads that file on EVERY
 # request, so a rotation is live without a restart — and the door mints nothing itself, because a
 # gateway that could mint its own credential would be a credential nobody decided to issue.
 
@@ -52,7 +52,7 @@ RestartSec=5
 # This process does strictly less than either of them: it reads two files under the state home and
 # writes one directory of them, holds no bot token, dials nothing outward, and starts no process.
 #
-# It used to say it was TIGHTER than herdr-tg.service. The two lines that were supposed to carry
+# It used to say it was TIGHTER than kickoff-channel.service. The two lines that were supposed to carry
 # that difference turn out not to run here at all — the note below them is what was measured — so
 # the whole of the difference is the missing AF_UNIX, and "tighter" was a word doing work the
 # kernel was not.
@@ -91,7 +91,7 @@ RestrictAddressFamilies=AF_INET AF_INET6
 # all, answered 301. Nothing warns: the unit starts clean, `systemctl show` reads the addresses
 # back as though they were in force, and the whole of the evidence is one journal line that no unit
 # fails on — "bpf-firewall: Preparation of BPF allow maps failed: Operation not permitted".
-# herdr-tg-app.service carries the same measurement beside the same pair.
+# kickoff-channel-app.service carries the same measurement beside the same pair.
 #
 # Kept rather than deleted, for two reasons. They are real the moment this unit is started by a
 # system manager, or by a user manager with the BPF controller delegated to it — a change in how it

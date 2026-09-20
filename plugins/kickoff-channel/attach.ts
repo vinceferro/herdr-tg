@@ -550,7 +550,7 @@ export function doorDerivedFromGit(c: Attachment, childKeepsConversation: boolea
 /**
  * The conversation this adapter proves itself as — resolved AFRESH on every attempt.
  *
- * Never resolved once: the operator may run `herdr-tg open` or `enroll` while the adapter is
+ * Never resolved once: the operator may run `kickoff-channel open` or `enroll` while the adapter is
  * running, and that is the documented recovery from "this project is not enrolled". An adapter
  * that cached the absence of a secret would make that recovery a lie.
  *
@@ -597,18 +597,18 @@ export function secretFor(c: Attachment): Project | null {
 export function notEnrolled(c: Attachment): Unattachable {
   if (c.tokenFile) {
     return {
-      why: 'The secret this session was pointed at is not there or cannot be read, so the hub has no way to know which project it is. Mount the secret where KICKOFF_HUB_TOKEN_FILE says, or open the project at a terminal:  herdr-tg open',
-      note: `no secret at ${c.tokenFile} (KICKOFF_HUB_TOKEN_FILE); mount it there, or at a terminal: herdr-tg open`,
+      why: 'The secret this session was pointed at is not there or cannot be read, so the hub has no way to know which project it is. Mount the secret where KICKOFF_HUB_TOKEN_FILE says, or open the project at a terminal:  kickoff-channel open',
+      note: `no secret at ${c.tokenFile} (KICKOFF_HUB_TOKEN_FILE); mount it there, or at a terminal: kickoff-channel open`,
     }
   }
   if (c.conversation) {
     return {
-      why: `This session was told it is conversation ${c.conversation}, and the channel holds no secret for that conversation, so the hub has no way to know which conversation it is. Nothing here reaches him until that conversation is opened at a terminal — herdr-tg open for a project, herdr-tg grant for a room — or KICKOFF_HUB_CONVERSATION names one that is.`,
-      note: `no secret for conversation ${c.conversation}${c.channelHome ? '' : ', and no channel home on this box'}; open it at a terminal (herdr-tg open / herdr-tg grant), or fix KICKOFF_HUB_CONVERSATION`,
+      why: `This session was told it is conversation ${c.conversation}, and the channel holds no secret for that conversation, so the hub has no way to know which conversation it is. Nothing here reaches him until that conversation is opened at a terminal — kickoff-channel open for a project, kickoff-channel grant for a room — or KICKOFF_HUB_CONVERSATION names one that is.`,
+      note: `no secret for conversation ${c.conversation}${c.channelHome ? '' : ', and no channel home on this box'}; open it at a terminal (kickoff-channel open / kickoff-channel grant), or fix KICKOFF_HUB_CONVERSATION`,
     }
   }
   return {
-    why: 'This project is not enrolled, so the hub has no way to know which project it is. Open it at a terminal:  herdr-tg open <the project folder>',
-    note: 'no secret for this project; open it at a terminal with herdr-tg open',
+    why: 'This project is not enrolled, so the hub has no way to know which project it is. Open it at a terminal:  kickoff-channel open <the project folder>',
+    note: 'no secret for this project; open it at a terminal with kickoff-channel open',
   }
 }

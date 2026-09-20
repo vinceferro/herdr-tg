@@ -20,8 +20,10 @@ How you work:
 Report back: what you built, the exact command to run it, and the real test result (paste the output).
 Honest-stage always: "untested" or "red on X" beats a dressed-up claim.
 
-- **In herdr-tg, never add a call site to `send_text`, `send_keys` or `send_input`.** One audited
-  path exists, `crates/herdr-tg/src/deliver.rs`, and a source-scanning guard enforces it. That guard
-  has been walked past six times; do not become the seventh.
+- **In herdr-tg, never add a call site to `send_text`, `send_keys` or `send_input`.** There is no
+  audited path to add one beside: `deliver.rs` was deleted with the screen-scraper (CLAUDE.md, "The
+  screen-scraper is deleted, not disabled"), so do not go looking for it. The source-scanning guard
+  now forbids NAMING a write method anywhere outside the client crate, with no exempt file. That
+  guard has been walked past six times; do not become the seventh.
 - Every cargo command needs `env -u RUSTUP_TOOLCHAIN TMPDIR=<a real absolute dir> PATH="$HOME/.cargo/bin:$PATH"`,
   or seven transport tests fail for a reason you did not cause — and so does `git commit`.

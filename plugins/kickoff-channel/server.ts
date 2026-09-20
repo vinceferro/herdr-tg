@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * kickoff-channel — the agent's half of the herdr-tg hub.
+ * kickoff-channel — the agent's half of the Kickoff Channel hub.
  *
  * An MCP server the engine starts as the session's channel. It dials one Unix socket and speaks the
  * frames in `crates/hub-proto`. It holds no Telegram token, no chat allowlist and no model: the hub
@@ -121,7 +121,7 @@ const NOTHING_LISTENING = VIA_FANIN
  * next attempt corrects it to NOTHING_LISTENING, which names the relay.
  */
 const LINK_DROPPED = VIA_FANIN
-  ? 'The link to his phone dropped. Everything on this machine that carries it is still answering except the hub itself, so nothing reaches him until herdr-tg is running again.'
+  ? 'The link to his phone dropped. Everything on this machine that carries it is still answering except the hub itself, so nothing reaches him until kickoff-channel is running again.'
   : 'The link to his phone dropped and is being rebuilt.'
 
 /**
@@ -258,7 +258,7 @@ function attached(a: Record<string, unknown>, never: string): Attached | { file:
     return {
       file: null,
       why: link.isUp
-        ? 'the hub on this machine is older than files and cannot carry one. Restart herdr-tg and say it again with the file.'
+        ? 'the hub on this machine is older than files and cannot carry one. Restart kickoff-channel and say it again with the file.'
         : 'the link to his phone is not up, so no hub has said where files go yet. Say it again with the file once it is.',
     }
   }
@@ -362,7 +362,7 @@ const mcp = new Server(
   // The third place this number is written, and the only one no installer, marketplace or registry
   // ever reads — which is how it fell a week behind the two manifests. `the_bridge_announces_the_
   // version_its_manifests_carry` fails the suite if it is left out of a bump again.
-  { name: 'kickoff-channel', version: '0.2.1' },
+  { name: 'kickoff-channel', version: '0.2.2' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -784,7 +784,7 @@ let heldByAnother = 0
 /**
  * Who this connection says it is, and where it dials — worked out again on every attempt.
  *
- * Never resolved once: the operator may run `herdr-tg enroll` while the session is running, and
+ * Never resolved once: the operator may run `kickoff-channel enroll` while the session is running, and
  * that is the recovery a tool result tells him to perform.
  */
 function identify(): Identity {
@@ -977,7 +977,7 @@ function onFrame(frame: Record<string, any>): void {
       if (LANE && frame.lane !== LANE) {
         link.markDown(
           true,
-          `The hub on this machine is older than this bridge and cannot give a ${WHAT_WE_ARE} a place of its own, so nothing from this ${WHAT_WE_ARE} (${LANE}) can reach him without pretending to be the whole project. Restart herdr-tg and this session will connect.`,
+          `The hub on this machine is older than this bridge and cannot give a ${WHAT_WE_ARE} a place of its own, so nothing from this ${WHAT_WE_ARE} (${LANE}) can reach him without pretending to be the whole project. Restart kickoff-channel and this session will connect.`,
         )
         note(`the hub did not confirm this ${WHAT_WE_ARE}; it is older than this bridge`)
         link.end()
@@ -999,19 +999,19 @@ function onFrame(frame: Record<string, any>): void {
       // something has to stop promising it and name what a person must do instead.
       // A secret the CHANNEL keeps that the hub refuses is a different fault from a repo that
       // was never enrolled, and it reaches here wearing the same name. Most often it is a stale
-      // copy — a rotation typed with a herdr-tg from before conversations existed, which rewrites
+      // copy — a rotation typed with a build from before conversations existed, which rewrites
       // the repo's copy alone — and the verb that mends it is the one that copies the current
       // bytes across. Sending whoever reads this to `open` looped: `open` says "already open".
       // For a room there is no folder to enrol at all.
       const staleCopy =
         project?.how === 'named'
-          ? `The secret the channel keeps for conversation ${project.conversation} is not one the hub knows, so nothing here reaches him. It has to be granted again at a terminal —  herdr-tg grant  — or KICKOFF_HUB_CONVERSATION has to name a conversation that is.`
+          ? `The secret the channel keeps for conversation ${project.conversation} is not one the hub knows, so nothing here reaches him. It has to be granted again at a terminal —  kickoff-channel grant  — or KICKOFF_HUB_CONVERSATION has to name a conversation that is.`
           : project?.how === 'bound'
-            ? 'The secret the channel keeps for this project is not one the hub knows — most often a rotation typed with a herdr-tg from before conversations existed, which rewrites the repo\'s copy alone. At a terminal, copy the repo\'s current secret across:  herdr-tg adopt-secrets --apply  — or, if the repo holds none, enrol the project again:  herdr-tg enroll <the project folder>'
+            ? 'The secret the channel keeps for this project is not one the hub knows — most often a rotation typed with a build from before conversations existed, which rewrites the repo\'s copy alone. At a terminal, copy the repo\'s current secret across:  kickoff-channel adopt-secrets --apply  — or, if the repo holds none, enrol the project again:  kickoff-channel enroll <the project folder>'
             : null
       const forGood: Record<string, string> = {
-        unknown_project: staleCopy ?? 'The hub does not know this project. Open it at a terminal:  herdr-tg open <the project folder>  — or, if it was enrolled before, enrol it again:  herdr-tg enroll <the project folder>',
-        bad_token: staleCopy ?? 'The secret this session presents is not one the hub knows. Enrol the project again at a terminal:  herdr-tg enroll <the project folder>',
+        unknown_project: staleCopy ?? 'The hub does not know this project. Open it at a terminal:  kickoff-channel open <the project folder>  — or, if it was enrolled before, enrol it again:  kickoff-channel enroll <the project folder>',
+        bad_token: staleCopy ?? 'The secret this session presents is not one the hub knows. Enrol the project again at a terminal:  kickoff-channel enroll <the project folder>',
         not_enabled: 'This project is enrolled with the hub but switched off, so nothing is delivered for it.',
         version_skew: 'The hub speaks a different version of this protocol than the bridge. Run:  kickoff pull',
         // The one refusal no person can mend while this session runs. Every other permanent one
@@ -1042,8 +1042,8 @@ function onFrame(frame: Record<string, any>): void {
             // exist is the exact harm the split is for.
             'This session speaks for the project as a whole, and the relay it was pointed at carries one conversation of that project, so it was turned away and nothing here reaches him. Whoever starts this session has to name the same conversation the relay carries, with KICKOFF_HUB_ADDRESS, or point it at the relay for the project itself.'
           : CONFIG?.addressWasGiven
-            ? `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this is a name the hub will not address and nothing here reaches him until whoever started this session gives it a different one.`
-            : `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting herdr-tg is the whole of the fix; if it is not, this name — git's own for the worktree the session runs in — is one the hub will not address, and nothing here reaches him until that worktree is remade under a plainer name.`,
+            ? `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting kickoff-channel is the whole of the fix; if it is not, this is a name the hub will not address and nothing here reaches him until whoever started this session gives it a different one.`
+            : `The hub would not give this conversation (${LANE}) a place of its own, so nothing from this session reaches him. If the hub on this machine is older than this bridge, restarting kickoff-channel is the whole of the fix; if it is not, this name — git's own for the worktree the session runs in — is one the hub will not address, and nothing here reaches him until that worktree is remade under a plainer name.`,
       }
       // The claim is per CONVERSATION now, so a refusal reaching one means that conversation is
       // held — the project's own topic and every other conversation of it may be perfectly free.

@@ -9,7 +9,7 @@
 //! # DENY BY DEFAULT — the whole workspace, not an allowlist of two directories
 //!
 //! The first version of this file scanned exactly two hardcoded directory literals,
-//! `crates/herdr-client/src` and `crates/herdr-tg/src`. A reviewer walked straight past it: a THIRD
+//! `crates/herdr-client/src` and `crates/kickoff-channel/src`. A reviewer walked straight past it: a THIRD
 //! workspace member calling `send_text` left the suite green, and so did the same call planted in
 //! `tests/`, `examples/` or `build.rs` of the two crates it did scan. Slice 2 adds exactly that
 //! shape — a new bot crate — so the guard would have gone blind on the commit that needed it most.
@@ -122,7 +122,7 @@ const DEFINING_MEMBER: &str = "crates/herdr-client";
 /// comment rather than a path.
 ///
 /// The rule used to be "a write may appear in exactly one audited module", and the module was
-/// `crates/herdr-tg/src/deliver.rs`: it read the pane back after every write so that delivery was
+/// `crates/kickoff-channel/src/deliver.rs`: it read the pane back after every write so that delivery was
 /// verified rather than assumed. Five review rounds could not make that safe, for a reason that
 /// was never about the code — herdr's protocol carries agent status and raw screen bytes and
 /// nothing about what an agent is ASKING, so anything answering a prompt is reconstructing
@@ -151,7 +151,7 @@ fn workspace_root() -> PathBuf {
 ///
 /// A name alone is never enough, and that is the entire point of this function. The previous rule
 /// was a two-name list matched against the bare directory name at ANY depth, so
-/// `crates/herdr-tg/src/target/` — an ordinary Rust module, in a crate that already has a `Target`
+/// `crates/kickoff-channel/src/target/` — an ordinary Rust module, in a crate that already has a `Target`
 /// enum — was pruned out of the tree, and a live `send_text` sat inside it with every test green.
 ///
 /// `target` is skipped ONLY when its parent holds a `Cargo.toml`, i.e. when it is the build output
@@ -1340,7 +1340,7 @@ fn write_reach_on(line: &str) -> Option<&'static str> {
 
 /// Rule 1's offenders in the workspace rooted at `root`, and how many files it read to find them.
 ///
-/// Scoped by the DEFINING crate and walked from the ROOT — not `crates/herdr-tg/src`, and no
+/// Scoped by the DEFINING crate and walked from the ROOT — not `crates/kickoff-channel/src`, and no
 /// longer a list of member directories. A crate added in slice 2 is covered on the commit that
 /// adds it, and so is a member's own source file that a Cargo target path parks outside the
 /// member's directory. Comments and string literals count: a `//` TODO naming the method is one
@@ -1731,9 +1731,9 @@ fn there_is_no_exempt_file_and_the_deleted_write_path_has_not_come_back() {
     // the failure names the history instead of reading as a mystery.
     let root = workspace_root();
     for gone in [
-        "crates/herdr-tg/src/deliver.rs",
-        "crates/herdr-tg/src/permission.rs",
-        "crates/herdr-tg/src/mirror.rs",
+        "crates/kickoff-channel/src/deliver.rs",
+        "crates/kickoff-channel/src/permission.rs",
+        "crates/kickoff-channel/src/mirror.rs",
     ] {
         assert!(
             !root.join(gone).is_file(),

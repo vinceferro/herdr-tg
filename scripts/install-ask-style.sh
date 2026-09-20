@@ -3,7 +3,7 @@
 # phone.
 #
 # An agent in a herdr pane reads its OWN project's instructions — never this repo's. So the rules in
-# docs/ASKING-FROM-A-PHONE.md have to be copied into each project that herdr-tg watches. This script
+# docs/ASKING-FROM-A-PHONE.md have to be copied into each project that Kickoff Channel watches. This
 # is that copy, kept between markers so it is idempotent and removable.
 #
 #   bash scripts/install-ask-style.sh /path/to/project        # install or refresh

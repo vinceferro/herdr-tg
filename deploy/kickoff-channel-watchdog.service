@@ -1,0 +1,57 @@
+[Unit]
+Description=Kickoff Channel watchdog — buzz the operator when the hub stops answering
+Documentation=https://github.com/vinceferro/herdr-tg
+# Deliberately NO After=/Requires= on kickoff-channel.service. An alarm ordered after the thing it
+# watches is an alarm that can be taken down with it.
+# The failure route must not be the channel that is failing, so it is a desktop notification.
+OnFailure=kickoff-channel-watchdog-failed.service
+
+[Service]
+Type=oneshot
+# The name scripts/install-watchdog.sh really lays down. A unit pointing at a binary no installer
+# in this repo writes is a unit that fails at start, every five seconds, on a box he reads from a
+# phone — so the two are changed together or not at all.
+ExecStart=%h/.local/bin/kickoff-channel-watchdog
+
+# A --user manager does NOT inherit the login shell's environment. XDG_STATE_HOME and
+# XDG_CONFIG_HOME are set in the operator's shell and absent here, so the script's `${XDG_…:-…}`
+# fallbacks would silently resolve to different paths than the ones he tested by hand — the
+# watchdog would then watch a file nobody writes and exit 0 forever. Name them.
+#
+# These two keep their former spelling on purpose. The only thing that reads them is
+# deploy/herdr-tg-watchdog.sh, a shell script that shares no code with the hub, and the binary's
+# two-name reader (`compat.rs`) never sees these suffixes — so `KICKOFF_CHANNEL_STATE_DIR` here
+# would be read by nobody and the script would fall back to `${XDG_…:-…}`, which is exactly the
+# silence the paragraph above exists to prevent. The path does not move either: other
+# organisations on this box hard-code it.
+Environment=HERDR_TG_STATE_DIR=%h/.local/state/herdr-tg
+Environment=HERDR_TG_ENV_FILE=%h/.config/herdr-tg/env
+# The default user PATH puts ~/.local/bin and mise's shims ahead of /usr/bin, and this unit holds
+# a bot token. A shim named `curl` earlier in that PATH would be handed the credential.
+Environment=PATH=/usr/bin:/bin
+
+# ── Hardening ───────────────────────────────────────────────────────────────────────────────────
+# The heading is load-bearing, not decoration: it is what
+# `tests/a_unit_promises_only_what_the_manager_running_it_enforces.rs` reads, and that guard walks
+# every unit in this directory. Without it these twelve lines were shipped and held to nothing,
+# which is the same state the pair of inert address filters were in before anybody ran them.
+#
+# Every line below was measured on the manager that runs it, one probe under `systemd-run --user`
+# twice — once bare, once under this unit's own directives — and a line counts as doing something
+# only where the two runs disagreed. This unit sets none of the pair that does nothing here.
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_INET/AF_INET6 for the Bot API. AF_UNIX and AF_NETLINK because glibc's resolver uses them to
+# reach a local stub resolver and to enumerate interfaces; measured working without them on this
+# box, but a resolver change would break the alarm silently, which is the failure this file exists
+# to prevent. Listing them costs nothing.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

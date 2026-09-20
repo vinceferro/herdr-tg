@@ -150,7 +150,7 @@ check('a question asked by an unenrolled session never claims his phone buzzed',
 check('it says in plain words that he was not asked',
   /not asked/i.test(askedInVain.text), askedInVain.text)
 check('it names the command that would fix it',
-  /herdr-tg (open|enroll)/.test(askedInVain.text), askedInVain.text)
+  /kickoff-channel (open|enroll)/.test(askedInVain.text), askedInVain.text)
 check('and a failure nothing can mend on its own comes back as an error',
   askedInVain.isError, askedInVain.text)
 
@@ -560,7 +560,7 @@ const welcome = (s: any) =>
     limits: { max_frame_bytes: 65536, per_minute: 20 } }) + '\n')
 
 // A question the agent was told was NEVER asked must not be sitting in a queue that will ask it.
-// The recovery that message prescribes — `herdr-tg enroll` — is exactly what produces the welcome
+// The recovery that message prescribes — `kickoff-channel enroll` — is exactly what produces the welcome
 // that would drain it, so the operator's own fix was what detonated it: his phone buzzed with a
 // question the agent had given up on, nothing would ever take the buttons off it, and an answer
 // came back for an ask that, as far as the agent knew, was never made.
@@ -746,7 +746,7 @@ check('a lane the hub will not address is told for good rather than retried',
 //
 // RED, before the fix: '… until the worktree is remade under a plainer one.' — and nothing else.
 check('and it names restarting the hub, not only remaking the worktree',
-  /herdr-tg/.test(badSaid.text) && /remade/.test(badSaid.text), badSaid.text)
+  /kickoff-channel/.test(badSaid.text) && /remade/.test(badSaid.text), badSaid.text)
 badBridge.child.kill()
 badHub.stop()
 
@@ -1312,7 +1312,7 @@ const unenrolled = startBridge({ KICKOFF_HUB_PROJECT_DIR: nowhere, KICKOFF_HUB_S
 await handshake(unenrolled)
 const unenrolledSaid = await call(unenrolled, 880, 'reply', { text: 'anything' })
 check('every_hint_an_agent_reads_names_a_verb_and_never_a_path',
-  /herdr-tg open/.test(unenrolledSaid.text) && !unenrolledSaid.text.includes(nowhere) && !unenrolledSaid.text.includes(dir),
+  /kickoff-channel open/.test(unenrolledSaid.text) && !unenrolledSaid.text.includes(nowhere) && !unenrolledSaid.text.includes(dir),
   unenrolledSaid.text)
 unenrolled.child.kill()
 
@@ -1417,7 +1417,7 @@ const echoingHub = (path: string) => fakeHub(path, (h, s) =>
     limits: { max_frame_bytes: 65536, per_minute: 20 } }) + '\n'))
 
 // A repository with a lane worktree and NO token anywhere in it: the shape of a repo opened with
-// `herdr-tg open`, or one whose repo copy was taken away.
+// `kickoff-channel open`, or one whose repo copy was taken away.
 const cleanRepo = join(dir, 'clean')
 mkdirSync(cleanRepo, { recursive: true })
 const cleanGit = (...args: string[]) => {
@@ -1490,7 +1490,7 @@ check('a_conversation_it_cannot_read_is_refused_and_never_falls_through',
   !unreadableHub.got.some(f => f.t === 'hello') && unreadableSaid.isError && unreadableSaid.text.includes('c-0c0c0c0c0c0c'),
   `${unreadableHub.got.length} frames at the hub; ${unreadableSaid.text}`)
 check('and the refusal names a verb and never a path',
-  /herdr-tg (open|grant)/.test(unreadableSaid.text) && !unreadableSaid.text.includes(dir),
+  /kickoff-channel (open|grant)/.test(unreadableSaid.text) && !unreadableSaid.text.includes(dir),
   unreadableSaid.text)
 unreadable.child.kill()
 unreadableHub.stop()
@@ -1622,7 +1622,7 @@ for (const bad of ['../../etc', 'p-0123456789AB', 'c-0123456789a', 'p-0123456789
 }
 
 // A secret the channel keeps that the hub refuses — a stale copy left by a rotation typed with a
-// herdr-tg from before conversations existed — arrives as `unknown_project`, and the sentence sent
+// build from before conversations existed — arrives as `unknown_project`, and the sentence sent
 // the agent to `open`, which says "already open". The verb that mends it is adopt-secrets, and for
 // a room there is no folder to enrol at all.
 {
@@ -1651,7 +1651,7 @@ for (const bad of ['../../etc', 'p-0123456789AB', 'c-0123456789a', 'p-0123456789
   await Bun.sleep(300)
   const staleRoomSaid = await call(staleRoom, 891, 'reply', { text: 'anything' })
   check('a_named_rooms_secret_the_hub_refuses_names_the_room_and_the_grant_and_never_an_enrolment',
-    staleRoomSaid.text.includes(roomA) && /herdr-tg grant/.test(staleRoomSaid.text) && !/herdr-tg enroll/.test(staleRoomSaid.text),
+    staleRoomSaid.text.includes(roomA) && /kickoff-channel grant/.test(staleRoomSaid.text) && !/kickoff-channel enroll/.test(staleRoomSaid.text),
     staleRoomSaid.text)
   staleRoom.child.kill()
   staleRoomHub.stop()

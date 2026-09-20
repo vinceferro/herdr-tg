@@ -1,0 +1,1025 @@
+//! `kickoff-channel enroll <repo>`, `disable <repo>`, `enable <repo>`, `allow <repo> <user>` and
+//! `disallow <repo> <user>` — the terminal-only door.
+//!
+//! Admission is the one thing no message can do. Nothing arriving over Telegram or over the hub's
+//! socket can add a project, mint a secret, switch one on or off, or let a person speak: inbound
+//! content selects from what the machine already knows, and it never names something new. That
+//! boundary is only real if the way in is argv, at a keyboard, which is what this file is — and
+//! `nothing_inbound_can_add_a_person.rs` fails the build if the bot or the hub ever names the
+//! setter this file calls. The listing that reads what this file wrote is `projects.rs`.
+
+use std::io::IsTerminal;
+use std::path::Path;
+
+use crate::registry::{Registry, TOKEN_FILE};
+
+/// Enrol a repo, or rotate the secret of one already enrolled.
+pub(crate) fn enrol(repo: &Path, even_if_git_would_commit_it: bool) -> anyhow::Result<()> {
+    enrol_into(
+        &Registry::default_path(),
+        repo,
+        even_if_git_would_commit_it,
+        std::io::stdin().is_terminal(),
+    )
+}
+
+/// The same, against a named registry and with "is a person typing this" passed in, so the door can
+/// be tested without enrolling a real project into the operator's own state directory and without
+/// the test needing a terminal of its own.
+fn enrol_into(
+    registry_path: &Path,
+    repo: &Path,
+    even_if_git_would_commit_it: bool,
+    at_a_terminal: bool,
+) -> anyhow::Result<()> {
+    let mut registry = Registry::load(registry_path);
+    // ASKED FIRST, before a byte is minted or written, and that order is the whole of the guard.
+    // Run afterwards — which is how it shipped — it produced a warning about a file that was
+    // already on disk inside a tracked tree: a note about damage, not a door. This is the one
+    // irreversible failure in this system, because a secret in a public git history cannot be
+    // untracked, and the agent living in that tree commits and pushes with nobody watching.
+    //
+    // And asked ONLY when this enrolment would put a secret into the tree at all. A project that
+    // holds its secret where the channel keeps it and nowhere else — opened with `open`, or with
+    // its repo copy taken away — is rotated there and nowhere else; refusing that for what git
+    // would commit sent the operator to put the token back into the tree, on the day a leaked
+    // secret made rotating it matter.
+    let writes_repo_copy = registry.would_write_repo_copy(repo);
+    let exposure = if writes_repo_copy {
+        secret_exposure(repo)
+    } else {
+        SecretExposure::Silent
+    };
+    if let SecretExposure::WouldCommit { said, remedy } = &exposure {
+        // The override needs a PERSON, not just an argument. When a session's project is not
+        // enrolled, the channel plugin hands the coding agent `Run:  kickoff-channel enroll <dir>` as the
+        // text of a tool result — so the likeliest reader of this refusal is an autonomous agent
+        // that was just told to run this command, in a tree whose own charter has it commit and
+        // push unattended. An override that a non-interactive process can pass on its own is not a
+        // decision anybody made, and a refusal that prints the whole bypass command is not a
+        // refusal. The flag is named in prose for that reason: a person can still find it.
+        if !even_if_git_would_commit_it {
+            anyhow::bail!(
+                "{said}\n\nNothing has been written — no secret, and nothing enrolled. {remedy}\n\n\
+                 Then run this again. If you mean to write the secret there anyway, run this at a \
+                 terminal and add the --even-if-git-would-commit-it flag yourself."
+            );
+        }
+        if !at_a_terminal {
+            anyhow::bail!(
+                "{said}\n\nNothing has been written — no secret, and nothing enrolled. \
+                 --even-if-git-would-commit-it puts a secret inside a tree git would commit it \
+                 from, and that is a thing a person has to choose: nothing here was typed at a \
+                 terminal. Run it again at a keyboard if you mean it.\n\n{remedy}"
+            );
+        }
+    }
+
+    // The secret is returned so that a caller COULD show it. This one deliberately does not: the
+    // bridge reads it from the file, and echoing it here would leave a second copy in a scrollback
+    // buffer, a screen recording, or a session transcript that nobody chose to put it in.
+    let (project, _secret) = registry.enrol(repo)?;
+
+    println!("enrolled       {}", project.title);
+    println!("project        {}", project.id);
+    println!("repo           {}", project.repo.display());
+    // Every place the secret went is said: the repo's copy, which a bridge from before
+    // conversations existed reads, and the channel's, which a newer one finds first — so a
+    // rotation that rewrote only one would have left the other presenting bytes the hub no longer
+    // knows. A project holding no repo copy gets none, and that is said too.
+    if writes_repo_copy {
+        println!(
+            "secret written {}, and where the channel keeps it",
+            project.repo.join(TOKEN_FILE).display()
+        );
+    } else {
+        println!("secret written where the channel keeps it, and nowhere in the repo");
+    }
+    match project.topic_id {
+        Some(id) => println!("topic          {id} (kept from the previous enrolment)"),
+        None => println!("topic          created the first time its bridge connects"),
+    }
+
+    // The secret goes to stdout exactly once, because nothing here can read it back — the registry
+    // holds only a hash of it. Printing it to a pipe or a log would put it somewhere nobody chose.
+    if std::io::stdout().is_terminal() {
+        println!();
+        println!(
+            "Its bridge reads the secret from where it was written. You do not need to copy it."
+        );
+        // Two homes, one writer from now on. A build from before conversations existed rewrites
+        // the repo's copy alone and leaves the channel's behind, and every new session then
+        // presents the stale one and is turned away.
+        println!(
+            "Rotate it only with this build from now on: an older build rewrites the repo's \
+             copy alone and leaves the channel's behind."
+        );
+    }
+
+    // Last, so it is the line still on the screen. `WouldCommit` only reaches here when the
+    // operator asked for it by name — he is still told exactly what he has just done, because
+    // meaning to do it is not the same as remembering it a week later.
+    if let Some(line) = exposure.after_the_secret_is_written() {
+        println!();
+        println!("⚠ {line}");
+    }
+    Ok(())
+}
+
+/// `kickoff-channel disable <repo>` and `kickoff-channel enable <repo>`: the switch, at the keyboard.
+///
+/// Off is written into the registry, which the running hub watches — so a bridge already on the
+/// socket loses its claim within about a second and is told why, and the next one to dial is
+/// turned away at `hello`. What it had queued is answered `no` unsent; only a message it was
+/// already in the middle of sending is finished, because a Telegram call cancelled mid-flight is
+/// a message that lands with an answer saying it did not.
+/// Nothing about the project is forgotten: its secret, its topic and its history all stay, and
+/// `enable` is the whole of the way back.
+///
+/// By repo it is the project: the seed and every room of it, and the rooms are said, because
+/// "off" that quietly left a room on the air is the one thing this switch must never mean. A
+/// room's own id switches that room alone.
+pub(crate) fn switch(repo: &Path, on: bool) -> anyhow::Result<()> {
+    let switched = switch_in(&Registry::default_path(), repo, on)?;
+    let project = &switched.named;
+    let rooms = match switched.rooms.len() {
+        0 => String::new(),
+        1 => ", and the one room of it".to_owned(),
+        n => format!(", and the {n} rooms of it"),
+    };
+    if on {
+        println!("switched on    {}{rooms}", project.title);
+        println!(
+            "               Its bridge is admitted the next time it dials. One that was turned \
+             away tries again on its own, within a minute."
+        );
+    } else {
+        println!("switched off   {}{rooms}", project.title);
+        println!(
+            "               Its bridge is turned away from now on, and one already connected is \
+             dropped now — a message it was in the middle of sending may still land. Its topic \
+             and its history stay."
+        );
+        println!(
+            "               Switch it back on with:  kickoff-channel enable {}",
+            if crate::registry::is_room(&project.id) {
+                project.id.to_string()
+            } else {
+                project.repo.display().to_string()
+            }
+        );
+    }
+    for room in &switched.rooms {
+        println!(
+            "               {}   {}",
+            if on { "on " } else { "off" },
+            room.title
+        );
+    }
+    Ok(())
+}
+
+/// The same, against a named registry, so it can be tested without touching the operator's own.
+fn switch_in(
+    registry_path: &Path,
+    repo: &Path,
+    on: bool,
+) -> anyhow::Result<crate::registry::Switched> {
+    let mut registry = Registry::load(registry_path);
+    Ok(registry.switch(repo, on)?)
+}
+
+/// `kickoff-channel allow <repo> <user>` and `kickoff-channel disallow <repo> <user>`: who may speak in a
+/// project's conversations, decided at the keyboard.
+///
+/// A registry write and nothing else, like the switch. The running hub watches the file and
+/// answers "may this person speak here" from the copy it holds, so the person is heard — or no
+/// longer heard — within about a second, in the project's own topic and in every one of its
+/// other conversations', with no restart. A person let into one project has no standing anywhere else: not
+/// in another project, not in General, and not to give the bot a command. The people who may do
+/// those things are named in the configuration, never in this file.
+pub(crate) fn let_speak(repo: &Path, user: i64, may: bool) -> anyhow::Result<()> {
+    let project = let_speak_in(&Registry::default_path(), repo, user, may)?;
+    if may {
+        println!("allowed        {user} may now speak in {}", project.title);
+        println!(
+            "               In its topic and in its other conversations' topics; nowhere else, \
+             and not to give me commands. Heard within a second — no restart."
+        );
+        println!(
+            "               Take it back with:  kickoff-channel disallow {} {user}",
+            project.repo.display()
+        );
+    } else {
+        println!(
+            "disallowed     {user} may no longer speak in {}",
+            project.title
+        );
+        println!("               From now on. What was already relayed stays relayed.");
+    }
+    let people: Vec<String> = project.allowed_users.iter().map(i64::to_string).collect();
+    println!(
+        "               May speak there now: {}",
+        if people.is_empty() {
+            "nobody beyond the people who may speak anywhere".to_owned()
+        } else {
+            people.join(", ")
+        }
+    );
+    Ok(())
+}
+
+/// The same, against a named registry, so it can be tested without touching the operator's own.
+fn let_speak_in(
+    registry_path: &Path,
+    repo: &Path,
+    user: i64,
+    may: bool,
+) -> anyhow::Result<crate::registry::Project> {
+    let mut registry = Registry::load(registry_path);
+    Ok(registry.set_may_speak(repo, user, may)?)
+}
+
+/// What git says about whether this project's own secret would be committed.
+///
+/// Three answers and not two, because they call for three different things. "It is ignored" and
+/// "there is no repository here" are both silence. "git would commit it" is the only one that
+/// refuses. "I could not ask" is a warning and must never become a refusal — a machine whose git
+/// is missing or broken has to be able to enrol a project.
+#[derive(Debug)]
+enum SecretExposure {
+    /// Nothing to say: git ignores it, or there is no working tree here to commit it from.
+    Silent,
+    /// git says it would be committed. The whole point of the check.
+    ///
+    /// `remedy` is carried separately because it is not the same sentence in both shapes git can
+    /// mean this in, and because it has to be said on BOTH paths — the one that refuses, and the
+    /// one where the operator went ahead and the secret is now actually sitting there.
+    WouldCommit { said: String, remedy: String },
+    /// git would not answer. An unanswered question about a credential is said out loud.
+    Unanswered(String),
+}
+
+impl SecretExposure {
+    /// What is said once the secret is actually on disk, or `None` when there is nothing to say.
+    fn after_the_secret_is_written(&self) -> Option<String> {
+        match self {
+            Self::Silent => None,
+            // The remedy comes along. It used to stop at "you asked for it", which had the two
+            // paths backwards: the operator who was STOPPED was told what to do, and the one now
+            // holding a secret inside a tree git would commit it from was told nothing at all —
+            // and this is the only path on which that secret actually reaches disk.
+            Self::WouldCommit { said, remedy } => Some(format!(
+                "{said} You asked for it to be written there anyway, and it is on disk now. {remedy}"
+            )),
+            Self::Unanswered(said) => Some(said.clone()),
+        }
+    }
+}
+
+/// Ask git whether this project's secret would be committed.
+///
+/// Asks git rather than parsing `.gitignore` by hand. The hand-rolled version read exactly one
+/// file at the repo root and matched five literal strings, so it stayed SILENT for the repo shape
+/// where the danger is greatest — one with no root `.gitignore` at all, where nothing is ignored
+/// and everything gets committed. It also could not see a nested `.gitignore`, `core.excludesFile`,
+/// or `.git/info/exclude`, all of which git honours and all of which a real repo uses.
+///
+/// It also used to open with `if !repo.join(".git").exists() { return None }`, which is not the
+/// same question. A directory INSIDE a working tree has no `.git` of its own, so enrolling one
+/// wrote a 0600 secret into a tracked tree and this guard — the only thing between that secret and
+/// a public remote — never even asked git.
+///
+/// **Fails closed.** If git cannot answer, the operator is told rather than reassured: this is the
+/// only thing standing between a secret and a public remote, and "I could not check" must never
+/// render as silence.
+fn secret_exposure(repo: &Path) -> SecretExposure {
+    // Canonical, because the tiebreak below walks this folder's ancestors looking for a `.git`, and
+    // a relative path or a symlink walks the wrong ones. A folder that will not resolve is one the
+    // registry is about to refuse by name, and there is nothing to say about it here.
+    let Ok(repo) = repo.canonicalize() else {
+        return SecretExposure::Silent;
+    };
+    let repo = repo.as_path();
+
+    let unanswered = |what: String| {
+        SecretExposure::Unanswered(format!(
+            "I could not ask git whether {TOKEN_FILE} is ignored in {} ({what}). Check it yourself \
+             before you commit: that file is this project's secret.",
+            repo.display()
+        ))
+    };
+
+    match git_asked_about_nothing_it_inherited()
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        // git ran and would not name a working tree. Either there genuinely is not one — no remote,
+        // no leak, and refusing here would shut the door on every project that is not under git —
+        // or git refused for its own reasons, which is an unanswered question about a credential.
+        // `.git` somewhere above is what tells the two apart, and it is decided WITHOUT git, so
+        // that a git that will not talk cannot vote on it.
+        Ok(_) if !inside_a_working_tree(repo) => return SecretExposure::Silent,
+        Ok(o) => return unanswered(format!("git exited {}", o.status)),
+        Err(e) => return unanswered(e.to_string()),
+    }
+
+    let out = git_asked_about_nothing_it_inherited()
+        .arg("-C")
+        .arg(repo)
+        .args(["check-ignore", "-q", TOKEN_FILE])
+        .output();
+    match out {
+        // 0 = ignored. Nothing to say.
+        Ok(o) if o.status.code() == Some(0) => SecretExposure::Silent,
+        // 1 = not ignored. This is the whole point of the check — but "not ignored" covers two
+        // shapes that need opposite advice, so the second question gets asked before the sentence
+        // is chosen. See `already_tracked`.
+        Ok(o) if o.status.code() == Some(1) && already_tracked(repo) => {
+            SecretExposure::WouldCommit {
+                said: format!(
+                    "git already tracks {TOKEN_FILE} in {}, and that file is this project's secret.",
+                    repo.display()
+                ),
+                remedy: format!(
+                    "git is tracking that file already, so a .gitignore rule will not help — a rule \
+                 only applies to files git is not tracking yet. Take it out of the index first:\n\
+                 \n    git -C {} rm --cached {TOKEN_FILE}\n\nAnd if that repo has ever been \
+                 pushed, treat the secret in it as public: it is in the history, and writing a new \
+                 one over it does not take the old one out.",
+                    repo.display()
+                ),
+            }
+        }
+        Ok(o) if o.status.code() == Some(1) => SecretExposure::WouldCommit {
+            said: format!(
+                "git would commit {TOKEN_FILE} in {}, and that file is this project's secret.",
+                repo.display()
+            ),
+            remedy: format!(
+                "Add {TOKEN_FILE} to that repo's .gitignore before anything in that tree is \
+                 committed, or a secret written there goes wherever that repo is pushed."
+            ),
+        },
+        // Anything else — git missing, a fatal error, a signal — is an unanswered question, and an
+        // unanswered question about a credential is said out loud.
+        other => unanswered(match &other {
+            Ok(o) => format!("git exited {}", o.status),
+            Err(e) => e.to_string(),
+        }),
+    }
+}
+
+/// Whether git is already TRACKING this project's secret, rather than merely willing to.
+///
+/// `check-ignore` consults the index, so a token file that is already tracked answers "not ignored"
+/// even when a matching `.gitignore` rule is sitting right there — correctly, because git really
+/// would commit a change to it. But the two shapes need opposite advice: adding the rule fixes the
+/// first and does exactly nothing to the second, so an operator told to add it can follow that
+/// instruction to the letter, twice, and get the identical refusal both times.
+///
+/// A second question git will not answer falls back to the milder wording, which is true in both
+/// shapes — claiming a file is tracked when it is not would be its own piece of misinformation.
+fn already_tracked(repo: &Path) -> bool {
+    git_asked_about_nothing_it_inherited()
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-files", "--error-unmatch", "--", TOKEN_FILE])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Whether any folder at or above `repo` holds a `.git` that git itself would open.
+///
+/// Decided without running git, on purpose: it is the tiebreak for a `git rev-parse` that failed,
+/// where "there is no repository here" and "git would not answer" mean opposite things and only
+/// one of them is safe to be quiet about.
+/// `git`, asked about the repository we NAME and never about one we inherited.
+///
+/// git exports its own environment into everything it runs — a pre-commit hook gets `GIT_DIR`
+/// and `GIT_INDEX_FILE`, and every child of that hook inherits them. A `git -C <repo>` still
+/// changes directory, but a relative `GIT_INDEX_FILE=.git/index` then resolves against the new
+/// one, and git reads the index of whatever it was handed rather than the repo we asked about.
+///
+/// It cost a debugging round to find, because it CANNOT happen when the suite is run by hand:
+/// eight clean runs, and a failure on every run under the hook, with git's own words in the end —
+/// `.git/index: index file open failed: Not a directory`, which is that variable verbatim.
+///
+/// The production sites matter more than the test ones. This module asks git whether a project's
+/// secret is ignored, and an answer about the wrong repository is a credential judgement made on
+/// the wrong facts — it would report a token safely ignored because some OTHER tree ignores it.
+/// So the ambient git environment is cleared at every call site here, not just where it bit.
+fn git_asked_about_nothing_it_inherited() -> std::process::Command {
+    let mut git = std::process::Command::new("git");
+    for inherited in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_CONFIG",
+    ] {
+        git.env_remove(inherited);
+    }
+    git
+}
+
+fn inside_a_working_tree(repo: &Path) -> bool {
+    repo.ancestors()
+        .any(|d| dot_git_is_gits_own(&d.join(".git")))
+}
+
+/// Whether a `.git` entry is plausibly git's, judged by what it holds rather than by the fact that
+/// something with that name is sitting there.
+///
+/// An EMPTY folder named `.git` sat above this box's temp root for a fortnight. git calls that "not
+/// a repository" and will not commit a byte from under it, but the question here used to be answered
+/// by existence alone — so every fixture made below it read as "inside a checkout", enrolment warned
+/// about a secret no repository could ever take, and the false alarm was believed: recorded as an
+/// environment fault and worked around by everyone who came after. A warning nobody can act on is
+/// how the one that matters gets trained away.
+///
+/// Both real shapes count. A git directory always holds `HEAD` — it is the first thing git's own
+/// check for one looks for, and the empty folder had none. A linked worktree or a submodule has no
+/// directory at all, but a one-line file naming the real one (`gitdir: <path>`); this project is
+/// developed in worktrees, so reading that as open ground would take the warning away from a tree
+/// that genuinely does commit.
+///
+/// **An entry that cannot be read counts as git's.** The two answers at the call site are "say
+/// nothing and write the secret into this tree" and "tell him git could not be asked and the file
+/// is his project's secret". Only the first can lose a credential, so where the machine cannot tell
+/// what it is looking at, it says so rather than going quiet.
+fn dot_git_is_gits_own(dot_git: &Path) -> bool {
+    match std::fs::metadata(dot_git) {
+        // `try_exists` separates "there is no HEAD" from "I was not allowed to look", and only the
+        // first is proof that this is not a repository.
+        Ok(entry) if entry.is_dir() => dot_git.join("HEAD").try_exists().unwrap_or(true),
+        Ok(_) => std::fs::read_to_string(dot_git)
+            .map_or(true, |line| line.trim_start().starts_with("gitdir:")),
+        // Nothing of that name here. The walk carries on up, so a stray entry at one level never
+        // hides a real checkout above it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_switch_at_the_terminal_is_written_where_the_hub_reads_it_and_the_listing_says_so() {
+        // The switch is a registry write and nothing else, on purpose: the hub re-reads that file
+        // on every admission and watches it for a live connection to drop, so a write here is the
+        // whole of what "off" has to be. And the terminal listing has said "(switched off)" since
+        // before anything could set the flag — it is worth one assertion that it still does.
+        let d = tempfile::tempdir().expect("tmp");
+        let registry = d.path().join("projects.json");
+        let dir = d.path().join("loud-one");
+        std::fs::create_dir_all(&dir).expect("dir");
+        crate::registry::Registry::load(&registry)
+            .enrol(&dir)
+            .expect("enrols");
+
+        let off = switch_in(&registry, &dir, false)
+            .expect("switches off")
+            .named;
+        assert!(!off.enabled);
+        let on_disk = crate::registry::Registry::load(&registry);
+        assert!(
+            !on_disk.get(&off.id).expect("still enrolled").enabled,
+            "the switch was not written where the hub reads it"
+        );
+
+        let on = switch_in(&registry, &dir, true).expect("switches on").named;
+        assert!(on.enabled);
+        assert!(
+            crate::registry::Registry::load(&registry)
+                .get(&on.id)
+                .expect("still enrolled")
+                .enabled
+        );
+
+        // A path nobody enrolled is a refusal in plain words, never an enrolment.
+        let said = switch_in(&registry, &d.path().join("nobody"), true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert_eq!(
+            crate::registry::Registry::load(&registry).all().count(),
+            1,
+            "a switch enrolled something"
+        );
+    }
+
+    #[test]
+    fn letting_a_person_in_at_the_terminal_is_written_where_the_hub_reads_it() {
+        // Like the switch: a registry write and nothing else, because the hub re-reads that file
+        // and answers from its copy. And like the switch, only for a project that is enrolled —
+        // letting someone into nothing must not enrol something — and only a person, never a
+        // group, refused in plain words.
+        let d = tempfile::tempdir().expect("tmp");
+        let registry = d.path().join("projects.json");
+        let dir = d.path().join("a-room");
+        std::fs::create_dir_all(&dir).expect("dir");
+        crate::registry::Registry::load(&registry)
+            .enrol(&dir)
+            .expect("enrols");
+        const GUEST: i64 = 555_001;
+
+        let with = let_speak_in(&registry, &dir, GUEST, true).expect("lets in");
+        assert!(with.allowed_users.contains(&GUEST));
+        assert!(
+            crate::registry::Registry::load(&registry)
+                .get(&with.id)
+                .expect("still enrolled")
+                .allowed_users
+                .contains(&GUEST),
+            "the person was not written where the hub reads it"
+        );
+
+        let without = let_speak_in(&registry, &dir, GUEST, false).expect("shuts out");
+        assert!(without.allowed_users.is_empty());
+        assert!(
+            crate::registry::Registry::load(&registry)
+                .get(&without.id)
+                .expect("still enrolled")
+                .allowed_users
+                .is_empty(),
+            "the file still lets the person in"
+        );
+
+        let said = let_speak_in(&registry, &dir, -1009, true)
+            .expect_err("a group was let in")
+            .to_string();
+        assert!(said.contains("not a person"), "{said}");
+
+        let said = let_speak_in(&registry, &d.path().join("nobody"), GUEST, true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains("nothing is enrolled"), "{said}");
+        assert_eq!(
+            crate::registry::Registry::load(&registry).all().count(),
+            1,
+            "letting someone in enrolled something"
+        );
+    }
+
+    /// A real git repo, because the check now asks git and a fake `.git` directory is not one.
+    fn repo_with(gitignore: Option<&str>) -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tmp");
+        let ok = git_asked_about_nothing_it_inherited()
+            .arg("-C")
+            .arg(d.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("run git");
+        assert!(ok.success(), "git init failed");
+        if let Some(body) = gitignore {
+            std::fs::write(d.path().join(".gitignore"), body).expect("write");
+        }
+        d
+    }
+
+    /// A folder that is genuinely outside any git working tree.
+    ///
+    /// Stated rather than assumed. `tempfile::tempdir()` puts its folder wherever TMPDIR points,
+    /// this repo tells every agent to choose TMPDIR by hand, and a short absolute path inside a
+    /// checkout is an obvious pick — at which point the fixture IS in a repo, the door correctly
+    /// refuses it, and two tests go red as though the door were broken. One self-explaining line
+    /// beats that.
+    fn folder_outside_any_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tmp");
+        let canonical = d.path().canonicalize().expect("canonical");
+        // Two different causes, and sending the reader after the wrong one is what cost a
+        // fortnight here: a checkout really above TMPDIR is fixed by moving TMPDIR, and somebody's
+        // leftover `.git` above it is fixed by taking that folder away — moving TMPDIR around it
+        // only hides it until the next one. So the message names the entry rather than the setting.
+        assert!(
+            !inside_a_working_tree(&canonical),
+            "this test needs a folder with no git repository above it, and there is one above {}. \
+             Look up that path for a `.git`: if it belongs to a checkout, point TMPDIR somewhere \
+             outside it, and if somebody left it behind, take it away — moving TMPDIR only hides \
+             it until the next one.",
+            canonical.display()
+        );
+        d
+    }
+
+    /// A repo that has actually COMMITTED its own secret, with a .gitignore rule for it as well.
+    ///
+    /// This is the post-leak shape, and the one where the two facts come apart: git honours the
+    /// rule for new files and goes on tracking this one regardless, so `check-ignore` correctly
+    /// answers "not ignored" and the remedy is not the rule.
+    fn repo_that_already_committed_the_secret() -> tempfile::TempDir {
+        let d = repo_with(Some(&format!("{TOKEN_FILE}\n")));
+        let git = |args: &[&str]| {
+            let ok = git_asked_about_nothing_it_inherited()
+                .arg("-C")
+                .arg(d.path())
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(ok.status.success(), "git {args:?} failed");
+        };
+        git(&["config", "user.email", "nobody@example.invalid"]);
+        git(&["config", "user.name", "a test"]);
+        std::fs::create_dir_all(d.path().join(".kickoff")).expect("dir");
+        std::fs::write(d.path().join(TOKEN_FILE), "an-old-secret\n").expect("write");
+        git(&["add", "-f", ".gitignore", TOKEN_FILE]);
+        git(&["commit", "-qm", "the shape this is about"]);
+        d
+    }
+
+    #[test]
+    fn the_override_is_refused_unless_a_person_is_at_the_keyboard() {
+        // The flag exists so the operator can say he means it. As first built it was honoured with
+        // stdin, stdout and stderr all closed, from a non-interactive shell — and the refusal ended
+        // with a complete, ready-to-paste command line containing the flag.
+        //
+        // That combination matters here and not in a generic tool. When a session's project is not
+        // enrolled, the channel plugin returns `Run:  kickoff-channel enroll <dir>` as the text of a tool
+        // result, so the reader of this refusal is most often an autonomous agent that was just
+        // told to run this command, inside a tree whose own charter has it commit and push
+        // unattended. A refusal that hands that reader the bypass is not a refusal.
+        let d = repo_with(Some("target/\n"));
+        let state = tempfile::tempdir().expect("tmp");
+        let registry = state.path().join("projects.json");
+
+        let refused = enrol_into(&registry, d.path(), true, false)
+            .expect_err("the override must not be honoured with nobody at the keyboard");
+        assert!(
+            !d.path().join(TOKEN_FILE).exists() && !registry.exists(),
+            "a secret was written for an override nobody typed"
+        );
+        assert!(
+            refused.to_string().contains("terminal"),
+            "it does not say what is missing: {refused}"
+        );
+
+        // And the ordinary refusal stops being a copy-paste. It still NAMES the flag — a door with
+        // no handle is a door nobody can use — but naming it and handing over the whole command
+        // line are different things when the reader is a machine.
+        let plain = enrol_into(&registry, d.path(), false, false).expect_err("it must refuse");
+        assert!(
+            plain.to_string().contains("--even-if-git-would-commit-it"),
+            "it refuses without saying how to go ahead: {plain}"
+        );
+        assert!(
+            !plain.to_string().contains("kickoff-channel enroll"),
+            "the refusal hands the reader the exact command that bypasses it: {plain}"
+        );
+
+        // Typed at a keyboard it still goes through, because this is also the rotation path.
+        enrol_into(&registry, d.path(), true, true).expect("a person may still say he means it");
+        assert!(d.path().join(TOKEN_FILE).exists());
+    }
+
+    #[test]
+    fn a_secret_git_already_tracks_is_told_the_one_remedy_that_untracks_it() {
+        // `check-ignore` consults the index, so a token file that is ALREADY TRACKED answers "not
+        // ignored" even with a matching rule in .gitignore — correctly, because git really would
+        // commit a change to it. The refusal then said "add it to that repo's .gitignore and run
+        // this again", which in this shape is advice the operator can follow to the letter, twice,
+        // and get the identical refusal both times. The one thing git needs was never named.
+        //
+        // This is the post-leak shape, which is exactly when rotating a secret matters most.
+        let d = repo_that_already_committed_the_secret();
+        let (said, remedy) = would_commit(d.path());
+        assert!(
+            remedy.contains("rm --cached"),
+            "the only remedy that clears this is never named: {said} / {remedy}"
+        );
+        assert!(
+            !remedy.contains(".gitignore") || remedy.contains("will not"),
+            "it still prescribes the rule that is already there and changes nothing: {remedy}"
+        );
+        // The secret is in the history, and a fresh one written over it does not take the old one
+        // out. He is owed that, because it is the difference between rotating and being safe.
+        assert!(
+            remedy.contains("history"),
+            "it does not say the old secret is already in the history: {remedy}"
+        );
+    }
+
+    #[test]
+    fn going_ahead_anyway_still_says_what_to_do_about_the_secret_now_sitting_there() {
+        // Backwards, as first built: the operator who was STOPPED was told what to do, and the one
+        // holding a live exposure was told only "You asked for it to be written there anyway." The
+        // flag path is the only path on which the secret actually reaches disk inside a tree git
+        // would commit it from, so it is the path where the remedy is load-bearing.
+        let untracked = repo_with(Some("target/\n"));
+        let line = secret_exposure(untracked.path())
+            .after_the_secret_is_written()
+            .expect("it must still say something");
+        assert!(
+            line.contains(".gitignore"),
+            "the operator is left holding a live exposure with no idea what to do: {line}"
+        );
+
+        let tracked = repo_that_already_committed_the_secret();
+        let line = secret_exposure(tracked.path())
+            .after_the_secret_is_written()
+            .expect("it must still say something");
+        assert!(
+            line.contains("rm --cached"),
+            "a secret written over one git already tracks, with no way out named: {line}"
+        );
+    }
+
+    #[test]
+    fn a_repo_whose_git_would_commit_the_secret_is_refused_before_the_secret_exists() {
+        // The one irreversible failure this system has. A secret in a public git history cannot be
+        // untracked, and the coordinator living in that tree commits and pushes with nobody
+        // watching. The check existed and it ran AFTER the mint, so what it produced was not a
+        // guard but a note about damage already done: the file was on disk, inside a tracked tree,
+        // before the operator read a word about it.
+        let d = repo_with(Some("target/\n"));
+        let state = tempfile::tempdir().expect("tmp");
+        let registry = state.path().join("projects.json");
+
+        let refused = enrol_into(&registry, d.path(), false, true).expect_err("it must refuse");
+        let said = refused.to_string();
+        assert!(
+            said.contains(TOKEN_FILE),
+            "it does not name the file: {said}"
+        );
+
+        assert!(
+            !d.path().join(TOKEN_FILE).exists(),
+            "the secret was written into a tree git would commit it from"
+        );
+        assert!(
+            !registry.exists(),
+            "the project was enrolled even though its secret was refused"
+        );
+
+        // And it says how to mean it anyway, because `enroll` is also how a leaked secret is
+        // rotated: a door with no handle is a door nobody can use.
+        assert!(
+            said.contains("--even-if-git-would-commit-it"),
+            "it refuses without saying how to go ahead: {said}"
+        );
+
+        // Said out loud, it goes through — and only then is anything written.
+        enrol_into(&registry, d.path(), true, true)
+            .expect("a deliberate rotation is still possible");
+        assert!(d.path().join(TOKEN_FILE).exists());
+        assert!(registry.exists());
+    }
+
+    #[test]
+    fn the_git_guard_does_not_fire_on_a_rotation_that_writes_nothing_into_the_repo() {
+        // `open` collects the prize — no file in the repo — and rotation is `enroll`. In a repo
+        // git would commit the token from, that rotation was refused outright by this guard, or
+        // went ahead under the override and put the file back; there was no way to rotate a
+        // leaked secret on an opened project without re-introducing the thing `open` removed.
+        // The guard is about a secret ENTERING the tree, so it asks first whether one would.
+        let d = repo_with(Some("target/\n"));
+        let state = tempfile::tempdir().expect("tmp");
+        let registry = state.path().join("projects.json");
+        crate::registry::Registry::load(&registry)
+            .open(d.path())
+            .expect("opens, writing nothing into the repo");
+        assert!(!d.path().join(".kickoff").exists());
+
+        enrol_into(&registry, d.path(), false, true)
+            .expect("a rotation that writes nothing into the repo must not be refused for what git would commit");
+        assert!(
+            !d.path().join(".kickoff").exists(),
+            "the rotation put the token back into the tree"
+        );
+
+        // A project whose repo copy is still there is still guarded, because the rotation would
+        // write it again.
+        let adopted = repo_with(Some("target/\n"));
+        std::fs::create_dir_all(adopted.path().join(".kickoff")).expect("dir");
+        std::fs::write(adopted.path().join(TOKEN_FILE), "old-bytes").expect("write");
+        let (p, s) = crate::registry::Registry::load(&registry)
+            .enrol(adopted.path())
+            .expect("enrolled (test fixture; the guard is the door's, not the registry's)");
+        assert_eq!(
+            std::fs::read_to_string(adopted.path().join(TOKEN_FILE)).expect("readable"),
+            s
+        );
+        let refused = enrol_into(&registry, adopted.path(), false, true).expect_err("refused");
+        assert!(refused.to_string().contains(TOKEN_FILE), "{refused}");
+        assert_eq!(
+            crate::registry::Registry::load(&registry)
+                .get(&p.id)
+                .expect("still enrolled")
+                .token_sha256,
+            p.token_sha256,
+            "a refused rotation rotated"
+        );
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_git_repo_at_all_still_enrols() {
+        // Getting this wrong shuts the door on the operator. There is no repository, so there is no
+        // remote and nothing to leak — and a refusal here would fire on every project that is not
+        // under git, for a danger that does not exist.
+        let d = folder_outside_any_repo();
+        let state = tempfile::tempdir().expect("tmp");
+        let registry = state.path().join("projects.json");
+        enrol_into(&registry, d.path(), false, true)
+            .expect("a folder with no git must still enrol");
+        assert!(d.path().join(TOKEN_FILE).exists());
+    }
+
+    #[test]
+    fn a_repo_git_will_not_answer_about_is_warned_about_rather_than_refused() {
+        // "I could not check" and "I checked, and it would be committed" are different answers, and
+        // only one of them is a refusal. A machine whose git is broken, missing, or looking at a
+        // `.git` it cannot read must still be able to enrol a project.
+        let d = tempfile::tempdir().expect("tmp");
+        // A `.git` that is a file and not a gitdir: git refuses to name a working tree, while the
+        // tiebreak — decided without git, so a git that will not talk cannot vote on it — still
+        // sees that this is inside one.
+        std::fs::write(d.path().join(".git"), "gitdir: nowhere-that-exists\n").expect("write");
+        assert!(matches!(
+            secret_exposure(d.path()),
+            SecretExposure::Unanswered(_)
+        ));
+
+        let state = tempfile::tempdir().expect("tmp");
+        let registry = state.path().join("projects.json");
+        enrol_into(&registry, d.path(), false, true)
+            .expect("an unanswered question is not a refusal");
+        assert!(d.path().join(TOKEN_FILE).exists());
+    }
+
+    /// The one answer that refuses, told apart from the two that do not.
+    fn would_commit(d: &Path) -> (String, String) {
+        match secret_exposure(d) {
+            SecretExposure::WouldCommit { said, remedy } => (said, remedy),
+            other => panic!("git was expected to say it would commit the secret, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_repo_that_would_commit_its_own_secret_is_told_apart_from_one_that_would_not() {
+        let d = repo_with(Some("target/\n"));
+        assert!(would_commit(d.path()).0.contains(TOKEN_FILE));
+    }
+
+    #[test]
+    fn a_repo_with_no_gitignore_at_all_is_the_shape_git_says_would_commit_it() {
+        // The shape the hand-rolled check stayed silent for, and the one where the danger is
+        // greatest: nothing is ignored, so everything gets committed.
+        let d = repo_with(None);
+        assert!(would_commit(d.path()).0.contains(TOKEN_FILE));
+    }
+
+    #[test]
+    fn a_repo_that_already_ignores_the_secret_is_left_alone() {
+        for line in [".kickoff/", ".kickoff", ".kickoff/hub.token", "*.token"] {
+            let d = repo_with(Some(&format!("target/\n{line}\n")));
+            assert!(
+                matches!(secret_exposure(d.path()), SecretExposure::Silent),
+                "a repo already ignoring {line} was not let through"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nested_gitignore_counts_because_git_says_it_does() {
+        // The hand-rolled version read only the root file. git reads every level, and so a project
+        // that ignores its secret one directory down was warned about for nothing — which is how a
+        // warning gets trained away before the one that matters.
+        let d = repo_with(Some("target/\n"));
+        std::fs::create_dir_all(d.path().join(".kickoff")).expect("dir");
+        std::fs::write(d.path().join(".kickoff/.gitignore"), "hub.token\n").expect("write");
+        assert!(matches!(secret_exposure(d.path()), SecretExposure::Silent));
+    }
+
+    #[test]
+    fn a_folder_inside_a_working_tree_is_checked_rather_than_waved_through() {
+        // It has no `.git` of its own, which is exactly why the guard used to return before asking
+        // git anything at all — and a secret written there is a secret in a tracked tree.
+        let d = repo_with(Some(".kickoff/hub.token\n"));
+        let inside = d.path().join("crates");
+        std::fs::create_dir_all(&inside).expect("dir");
+        assert!(would_commit(&inside).0.contains(TOKEN_FILE));
+    }
+
+    #[test]
+    fn an_empty_directory_named_git_above_a_project_is_not_a_working_tree() {
+        // The shape that cost this box a fortnight. An empty folder named `.git` sat at the temp
+        // root from early September. git itself says there is no repository there — so nothing in
+        // that tree could ever be committed — but the tiebreak asked only whether something called
+        // `.git` was present, so every fixture made under it read as "inside a checkout", two
+        // enrolment tests warned about a secret no repository could take, and the warning was
+        // believed: written down as an environment fault and worked around by everyone after.
+        let root = folder_outside_any_repo();
+        std::fs::create_dir_all(root.path().join(".git")).expect("dir");
+        let project = root.path().join("a-project");
+        std::fs::create_dir_all(&project).expect("dir");
+        let project = project.canonicalize().expect("canonical");
+
+        assert!(
+            !inside_a_working_tree(&project),
+            "an empty folder named .git was taken for a repository"
+        );
+        assert!(
+            matches!(secret_exposure(&project), SecretExposure::Silent),
+            "a project with no repository above it was warned about a secret nothing can commit"
+        );
+    }
+
+    #[test]
+    fn a_project_under_a_real_repository_is_still_seen_as_being_in_a_working_tree() {
+        // The other direction, and the one that loses a secret: this is the tiebreak that decides
+        // whether an unanswerable git is met with silence, so a real checkout must go on reading
+        // as one however carefully the fakes are turned away.
+        let d = repo_with(None);
+        let inside = d.path().join("crates").join("herdr-tg");
+        std::fs::create_dir_all(&inside).expect("dir");
+        let inside = inside.canonicalize().expect("canonical");
+
+        assert!(
+            inside_a_working_tree(&inside),
+            "a folder inside a real checkout was taken for open ground"
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_whose_git_is_a_file_naming_its_gitdir_is_a_working_tree() {
+        // A linked worktree has no `.git` directory at all — it has a one-line file pointing at
+        // the real one. This project is developed in worktrees, so reading that shape as "no
+        // repository here" would take the warning away from a tree that really does commit.
+        let outside = folder_outside_any_repo();
+        let repo = outside.path().join("the-repo");
+        let lane = outside.path().join("a-lane");
+        std::fs::create_dir_all(&repo).expect("dir");
+        let git = |args: &[&str]| {
+            let done = git_asked_about_nothing_it_inherited()
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            // git's own words, not just "failed": this assertion threw them away once and cost a
+            // debugging round on a failure that only appeared under the full parallel suite.
+            assert!(
+                done.status.success(),
+                "git {args:?} failed: {}{}",
+                String::from_utf8_lossy(&done.stderr),
+                String::from_utf8_lossy(&done.stdout)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "nobody@example.invalid"]);
+        git(&["config", "user.name", "a test"]);
+        // A worktree can only be added to a repository that has a commit.
+        git(&["commit", "-q", "--allow-empty", "-m", "the first one"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "a-lane",
+            lane.to_str().expect("a path git can be handed"),
+        ]);
+
+        assert!(
+            lane.join(".git").is_file(),
+            "this fixture proves nothing unless a worktree's .git is still a file"
+        );
+        assert!(
+            inside_a_working_tree(&lane.canonicalize().expect("canonical")),
+            "a linked worktree was taken for open ground"
+        );
+    }
+
+    #[test]
+    fn a_stray_file_named_git_that_names_no_gitdir_is_not_a_working_tree() {
+        // The same false alarm as the empty directory, wearing the other shape. git cannot open a
+        // repository through it either, so there is nothing here that could commit anything.
+        let root = folder_outside_any_repo();
+        std::fs::write(root.path().join(".git"), "somebody's note\n").expect("write");
+        let project = root.path().join("a-project");
+        std::fs::create_dir_all(&project).expect("dir");
+        let project = project.canonicalize().expect("canonical");
+
+        assert!(
+            !inside_a_working_tree(&project),
+            "a file named .git that points nowhere was taken for a repository"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_git_repo_is_let_through() {
+        // No remote, no leak. A warning here would fire on every non-git project and teach the
+        // operator to ignore the one that counts.
+        let d = folder_outside_any_repo();
+        assert!(matches!(secret_exposure(d.path()), SecretExposure::Silent));
+    }
+}

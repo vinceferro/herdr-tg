@@ -22,14 +22,14 @@ Slice 3 can type the wrong thing into the right terminal, and the guard that is 
 
 ### BLOCKER (4)
 
-#### `$REPO/crates/herdr-tg/src/permission.rs`
+#### `$REPO/crates/kickoff-channel/src/permission.rs`
 
 A TWO-OPTION dialog is never recognised, so the operator's "no" is typed as text and the Enter that follows confirms the highlighted option. permission.rs:147 requires EXACTLY ONE background value to occur exactly once among the options. With two options — one selected, one not — both backgrounds occur exactly once, `unique.len() == 2`, and `parse` returns None. bot.rs:638 then falls through to the text path (`deliver::deliver`), which sends `send_input(text)` followed by `send_keys(["Enter"])`. The module's own header says this fallthrough is "the dangerous path"; the `parse` doc at line 110-114 contradicts it and calls a false negative merely "a worse reply experience". Yes/No is the most common confirm shape there is.
 
 **Reproduction**
 
 ```
-Test a7 in $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/attack.rs against a fake pane that swallows text and confirms on Enter:
+Test a7 in $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/attack.rs against a fake pane that swallows text and confirms on Enter:
 $ cargo test --bin herdr-tg attack -- --nocapture
 dialog recognised as a choice? false
 keys that reached the pane: ["Enter"]
@@ -46,12 +46,12 @@ two-option, selected=0 -> None
 
 #### `$REPO/crates/herdr-client/tests/no_live_write_call_site.rs`
 
-The D3 write guard is blind to every path containing a directory named `target`. `SKIP_DIRS = ["target", ".git"]` (line 53) is matched against ANY directory name at ANY depth, not just the workspace build directory. `crates/herdr-tg/src/target/` is therefore never walked by rule 1 (name anywhere in a non-client member) or rule 2 (call anywhere outside cfg(test)). The per-member "contributed at least one file" checks are satisfied by the crate's other files, so the scan is not detected as vacuous. This is the same shape as the previous round's finding — a real write ships with every gate green — and it needs no lexer trick, survives `cargo fmt`, and is clippy-clean. A module named `target` is not exotic in a codebase that already has a `Target` enum in routing.rs.
+The D3 write guard is blind to every path containing a directory named `target`. `SKIP_DIRS = ["target", ".git"]` (line 53) is matched against ANY directory name at ANY depth, not just the workspace build directory. `crates/kickoff-channel/src/target/` is therefore never walked by rule 1 (name anywhere in a non-client member) or rule 2 (call anywhere outside cfg(test)). The per-member "contributed at least one file" checks are satisfied by the crate's other files, so the scan is not detected as vacuous. This is the same shape as the previous round's finding — a real write ships with every gate green — and it needs no lexer trick, survives `cargo fmt`, and is clippy-clean. A module named `target` is not exotic in a codebase that already has a `Target` enum in routing.rs.
 
 **Reproduction**
 
 ```
-Copied the repo to $SCRATCH/atk/clean, added ONE file, crates/herdr-tg/src/target/mod.rs, containing `let _ = client.send_text(pane, text).await?;` outside #[cfg(test)], plus `mod target;` in main.rs. Then:
+Copied the repo to $SCRATCH/atk/clean, added ONE file, crates/kickoff-channel/src/target/mod.rs, containing `let _ = client.send_text(pane, text).await?;` outside #[cfg(test)], plus `mod target;` in main.rs. Then:
 $ cargo fmt --check                       -> cargo fmt --check          : GREEN
 $ cargo clippy --workspace --all-targets -- -D warnings -> clippy -D warnings errors  : 0
 $ cargo test --workspace                  -> cargo test --workspace     : 232 passed, 0 failed
@@ -60,14 +60,14 @@ $ cargo test --workspace                  -> cargo test --workspace     : 232 pa
 
 **Fix** — Anchor the skip to the workspace build directory only: skip a directory named `target` when its parent contains a Cargo.toml (or simply skip exactly `<root>/target` and `<member>/target`), never on bare name at arbitrary depth. Add a self-test that plants a file under `crates/*/src/target/` and asserts the walk sees it — the guard already has `the_guard_itself_detects_a_planted_call_site` for the lexer; it needs the same for the walk.
 
-#### `$REPO/crates/herdr-tg/src/bot.rs`
+#### `$REPO/crates/kickoff-channel/src/bot.rs`
 
 A permission button is resolved by POSITION against a freshly-parsed dialog, and the label the button displayed is never checked. bot.rs:379-389 turns the callback payload `c|<pane>|<idx>` into the 1-based string `one_based` and hands that to `deliver::choose`, which at deliver.rs:281 calls `prompt.match_option("3")` on a dialog it re-read a moment ago. Nothing carries or verifies the option TEXT. Telegram buttons stay tappable forever, so a tap on an older ask — or on the current ask after the pane moved to a different dialog with a different option order — confirms whatever now sits at that index. The bridge only names the option it actually chose in the confirmation, i.e. after the keys are irreversible.
 
 **Reproduction**
 
 ```
-Test a8 in $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/attack.rs — push carried [Allow once, Allow always, Reject] so the "Reject" button is index 2 -> choose("3"); the pane now shows [Reject, Allow once, Allow always]:
+Test a8 in $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/attack.rs — push carried [Allow once, Allow always, Reject] so the "Reject" button is index 2 -> choose("3"); the pane now shows [Reject, Allow once, Allow always]:
 $ cargo test --bin herdr-tg attack -- --nocapture
 keys: ["Right", "Right", "Enter"]
 confirmed: Some("Allow always")
@@ -77,14 +77,14 @@ assertion `left != right` failed: a button labelled Reject confirmed Allow alway
 
 **Fix** — Put the label in the callback payload (or in a side table keyed by message id) and have `choose` take the intended LABEL, not an index: re-parse, find that exact label in the current options, and refuse with "that prompt has changed" if it is absent or ambiguous. `match_option` already does exact-then-unique-prefix matching, so this is a signature change, not new logic.
 
-#### `$REPO/crates/herdr-tg/src/deliver.rs`
+#### `$REPO/crates/kickoff-channel/src/deliver.rs`
 
 The two-writer race grants, and the read-back reports it as a clean success. `Prompt::keys_to` (permission.rs:50) emits a RELATIVE move computed from the selection observed in the read. If the operator moves the selection at the keyboard between that read and the keys landing, the move lands somewhere else — and because neither the code nor the harness wraps, moving toward index 0 silently under-shoots. permission.rs:43-44 asserts "nothing else drives this pane", which is exactly false for the product's core scenario (operator at the laptop, phone in hand). `choose`'s verification (deliver.rs:302) only asks whether a dialog is still parseable, which is true of ANY confirmation, so the bridge says "✅ Reject." after confirming Allow once.
 
 **Reproduction**
 
 ```
-Test r1 in $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/race.rs — bridge's ANSI read shows selection=2, operator has since arrowed back to 0, operator asks for "Reject":
+Test r1 in $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/race.rs — bridge's ANSI read shows selection=2, operator has since arrowed back to 0, operator asks for "Reject":
 $ cargo test --bin herdr-tg target::race -- --nocapture
 keys sent      : ["Enter"]
 harness confirmed: Some("Allow once")
@@ -99,14 +99,14 @@ absolute homing (Left x n-1, then Right x target) lands on the target for every 
 
 ### MAJOR (6)
 
-#### `$REPO/crates/herdr-tg/src/permission.rs`
+#### `$REPO/crates/kickoff-channel/src/permission.rs`
 
 One line of ordinary agent prose disables dialog recognition for the whole pane. `parse` at line 116 takes the FIRST line matching `is_option_row`, and `is_option_row` matches any line containing both "select" and "confirm" (case-insensitive) — or "↑/↓". The real dialog's option row is near the bottom of the pane, so any earlier transcript line containing those two words wins, yields fewer than two options, and returns None. The pane then takes the text path (blocker #1's route). The agent writes that prose, so this is influenceable by whatever is running in the pane.
 
 **Reproduction**
 
 ```
-Test a3 in $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/attack.rs, prepending one line to the real captured fixture:
+Test a3 in $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/attack.rs, prepending one line to the real captured fixture:
 $ cargo test --bin herdr-tg attack -- --nocapture
 with one line of agent prose above it -> None
 assertion failed: one line of ordinary agent prose above the dialog made the dialog invisible
@@ -115,14 +115,14 @@ assertion failed: one line of ordinary agent prose above the dialog made the dia
 
 **Fix** — Scan candidate rows from the BOTTOM up and take the last match, and require the row to yield >= 2 non-hint SGR runs before accepting it as the option row — i.e. iterate `ansi.lines().rev()` and keep the first line that produces a valid prompt rather than the first line that merely mentions the words.
 
-#### `$REPO/crates/herdr-tg/src/permission.rs`
+#### `$REPO/crates/kickoff-channel/src/permission.rs`
 
 `background_of` (line 205-215) reads a truecolor FOREGROUND as a background. It scans each ESC-separated SGR fragment for the substring "48;" — so `38;2;248;250;252m` (a stock light foreground; 248, 148 and 48 in the R or G slot all do it) matches at "248;" and returns the phantom background "48;250;252". The captured real dialog emits fg BEFORE bg, so the phantom is found first and wins over the genuine `48;2;...` background. When two options share such a foreground and a third does not, the "exactly one unique background" rule points at the wrong option, and `keys_to` then computes the move from a selection that is not the real one.
 
 **Reproduction**
 
 ```
-Tests a4/a5 in $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/attack.rs, an opencode-shaped row where "Allow once" (truly selected, real yellow bg) and "Allow always" both use fg #f8fafc:
+Tests a4/a5 in $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/attack.rs, an opencode-shaped row where "Allow once" (truly selected, real yellow bg) and "Allow always" both use fg #f8fafc:
 $ cargo test --bin herdr-tg attack -- --nocapture
 truly selected = 0, parser says selected = 2
 operator tapped Reject; keys ["Enter"]; the harness confirms "Allow once"
@@ -131,38 +131,38 @@ assertion `left == right` failed: tapping Reject confirmed Allow once
 
 **Fix** — Parse the SGR fragment properly instead of substring-searching: split the parameters on ';' and only treat a parameter list as a background when the FIRST parameter is exactly 40-49 or 48/100-107 — never on a substring hit anywhere in the sequence. `background_of`'s existing unit test only covers well-formed inputs and passes either way.
 
-#### `$REPO/crates/herdr-tg/src/bot.rs`
+#### `$REPO/crates/kickoff-channel/src/bot.rs`
 
 The dialog check fails OPEN on a read error. bot.rs:635-637: `let is_dialog = match client.read_visible_ansi(&pane).await { Ok(r) => permission::parse(&r.text), Err(_) => None }`. A transient socket error, a timeout, or a herdr hiccup turns a live permission dialog into "not a dialog", and the operator's reply goes down the text + Enter path. The whole point of the module is that this path is the catastrophe.
 
 **Reproduction**
 
 ```
-Read of bot.rs:635-637 plus the confirmed consequence of the text path against a modal (test a7 above: keys ["Enter"], dialog confirmed "Yes", operator told "✅ Sent."). No test in the suite covers the Err arm — `grep -rn "read_visible_ansi" crates/herdr-tg/src` shows the only production call sites are bot.rs:635 and notify.rs's recheck, which has the same `Err(_) => Vec::new()` shape.
+Read of bot.rs:635-637 plus the confirmed consequence of the text path against a modal (test a7 above: keys ["Enter"], dialog confirmed "Yes", operator told "✅ Sent."). No test in the suite covers the Err arm — `grep -rn "read_visible_ansi" crates/kickoff-channel/src` shows the only production call sites are bot.rs:635 and notify.rs's recheck, which has the same `Err(_) => Vec::new()` shape.
 ```
 
 **Fix** — On a read error, do not write at all: return `voice::nothing_sent(Reason::HerdUnreachable)`. A reply the operator can retry is strictly better than a keystroke into an unknown screen.
 
-#### `$REPO/crates/herdr-tg/src/routing.rs`
+#### `$REPO/crates/kickoff-channel/src/routing.rs`
 
 A topic keeps routing into a pane whose agent has exited, and the reply is then EXECUTED by the shell. `Routing::resolve`'s liveness test (routing.rs:131) is `snapshot.panes.iter().any(|pane| pane.pane_id == *p)` — pane exists, nothing about an agent. `ensure_all_topics` only creates topics for panes with an agent, but nothing ever unbinds one. An agent quitting leaves a shell at a prompt in the same pane; the operator opens the still-existing topic, replies, and the bridge sends `send_input(text)` then `send_keys(["Enter"])` — send_input does not execute lines, but the separate Enter submits the line the shell now holds.
 
 **Reproduction**
 
 ```
-Test in $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/topic.rs, a snapshot whose only pane has no `agent` and no `display_agent`:
+Test in $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/topic.rs, a snapshot whose only pane has no `agent` and no `display_agent`:
 $ cargo test --bin herdr-tg target::topic -- --nocapture
 resolve -> Pane { pane: PaneId("wA:p1"), why: Topic }
 assertion failed: the reply is aimed at a bare shell: send_input + Enter EXECUTES it
 
-And the wire shape that then runs, from $SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/wire.rs:
+And the wire shape that then runs, from $SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/wire.rs:
 WIRE  {"id":"2","method":"pane.send_input","params":{..."text":"please rebase onto main first\nthen ship it"}}
 WIRE  {"id":"4","method":"pane.send_keys","params":{..."keys":["Enter"]}}
 ```
 
 **Fix** — Make `resolve`'s liveness predicate require `p.agent.is_some() || p.display_agent.is_some()`, and return `Target::Gone` otherwise — PLAN.md's failure table already says a dead target must produce a picker, not a write. The snapshot is already in hand at the call site.
 
-#### `$REPO/crates/herdr-tg/src/routing.rs`
+#### `$REPO/crates/kickoff-channel/src/routing.rs`
 
 Topic and sticky bindings are bare pane-id strings with no session anchor, and herdr's id space is session-scoped. `topics: BTreeMap<i32, String>` (line 64) and `sticky: BTreeMap<i64, String>` persist across bridge restarts by design, and are never pruned. herdr allocates workspace ids w1, w2, ... and pane ids p1, p2, ... from counters that restart when herdr restarts, so after a herdr restart or a reboot the same strings name different terminals — and `alive()` happily confirms them. The topic's title still shows the old workspace label. `PaneInfo` already decodes `terminal_id` (a random per-terminal id) and `cwd`, so a stable anchor is free.
 
@@ -213,7 +213,7 @@ guard would scan members = ["crates/herdr-client"]   (from a manifest listing de
 **Reproduction**
 
 ```
-$SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/keycfg.rs:
+$SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/keycfg.rs:
 $ cargo test --bin herdr-tg target::keycfg -- --nocapture
 Key::parse("M-b") -> Ok("M-b")
 Key::parse("Home") -> Ok("Home")
@@ -226,7 +226,7 @@ assertion failed: SLICE-3-PROBE P2: the Key newtype must reject the `-` chord fo
 
 **Fix** — Implement the probe's grammar in `Key::parse`: split on '+', require every leading segment to be one of ctrl/alt/shift/super and the final segment to be a single char or a name from the probe's accepted list; reject anything containing '-'. Failing that, at minimum reject `-` forms in `Config::load` so the error message stops being a lie.
 
-#### `$REPO/crates/herdr-tg/src/bot.rs`
+#### `$REPO/crates/kickoff-channel/src/bot.rs`
 
 The button path writes without a guaranteed audit record, and logs the wrong thing. bot.rs:386-388 discards the result of `audit.sent(...)` with `let _ =`, whereas the text path at bot.rs:671-676 refuses to type at all when the audit log cannot be written ("this bridge does not type into a terminal without a record of it"). The button path also records `"[button] option 2"` — the index, not the label, and not the option that was actually confirmed. PLAN.md's trustworthiness rule is "every keystroke into a pane is audit-logged".
 
@@ -240,17 +240,17 @@ Read of bot.rs:386-388 versus bot.rs:671-676. The two call sites differ only in 
 
 **Fix** — Apply the text path's rule to the button path: on an audit write failure, answer the callback with a refusal and do not call `choose`. Log the option LABEL alongside the index once the label is carried in the payload (blocker #3's fix).
 
-#### `$REPO/crates/herdr-tg/src/deliver.rs`
+#### `$REPO/crates/kickoff-channel/src/deliver.rs`
 
 Three honesty gaps in the confirmation ladder. (1) `choose`'s success test at deliver.rs:302 is `permission::parse(&now).is_none()`, which is also true when the dialog is merely unparseable — so a 3-option dialog replaced by a 2-option one reports "the dialog closed". (2) `Rung::Acted` is never constructed anywhere in the crate, so the ladder's documented top rung and its "✅ Sent — it picked it up." wording are unreachable. (3) crates/herdr-client/src/proto/request.rs:151-157 still carries the slice-1 banner "NO LIVE CALL SITE ... no code path outside #[cfg(test)] constructs one, and the binary exposes no subcommand that reaches HerdrClient::send_text / send_keys / send_input", which slice 3 made false.
 
 **Reproduction**
 
 ```
-$ grep -rn "Rung::Acted" crates/herdr-tg/src/
-crates/herdr-tg/src/voice.rs:215,224,354,408,439   (docs, match arm, tests)
-crates/herdr-tg/src/deliver.rs:25,499,503          (docs, ordering tests)
-crates/herdr-tg/src/notify.rs:68                   (doc)
+$ grep -rn "Rung::Acted" crates/kickoff-channel/src/
+crates/kickoff-channel/src/voice.rs:215,224,354,408,439   (docs, match arm, tests)
+crates/kickoff-channel/src/deliver.rs:25,499,503          (docs, ordering tests)
+crates/kickoff-channel/src/notify.rs:68                   (doc)
 -- no construction site outside tests; deliver.rs:65-69 carries #[allow(dead_code, reason = "constructed by the push loop")] and the push loop does not construct it.
 
 And two-option unparseability, from test a2 above: two-option, selected=0 -> None
@@ -261,7 +261,7 @@ And two-option unparseability, from test a2 above: two-option, selected=0 -> Non
 ### What held
 
 - The sealed trait holds against a real out-of-workspace crate. Built $SCRATCH/atk/foreign against the client crate: `impl Request for Evil` with `const METHOD = concat!("pane.send","_text")` -> E0277 (`Evil: client::sealed::Sealed` not satisfied); `proto::request::PaneSendTextRequest` -> E0603 module private; `client::sealed::Sealed` -> E0603; `ReadSource::Recent` -> E0603 enum private. No second door found: every request type is `pub(crate)`, the only `impl From` in the crate is `From<&str>` for the id newtypes, there is no Deref/AsRef/Borrow impl anywhere, and no public fn signature takes a `ReadSource`.
-- The wire shape is what deliver.rs claims. Drove `deliver::deliver` with a multi-line reply against a spy Unix socket ($SCRATCH/atk/herdr-tg/crates/herdr-tg/src/target/wire.rs): pane.read(source:visible) -> pane.send_input{text:"...\nthen ship it"} -> pane.read -> pane.send_keys{keys:["Enter"]} -> pane.read. `pane.send_text` never appears on the operator-text path, and every read is `source:"visible"`.
+- The wire shape is what deliver.rs claims. Drove `deliver::deliver` with a multi-line reply against a spy Unix socket ($SCRATCH/atk/herdr-tg/crates/kickoff-channel/src/target/wire.rs): pane.read(source:visible) -> pane.send_input{text:"...\nthen ship it"} -> pane.read -> pane.send_keys{keys:["Enter"]} -> pane.read. `pane.send_text` never appears on the operator-text path, and every read is `source:"visible"`.
 - Rule 1 of the write guard is genuinely strict inside the directories it does walk — it tripped on my own probe module the moment it merely mentioned `send_input` in a doc comment and in a trait-impl signature.
 - `match_option` refuses ambiguity rather than resolving it: "allow" against [Allow once, Allow always, Reject] returns None; "0" and "4" are bounds-rejected; "" and "yes please" return None.
 - `keys_to` never wraps and refuses an out-of-range target (`keys_to(3)` on 3 options -> None).
@@ -277,7 +277,7 @@ Two live paths put the operator's words into a pane they were not looking at, an
 
 ### BLOCKER (2)
 
-#### `$REPO/crates/herdr-tg/src/routing.rs:61-69,124-173`
+#### `$REPO/crates/kickoff-channel/src/routing.rs:61-69,124-173`
 
 `topics: BTreeMap<i32,String>` and `pushes: BTreeMap<i64,String>` are keyed on the bare Telegram id with no chat scoping, but message ids and topic ids are PER-CHAT counters. `resolve()` never consults `chat` for rules 0 and 1. Both allowlisted chats (<chat-id> and -<chat-id>) therefore share one id space, and every entry in `pushes` was written by the forum group (in forum mode `say_in_topic` returns before the flat branch). A swipe-to-reply in the private DM — the standard mobile gesture — hits rule 1, the rule the module documents as 'the only rule that needs no memory and cannot go stale', and routes into another conversation's pane. This is D3's catastrophic failure reachable with one thumb.
 
@@ -298,7 +298,7 @@ Allowlist confirmed from the running unit: `tr '\0' '\n' < /proc/3279411/environ
 
 **Fix** — Key both maps on `(chat_id, id)` and pass `chat` into rules 0 and 1. Additionally gate rule 0 on `chat == forum_chat_id` — a `message_thread_id` from a non-forum supergroup is a reply-thread root, not a pane topic. Separately decide what a General-topic message (thread_id None inside the forum) should do; falling through to sticky is the same class of surprise, and the live sticky for that chat is wE:p1.
 
-#### `$REPO/crates/herdr-tg/src/permission.rs:138-150`
+#### `$REPO/crates/kickoff-channel/src/permission.rs:138-150`
 
 The selection is found by 'exactly one background occurs exactly once'. With TWO options — Allow/Deny, Yes/No, the commonest permission shape there is — the selected and the unselected background each occur once, `unique.len() == 2`, and `parse` returns None. The pane is then treated as prose: `notify::recheck` reports `options: []`, `push_ask` renders the '📌 Send my replies here' button (inviting a text reply), and `route_and_deliver`'s `if let Some(prompt) = is_dialog` falls through to `deliver::deliver`, which calls `send_input_text` then `send_submit_key` unconditionally (deliver.rs:174,195). On a focused dialog the text goes nowhere and the Enter confirms the highlighted option. Replying 'no' to an Allow/Deny prompt grants it — verbatim the failure permission.rs's own header says it exists to prevent. The conservative fallback is the dangerous one.
 
@@ -317,7 +317,7 @@ That test asserts `parse(...).is_none()` for ["Allow","Deny"], ["Yes","No"] and 
 
 ### MAJOR (6)
 
-#### `$REPO/crates/herdr-tg/src/notify.rs:372,562,640-648`
+#### `$REPO/crates/kickoff-channel/src/notify.rs:372,562,640-648`
 
 `recheck` collapses 'the ask resolved' and 'I could not tell' into the same None: `let agents = client.agents().await.ok()?;`. The spawned debounce task sends that None and exits. There is no retry — the outer loop only re-runs the snapshot replay after a resubscribe, and the `resubscribe_check` timeout only breaks when the agent-pane SET changes. So one transient error on the `agent.list` at the instant the debounce expires drops a real, standing ask forever. The None arm at :562 also leaks the pane from `pending` (a later status edge clears it, so that part is one-shot). `finished()` at :430 has the identical shape.
 
@@ -338,7 +338,7 @@ Baseline run with no staged failure pushes seq 7 at t+12.6 s, so the only differ
 
 **Fix** — Make `recheck` return a tri-state (StillBlocked | Resolved | Unknown). On Unknown, re-arm the timer with bounded backoff rather than reporting a resolution. Send the pane id alongside the None so `pending.remove` runs on every path.
 
-#### `$REPO/crates/herdr-tg/src/mirror.rs:55-61`
+#### `$REPO/crates/kickoff-channel/src/mirror.rs:55-61`
 
 `observe` relays only when two consecutive 4 s reads (bot.rs:828 MIRROR_TICK) are BYTE-IDENTICAL after `strip_chrome`. A real opencode pane paints a braille spinner inside the running tool-call line, which `strip_chrome` keeps — rule 3 filters the literal "esc interrupt" and lines starting `ctrl+`, not a spinner inside a content line. The screen therefore never settles while the agent is working, and the mirror — the feature the operator explicitly asked for so that walking away is a non-event — is silent for exactly the period they are away.
 
@@ -360,7 +360,7 @@ Test files: $SCRATCH/attack/tests/a2b_live_mirror.rs and a2c_longmirror.rs.
 
 **Fix** — Do not settle on raw equality. Normalise volatile glyphs (spinner frames, elapsed-time and token counters) before comparing, or settle on the prose subset only — `worth_relaying`'s `looks_like_prose` filter already exists and the spinner line is not prose. A stability window over the prose projection would relay mid-session without the firehose.
 
-#### `$REPO/crates/herdr-tg/src/mirror.rs:116`
+#### `$REPO/crates/kickoff-channel/src/mirror.rs:116`
 
 `new_since` anchors on the previous screen's last substantial line and locates it with `rposition` — the LAST occurrence. When that line reappears BELOW new content (a retried command, a repeated log line, a redrawn footer), the anchor jumps past the new text and everything between the two occurrences is dropped. `observe` then advances `self.seen` to the new screen anyway (mirror.rs:69, before the `fresh?` at :71), so the skipped text is baselined out. Losing an agent's words is the failure this module's own doc calls the one that matters.
 
@@ -382,7 +382,7 @@ Test files: $SCRATCH/attack/tests/a2_mirror.rs and a2d_anchor_live.rs.
 
 **Fix** — Anchor on a multi-line suffix (join the last 2-3 substantial lines) so a single repeated line cannot match, and prefer the FIRST occurrence at or after the previously-known offset rather than `rposition`. Do not advance `seen` when the diff produced nothing.
 
-#### `$REPO/crates/herdr-tg/src/bot.rs:359,422`
+#### `$REPO/crates/kickoff-channel/src/bot.rs:359,422`
 
 The identity gate is per-CHAT, not per-user: `on_message` checks `msg.chat.id.0` and `on_callback` checks `q.message.chat().id.0`. Neither looks at `msg.from` / `q.from`. The allowlist on the running service contains a supergroup, so every current and future member of that group — and anyone the operator ever invites — has a keyboard attached to the operator's terminals and can tap permission buttons. PLAN.md calls this gate 'the equivalent of Collie's COLLIE_TRUSTED_USER', which is a USER.
 
@@ -394,12 +394,12 @@ The identity gate is per-CHAT, not per-user: `on_message` checks `msg.chat.id.0`
 <chat-id>.957Z	sent	chat=-<chat-id>	pane=wE:p1	bytes=26	text=Yes it worked really well!
 <chat-id>.109Z	outcome	pane=wE:p1	rung=Submitted	detail=the pane changed after Enter …
 ```
-Writes only happen after `Gate::admit`, so the group id is definitively admitted. `grep -n 'msg.from\|q.from' crates/herdr-tg/src/bot.rs` returns nothing.
+Writes only happen after `Gate::admit`, so the group id is definitively admitted. `grep -n 'msg.from\|q.from' crates/kickoff-channel/src/bot.rs` returns nothing.
 ```
 
 **Fix** — Add `allowed_user_ids` and require BOTH: chat on the chat allowlist AND `msg.from`/`q.from` on the user allowlist. Keep it fail-closed the same way (empty user list = nobody) and log the rejected user id so the operator can read their own out of journalctl.
 
-#### `$REPO/crates/herdr-tg/src/routing.rs:95-109`
+#### `$REPO/crates/kickoff-channel/src/routing.rs:95-109`
 
 A topic->pane binding is created once and never unbound, revalidated, renamed, or expired. `topic_for` matches on the pane-id STRING alone; `ensure_all_topics` (bot.rs:802) skips any pane that already has a topic. So if a pane id is ever reused by a different session, the dead agent's topic — still titled with the old workspace's name — silently becomes a live keyboard into someone else's agent, and no fresh topic is created. `pane.moved` is not handled at all despite PLAN.md's failure row promising silent sticky migration; the only mention in the crate is a render string at render.rs:157.
 
@@ -415,7 +415,7 @@ Reachability, probed on a throwaway `herdr --session probe` (never the live herd
 
 **Fix** — Store an identity alongside the pane id (workspace label + identity_cwd, or PaneInfo.terminal_id accepting that it rotates on a herdr restart) and treat a mismatch as `Target::Gone` rather than a hit. Handle `RosterEvent::PaneMoved` to migrate the binding. Close or rename a topic when its pane leaves the herd, and bound the `topics` map the way `pushes` is bounded.
 
-#### `$REPO/crates/herdr-tg/src/bot.rs:381-402`
+#### `$REPO/crates/kickoff-channel/src/bot.rs:381-402`
 
 Callback data is `c|<pane>|<index>`; the option LABEL the operator tapped is not carried. bot.rs converts the index to a 1-based string and `deliver::choose` resolves it POSITIONALLY against a freshly-parsed dialog. If the agent moved to a different prompt between the push and the tap, the tap selects whatever now sits at that position — a button labelled 'Reject' can grant a permission. The allowlist is checked on callbacks, but nothing checks that the dialog is still the one the button was drawn for, and there is no confirmation step.
 
@@ -434,7 +434,7 @@ The push rendered [Allow once][Allow always][Reject]; tapping Reject sends `c|pa
 
 ### MINOR (2)
 
-#### `$REPO/crates/herdr-tg/src/bot.rs:386-388,398`
+#### `$REPO/crates/kickoff-channel/src/bot.rs:386-388,398`
 
 The append-only audit log — the accountability mechanism PLAN.md leans on — writes a `sent` record BEFORE the attempt, then writes nothing at all on the `Ok(Err(why))` branch where `choose` deliberately sent no keys ('that pane is no longer showing a choice', 'I don't know which option…'). The log therefore asserts a keystroke was sent for events where none was, and leaves no terminal record either way.
 
@@ -452,7 +452,7 @@ sent records: 18 | with no outcome/failed record after them: 7
 
 **Fix** — Rename the pre-write record to `attempted` and emit a terminal record on every branch, including `Ok(Err(_))` (`refused`, with the reason). A record that can dangle cannot be read as an audit trail.
 
-#### `$REPO/crates/herdr-tg/src/notify.rs:513-524,546-556`
+#### `$REPO/crates/kickoff-channel/src/notify.rs:513-524,546-556`
 
 Two debounce leaks. (a) The snapshot replay that runs at startup and after every resubscribe pushes blocked/done panes with ZERO debounce, contradicting 'an ask that resolves inside the window never notifies'; under Restart=always / RestartSec=5 this fires on every restart for any ask younger than the window. (b) A debounce timer left over from an already-resolved ask fires against whatever the pane is doing when it wakes, short-circuiting the window for the NEXT ask.
 
@@ -492,7 +492,7 @@ Pane content has already left the machine: 13 live ask excerpts from the operato
 
 ### BLOCKER (1)
 
-#### `crates/herdr-tg/src/summarize.rs`
+#### `crates/kickoff-channel/src/summarize.rs`
 
 The gist has ALREADY sent 13 live pane excerpts off the machine to a hosted provider (api.z.ai), and nothing in herdr-tg can detect or prevent it. `Summarizer` fires at a URL it never validates, sends a task-class string it never verifies resolved, and reads only `/choices/0/message/content` from the reply — it ignores the `model` field that would tell it who answered. The local gateway's rule is `resolveTaskClass`: unknown or absent class -> `default` chain -> `glm-5.3-flash` -> `https://api.z.ai/api/coding/paas/v4`. Three independent routes reopen this: (a) the class header missing or misspelled, (b) `HERDR_TG_SUMMARIZER_CLASS=bulk` — a value the crate's own test sets — whose chain is `[local-qwen3, glm-5.3-flash]`, i.e. a hosted FALLBACK, (c) `HERDR_TG_SUMMARIZER_MODEL` pinning a provider and bypassing the chain entirely (the journal shows it was pinned to glm-5.3-flash on 4 of the last 9 service starts). The current default is local only because the string "autocomplete" happens to match a key in a DIFFERENT project's JSON file that herdr-tg never reads.
 
@@ -529,14 +529,14 @@ $ journalctl --user -u herdr-tg -o cat | grep gist | sort | uniq -c
 
 ### MAJOR (4)
 
-#### `crates/herdr-tg/src/bot.rs`
+#### `crates/kickoff-channel/src/bot.rs`
 
 The mirror bypasses D4's cap and is the only unclamped message path. `fit()` — the 4096-char clamp — is called in exactly one place, the `/status` render at line 458. Every pushed beat goes through `say_in_topic`, which sends `body` straight to `send_message` with no clamp. On the ask path that is safe because `excerpt_from` caps at 12 lines / 900 chars, which the module doc calls "D4's mitigation in code". The mirror path has no ceiling at all: `mirror::worth_relaying` has a 40-char FLOOR and nothing above it, and `new_since` returns the ENTIRE visible screen whenever the anchor line has scrolled away. So one settled tick after a scroll relays every prose line on the screen — literally the full pane dump D4 says never happens. Two consequences: the accepted-risk contract is broken, and any body over 4096 is rejected by Telegram, logged as one `tracing::error!` and dropped, so the topic silently loses exactly the longest thing the agent said. The test named `a_busy_pane_cannot_become_a_transcript` guards only `excerpt_from` and stays green.
 
 **Reproduction**
 
 ```
-$ grep -n 'fit(' crates/herdr-tg/src/bot.rs
+$ grep -n 'fit(' crates/kickoff-channel/src/bot.rs
 458:            Ok(snap) => fit(render::herd_telegram(&snap)),
 569:fn fit(html: String) -> String {        # + 4 hits in #[cfg(test)] only
 (say_in_topic, lines 275-315, calls send_message(forum, body) with no fit())
@@ -564,7 +564,7 @@ busiest 10-min bucket: 20 relays, 19881 chars   (~120 KB/hour of pane prose)
 
 **Fix** — Call `fit()` on `body` inside `say_in_topic` (both the forum and the flat branch) — that alone stops the silent drop. Separately, give the mirror the ceiling the ask path has: cap `worth_relaying` at the same EXCERPT_LINES/EXCERPT_CHARS budget and cut from the front with the same leading '…', so "never full pane dumps" is one constant shared by both paths rather than a property of one of them. Then move `a_busy_pane_cannot_become_a_transcript` to assert it of the mirror too — the current test's name promises a property the mirror does not have.
 
-#### `crates/herdr-tg/src/config.rs`
+#### `crates/kickoff-channel/src/config.rs`
 
 No workspace scope is configured, so the bridge mirrors EVERY workspace on the box, not one. `Config::load(None)` returns `workspace: None`; `snapshot_for(client, ctx.workspace.as_deref())` then skips `narrow_to_workspace` and the mirror loop iterates every agent pane in the herd. The unit runs `herdr-tg serve` with no `--config`, and no `herdr-tg.toml` exists anywhere on the machine, so this is the live configuration, not a hypothetical one. D2 is "one bot per workspace"; the default is all workspaces, i.e. the scope fails open. Confirmed in the journal: four unrelated projects' panes have already been relayed into Telegram, including wE:p1 — the coordinator's own pane, which is where this review session runs.
 
@@ -586,7 +586,7 @@ $ journalctl ... | grep 'relaying pane=wE:p1' | wc -l  ->  5 relays, 7566 chars
 
 **Fix** — Make the scope explicit and fail closed the way the chat allowlist does: if `workspace` is absent from both the TOML and a `HERDR_TG_WORKSPACE` env var, refuse to start with the same shape of error `HERDR_TG_TOKEN` gets ("one bot per workspace — set workspace = ... or pass --workspace"). A bridge that streams terminals to a cloud chat should never infer "all of them" from a missing field. If an all-workspaces mode is genuinely wanted later, it should be `workspace = "*"`, typed by a human.
 
-#### `crates/herdr-tg/src/bot.rs`
+#### `crates/kickoff-channel/src/bot.rs`
 
 The operator's real Telegram user id is committed and PUSHED to the public repo, and the de-identification guard structurally cannot see it. `<chat-id>` appears three times in bot.rs's tests and is byte-identical to the live entry in HERDR_TG_ALLOWED_CHAT_IDS. `fixtures_are_deidentified.rs` — widened one commit ago — still only enumerates `crates/*/tests/fixtures`; it never looks at src/, docs/, scripts/, PLAN.md or git history, and its five detectors are all structural shapes (home path, ses_ id, UUID, user@host prompt, ~/path) with no detector for a username, a hostname, or a chat id. So the widening moved the boundary from one fixture directory to all fixture directories; it did not widen the class of thing being looked for, and the class that leaked here is one it has never looked for. The operator's username and both machine names are public for the same reason.
 
@@ -594,9 +594,9 @@ The operator's real Telegram user id is committed and PUSHED to the public repo,
 
 ```
 $ git grep -n '<chat-id>' origin/main
-origin/main:crates/herdr-tg/src/bot.rs:904:        for probe in [0, 1, -1, <chat-id>, i64::MAX, i64::MIN] {
-origin/main:crates/herdr-tg/src/bot.rs:911:        let g = gate(&[<chat-id>, -<chat-id>]);
-origin/main:crates/herdr-tg/src/bot.rs:912:        assert!(g.admit(<chat-id>));
+origin/main:crates/kickoff-channel/src/bot.rs:904:        for probe in [0, 1, -1, <chat-id>, i64::MAX, i64::MIN] {
+origin/main:crates/kickoff-channel/src/bot.rs:911:        let g = gate(&[<chat-id>, -<chat-id>]);
+origin/main:crates/kickoff-channel/src/bot.rs:912:        assert!(g.admit(<chat-id>));
 
 $ python3 -c "parse ~/.config/herdr-tg/env, print only booleans"
 HERDR_TG_ALLOWED_CHAT_IDS: len=24 matches_repo_<chat-id>=True     # 9 + 1 + 14 = the whole value
@@ -615,7 +615,7 @@ distinct findings: 12   -- all placeholders (/home/testuser, user@host:~, ~/Proj
 
 **Fix** — Two separate moves. (1) Content: replace `<chat-id>` in bot.rs with an obviously-synthetic id, and treat the published one as burned — a Telegram user id is permanent and the repo history already carries it, so a history rewrite plus a force-push is the only real removal; decide whether that is worth it, but do not leave it believing the guard covered it. (2) Guard: give it the two things it lacks — scan the whole worktree (or at minimum src/, docs/, scripts/, *.md) rather than fixture directories, and add the identity needles `scripts/scrub-fixtures.py` already derives at runtime (getpass.getuser(), socket.gethostname(), basename($HOME)) plus a 9-10-digit-bare-integer heuristic for chat ids. The python check already knows how to derive identity without hardcoding it; the Rust test is the one that runs on every commit and it is the one that cannot.
 
-#### `crates/herdr-tg/src/voice.rs`
+#### `crates/kickoff-channel/src/voice.rs`
 
 `looks_like_prose` is a typography test, not a redaction test, and the mirror uses it as the only thing standing between an agent's screen and Telegram. It rejects a line for starting with $ + - # > | /, containing :: or @@, or carrying a file.ext:line reference, then checks letter density and punctuation density. A secret in a sentence satisfies all of that. 10 of 12 crafted secret-bearing lines pass, including a bare `ANTHROPIC_API_KEY=sk-ant-...` assignment (it passes because it has only two underscores and one equals sign — `STRIPE_SECRET_KEY=sk_live_...` is rejected only because it happens to have more underscores, which is accident, not policy). On the operator's real herd, 73% of cleaned pane lines classify as prose and are therefore relay-eligible. D4's stated mitigation for this is "agents redact secrets in asks" — but the mirror is not an ask: it fires unprompted every 4 seconds on prose the agent never intended to send anywhere.
 
@@ -646,7 +646,7 @@ distinct PROSE lines carrying a path / host / key-shaped token:
 
 ### MINOR (3)
 
-#### `crates/herdr-tg/src/routing.rs`
+#### `crates/kickoff-channel/src/routing.rs`
 
 `routing.state.json` and `pushed.state.json` are world-readable (0644) while the audit log next to them is deliberately 0600. Both `Routing::save` and `notify::Pushed::save` use `std::fs::write`, which creates at 0666 & ~umask — the unit's UMask is 0022, so 0644 by construction on any box, not an accident of this one. The temp file written before the rename has the same mode. The files carry the operator's Telegram user id, the forum supergroup id, the pane->topic map and the pane->message-id map. No pane content, but the audit module's own reasoning ("Mode 0600 at creation — this holds the operator's own words") applies to a chat id just as much: it is the identity the whole allowlist is built on.
 
@@ -664,14 +664,14 @@ $ umask ; systemctl --user show herdr-tg -p UMask
 UMask=0022
 $ head -c 200 ~/.local/state/herdr-tg/routing.state.json
 { "sticky": { "-<chat-id>": "wE:p1", "<chat-id>": "wA:p1" }, ...
-$ sed -n '194,201p' crates/herdr-tg/src/routing.rs
+$ sed -n '194,201p' crates/kickoff-channel/src/routing.rs
         let tmp = path.with_extension("state.json.tmp");
         std::fs::write(&tmp, body)?;      # <- default perms, no OpenOptions::mode
 ```
 
 **Fix** — Write both state files the way `audit::append` already writes its log: `OpenOptions::new().create(true).write(true).truncate(true).mode(0o600)` on the temp file before the rename (rename preserves the mode), and `std::fs::set_permissions(dir, 0o700)` after `create_dir_all`. The audit module already has the exact code; this is lifting it two directories over.
 
-#### `crates/herdr-tg/src/config.rs`
+#### `crates/kickoff-channel/src/config.rs`
 
 `Config` and `Summarizer` both derive `Debug` and print their credentials verbatim, and the test that claims otherwise does not test it. `the_token_is_reachable_only_through_its_accessor` asserts `c.token() == "t"` — it checks that the accessor works, not that the accessor is the only route. The derived Debug is a second read of the credential that the module's stated rationale ("a method rather than a public field: it makes every read of the credential a visible call site that a reviewer can grep for") explicitly exists to prevent, and it is exactly the read a grep for `.token()` will not find. Nothing formats either struct today, so this is latent, not live — but `Ctx` holds the `Summarizer` and one `tracing::debug!(?cfg)` added by a future maintainer puts a live bot token in the journal.
 
@@ -689,7 +689,7 @@ Summarizer Debug output:
                model: None, key: "lg_live_THIS_IS_THE_GATEWAY_KEY", timeout: 4s }
   gateway key present in Debug output: true
 
-$ grep -rn 'derive(Debug' -A2 crates/herdr-tg/src/config.rs crates/herdr-tg/src/summarize.rs
+$ grep -rn 'derive(Debug' -A2 crates/kickoff-channel/src/config.rs crates/kickoff-channel/src/summarize.rs
 config.rs:59:#[derive(Debug, Clone)]  pub struct Config { token: String, ...
 summarize.rs:35:#[derive(Debug, Clone)] pub struct Summarizer { ... pub key: String, ...
 ```
@@ -698,12 +698,12 @@ summarize.rs:35:#[derive(Debug, Clone)] pub struct Summarizer { ... pub key: Str
 
 #### `scripts/scrub-fixtures.py`
 
-`--check` silently skips every fixture that is not `.json` or `.ndjson`, so the only check that knows the operator's real username and hostname never runs on the two fixtures that are verbatim screen captures. `fixture_files()` filters on `p.suffix in {".json", ".ndjson"}`, so pointing it at `crates/herdr-tg/tests/fixtures` inspects one file out of three and prints "CHECK CLEAN" — `tui-pane.txt` and `opencode-permission.ansi` are never opened. Those two are precisely the files captured off a real screen, and `tui-pane.txt` is the file that carried a real session id one commit ago. The Rust guard does read them (any extension, read_to_string), but the Rust guard has no identity needles; the python check has the needles and cannot see the files. Both are clean today — by hand, not by gate.
+`--check` silently skips every fixture that is not `.json` or `.ndjson`, so the only check that knows the operator's real username and hostname never runs on the two fixtures that are verbatim screen captures. `fixture_files()` filters on `p.suffix in {".json", ".ndjson"}`, so pointing it at `crates/kickoff-channel/tests/fixtures` inspects one file out of three and prints "CHECK CLEAN" — `tui-pane.txt` and `opencode-permission.ansi` are never opened. Those two are precisely the files captured off a real screen, and `tui-pane.txt` is the file that carried a real session id one commit ago. The Rust guard does read them (any extension, read_to_string), but the Rust guard has no identity needles; the python check has the needles and cannot see the files. Both are clean today — by hand, not by gate.
 
 **Reproduction**
 
 ```
-$ python3 scripts/scrub-fixtures.py --check --fixtures crates/herdr-tg/tests/fixtures
+$ python3 scripts/scrub-fixtures.py --check --fixtures crates/kickoff-channel/tests/fixtures
   clean gist-cases.json
 scrub-fixtures: CHECK CLEAN
 rc=0
@@ -713,7 +713,7 @@ herdr-tg dir -> ['gist-cases.json']                # tui-pane.txt and opencode-p
 client   dir -> ['snapshot.json','pane_read.json','events-mixed.ndjson','errors.ndjson','pong.json','herdr-schema-p20.json']
 needles: ['$HOME', 'user', '<host>']        # the needles exist; the files never reach them
 
-$ ls crates/herdr-tg/tests/fixtures/
+$ ls crates/kickoff-channel/tests/fixtures/
 gist-cases.json  opencode-permission.ansi  tui-pane.txt
 ```
 

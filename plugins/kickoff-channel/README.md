@@ -1,6 +1,6 @@
 # kickoff-channel
 
-The agent's half of the herdr-tg hub. Claude Code starts it as this session's channel; it dials
+The agent's half of the Kickoff Channel hub. Claude Code starts it as this session's channel; it dials
 `/run/user/<uid>/kickoff/hub.sock` and speaks the frames in `crates/hub-proto`.
 
 It holds **no** Telegram token, no chat allowlist and no LLM. The hub owns all three. This process
@@ -22,7 +22,7 @@ longer two writers fighting over one keyboard.
 
 ## Enrolling
 
-    herdr-tg enroll <repo>      # mints <repo>/.kickoff/hub.token, mode 0600
+    kickoff-channel enroll <repo>   # mints <repo>/.kickoff/hub.token, mode 0600
 
 `hub.token` is this project's secret. Make sure git ignores it — `enroll` asks git and warns if not.
 

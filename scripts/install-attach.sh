@@ -83,4 +83,4 @@ say
 say "    systemctl --user enable --now kickoff-hub-attach@<label>"
 say "    journalctl --user -u kickoff-hub-attach@<label> -f"
 say
-say "Enrolment stays a terminal act, once per project:  herdr-tg enroll <repo>"
+say "Enrolment stays a terminal act, once per project:  kickoff-channel enroll <repo>"

@@ -6,8 +6,10 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
 
 ## This repo
 
-- **What it is:** a Telegram front door for a herd of coding agents — it relays what an agent says
-  and asks to the operator's phone, and can send a reply back into the pane he meant.
+- **What it is:** `kickoff-channel` — the front door for a herd of coding agents. It relays what an
+  agent says and asks to the operator, through his phone or through the kickoff PWA, and carries
+  his answer back into the turn that asked. The command is also installed as `herdr-tg`, its first
+  name, which other software on this box still calls; both are the same program.
 - **Domains + their specialists:** wire protocol → `wire-protocol` · the audited keystroke path and
   its guard → `write-safety` · what leaves the machine → `egress` · the Telegram surface →
   `operator-channel`. Screen interpretation is deliberately unowned; see CLAUDE.md for why.
@@ -59,9 +61,10 @@ and eject keeps it by default. Put everything specific to THIS repo here; the pu
 - **Never start the service.** It is stopped by decision, after a review found four ways it could
   type the wrong thing into a real terminal. Restarting it is the operator's call, and only his.
 - **The Telegram surface is retired; the hub is demoted, not dead (17 September 2026).** The
-  operator revoked the bot token himself (~12:38 CEST) and the same hour `herdr-tg.service`,
-  `herdr-tg-watchdog.timer` and `kickoff-hub-attach@oc-dogfood.service` were stopped and disabled,
-  so a dead credential would not be polled, refused and nagged about forever. This matches his
+  operator revoked the bot token himself (~12:38 CEST) and the same hour the phone hub, the watchdog
+  timer and `kickoff-hub-attach@oc-dogfood.service` were stopped and disabled — under the names the
+  first two carried then, `herdr-tg.service` and `herdr-tg-watchdog.timer` — so a dead credential
+  would not be polled, refused and nagged about forever. This matches his
   ruling the same day (`.kickoff/memory/telegram-is-a-connector-kickoff-will-drive-it.md`): the
   work surface is the PWA and the herdr TUI; the hub stays the conversation plane for the PWA to
   be proven on, with the Telegram connector arriving later as kickoff work. Ordering, his words:

@@ -15,17 +15,23 @@ down as instructions:
 - `deploy/herdr-tg.service` had gained `Conflicts=kickoff-hub.service`, so starting OUR phone hub
   would have had systemd **stop their running hub**.
 
-Renamed to `herdr-tg-app.service`. Nothing was committed or installed, so nothing happened; their
-unit never moved. A sceptic found it by running `systemctl --user status` on the real box — reading
-the diff could not have.
+Renamed to `herdr-tg-app.service` — and, on 20 September, to `kickoff-channel-app.service` with
+every other unit here, when the product's name reached the surface. Nothing was committed or
+installed at the time, so nothing happened; their unit never moved. A sceptic found it by running
+`systemctl --user status` on the real box — reading the diff could not have.
 
 **Why:** a user manager's unit names are ONE namespace shared by every organisation on this
-machine, and several live here. Our other units are all prefixed `herdr-tg`, so the convention
-existed and this one simply left it. The word "kickoff" feels like ours because the product is
-called kickoff-channel — which is exactly the trap, because it feels like theirs to them too.
+machine, and several live here. Our other units were all prefixed `herdr-tg` at the time, so the
+convention existed and this one simply left it. The word "kickoff" feels like ours because the
+product is called kickoff-channel — which is exactly the trap, because it feels like theirs to
+them too.
 
-**How to apply:** prefix every unit, timer and socket this repo ships with `herdr-tg`. Before
-adding one, run `systemctl --user list-unit-files '<name>*'` and `ls ~/.config/systemd/user/` —
-a name that already exists is not yours. The same goes for any `Conflicts=`, `Requires=` or
-`Before=` naming a unit this repo does not ship. Related:
+**How to apply:** prefix every unit, timer and socket this repo ships with `kickoff-channel` —
+`kickoff-channel.service`, `kickoff-channel-app.service`, `kickoff-channel-watchdog.*`, each
+checked free on this box before it was taken. The prefix moved with the product's name on
+20 September and the lesson did not: `kickoff-channel` is a longer, more specific name than
+`kickoff-hub`, which is what makes it safe here, and a shorter one would walk straight back into
+this. Before adding a unit, run `systemctl --user list-unit-files '<name>*'` and
+`ls ~/.config/systemd/user/` — a name that already exists is not yours. The same goes for any
+`Conflicts=`, `Requires=` or `Before=` naming a unit this repo does not ship. Related:
 [[a-guard-that-fires-only-on-the-whole-leak]].

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the herdr-tg watchdog — and PROVE it, so it is not a watchdog you are guessing about.
+# Install the Kickoff Channel watchdog — and PROVE it, so it is not a watchdog you are guessing about.
 #
 #     bash scripts/install-watchdog.sh          # install, prove the decision, prove the send
 #     bash scripts/install-watchdog.sh --dry    # install only; send nothing
@@ -31,7 +31,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-BIN_DST="$HOME/.local/bin/herdr-tg-watchdog"
+# The name deploy/kickoff-channel-watchdog.service starts. A unit pointing at a binary no installer
+# writes is a unit that fails at start every five seconds, so these two move together or not at all.
+BIN_DST="$HOME/.local/bin/kickoff-channel-watchdog"
 ENV_FILE="$HOME/.config/herdr-tg/env"
 STATE_DIR="$HOME/.local/state/herdr-tg"
 PROVE=yes; FIRE=no; INSTALL=yes
@@ -48,6 +50,27 @@ esac
 say() { printf '%s\n' "$*"; }
 die() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
 
+# Take down the timer and units this install replaces — and ONLY where the file on disk is ours.
+#
+# A user manager has one unit namespace for every organisation on the box, so a blind
+# `disable --now` on a name we no longer ship is how one project stops another project's service.
+# Leaving them is not an option either: the old timer runs its own copy of the script every minute
+# beside the new one, so he gets every alarm twice and every drill twice, which teaches him to
+# ignore the one message that has to be trusted.
+retire_superseded() {
+  local unit
+  for unit in herdr-tg-watchdog.timer herdr-tg-watchdog.service herdr-tg-watchdog-failed.service; do
+    [ -f "$UNIT_DIR/$unit" ] || continue
+    if grep -q 'github.com/vinceferro/herdr-tg' "$UNIT_DIR/$unit"; then
+      systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
+      rm -f "$UNIT_DIR/$unit"
+      say "  retired $unit — it is this watchdog under its former name"
+    else
+      say "  ⚠ $UNIT_DIR/$unit exists and is NOT ours; left alone. You may now be alarmed twice."
+    fi
+  done
+}
+
 # An agent session on this box inherits TMPDIR as the literal string "%h/.cache/tmp" — an
 # unexpanded systemd specifier — so mktemp hands back a RELATIVE path. CLAUDE.md documents this for
 # cargo; it bites shell just as hard, and here it made the staged proof print a nonsense path.
@@ -56,11 +79,11 @@ case "${TMPDIR:-/tmp}" in
   *)  TMPDIR=/tmp; export TMPDIR ;;
 esac
 
-say "herdr-tg watchdog — install and prove"
+say "Kickoff Channel watchdog — install and prove"
 say "──────────────────────────────────────────────────────────────────"
 
-for f in deploy/herdr-tg-watchdog.sh deploy/herdr-tg-watchdog.service \
-         deploy/herdr-tg-watchdog-failed.service deploy/herdr-tg-watchdog.timer; do
+for f in deploy/herdr-tg-watchdog.sh deploy/kickoff-channel-watchdog.service \
+         deploy/kickoff-channel-watchdog-failed.service deploy/kickoff-channel-watchdog.timer; do
   [ -f "$REPO/$f" ] || die "missing $f"
 done
 command -v systemctl >/dev/null || die "systemctl not found — this needs systemd"
@@ -72,9 +95,13 @@ command -v notify-send >/dev/null || say "  ⚠ notify-send missing: OnFailure h
 # have — and this box is on the app plane.
 if [ "$INSTALL" = yes ]; then
   [ -r "$ENV_FILE" ] || die "no credentials at $ENV_FILE — run \`bash scripts/setup-token.sh\` first"
-  grep -q '^HERDR_TG_TOKEN=' "$ENV_FILE" || die "$ENV_FILE has no HERDR_TG_TOKEN"
-  grep -q '^HERDR_TG_ALLOWED_CHAT_IDS=' "$ENV_FILE" \
-    || die "$ENV_FILE has no HERDR_TG_ALLOWED_CHAT_IDS — the watchdog would have nobody to alarm"
+  # Either spelling counts. The hub reads the current name and the former one, and an installer
+  # stricter than the program it installs refuses a perfectly good credential file over the name
+  # somebody wrote on it.
+  grep -qE '^(KICKOFF_CHANNEL|HERDR_TG)_TOKEN=' "$ENV_FILE" \
+    || die "$ENV_FILE has no KICKOFF_CHANNEL_TOKEN (or HERDR_TG_TOKEN)"
+  grep -qE '^(KICKOFF_CHANNEL|HERDR_TG)_ALLOWED_CHAT_IDS=' "$ENV_FILE" \
+    || die "$ENV_FILE has no chat allowlist — the watchdog would have nobody to alarm"
   perms=$(stat -c '%a' "$ENV_FILE")
   case "$perms" in 600|400) ;; *) die "$ENV_FILE is mode $perms and holds a bot token. Fix: chmod 600 $ENV_FILE" ;; esac
 
@@ -87,9 +114,10 @@ if [ "$INSTALL" = yes ]; then
 
   mkdir -p "$HOME/.local/bin" "$UNIT_DIR" "$STATE_DIR"
   install -m 0755 "$REPO/deploy/herdr-tg-watchdog.sh" "$BIN_DST"
-  install -m 0644 "$REPO/deploy/herdr-tg-watchdog.service"        "$UNIT_DIR/herdr-tg-watchdog.service"
-  install -m 0644 "$REPO/deploy/herdr-tg-watchdog-failed.service" "$UNIT_DIR/herdr-tg-watchdog-failed.service"
-  install -m 0644 "$REPO/deploy/herdr-tg-watchdog.timer"          "$UNIT_DIR/herdr-tg-watchdog.timer"
+  install -m 0644 "$REPO/deploy/kickoff-channel-watchdog.service"        "$UNIT_DIR/kickoff-channel-watchdog.service"
+  install -m 0644 "$REPO/deploy/kickoff-channel-watchdog-failed.service" "$UNIT_DIR/kickoff-channel-watchdog-failed.service"
+  install -m 0644 "$REPO/deploy/kickoff-channel-watchdog.timer"          "$UNIT_DIR/kickoff-channel-watchdog.timer"
+  retire_superseded
   systemctl --user daemon-reload
   say "  installed the script, both units and the timer"
 fi
@@ -97,10 +125,10 @@ fi
 # What proof 1 runs, and which unit it holds the state directory against. Installed, they are the
 # copies the timer will really use; under --prove they are this repo's, which is what the install
 # would have copied — said out loud below rather than left for the reader to work out.
-WD="$BIN_DST"; UNIT_UNDER_PROOF="$UNIT_DIR/herdr-tg-watchdog.service"
+WD="$BIN_DST"; UNIT_UNDER_PROOF="$UNIT_DIR/kickoff-channel-watchdog.service"
 if [ "$INSTALL" != yes ]; then
   WD="$REPO/deploy/herdr-tg-watchdog.sh"
-  UNIT_UNDER_PROOF="$REPO/deploy/herdr-tg-watchdog.service"
+  UNIT_UNDER_PROOF="$REPO/deploy/kickoff-channel-watchdog.service"
   say "  --prove: nothing installed, nothing enabled. Proving this repo's copy."
 fi
 
@@ -133,6 +161,12 @@ printf '%s' "$DRY" | grep -q 'phone line is down' || die "a stale hub produced n
 # names the dir it was given, and the INSTALLED unit is pointed at the operator's real one.
 printf '%s' "$DRY" | grep -qF "$STAGE/watchdog.disarmed" \
   || die "the alarm does not name the disarm file of the directory it is watching"
+# The variable keeps its former spelling and so does the path, and both halves are deliberate. The
+# only reader of this setting is deploy/herdr-tg-watchdog.sh — a shell script sharing no code with
+# the hub — and the binary's two-name reader (`compat.rs`) never sees this suffix, so a unit saying
+# `KICKOFF_CHANNEL_STATE_DIR` would be read by nobody and the script would fall back to its
+# `${XDG_…:-…}` default: the one silent failure this whole file exists to prevent. The path is
+# hard-coded by other organisations on this box and does not move either.
 grep -qF "Environment=HERDR_TG_STATE_DIR=%h/.local/state/herdr-tg" "$UNIT_UNDER_PROOF" \
   || die "the installed unit does not point at $STATE_DIR"
 
@@ -269,7 +303,7 @@ if [ "$INSTALL" != yes ]; then
 fi
 
 if [ "$PROVE" != yes ]; then
-  systemctl --user enable herdr-tg-watchdog.timer >/dev/null
+  systemctl --user enable kickoff-channel-watchdog.timer >/dev/null
   say; say "--dry: nothing was sent. The send path is UNPROVEN."; exit 0
 fi
 
@@ -282,7 +316,7 @@ say "Proof 2 — sending one drill message through the unit's own sandbox…"
 # `%h/.config/herdr-tg/env` would make the drill fail for a reason that has nothing to do with the
 # alarm. Expand it here, the same way systemd would.
 mapfile -t PROPS < <(awk '/^\[Service\]/{s=1;next} /^\[/{s=0} s && /^[A-Za-z]+=/ && !/^ExecStart=/ && !/^Type=/ {print "-p"; print $0}' \
-                     "$UNIT_DIR/herdr-tg-watchdog.service" | sed "s#%h#$HOME#g")
+                     "$UNIT_DIR/kickoff-channel-watchdog.service" | sed "s#%h#$HOME#g")
 systemd-run --user --wait --collect --quiet --pty "${PROPS[@]}" "$BIN_DST" --test \
   || die "the drill did not send. The watchdog is installed and CANNOT reach you."
 
@@ -313,9 +347,9 @@ if [ "$FIRE" = yes ]; then
   say "  ✓ decision and send, end to end, through the unit's sandbox"
 fi
 
-systemctl --user enable --now herdr-tg-watchdog.timer >/dev/null
+systemctl --user enable --now kickoff-channel-watchdog.timer >/dev/null
 say "  timer enabled and started"
-systemctl --user list-timers herdr-tg-watchdog.timer --no-pager | sed 's/^/  /'
+systemctl --user list-timers kickoff-channel-watchdog.timer --no-pager | sed 's/^/  /'
 
 say
 say "✅ Telegram accepted the drill. Check your phone — HTTP 200 means the Bot API took it,"
@@ -334,5 +368,5 @@ say "              names the leg, because the fix differs — a held update line
 say "              copy of the bot, and on the app plane there is no bot to be a second copy of."
 say "  silence:    touch $STATE_DIR/watchdog.disarmed   (wears off after a day)"
 say "  if it dies: the unit goes 'failed' and notify-send shouts at the screen"
-say "  logs:       journalctl --user -u herdr-tg-watchdog -f"
-say "  remove:     systemctl --user disable --now herdr-tg-watchdog.timer"
+say "  logs:       journalctl --user -u kickoff-channel-watchdog -f"
+say "  remove:     systemctl --user disable --now kickoff-channel-watchdog.timer"

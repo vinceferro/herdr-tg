@@ -2,7 +2,7 @@
 Description=kickoff-hub-attach — the worker "%i", wired to the hub
 Documentation=https://github.com/vinceferro/herdr-tg/blob/main/docs/ATTACHING.md
 After=default.target
-# Never give up. The same reasoning as herdr-tg.service: the operator is on a phone, and a
+# Never give up. The same reasoning as kickoff-channel.service: the operator is on a phone, and a
 # start-limit burst would leave a worker dead until he reaches a keyboard.
 StartLimitIntervalSec=0
 
@@ -59,8 +59,8 @@ TimeoutStopSec=20
 Restart=always
 RestartSec=5
 # No hardening block, on purpose. This unit runs an agent's shell, and every line of
-# herdr-tg.service's hardening is a line that agent would trip. The wall is the safety, and the
-# wall is kickoff's; this unit is for a worker on the operator's own desk.
+# kickoff-channel.service's hardening is a line that agent would trip. The wall is the safety, and
+# the wall is kickoff's; this unit is for a worker on the operator's own desk.
 
 [Install]
 WantedBy=default.target

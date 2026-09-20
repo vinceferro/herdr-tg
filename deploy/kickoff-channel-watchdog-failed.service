@@ -1,0 +1,10 @@
+[Unit]
+Description=Kickoff Channel watchdog could not reach the operator
+Documentation=https://github.com/vinceferro/herdr-tg
+
+[Service]
+Type=oneshot
+# The watchdog exits non-zero exactly when it knows the operator was not told, or could not be
+# told reliably. Telegram is by definition not the route to use for that, so this is the screen
+# in front of the machine. It is the last resort, and it is deliberately not clever.
+ExecStart=/usr/bin/notify-send --urgency=critical "Kickoff Channel watchdog FAILED" "It could not reach your phone. Run: journalctl --user -u kickoff-channel-watchdog -n 20"

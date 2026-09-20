@@ -93,20 +93,20 @@ Every row traces to a file, and every row survived a sceptic briefed to kill it.
 The least work that lets you enrol a second project and trust it. Four changes; the last is one line.
 
 **1 — the enrolment door fails closed.** Move `gitignore_gap` ahead of the mint in
-`crates/herdr-tg/src/cmd/enroll.rs` and make the "git would commit it" branch return `Err` with
+`crates/kickoff-channel/src/cmd/enroll.rs` and make the "git would commit it" branch return `Err` with
 nothing written, behind an opt-out flag so a rotation is still possible. Leave the "could not ask
 git" branch a warning.
 
 > `a_repo_whose_git_would_commit_the_secret_is_refused_before_the_secret_exists`
 
-**2 — a retirement stays inside its own session.** `crates/herdr-tg/src/hub.rs`: add `instance` to
+**2 — a retirement stays inside its own session.** `crates/kickoff-channel/src/hub.rs`: add `instance` to
 the filter in `messages_for`, thread it through `retire` and its caller, and retire the evicted
 instance's open questions where the eviction already happens.
 
 > `an_answer_from_one_session_never_rewrites_the_question_another_session_left_open`
 
-**3 — the list stops lying about who is running.** `crates/herdr-tg/src/bot.rs` and
-`crates/herdr-tg/src/hub.rs`: `reread()` the registry in `projects_digest`, and render from the
+**3 — the list stops lying about who is running.** `crates/kickoff-channel/src/bot.rs` and
+`crates/kickoff-channel/src/hub.rs`: `reread()` the registry in `projects_digest`, and render from the
 claims map rather than from `topic_id`. With one project you knew; with two you do not.
 
 > `the_project_list_calls_a_project_connected_only_while_its_bridge_is_on_the_socket`

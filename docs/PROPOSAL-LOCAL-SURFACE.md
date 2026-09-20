@@ -2,7 +2,7 @@
      HEAD f5ecb11 and three judges read the code each one cited; this is the winner with the grafts
      the judges named, and with the four places the judges found the designs had misread the code
      corrected. Every file:line below was read at f5ecb11; every "I did not check" is literal. Paths
-     are repo-relative; `<state>` is the hub's state directory (`crates/herdr-tg/src/lock.rs:39`),
+     are repo-relative; `<state>` is the hub's state directory (`crates/kickoff-channel/src/lock.rs:39`),
      and `~` stands for the home directory. No secret, chat id, user id or home path appears here. -->
 
 # The local surface
@@ -21,7 +21,7 @@ locally as well"*.
 
 Read plainly: from his laptop — herdr, a terminal — and from his phone — Telegram — he wants to see
 and steer the **same** agents, not two disjoint views. Today they are disjoint. `herdr-tg status`
-prints herdr's snapshot and reads nothing of the hub's (`crates/herdr-tg/src/cmd/status.rs:14-32`,
+prints herdr's snapshot and reads nothing of the hub's (`crates/kickoff-channel/src/cmd/status.rs:14-32`,
 `render.rs:23-45`); the phone shows the hub's topics and knows nothing of a pane. On this box on
 6 September herdr showed seven workspaces and eleven panes, the hub showed five conversations with
 three connected, two of the enrolled projects had no herdr workspace, and several herdr workspaces
@@ -55,7 +55,7 @@ be looking at.
 
 The hub stays the only process that holds the claims and the ledger. It gains **one more file it
 writes for a process that is not the hub** — a mirror of the conversation view — on the exact
-discipline `hub.connected.json` already has (`crates/herdr-tg/src/presence.rs:1-27`: a file, not a
+discipline `hub.connected.json` already has (`crates/kickoff-channel/src/presence.rs:1-27`: a file, not a
 query, because every socket connection presents a secret proving one project and a secret-less
 query would be a new frame kind; written whole under the hub's pid; believed by a reader only when
 the lock's holder is alive, is a herdr-tg, and wrote it, `presence.rs:148-166`).
@@ -136,7 +136,7 @@ the claims map every time, never patched**: it is a derived copy, and a derived 
 incrementally is the one that drifts.
 
 **New directory B — the answer drop.** `<state>/answers/`, 0700 via `private_state_dir`
-(`crates/herdr-tg/src/conversations.rs:437`). `herdr-tg answer` writes `<nonce>.json` =
+(`crates/kickoff-channel/src/conversations.rs:437`). `herdr-tg answer` writes `<nonce>.json` =
 `{"conversation":"p-…","address":"engineering"|null,"ask_id":"a3","option_id":"y","at":<secs>}` at
 0600 by temp-and-rename. The hub's registry-watch loop (`hub.rs:2210-2229`: a stat every second, a
 re-read on change) gains a second directory to sweep. For each request the hub writes
@@ -152,7 +152,7 @@ Why a file and not a frame: `presence.rs:11-13` — a secret-less query over the
 frame kind. Why a file and not a second socket: §4.
 
 **New verb.** `answer <conversation-or-title>[/<address>] <ask_id> <option_id>` under `enum Cmd`
-(`crates/herdr-tg/src/main.rs:76-77`). The conversation accepts the id or the registry title, as
+(`crates/kickoff-channel/src/main.rs:76-77`). The conversation accepts the id or the registry title, as
 `status --workspace` accepts an id or a label (`cmd/status.rs:49-58`). **It answers only by option.
 It never carries text.** Typed steering from the laptop is refused on purpose: the agent's own
 terminal is a keystroke away from the laptop, and a typed line toward an agent from a file is the
