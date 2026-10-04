@@ -1,0 +1,2 @@
+{"v":1,"id":"wip-80","t":"wip","lane":"fleet","full":true,"lanes":[{"id":"lane-1004-170001-0001","short":"over-budget-demo","agent":"builder","status":"running","respawns":0,"proof":true,"updated":"2026-10-04T13:00:00Z","age_min":60}],"total":1,"shown":1,"truncated":0,"seq":80}
+{"t":"ack","ref":"disp-demo-1","verdict":"rejected","why":"over_budget"}

@@ -146,7 +146,7 @@ is run against the real door by the suite.
 
 ## The commands
 
-Sixteen, and every one of them is run at a keyboard. Nothing in Telegram can reach any of them.
+Seventeen, and every one of them is run at a keyboard. Nothing in Telegram can reach any of them.
 
 The command is installed under two names, and one of them is retired. `kickoff-channel` is the
 product's name and the one everything here uses; `herdr-tg` is the same program under the name it
@@ -178,6 +178,7 @@ appears, whatever it is called.
 | `read` | print what one of herdr's screens is showing, as text, byte for byte. Read-only |
 | `doctor` | is this bridge's view of herdr still valid, and is the control plane being watched |
 | `watch` | decode herdr's event stream. Read-only |
+| `strip` | the lane board as frames, one line per lane — agent, state, last beat, proof — refreshed from a replay of the frames, with one dispatch affordance (`d`) that sends a command frame and reads its receipt. Runs nothing itself |
 | `door-token` | mint the token the PWA's gateway takes on its write door. Refuses to overwrite; rotation names the old token's first characters |
 
 ## Build and test

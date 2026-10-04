@@ -17,6 +17,7 @@ pub(crate) mod enroll;
 pub(crate) mod projects;
 pub(crate) mod read;
 pub(crate) mod status;
+pub(crate) mod strip;
 pub(crate) mod watch;
 
 use std::io::Write;
