@@ -113,6 +113,8 @@ mod tests {
                     proof: None,
                     updated: None,
                     age_min: None,
+                    plan: None,
+                    progress_snapshot: None,
                 })
                 .collect(),
             total: Some(lanes.len() as u64),

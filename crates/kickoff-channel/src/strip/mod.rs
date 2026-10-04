@@ -256,7 +256,7 @@ async fn pick_and_emit(
 
     let agent_line = ask("  agent (number or name): ", lines, &mut out).await?;
     let task_line = ask(
-        "  task (an absolute file path, or --Text for a task typed here): ",
+        "  task (an absolute file path, or -Text for a task typed here): ",
         lines,
         &mut out,
     )

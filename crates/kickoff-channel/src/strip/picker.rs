@@ -11,6 +11,7 @@
 //! this side checks anyway because a pick that composes a frame the operator can see is doomed
 //! is a pick that wasted his time.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::bail;
@@ -25,7 +26,9 @@ use super::frames::DispatchFrame;
 ///   name the executor may know and this strip cannot see.
 /// * The task is an absolute path on this box (checked readable here, because the operator is
 ///   standing at this box and can fix it now, in the pick, rather than after a round trip), or
-///   `--Text` for the spec's inline form.
+///   `-Text` for the inline form — the contract's marker, ONE dash, because their
+///   `lane-dispatch.sh` strips exactly one leading dash and writes the rest to the task file;
+///   the spec-era `--Text` would leave a stray `-` in the lane's task.
 /// * The reason is one line, sent as given — the spec logs it, and an empty reason is an empty
 ///   reason rather than a refusal: the frame is honest either way.
 ///
@@ -59,14 +62,15 @@ pub(crate) fn compose_spawn(
     if task.is_empty() {
         bail!("no task was chosen; nothing was sent");
     }
-    if task == "--" {
-        bail!("-- with nothing after it is not a task; nothing was sent");
+    if task == "-" {
+        bail!("- with nothing after it is not a task; nothing was sent");
     }
-    let task_ref = if task.starts_with("--") {
-        // The inline form keeps its marker IN the field: the spec's own words are "a path on
-        // the box, or \"--Text\" inline", so the executor tells the two apart by the very
-        // bytes this side was handed. Stripping the marker here would launder the inline form
-        // into something that looks like a relative path.
+    let task_ref = if task.starts_with('-') {
+        // The inline form keeps its marker IN the field: the contract's convention is
+        // `-Text` (one dash — their lane-dispatch.sh strips exactly one leading dash,
+        // `${TASK_ARG#-}`, and writes the rest to the lane's task file), so the executor
+        // tells the two apart by the very bytes this side was handed. Stripping the marker
+        // here would launder the inline form into something that looks like a relative path.
         task.to_owned()
     } else {
         let path = Path::new(task);
@@ -100,19 +104,33 @@ pub(crate) fn compose_spawn(
 /// vocabulary; the strip's sentences are this product's — an unfamiliar code renders as
 /// itself, because mapping an unknown refusal onto a known one would misreport whose refusal
 /// it was.
+///
+/// `accepted` means the executor took the command and ran the spawn — NOT that the lane
+/// finished (the contract's own honesty rule: completion arrives through `wip` frames, never
+/// through the receipt), which is why the sentence stops at "took the command" and, when the
+/// receipt carries `lane_id`, names the lane to watch. The contract's v0 verdict set is
+/// `accepted | rejected` only — the spec-era `held` is explicitly not built (a command that
+/// cannot be taken is REJECTED, `no_worker`) — so a verdict this build does not know renders
+/// verbatim below, which is exactly how a future `held` will read honestly on the day one
+/// lands without a release here.
 pub(crate) fn receipt_line(receipt: &super::frames::DispatchReceipt) -> String {
     let why = receipt.why.as_deref().map(why_in_words);
     match (receipt.verdict.as_str(), why) {
-        ("accepted", _) => format!(
-            "receipt {}: accepted — the executor took the command",
-            receipt.ref_id
-        ),
+        ("accepted", _) => {
+            let mut line = format!(
+                "receipt {}: accepted — the executor took the command",
+                receipt.ref_id
+            );
+            if let Some(lane_id) = receipt.lane_id.as_deref() {
+                let _ = write!(
+                    line,
+                    "; watch {lane_id} on the board — accepted is not finished"
+                );
+            }
+            line
+        }
         ("rejected", Some(why)) => format!("receipt {}: rejected — {}", receipt.ref_id, why),
         ("rejected", None) => format!("receipt {}: rejected", receipt.ref_id),
-        ("held", _) => format!(
-            "receipt {}: held — the executor is down; it will be delivered when it wakes",
-            receipt.ref_id
-        ),
         (other, why) => match why {
             Some(why) => format!("receipt {}: {other} — {why}", receipt.ref_id),
             None => format!("receipt {}: {other}", receipt.ref_id),
@@ -127,7 +145,13 @@ fn why_in_words(why: &str) -> String {
         "unknown_agent" => "that agent is not one the executor knows".to_owned(),
         "bad_task_ref" => "the task file could not be used".to_owned(),
         "not_permitted" => "this connection may not dispatch".to_owned(),
+        // The spec's sixth word, RESERVED in v0 (it names the steer/stop slice's busy-lane
+        // refusal): the sentence exists so the day that slice lands it reads in words.
         "lane_busy" => "the lane is busy".to_owned(),
+        // The contract v0's three additions, where the executor's truth needed a word.
+        "bad_dispatch" => "the frame was malformed".to_owned(),
+        "duplicate_ref" => "another live command already holds that dispatch id".to_owned(),
+        "spawn_timeout" => "the executor killed its own spawn past its deadline".to_owned(),
         other => other.to_owned(),
     }
 }
@@ -220,7 +244,7 @@ mod tests {
         assert_eq!(from_name.agent.as_deref(), Some("planner"));
     }
 
-    /// Fail-closed picks: empty answers, a relative path, a missing file, a bare `--`. Each
+    /// Fail-closed picks: empty answers, a relative path, a missing file, a bare `-`. Each
     /// refuses with a sentence that says nothing was sent.
     #[test]
     fn a_pick_that_cannot_compose_refuses_and_says_nothing_was_sent() {
@@ -229,7 +253,7 @@ mod tests {
             ("builder", ""),
             ("builder", "tasks/relative.md"),
             ("builder", "/tmp/definitely-not-here.md"),
-            ("builder", "--"),
+            ("builder", "-"),
         ] {
             let err = compose_spawn(&[], "disp-x".to_owned(), agent, task, "", |path: &Path| {
                 path != Path::new("/tmp/definitely-not-here.md")
@@ -242,41 +266,65 @@ mod tests {
         }
     }
 
-    /// The inline form keeps its marker: `--Text` stays `--Text` on the wire, because the
-    /// spec's executor tells a path from inline text by those very bytes, and a stripped
-    /// marker would arrive looking like a relative path.
+    /// The inline form keeps its marker: `-Text` stays `-Text` on the wire — ONE dash, the
+    /// contract's `lane-dispatch.sh` convention (the script strips exactly one leading dash
+    /// and writes the rest to the lane's task file) — and a stripped marker would arrive
+    /// looking like a relative path.
     #[test]
     fn the_inline_task_form_keeps_its_marker_in_the_field() {
         let frame = compose_spawn(
             &[],
             "disp-1".to_owned(),
             "builder",
-            "--fix the failing gate",
+            "-fix the failing gate",
             "",
             everything_readable(),
         )
         .expect("composes");
-        assert_eq!(frame.task_ref.as_deref(), Some("--fix the failing gate"));
+        assert_eq!(frame.task_ref.as_deref(), Some("-fix the failing gate"));
     }
 
-    /// Receipts read as sentences, verdicts verbatim, unknown whys as themselves.
+    /// Receipts read as sentences, verdicts verbatim, unknown whys as themselves — and a
+    /// verdict this build does not know (the spec-era `held`, for one: the contract's v0
+    /// rejects instead) renders as itself rather than as a sentence this build invented for a
+    /// verdict the executor never sent.
     #[test]
     fn a_receipt_is_a_sentence_and_an_unknown_why_is_itself() {
         use super::super::frames::DispatchReceipt;
 
         let accepted = DispatchReceipt {
+            v: Some(1),
+            id: Some("h12".to_owned()),
             t: "ack".to_owned(),
             ref_id: "disp-1".to_owned(),
+            delivered: Some("yes".to_owned()),
             verdict: "accepted".to_owned(),
             why: None,
+            lane_id: Some("lane-1004-130001-733100".to_owned()),
         };
-        assert!(receipt_line(&accepted).starts_with("receipt disp-1: accepted"));
+        let line = receipt_line(&accepted);
+        assert!(
+            line.starts_with("receipt disp-1: accepted"),
+            "the sentence a person reads:\n{line}"
+        );
+        assert!(
+            line.contains("watch lane-1004-130001-733100 on the board"),
+            "an accepted receipt names the lane the wip frames will carry:\n{line}"
+        );
+        assert!(
+            line.contains("accepted is not finished"),
+            "the contract's honesty rule is carried to the operator:\n{line}"
+        );
 
         let over_budget = DispatchReceipt {
+            v: Some(1),
+            id: None,
             t: "ack".to_owned(),
             ref_id: "disp-2".to_owned(),
+            delivered: Some("yes".to_owned()),
             verdict: "rejected".to_owned(),
             why: Some("over_budget".to_owned()),
+            lane_id: None,
         };
         let line = receipt_line(&over_budget);
         assert!(
@@ -284,15 +332,56 @@ mod tests {
             "the wire's code becomes the operator's sentence:\n{line}"
         );
 
+        // The contract v0's own why words, spelled for a person.
+        let duplicate = DispatchReceipt {
+            v: None,
+            id: None,
+            t: "ack".to_owned(),
+            ref_id: "disp-2b".to_owned(),
+            delivered: None,
+            verdict: "rejected".to_owned(),
+            why: Some("duplicate_ref".to_owned()),
+            lane_id: None,
+        };
+        assert!(
+            receipt_line(&duplicate)
+                .contains("another live command already holds that dispatch id"),
+            "the v0 vocabulary is in words, not codes"
+        );
+
         let future = DispatchReceipt {
+            v: None,
+            id: None,
             t: "ack".to_owned(),
             ref_id: "disp-3".to_owned(),
+            delivered: None,
             verdict: "rejected".to_owned(),
             why: Some("a_code_this_build_never_heard_of".to_owned()),
+            lane_id: None,
         };
         assert!(
             receipt_line(&future).contains("a_code_this_build_never_heard_of"),
             "an unfamiliar refusal is itself, not a familiar one it resembles"
+        );
+
+        let held_someday = DispatchReceipt {
+            v: None,
+            id: None,
+            t: "ack".to_owned(),
+            ref_id: "disp-4".to_owned(),
+            delivered: None,
+            verdict: "held".to_owned(),
+            why: None,
+            lane_id: None,
+        };
+        let held_line = receipt_line(&held_someday);
+        assert!(
+            held_line.contains("receipt disp-4: held"),
+            "a verdict outside the contract's v0 set renders verbatim:\n{held_line}"
+        );
+        assert!(
+            !held_line.contains("when it wakes"),
+            "no sentence is invented for a verdict the executor never sent in v0"
         );
     }
 }
