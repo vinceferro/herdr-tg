@@ -1,0 +1,5 @@
+{"v":1,"id":"wip-50","t":"wip","lane":"wip","full":false,"lanes":[{"id":"lane-9999-000001-1111","short":"delta-ghost","agent":"builder","status":"running","respawns":0,"proof":true,"updated":"2026-10-04T13:00:00Z","age_min":30}],"total":1,"shown":1,"truncated":0,"seq":50}
+{"v":1,"id":"wip-50b","t":"wip","lane":"wip","lanes":[{"id":"lane-9999-000002-2222","short":"unmarked-ghost","agent":"builder","status":"running","respawns":0,"proof":true,"updated":"2026-10-04T13:00:00Z","age_min":30}],"total":1,"shown":1,"truncated":0,"seq":50}
+{"v":1,"id":"x-1","t":"telemetry","whatever":"a frame kind this strip has never heard of"}
+this line is not json at all
+{"v":1,"id":"wip-51","t":"wip","lane":"wip","full":true,"lanes":[{"id":"lane-1004-140001-3333","short":"real-lane","agent":"builder","status":"done","respawns":0,"proof":true,"updated":"2026-10-04T13:40:00Z","age_min":0}],"total":1,"shown":1,"truncated":0,"seq":51}

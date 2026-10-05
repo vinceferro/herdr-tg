@@ -48,6 +48,7 @@ mod presence;
 mod queue;
 mod registry;
 mod render;
+mod strip;
 mod summarize;
 mod surface;
 mod transport;
@@ -158,6 +159,46 @@ enum Cmd {
         /// the server closes it.
         #[arg(long, default_value = "5000", value_name = "MS")]
         timeout_ms: u64,
+    },
+
+    /// The lane board as frames, rendered as one line per lane: agent, lane, state, last
+    /// beat, proof status.
+    ///
+    /// Reads frames from a replay file — the live lane-relay connection lands behind the same
+    /// seam — and refreshes at the relay's own rhythm. While it runs, `d` offers the one
+    /// dispatch affordance (pick an agent and a task file, send the command frame, read the
+    /// receipt) and `q` leaves. This command runs nothing: a dispatch it composes is a frame
+    /// handed to the seam, for the executor that owns dispatching to take or refuse.
+    ///
+    /// `--once` renders the first board and exits, which is the mode a pipe or a test wants.
+    Strip {
+        /// An NDJSON file of lane-board frames to replay, one per line.
+        #[arg(long, value_name = "PATH")]
+        replay: std::path::PathBuf,
+
+        /// Append every dispatch frame composed here to this file, one JSON line per command.
+        /// Without it the strip still renders, and the pick says why it cannot send.
+        #[arg(long, value_name = "PATH")]
+        outbox: Option<std::path::PathBuf>,
+
+        /// Render the first board and exit.
+        #[arg(long)]
+        once: bool,
+
+        /// Milliseconds to wait between replayed frames. The default is the relay's own
+        /// coalescing floor, so the strip's rhythm here is the rhythm it will have live.
+        #[arg(long, default_value = "2000", value_name = "MS")]
+        cadence_ms: u64,
+
+        /// Milliseconds of silence before the strip says the board it is showing is the last
+        /// known, not live. Default: three cadences, never under a second.
+        #[arg(long, value_name = "MS")]
+        stale_after_ms: Option<u64>,
+
+        /// Use this id for the dispatch composed here, instead of minting one — for replays
+        /// whose scripted receipt names the id back. Live use mints its own.
+        #[arg(long, value_name = "ID")]
+        dispatch_id: Option<String>,
     },
 
     /// Enrol a project so its bridge may connect, or rotate the secret of one already enrolled.
@@ -407,6 +448,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             expect_status,
             timeout_ms,
         } => cmd::watch::run(&client, &pane, once, expect_status.as_deref(), timeout_ms).await,
+        Cmd::Strip {
+            replay,
+            outbox,
+            once,
+            cadence_ms,
+            stale_after_ms,
+            dispatch_id,
+        } => {
+            cmd::strip::run(
+                replay,
+                outbox,
+                once,
+                cadence_ms,
+                stale_after_ms,
+                dispatch_id,
+            )
+            .await
+        }
         Cmd::Enroll {
             repo,
             even_if_git_would_commit_it,
